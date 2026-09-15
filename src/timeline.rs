@@ -25,6 +25,9 @@ pub enum BlockKey {
 pub struct Block {
     pub key: BlockKey,
     pub text: Text<'static>,
+    /// Toggleable regions as `(first line, end line exclusive, expand key)`, in text-line
+    /// indices before wrapping. Work groups list their header and each tool row.
+    pub rows: Vec<(usize, usize, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,9 +36,31 @@ struct WorkEntry {
     turn_id: Option<String>,
     icon: &'static str,
     title: String,
+    /// One-line summary shown on the collapsed row.
     detail: Option<String>,
+    /// Everything the server sent about the call, for the expanded row. The server
+    /// projects tool payloads down to a summary before they reach the wire: the input is
+    /// cut at 180 characters and the output is its first meaningful line.
+    input: Option<String>,
+    output: Option<String>,
+    files: Vec<String>,
     status: String,
     tone: String,
+}
+
+impl WorkEntry {
+    fn has_more(&self) -> bool {
+        self.input
+            .as_deref()
+            .is_some_and(|i| Some(i) != self.detail.as_deref())
+            || self.output.is_some()
+            || !self.files.is_empty()
+    }
+}
+
+/// Expand key of one tool row inside a work group.
+fn row_key(group: &str, entry: &WorkEntry) -> String {
+    format!("{group}/{}", entry.key)
 }
 
 enum Item<'a> {
@@ -104,9 +129,11 @@ pub fn build(
                 entry.status = "completed".to_string();
             }
         }
+        let (text, rows) = render_work(pending, is_expanded, expanded, &key, width);
         blocks.push(Block {
             key: BlockKey::Work(key),
-            text: render_work(pending, is_expanded, width),
+            text,
+            rows,
         });
         pending.clear();
     };
@@ -128,6 +155,7 @@ pub fn build(
                 blocks.push(Block {
                     key: BlockKey::Message(message.id.clone()),
                     text,
+                    rows: Vec::new(),
                 });
             }
             Item::Activity(activity) => {
@@ -146,6 +174,7 @@ pub fn build(
                 blocks.push(Block {
                     key: BlockKey::Plan(plan.id.clone()),
                     text: render_plan(plan),
+                    rows: Vec::new(),
                 });
             }
         }
@@ -161,6 +190,7 @@ pub fn build(
         blocks.push(Block {
             key: BlockKey::Working,
             text: render_working(thread),
+            rows: Vec::new(),
         });
     }
     blocks
@@ -206,6 +236,9 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
                 icon,
                 title,
                 detail: tool_detail(item_type, activity),
+                input: tool_input(item_type, activity),
+                output: tool_output(activity),
+                files: tool_files(activity),
                 status,
                 tone: activity.tone.clone(),
             }
@@ -226,6 +259,9 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
                 icon: "⤷",
                 title: format!("agent: {}", activity.str("title").unwrap_or("task")),
                 detail: activity.str("role").map(str::to_string),
+                input: None,
+                output: None,
+                files: Vec::new(),
                 status,
                 tone: "info".into(),
             }
@@ -239,6 +275,9 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             icon: "?",
             title: activity.summary.clone(),
             detail: activity.str("detail").map(str::to_string),
+            input: None,
+            output: None,
+            files: Vec::new(),
             status: "inProgress".into(),
             tone: "approval".into(),
         },
@@ -254,6 +293,9 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
                 activity.str("decision").unwrap_or("resolved")
             ),
             detail: None,
+            input: None,
+            output: None,
+            files: Vec::new(),
             status: "completed".into(),
             tone: "approval".into(),
         },
@@ -263,6 +305,9 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             icon: "?",
             title: "Agent asked a question".into(),
             detail: None,
+            input: None,
+            output: None,
+            files: Vec::new(),
             status: "completed".into(),
             tone: "approval".into(),
         },
@@ -272,6 +317,9 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             icon: "⇣",
             title: "Context compacted".into(),
             detail: None,
+            input: None,
+            output: None,
+            files: Vec::new(),
             status: "completed".into(),
             tone: "info".into(),
         },
@@ -288,6 +336,9 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
                 .str("message")
                 .or_else(|| activity.str("detail"))
                 .map(str::to_string),
+            input: None,
+            output: None,
+            files: Vec::new(),
             status: if activity.tone == "error" {
                 "failed".into()
             } else {
@@ -305,6 +356,15 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             }
             if entry.detail.is_some() {
                 existing.detail = entry.detail;
+            }
+            if entry.input.is_some() {
+                existing.input = entry.input;
+            }
+            if entry.output.is_some() {
+                existing.output = entry.output;
+            }
+            if !entry.files.is_empty() {
+                existing.files = entry.files;
             }
             existing.icon = entry.icon;
         }
@@ -360,6 +420,67 @@ fn tool_detail(item_type: &str, activity: &Activity) -> Option<String> {
         .filter(|d| !d.is_empty())
 }
 
+/// The full input the server kept: the command, else the provider's detail string.
+fn tool_input(item_type: &str, activity: &Activity) -> Option<String> {
+    let data = &activity.payload["data"];
+    let command = if item_type == "command_execution" {
+        data.get("command").and_then(Value::as_str)
+    } else {
+        None
+    };
+    command
+        .or_else(|| activity.str("detail"))
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+}
+
+/// The output summary the server kept: a first line, a line count, or a file count.
+fn tool_output(activity: &Activity) -> Option<String> {
+    let data = &activity.payload["data"];
+    let raw = data.get("rawOutput");
+    if let Some(content) = raw
+        .and_then(|r| r.get("content"))
+        .and_then(Value::as_str)
+        .filter(|c| !c.trim().is_empty())
+    {
+        return Some(content.trim().to_string());
+    }
+    if let Some(total) = raw
+        .and_then(|r| r.get("totalFiles"))
+        .and_then(Value::as_u64)
+    {
+        let truncated = raw
+            .and_then(|r| r.get("truncated"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return Some(format!(
+            "{total} file{}{}",
+            if total == 1 { "" } else { "s" },
+            if truncated { " (truncated)" } else { "" }
+        ));
+    }
+    data.get("result")
+        .and_then(|r| r.get("content"))
+        .and_then(Value::as_str)
+        .filter(|c| !c.trim().is_empty())
+        .map(|c| c.trim().to_string())
+}
+
+fn tool_files(activity: &Activity) -> Vec<String> {
+    activity.payload["data"]
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|f| f.get("path").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("").trim()
 }
@@ -374,13 +495,22 @@ fn status_style(entry: &WorkEntry) -> Style {
     }
 }
 
-fn render_work(entries: &[WorkEntry], expanded: bool, width: u16) -> Text<'static> {
+type Rows = Vec<(usize, usize, String)>;
+
+fn render_work(
+    entries: &[WorkEntry],
+    expanded: bool,
+    expanded_keys: &HashSet<String>,
+    group_key: &str,
+    width: u16,
+) -> (Text<'static>, Rows) {
     let running = entries.iter().filter(|e| e.status == "inProgress").count();
     let failed = entries
         .iter()
         .filter(|e| e.status == "failed" || e.tone == "error")
         .count();
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut rows: Rows = Vec::new();
     let mut header = vec![
         Span::styled(
             if expanded { "▾ " } else { "▸ " },
@@ -420,32 +550,79 @@ fn render_work(entries: &[WorkEntry], expanded: bool, width: u16) -> Text<'stati
         ));
     }
     lines.push(Line::from(header));
-    if expanded {
-        for entry in entries {
-            let mut spans = vec![
-                Span::raw("  "),
-                Span::styled(format!("{} ", entry.icon), status_style(entry)),
-                Span::styled(
-                    entry.title.clone(),
-                    status_style(entry).add_modifier(Modifier::BOLD),
+    rows.push((0, 1, group_key.to_string()));
+    if !expanded {
+        return (Text::from(lines), rows);
+    }
+    let dim = Style::default().fg(Color::DarkGray);
+    for entry in entries {
+        let key = row_key(group_key, entry);
+        let open = entry.has_more() && expanded_keys.contains(&key);
+        let marker = if !entry.has_more() {
+            "  "
+        } else if open {
+            "▾ "
+        } else {
+            "▸ "
+        };
+        let first = lines.len();
+        let mut spans = vec![
+            Span::raw("  "),
+            Span::styled(marker, dim),
+            Span::styled(format!("{} ", entry.icon), status_style(entry)),
+            Span::styled(
+                entry.title.clone(),
+                status_style(entry).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if !open && let Some(detail) = &entry.detail {
+            spans.push(Span::styled(
+                format!(
+                    "  {}",
+                    truncate(
+                        detail,
+                        width.saturating_sub(entry.title.len() as u16 + 10) as usize
+                    )
                 ),
-            ];
-            if let Some(detail) = &entry.detail {
-                spans.push(Span::styled(
-                    format!(
-                        "  {}",
-                        truncate(
-                            detail,
-                            width.saturating_sub(entry.title.len() as u16 + 8) as usize
-                        )
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                ));
+                dim,
+            ));
+        }
+        lines.push(Line::from(spans));
+        if open {
+            if let Some(input) = &entry.input {
+                for line in input.lines() {
+                    lines.push(Line::from(vec![
+                        Span::raw("      "),
+                        Span::styled(line.to_string(), Style::default().fg(Color::Gray)),
+                    ]));
+                }
             }
-            lines.push(Line::from(spans));
+            if let Some(output) = &entry.output {
+                for (i, line) in output.lines().enumerate() {
+                    lines.push(Line::from(vec![
+                        Span::styled(if i == 0 { "      → " } else { "        " }, dim),
+                        Span::styled(line.to_string(), Style::default()),
+                    ]));
+                }
+            }
+            for file in &entry.files {
+                lines.push(Line::from(vec![
+                    Span::styled("      ✎ ", dim),
+                    Span::styled(file.clone(), Style::default().fg(Color::Gray)),
+                ]));
+            }
+            if entry.status != "completed" {
+                lines.push(Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(entry.status.clone(), status_style(entry)),
+                ]));
+            }
+        }
+        if entry.has_more() {
+            rows.push((first, lines.len(), key));
         }
     }
-    Text::from(lines)
+    (Text::from(lines), rows)
 }
 
 fn truncate(text: &str, max: usize) -> String {

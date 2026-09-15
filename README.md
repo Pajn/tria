@@ -58,14 +58,14 @@ Press `?` inside the app for the full list.
 | `n` | new thread (pick a project) |
 | `m` | change model |
 | `i` or `Enter` | write a message |
-| `za` `zR` `zM` | toggle / expand all / collapse all tool groups |
+| `za` `zR` `zM` | toggle / expand all / collapse all tool groups; `za` on a tool row inside an open group expands that row |
 | `1`..`9` | answer a pending approval |
 | `a` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `y` | copy the last assistant message (OSC 52) |
 | `gx` | open the thread's pull request in the browser |
 | `Ctrl-c` | interrupt the running turn |
 | mouse wheel | scroll the conversation, or the thread list when the pointer is over it |
-| left click | in the thread list: open a thread, or fold and unfold a section |
+| left click | in the thread list: open a thread, or fold and unfold a section; in the chat: fold and unfold a tool group or row |
 | drag | select text in the conversation; releasing copies it (OSC 52) |
 
 | Insert mode | |
@@ -86,6 +86,14 @@ number, title, draft or merged state, and a checks glyph (`✓` passing, `✗` f
 pending). The pull request on the thread's branch wins; otherwise the first open linked one.
 `gx` opens it in the browser through the platform's URL opener. `:pr` does the same, and
 offers a picker when several pull requests are linked.
+
+## Tool output
+
+Expanding a tool row shows what the server sends: the command or tool input, the first line
+of the output or a line count, changed files, and the status. The server projects tool
+payloads to that summary before they go on the wire, so the full output is not available to
+any client through the orchestration API. Rows without anything beyond their summary have no
+fold marker.
 
 ## Thread list
 

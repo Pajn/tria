@@ -164,6 +164,11 @@ advertised.
   `title`, `detail`), `approval.requested|resolved`, `user-input.requested|resolved`,
   `turn.plan.updated`, `runtime.error|warning|note`, `context-compaction`. Ignore
   `task.*`, `context-window.updated`, `checkpoint.*`, `worktree-setup`, `setup-script.*`.
+- **Tool output is summarized on the wire.** `projectActivityPayload` in the server keeps
+  `data.command`, `toolName`, `files[].path`, and `rawOutput.content` reduced to the first
+  meaningful line (84 characters) or an `N lines` count; MCP results become
+  `result.content` summaries; `detail` is cut at 180 characters. Full payloads stay in the
+  server's database only. A tool row can expand to show exactly this much.
 - **Reasoning is not on the wire.** Only assistant text becomes messages; reasoning items are
   filtered server-side. Nothing to render.
 - **Session**: `{ status: idle|starting|running|ready|interrupted|stopped|error,

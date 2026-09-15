@@ -1069,29 +1069,47 @@ impl App {
         }
     }
 
-    fn toggle_work_group(&mut self) {
+    /// First content line shown in the chat viewport.
+    fn chat_offset(&self) -> usize {
         let (height, total) = self.chat_viewport;
-        let offset = match self.scroll {
+        match self.scroll {
             Scroll::Follow => total.saturating_sub(height),
-            Scroll::Offset(o) => o,
-        };
+            Scroll::Offset(o) => o.min(total.saturating_sub(height)),
+        }
+    }
+
+    /// The tightest toggle region covering a content line: a tool row inside an expanded
+    /// group wins over the group itself.
+    fn toggle_key_at(&self, line: usize) -> Option<String> {
+        self.work_ranges
+            .iter()
+            .filter(|(start, end, _)| *start <= line && line < *end)
+            .min_by_key(|(start, end, _)| end - start)
+            .map(|(_, _, key)| key.clone())
+    }
+
+    fn toggle_expanded(&mut self, key: String) {
+        if !self.expanded.remove(&key) {
+            self.expanded.insert(key);
+        }
+    }
+
+    fn toggle_work_group(&mut self) {
+        let (height, _) = self.chat_viewport;
+        let offset = self.chat_offset();
         let middle = offset + height / 2;
         let key = self
-            .work_ranges
-            .iter()
-            .find(|(start, end, _)| *start <= middle && middle < *end)
+            .toggle_key_at(middle)
             .or_else(|| {
                 self.work_ranges
                     .iter()
                     .rev()
                     .find(|(start, _, _)| *start < offset + height)
+                    .map(|(_, _, key)| key.clone())
             })
-            .or_else(|| self.work_ranges.last())
-            .map(|(_, _, key)| key.clone());
-        if let Some(key) = key
-            && !self.expanded.remove(&key)
-        {
-            self.expanded.insert(key);
+            .or_else(|| self.work_ranges.last().map(|(_, _, key)| key.clone()));
+        if let Some(key) = key {
+            self.toggle_expanded(key);
         }
     }
 
@@ -1335,8 +1353,15 @@ impl App {
                 {
                     sel.dragging = false;
                     if sel.anchor == sel.head {
-                        // A plain click: nothing to copy.
+                        // A plain click: fold or unfold whatever tool row or group is there.
+                        let at = sel.anchor;
                         self.selection = None;
+                        if self.chat_area.contains(at) {
+                            let line = self.chat_offset() + (at.y - self.chat_area.y) as usize;
+                            if let Some(key) = self.toggle_key_at(line) {
+                                self.toggle_expanded(key);
+                            }
+                        }
                     } else {
                         // The renderer fills `clipboard_pending` from the drawn cells.
                         self.clipboard_pending = Some(String::new());

@@ -26,8 +26,16 @@ const COMPOSER_MAX_ROWS: u16 = 8;
 #[derive(Default)]
 pub struct ChatCache {
     key: Option<(String, u64, u16, u64, bool, usize)>,
-    blocks: Vec<(ChatBlock, usize)>,
+    blocks: Vec<CachedBlock>,
     total: usize,
+}
+
+pub struct CachedBlock {
+    block: ChatBlock,
+    /// Rendered height after wrapping.
+    height: usize,
+    /// Toggle regions in wrapped content lines relative to the block start.
+    rows: Vec<(usize, usize, String)>,
 }
 
 thread_local! {
@@ -448,14 +456,43 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         if needs_rebuild {
             let blocks = timeline::build(thread, &app.expanded, app.expand_all, inner.width);
             let mut total = 0usize;
-            let blocks: Vec<(ChatBlock, usize)> = blocks
+            let blocks: Vec<CachedBlock> = blocks
                 .into_iter()
                 .map(|block| {
                     let height = Paragraph::new(block.text.clone())
                         .wrap(Wrap { trim: false })
                         .line_count(inner.width);
                     total += height;
-                    (block, height)
+                    // Per-line wrapped heights turn text-line row ranges into content lines.
+                    let rows = if block.rows.is_empty() {
+                        Vec::new()
+                    } else {
+                        let mut starts = Vec::with_capacity(block.text.lines.len() + 1);
+                        let mut acc = 0usize;
+                        for line in &block.text.lines {
+                            starts.push(acc);
+                            acc += Paragraph::new(Text::from(line.clone()))
+                                .wrap(Wrap { trim: false })
+                                .line_count(inner.width);
+                        }
+                        starts.push(acc);
+                        block
+                            .rows
+                            .iter()
+                            .map(|(first, end, key)| {
+                                (
+                                    starts[*first],
+                                    starts[(*end).min(starts.len() - 1)],
+                                    key.clone(),
+                                )
+                            })
+                            .collect()
+                    };
+                    CachedBlock {
+                        block,
+                        height,
+                        rows,
+                    }
                 })
                 .collect();
             cache.blocks = blocks;
@@ -475,12 +512,21 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         let mut y = 0usize;
         let mut cursor = inner.y;
         let bottom = inner.y + inner.height;
-        for (block, block_height) in &cache.blocks {
+        for CachedBlock {
+            block,
+            height: block_height,
+            rows,
+        } in &cache.blocks
+        {
             let start = y;
             let end = y + block_height;
             y = end;
             if let BlockKey::Work(key) = &block.key {
                 app.work_ranges.push((start, end, key.clone()));
+                for (row_start, row_end, row_key) in rows {
+                    app.work_ranges
+                        .push((start + row_start, start + row_end, row_key.clone()));
+                }
             }
             if end <= offset {
                 continue;
