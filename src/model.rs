@@ -90,6 +90,21 @@ pub struct ThreadShell {
     #[serde(default)]
     pub pinned_at: Option<String>,
     #[serde(default)]
+    pub pin_order_key: Option<String>,
+    #[serde(default)]
+    pub settled_at: Option<String>,
+    #[serde(default)]
+    pub settled_override: Option<String>,
+    #[serde(default)]
+    pub unsettled_at: Option<String>,
+    #[serde(default)]
+    pub snoozed_until: Option<String>,
+    #[serde(default)]
+    pub has_actionable_proposed_plan: bool,
+    /// Native background work alive after the turn settled: "working" or "monitoring".
+    #[serde(default)]
+    pub background_liveness: Option<String>,
+    #[serde(default)]
     pub session: Option<Session>,
     #[serde(default)]
     pub latest_user_message_at: Option<String>,
@@ -109,12 +124,93 @@ fn default_interaction_mode() -> String {
     "default".to_string()
 }
 
+/// Sidebar status for a thread, ordered by priority (first match wins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadStatus {
+    Approval,
+    Question,
+    Working,
+    Failed,
+    Monitoring,
+    PlanReady,
+    Done,
+    Idle,
+}
+
+impl ThreadStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Approval => "approval",
+            Self::Question => "question",
+            Self::Working => "working",
+            Self::Failed => "failed",
+            Self::Monitoring => "monitoring",
+            Self::PlanReady => "plan ready",
+            Self::Done => "done",
+            Self::Idle => "idle",
+        }
+    }
+
+    /// Whether the status deserves attention in the list (everything but the resting states).
+    pub fn is_notable(self) -> bool {
+        !matches!(self, Self::Done | Self::Idle)
+    }
+}
+
 impl ThreadShell {
+    /// A turn is in flight, or the provider session is starting up for one.
     pub fn is_running(&self) -> bool {
-        matches!(
+        if matches!(
             self.latest_turn.as_ref().map(|t| t.state.as_str()),
             Some("running")
+        ) {
+            return true;
+        }
+        matches!(
+            self.session.as_ref().map(|s| s.status.as_str()),
+            Some("running") | Some("starting")
         )
+    }
+
+    pub fn is_settled(&self) -> bool {
+        self.settled_at.is_some()
+    }
+
+    /// `now` is an RFC 3339 timestamp; ISO-8601 strings in UTC compare lexicographically.
+    pub fn is_snoozed(&self, now: &str) -> bool {
+        self.snoozed_until
+            .as_deref()
+            .is_some_and(|until| until > now)
+    }
+
+    /// Mirrors the desktop sidebar's status resolution order.
+    pub fn status(&self) -> ThreadStatus {
+        if self.has_pending_approvals {
+            return ThreadStatus::Approval;
+        }
+        if self.has_pending_user_input {
+            return ThreadStatus::Question;
+        }
+        if self.is_running() {
+            return ThreadStatus::Working;
+        }
+        let session_status = self.session.as_ref().map(|s| s.status.as_str());
+        if session_status == Some("error") {
+            return ThreadStatus::Failed;
+        }
+        match self.background_liveness.as_deref() {
+            Some("working") => return ThreadStatus::Working,
+            Some("monitoring") => return ThreadStatus::Monitoring,
+            _ => {}
+        }
+        if self.interaction_mode == "plan" && self.has_actionable_proposed_plan {
+            return ThreadStatus::PlanReady;
+        }
+        match self.latest_turn.as_ref().map(|t| t.state.as_str()) {
+            Some("error") => ThreadStatus::Failed,
+            Some("completed") => ThreadStatus::Done,
+            _ => ThreadStatus::Idle,
+        }
     }
 }
 

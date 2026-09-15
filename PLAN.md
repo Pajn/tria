@@ -134,7 +134,17 @@ advertised.
 - **Project**: `{ id, title, workspaceRoot, defaultModelSelection, ... }`.
 - **Thread shell**: `{ id, projectId, title, modelSelection, runtimeMode, interactionMode,
   branch, session, latestTurn, hasPendingApprovals, hasPendingUserInput, planProgress,
-  pinnedAt, archivedAt, updatedAt, ... }`.
+  pinnedAt, pinOrderKey, archivedAt, settledAt, settledOverride, unsettledAt, snoozedUntil,
+  backgroundLiveness, hasActionableProposedPlan, updatedAt, ... }`.
+- **Sidebar sections** (as the desktop app derives them): *settled* when `settledAt` is set
+  (the server parks a thread after its turn finishes; `thread.settle` and `thread.unsettle`
+  move it by hand), *snoozed* when `snoozedUntil` is in the future, *pinned* when `pinnedAt`
+  is set, otherwise *active*. Active threads sort by `unsettledAt` when it is newer than
+  `createdAt`, settled ones by `settledAt`, snoozed ones by `snoozedUntil` ascending.
+- **Sidebar status**, first match wins: pending approval, pending user input, turn running or
+  session starting (working), session error (failed), `backgroundLiveness` working or
+  monitoring (native background work outliving the turn), plan mode with an actionable
+  proposed plan (plan ready), then the last turn's state.
 - **Thread detail**: shell fields plus `messages[]`, `activities[]`, `proposedPlans[]`,
   `session`, and `checkpoints[]` (ignore).
 - **Message**: `{ id, role: user|assistant|system, text, attachments?, turnId, streaming,
@@ -248,8 +258,9 @@ selection on thread creation, diffs, terminals, PR views, settings.
 Status: M0 through M2 are implemented and verified against a live server (pairing, streaming,
 approvals derivation, interrupt, new thread with bootstrap, rename, archive, answering agent
 questions including multi-select and custom text). M3 items shipped so far: model and effort
-pickers, `:` commands, prompt history, yank, config file. Not yet done: a recent-thread cache
-for instant back navigation, packaging.
+pickers, `:` commands, prompt history, yank, config file, sectioned sidebar (pinned, active,
+snoozed, folded gray settled shelf) with per-thread status labels and settle/unsettle/wake
+commands. Not yet done: a recent-thread cache for instant back navigation, packaging.
 
 **M0, spike (proves auth and framing).** CLI binary, no UI. Read `server-runtime.json`,
 exchange a pairing credential, fetch a ticket, open the socket, call `server.getConfig`, run

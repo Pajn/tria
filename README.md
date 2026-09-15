@@ -53,7 +53,8 @@ Press `?` inside the app for the full list.
 | `j` `k` `Ctrl-d` `Ctrl-u` `gg` `G` | scroll the conversation |
 | `J` `K` | next / previous thread |
 | `/` or `Space` | fuzzy thread picker |
-| `Tab` | focus the thread list; `j`/`k`, `Enter`, `Esc` |
+| `Tab` | focus the thread list; `j`/`k`, `Enter` opens a thread or folds a section, `Esc` |
+| `s` `S` | toggle the sidebar / the settled shelf |
 | `n` | new thread (pick a project) |
 | `m` | change model |
 | `i` or `Enter` | write a message |
@@ -72,7 +73,19 @@ Press `?` inside the app for the full list.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `archive`, `delete!`, `stop`,
-`older`, `answer`, `dismiss`, `sidebar`, `help`, `q`.
+`older`, `answer`, `dismiss`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
+
+## Thread list
+
+The sidebar mirrors the desktop app's sections: pinned, active, snoozed, and settled. Settled
+threads are ones the server has parked after their turn finished; they render grayed out in a
+shelf that starts folded (113 of them is normal). Press `S`, `:settled`, or `Enter` on the shelf
+header to unfold it. `J`/`K` and the picker only cycle through visible threads.
+
+Each row shows a status on the right when it needs attention: `approval`, `question`, `working`,
+`monitoring` (background work still running after the turn), `plan ready`, or `failed`.
+Otherwise it shows the project. `:settle` and `:unsettle` move the current thread between the
+active list and the shelf; `:wake` ends a snooze.
 
 ## Other subcommands
 

@@ -79,15 +79,48 @@ impl Shell {
         true
     }
 
-    /// Threads ordered for the picker: pinned first, then most recently updated.
-    pub fn sorted_threads(&self) -> Vec<&ThreadShell> {
-        let mut threads: Vec<&ThreadShell> = self.threads.values().collect();
-        threads.sort_by(|a, b| {
-            b.pinned_at
-                .is_some()
-                .cmp(&a.pinned_at.is_some())
+    /// Threads grouped the way the desktop sidebar shows them.
+    pub fn sections(&self, now: &str) -> Sections<'_> {
+        let mut sections = Sections::default();
+        for thread in self.threads.values() {
+            if thread.is_settled() {
+                sections.settled.push(thread);
+            } else if thread.is_snoozed(now) {
+                sections.snoozed.push(thread);
+            } else if thread.pinned_at.is_some() {
+                sections.pinned.push(thread);
+            } else {
+                sections.active.push(thread);
+            }
+        }
+        sections.pinned.sort_by(|a, b| {
+            a.pin_order_key
+                .cmp(&b.pin_order_key)
+                .then_with(|| b.pinned_at.cmp(&a.pinned_at))
+        });
+        // New or un-settled work floats to the top; the server's manual order keys are not
+        // interpreted here.
+        sections.active.sort_by(|a, b| anchor(b).cmp(anchor(a)));
+        sections
+            .snoozed
+            .sort_by(|a, b| a.snoozed_until.cmp(&b.snoozed_until));
+        sections.settled.sort_by(|a, b| {
+            b.settled_at
+                .cmp(&a.settled_at)
                 .then_with(|| b.updated_at.cmp(&a.updated_at))
         });
+        sections
+    }
+
+    /// Flat navigation order: pinned, active, then optionally snoozed and settled.
+    pub fn sorted_threads(&self, now: &str, include_parked: bool) -> Vec<&ThreadShell> {
+        let sections = self.sections(now);
+        let mut threads = sections.pinned;
+        threads.extend(sections.active);
+        if include_parked {
+            threads.extend(sections.snoozed);
+            threads.extend(sections.settled);
+        }
         threads
     }
 
@@ -97,6 +130,22 @@ impl Shell {
             .map(|p| p.title.as_str())
             .unwrap_or("?")
     }
+}
+
+#[derive(Debug, Default)]
+pub struct Sections<'a> {
+    pub pinned: Vec<&'a ThreadShell>,
+    pub active: Vec<&'a ThreadShell>,
+    pub snoozed: Vec<&'a ThreadShell>,
+    pub settled: Vec<&'a ThreadShell>,
+}
+
+fn anchor(thread: &ThreadShell) -> &str {
+    thread
+        .unsettled_at
+        .as_deref()
+        .filter(|u| *u > thread.created_at.as_str())
+        .unwrap_or(thread.created_at.as_str())
 }
 
 #[derive(Debug, Clone)]

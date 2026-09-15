@@ -145,7 +145,10 @@ pub struct App {
     pub question: Option<QuestionDraft>,
     pub custom_answer: String,
     pub sidebar_visible: bool,
+    /// Index into `sidebar_rows()`.
     pub sidebar_selected: usize,
+    pub show_settled: bool,
+    pub show_snoozed: bool,
     pub scroll: Scroll,
     pub expanded: HashSet<String>,
     pub expand_all: bool,
@@ -178,6 +181,8 @@ impl App {
             custom_answer: String::new(),
             sidebar_visible: true,
             sidebar_selected: 0,
+            show_settled: false,
+            show_snoozed: true,
             scroll: Scroll::Follow,
             expanded: HashSet::new(),
             expand_all: false,
@@ -199,6 +204,113 @@ impl App {
         FRAMES[self.spinner % FRAMES.len()]
     }
 
+    // ── Sidebar model ──────────────────────────────────────────────────
+
+    /// Threads reachable with J/K and the picker: pinned and active, plus the parked
+    /// sections when they are expanded.
+    pub fn visible_threads(&self) -> Vec<Id> {
+        let now = commands::now_iso();
+        let sections = self.shell.sections(&now);
+        let mut ids: Vec<Id> = sections
+            .pinned
+            .iter()
+            .chain(&sections.active)
+            .map(|t| t.id.clone())
+            .collect();
+        if self.show_snoozed {
+            ids.extend(sections.snoozed.iter().map(|t| t.id.clone()));
+        }
+        if self.show_settled {
+            ids.extend(sections.settled.iter().map(|t| t.id.clone()));
+        }
+        ids
+    }
+
+    /// Rows of the sidebar list, including section headers.
+    pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
+        let now = commands::now_iso();
+        let sections = self.shell.sections(&now);
+        let mut rows = Vec::new();
+        if !sections.pinned.is_empty() {
+            rows.push(SidebarRow::Header {
+                section: Section::Pinned,
+                count: sections.pinned.len(),
+                collapsed: false,
+            });
+            rows.extend(sections.pinned.iter().map(|t| SidebarRow::Thread {
+                id: t.id.clone(),
+                parked: false,
+            }));
+        }
+        rows.push(SidebarRow::Header {
+            section: Section::Active,
+            count: sections.active.len(),
+            collapsed: false,
+        });
+        rows.extend(sections.active.iter().map(|t| SidebarRow::Thread {
+            id: t.id.clone(),
+            parked: false,
+        }));
+        if !sections.snoozed.is_empty() {
+            rows.push(SidebarRow::Header {
+                section: Section::Snoozed,
+                count: sections.snoozed.len(),
+                collapsed: !self.show_snoozed,
+            });
+            if self.show_snoozed {
+                rows.extend(sections.snoozed.iter().map(|t| SidebarRow::Thread {
+                    id: t.id.clone(),
+                    parked: true,
+                }));
+            }
+        }
+        if !sections.settled.is_empty() {
+            rows.push(SidebarRow::Header {
+                section: Section::Settled,
+                count: sections.settled.len(),
+                collapsed: !self.show_settled,
+            });
+            if self.show_settled {
+                rows.extend(sections.settled.iter().map(|t| SidebarRow::Thread {
+                    id: t.id.clone(),
+                    parked: true,
+                }));
+            }
+        }
+        rows
+    }
+
+    fn select_sidebar_thread(&mut self, thread_id: &str) {
+        if let Some(index) = self
+            .sidebar_rows()
+            .iter()
+            .position(|row| matches!(row, SidebarRow::Thread { id, .. } if id == thread_id))
+        {
+            self.sidebar_selected = index;
+        }
+    }
+
+    fn toggle_section(&mut self, section: Section) {
+        match section {
+            Section::Settled => self.show_settled = !self.show_settled,
+            Section::Snoozed => self.show_snoozed = !self.show_snoozed,
+            Section::Pinned | Section::Active => {}
+        }
+    }
+
+    fn sidebar_activate(&mut self) {
+        let rows = self.sidebar_rows();
+        match rows.get(self.sidebar_selected) {
+            Some(SidebarRow::Thread { id, .. }) => {
+                let id = id.clone();
+                self.open_thread(&id);
+                self.focus = Focus::Chat;
+            }
+            Some(SidebarRow::Header { section, .. }) => self.toggle_section(*section),
+            None => {}
+        }
+    }
+
     // ── Navigation ─────────────────────────────────────────────────────
 
     pub fn open_thread(&mut self, thread_id: &str) {
@@ -215,29 +327,29 @@ impl App {
         self.scroll = Scroll::Follow;
         self.expanded.clear();
         self.handle.open_thread(thread_id);
-        if let Some(index) = self
-            .shell
-            .sorted_threads()
-            .iter()
-            .position(|t| t.id == thread_id)
-        {
-            self.sidebar_selected = index;
+        if let Some(thread) = self.shell.threads.get(thread_id) {
+            if thread.is_settled() {
+                self.show_settled = true;
+            } else if thread.is_snoozed(&commands::now_iso()) {
+                self.show_snoozed = true;
+            }
         }
+        self.select_sidebar_thread(thread_id);
     }
 
     fn open_relative(&mut self, delta: isize) {
-        let threads = self.shell.sorted_threads();
+        let threads = self.visible_threads();
         if threads.is_empty() {
             return;
         }
         let current = self
             .current_thread_id
             .as_ref()
-            .and_then(|id| threads.iter().position(|t| &t.id == id))
+            .and_then(|id| threads.iter().position(|t| t == id))
             .map(|i| i as isize)
             .unwrap_or(-1);
         let next = (current + delta).clamp(0, threads.len() as isize - 1) as usize;
-        let id = threads[next].id.clone();
+        let id = threads[next].clone();
         self.open_thread(&id);
     }
 
@@ -588,14 +700,18 @@ impl App {
         let items: Vec<PickerItem> = match kind {
             PickerKind::Thread => self
                 .shell
-                .sorted_threads()
+                .sorted_threads(&commands::now_iso(), true)
                 .iter()
                 .map(|t| PickerItem {
                     label: t.title.clone(),
                     detail: format!(
                         "{} · {}",
                         self.shell.project_title(&t.project_id),
-                        thread_status(t)
+                        if t.is_settled() {
+                            "settled"
+                        } else {
+                            t.status().label()
+                        }
                     ),
                     key: t.id.clone(),
                 })
@@ -828,6 +944,24 @@ impl App {
             "delete" => self.toast("use :delete! to confirm deleting this thread", true),
             "stop" | "interrupt" => self.interrupt(),
             "sidebar" => self.sidebar_visible = !self.sidebar_visible,
+            "settled" => self.show_settled = !self.show_settled,
+            "settle" => {
+                if let Some(id) = thread_id.as_deref() {
+                    self.dispatch(commands::simple("thread.settle", id));
+                    self.toast("settled", false);
+                }
+            }
+            "unsettle" => {
+                if let Some(id) = thread_id.as_deref() {
+                    self.dispatch(commands::unsettle(id));
+                    self.toast("un-settled", false);
+                }
+            }
+            "wake" | "unsnooze" => {
+                if let Some(id) = thread_id.as_deref() {
+                    self.dispatch(commands::unsnooze(id));
+                }
+            }
             "older" => self.load_older(),
             "dismiss" => self.dismiss_question(),
             "answer" | "a" => {
@@ -958,19 +1092,10 @@ impl App {
                 KeyCode::Char('g') if prefix == Some('g') => self.sidebar_selected = 0,
                 KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
                 KeyCode::Char('G') => {
-                    self.sidebar_selected = self.shell.threads.len().saturating_sub(1)
+                    self.sidebar_selected = self.sidebar_rows().len().saturating_sub(1)
                 }
-                KeyCode::Enter | KeyCode::Char('l') => {
-                    if let Some(id) = self
-                        .shell
-                        .sorted_threads()
-                        .get(self.sidebar_selected)
-                        .map(|t| t.id.clone())
-                    {
-                        self.open_thread(&id);
-                        self.focus = Focus::Chat;
-                    }
-                }
+                KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char(' ') => self.sidebar_activate(),
+                KeyCode::Char('S') => self.show_settled = !self.show_settled,
                 KeyCode::Esc | KeyCode::Tab | KeyCode::Char('h') => self.focus = Focus::Chat,
                 KeyCode::Char('/') => self.open_picker(PickerKind::Thread),
                 KeyCode::Char('n') => self.open_picker(PickerKind::Project),
@@ -1046,6 +1171,7 @@ impl App {
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('y') => self.yank_last_assistant(),
             KeyCode::Char('s') => self.sidebar_visible = !self.sidebar_visible,
+            KeyCode::Char('S') => self.show_settled = !self.show_settled,
             KeyCode::Char(c @ '1'..='9') => self.respond_approval(c as usize - '1' as usize),
             KeyCode::Esc => {
                 self.toast = None;
@@ -1056,7 +1182,7 @@ impl App {
     }
 
     fn sidebar_move(&mut self, delta: isize) {
-        let len = self.shell.threads.len();
+        let len = self.sidebar_rows().len();
         if len == 0 {
             return;
         }
@@ -1207,7 +1333,7 @@ impl App {
                 if self.current_thread_id.is_none()
                     && self.draft.is_none()
                     && self.shell.synchronized
-                    && let Some(first) = self.shell.sorted_threads().first().map(|t| t.id.clone())
+                    && let Some(first) = self.visible_threads().first().cloned()
                 {
                     self.open_thread(&first);
                 }
@@ -1296,21 +1422,36 @@ pub fn approval_options(approval: &PendingApproval) -> Vec<ApprovalOption> {
     ]
 }
 
-pub fn thread_status(thread: &crate::model::ThreadShell) -> &'static str {
-    if thread.has_pending_approvals {
-        "needs approval"
-    } else if thread.has_pending_user_input {
-        "asked a question"
-    } else if thread.is_running() {
-        "running"
-    } else {
-        match thread.latest_turn.as_ref().map(|t| t.state.as_str()) {
-            Some("error") => "error",
-            Some("interrupted") => "interrupted",
-            Some("completed") => "done",
-            _ => "idle",
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Pinned,
+    Active,
+    Snoozed,
+    Settled,
+}
+
+impl Section {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pinned => "pinned",
+            Self::Active => "active",
+            Self::Snoozed => "snoozed",
+            Self::Settled => "settled",
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum SidebarRow {
+    Header {
+        section: Section,
+        count: usize,
+        collapsed: bool,
+    },
+    Thread {
+        id: Id,
+        parked: bool,
+    },
 }
 
 // ── Event loop ─────────────────────────────────────────────────────────

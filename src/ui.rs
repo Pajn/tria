@@ -12,7 +12,8 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, Focus, Mode, PickerKind, Scroll, approval_options, thread_status},
+    app::{App, Focus, Mode, PickerKind, Scroll, Section, SidebarRow, approval_options},
+    model::ThreadStatus,
     session::Status,
     timeline::{self, Block as ChatBlock, BlockKey},
 };
@@ -100,6 +101,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+pub fn status_style(status: ThreadStatus) -> Style {
+    match status {
+        ThreadStatus::Approval | ThreadStatus::Question => Style::default().fg(Color::Yellow),
+        ThreadStatus::Working => Style::default().fg(Color::Cyan),
+        ThreadStatus::Monitoring => Style::default().fg(Color::Blue),
+        ThreadStatus::Failed => Style::default().fg(Color::Red),
+        ThreadStatus::PlanReady => Style::default().fg(Color::Magenta),
+        ThreadStatus::Done | ThreadStatus::Idle => Style::default().fg(Color::DarkGray),
+    }
+}
+
 fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Sidebar;
     let border_style = if focused {
@@ -117,52 +129,93 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let threads = app.shell.sorted_threads();
+    let rows = app.sidebar_rows();
     let width = inner.width as usize;
-    let items: Vec<ListItem> = threads
+    let dim = Style::default().fg(Color::DarkGray);
+    let items: Vec<ListItem> = rows
         .iter()
-        .map(|t| {
-            let (glyph, style) = if t.has_pending_approvals || t.has_pending_user_input {
-                ("!", Style::default().fg(Color::Yellow))
-            } else if t.is_running() {
-                (app.spinner_frame(), Style::default().fg(Color::Cyan))
-            } else if t.latest_turn.as_ref().is_some_and(|l| l.state == "error") {
-                ("✗", Style::default().fg(Color::Red))
-            } else {
-                ("·", Style::default().fg(Color::DarkGray))
-            };
-            let project = app.shell.project_title(&t.project_id);
-            let project_width = project.chars().count().min(12);
-            let title_width = width.saturating_sub(project_width + 4);
-            let title = fit(&t.title, title_width);
-            let is_current = app.current_thread_id.as_ref() == Some(&t.id);
-            let title_style = if is_current {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            let padding = " ".repeat(title_width.saturating_sub(title.chars().count()) + 1);
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{glyph} "), style),
-                Span::styled(title, title_style),
-                Span::raw(padding),
-                Span::styled(
-                    fit(project, project_width),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]))
+        .map(|row| match row {
+            SidebarRow::Header {
+                section,
+                count,
+                collapsed,
+            } => {
+                let arrow = match section {
+                    Section::Snoozed | Section::Settled => {
+                        if *collapsed {
+                            "▸ "
+                        } else {
+                            "▾ "
+                        }
+                    }
+                    _ => "  ",
+                };
+                let label = format!("{arrow}{} ({count})", section.label());
+                let hint = match section {
+                    Section::Settled if *collapsed => "  S",
+                    _ => "",
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(label, dim.add_modifier(Modifier::BOLD)),
+                    Span::styled(hint, dim.add_modifier(Modifier::DIM)),
+                ]))
+            }
+            SidebarRow::Thread { id, parked } => {
+                let Some(t) = app.shell.threads.get(id) else {
+                    return ListItem::new(Line::from(""));
+                };
+                let status = t.status();
+                let (glyph, glyph_style) = match status {
+                    ThreadStatus::Working => (app.spinner_frame(), status_style(status)),
+                    ThreadStatus::Approval | ThreadStatus::Question => ("!", status_style(status)),
+                    ThreadStatus::Failed => ("✗", status_style(status)),
+                    ThreadStatus::Monitoring => ("◔", status_style(status)),
+                    ThreadStatus::PlanReady => ("▤", status_style(status)),
+                    ThreadStatus::Done | ThreadStatus::Idle => ("·", dim),
+                };
+                let is_current = app.current_thread_id.as_ref() == Some(id);
+                // Parked (settled or snoozed) rows recede; a notable status replaces the project.
+                let right = if *parked {
+                    app.shell.project_title(&t.project_id).to_string()
+                } else if status.is_notable() {
+                    status.label().to_string()
+                } else {
+                    app.shell.project_title(&t.project_id).to_string()
+                };
+                let right_style = if !*parked && status.is_notable() {
+                    status_style(status)
+                } else {
+                    dim
+                };
+                let right_width = right.chars().count().min(12);
+                let title_width = width.saturating_sub(right_width + 4);
+                let title = fit(&t.title, title_width);
+                let mut title_style = if *parked { dim } else { Style::default() };
+                if is_current {
+                    title_style = title_style.add_modifier(Modifier::BOLD);
+                }
+                let padding = " ".repeat(title_width.saturating_sub(title.chars().count()) + 1);
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!(" {glyph} "),
+                        if *parked { dim } else { glyph_style },
+                    ),
+                    Span::styled(title, title_style),
+                    Span::raw(padding),
+                    Span::styled(fit(&right, right_width), right_style),
+                ]))
+            }
         })
         .collect();
 
     let mut state = ListState::default();
-    if !threads.is_empty() {
+    if !rows.is_empty() {
         let selected = if focused {
-            app.sidebar_selected.min(threads.len() - 1)
+            app.sidebar_selected.min(rows.len() - 1)
         } else {
-            app.current_thread_id
-                .as_ref()
-                .and_then(|id| threads.iter().position(|t| &t.id == id))
-                .unwrap_or(app.sidebar_selected.min(threads.len() - 1))
+            rows.iter()
+                .position(|row| matches!(row, SidebarRow::Thread { id, .. } if Some(id) == app.current_thread_id.as_ref()))
+                .unwrap_or(app.sidebar_selected.min(rows.len() - 1))
         };
         state.select(Some(selected));
     }
@@ -726,10 +779,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::Red),
                 ));
             } else {
-                spans.push(Span::styled(
-                    format!("  {}", thread_status(shell)),
-                    Style::default().fg(Color::DarkGray),
-                ));
+                let status = shell.status();
+                let mut label = format!("  {}", status.label());
+                if shell.is_settled() {
+                    label.push_str("  settled");
+                }
+                spans.push(Span::styled(label, status_style(status)));
             }
         }
     } else if let Some(draft) = &app.draft {
@@ -837,7 +892,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  j/k  Ctrl-d/u  gg/G      scroll chat"),
         Line::from("  J/K                     next / previous thread"),
         Line::from("  /  or  Space            fuzzy thread picker"),
-        Line::from("  Tab                     focus thread list (j/k, Enter, Esc)"),
+        Line::from(
+            "  Tab                     focus thread list (j/k, Enter opens or folds a section)",
+        ),
         Line::from("  n                       new thread (pick project)"),
         Line::from("  m                       change model"),
         Line::from("  i / Enter               write a message"),
@@ -847,7 +904,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             "  a                       answer the agent's question (digits, Space, c custom, Enter)",
         ),
         Line::from("  y                       yank last assistant message (OSC 52)"),
-        Line::from("  s                       toggle sidebar"),
+        Line::from("  s / S                   toggle sidebar / settled shelf"),
         Line::from("  Ctrl-c                  interrupt the running turn"),
         Line::from(""),
         Line::from(Span::styled("Insert", Style::default().bold())),
@@ -859,7 +916,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  :new [project]  :model  :effort [level]  :mode plan|default"),
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
-        Line::from("  :stop  :older  :answer  :dismiss  :sidebar  :help  :q"),
+        Line::from(
+            "  :settle  :unsettle  :wake  :settled  :stop  :older  :answer  :dismiss  :sidebar  :q",
+        ),
         Line::from(""),
         Line::from(Span::styled(
             "  press Esc to close",

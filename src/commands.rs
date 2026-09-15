@@ -144,6 +144,24 @@ pub fn simple(kind: &str, thread_id: &str) -> Value {
     })
 }
 
+pub fn unsettle(thread_id: &str) -> Value {
+    json!({
+        "type": "thread.unsettle",
+        "commandId": new_id(),
+        "threadId": thread_id,
+        "reason": "user",
+    })
+}
+
+pub fn unsnooze(thread_id: &str) -> Value {
+    json!({
+        "type": "thread.unsnooze",
+        "commandId": new_id(),
+        "threadId": thread_id,
+        "reason": "user",
+    })
+}
+
 pub fn runtime_mode_set(thread_id: &str, runtime_mode: &str) -> Value {
     json!({
         "type": "thread.runtime-mode.set",
