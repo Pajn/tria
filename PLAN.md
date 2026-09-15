@@ -236,7 +236,8 @@ digit keys. Streaming appends deltas and re-renders at most every 16 ms.
   previous thread, `Tab` focus thread list, `/` filter threads, `za` toggle the tool group under
   the cursor, `zM`/`zR` collapse or expand all, `i` or `Enter` to insert, `Esc` clear,
   `Ctrl-c` interrupt the running turn, `y` yank the assistant message under the cursor,
-  `1`..`9` answer a pending approval.
+  `1`..`9` answer a pending approval. The mouse wheel scrolls whichever pane it is over and
+  a left click in the thread list opens a thread or folds a section.
 - *Insert*: the composer. `Enter` sends, `Alt-Enter` or `Ctrl-j` inserts a newline, `Esc`
   returns to normal, `Up`/`Down` or `Ctrl-p`/`Ctrl-n` recall prompt history.
 - *Command line* (`:`): `:new [project]`, `:model`, `:mode plan|default`,

@@ -63,6 +63,8 @@ Press `?` inside the app for the full list.
 | `a` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `y` | copy the last assistant message (OSC 52) |
 | `Ctrl-c` | interrupt the running turn |
+| mouse wheel | scroll the conversation, or the thread list when the pointer is over it |
+| left click | in the thread list: open a thread, or fold and unfold a section |
 
 | Insert mode | |
 | --- | --- |

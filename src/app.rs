@@ -7,8 +7,12 @@ use std::{
 };
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use futures_util::StreamExt;
+use ratatui::layout::{Position, Rect};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -22,6 +26,8 @@ use crate::{
     ui,
 };
 
+/// Rows moved per mouse wheel notch.
+const MOUSE_SCROLL_LINES: usize = 3;
 const TICK: Duration = Duration::from_millis(120);
 const TOAST_TTL: Duration = Duration::from_secs(6);
 const PREFIX_TTL: Duration = Duration::from_millis(1200);
@@ -157,6 +163,13 @@ pub struct App {
     pending_prefix: Option<(char, Instant)>,
     /// Filled by the renderer each frame so key handling can page correctly.
     pub chat_viewport: (usize, usize),
+    /// First visible sidebar row; the renderer reads and clamps it.
+    pub sidebar_offset: usize,
+    /// Set by keyboard navigation so the renderer scrolls the selection into view.
+    pub sidebar_reveal: bool,
+    /// Screen regions from the last frame, for mouse hit testing.
+    pub sidebar_inner: Option<Rect>,
+    pub chat_area: Rect,
     pub work_ranges: Vec<(usize, usize, String)>,
     quit: bool,
 }
@@ -190,6 +203,10 @@ impl App {
             spinner: 0,
             pending_prefix: None,
             chat_viewport: (0, 0),
+            sidebar_offset: 0,
+            sidebar_reveal: false,
+            sidebar_inner: None,
+            chat_area: Rect::default(),
             work_ranges: Vec::new(),
             quit: false,
         }
@@ -287,6 +304,7 @@ impl App {
             .position(|row| matches!(row, SidebarRow::Thread { id, .. } if id == thread_id))
         {
             self.sidebar_selected = index;
+            self.sidebar_reveal = true;
         }
     }
 
@@ -1089,10 +1107,14 @@ impl App {
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => self.sidebar_move(1),
                 KeyCode::Char('k') | KeyCode::Up => self.sidebar_move(-1),
-                KeyCode::Char('g') if prefix == Some('g') => self.sidebar_selected = 0,
+                KeyCode::Char('g') if prefix == Some('g') => {
+                    self.sidebar_selected = 0;
+                    self.sidebar_reveal = true;
+                }
                 KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
                 KeyCode::Char('G') => {
-                    self.sidebar_selected = self.sidebar_rows().len().saturating_sub(1)
+                    self.sidebar_selected = self.sidebar_rows().len().saturating_sub(1);
+                    self.sidebar_reveal = true;
                 }
                 KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char(' ') => self.sidebar_activate(),
                 KeyCode::Char('S') => self.show_settled = !self.show_settled,
@@ -1188,6 +1210,66 @@ impl App {
         }
         self.sidebar_selected =
             (self.sidebar_selected as isize + delta).clamp(0, len as isize - 1) as usize;
+        self.sidebar_reveal = true;
+    }
+
+    // ── Mouse ──────────────────────────────────────────────────────────
+
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        // Overlays own the screen; the wheel and clicks would land on hidden widgets.
+        if matches!(self.mode, Mode::Picker | Mode::Help) {
+            return;
+        }
+        let at = Position::new(mouse.column, mouse.row);
+        let in_sidebar = self.sidebar_inner.is_some_and(|r| r.contains(at));
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                    -(MOUSE_SCROLL_LINES as isize)
+                } else {
+                    MOUSE_SCROLL_LINES as isize
+                };
+                if in_sidebar {
+                    let len = self.sidebar_rows().len();
+                    let height = self.sidebar_inner.map_or(0, |r| r.height as usize);
+                    let max = len.saturating_sub(height);
+                    self.sidebar_offset =
+                        (self.sidebar_offset as isize + delta).clamp(0, max as isize) as usize;
+                } else {
+                    self.scroll_by(delta);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_sidebar => {
+                let Some(inner) = self.sidebar_inner else {
+                    return;
+                };
+                let index = self.sidebar_offset + (mouse.row - inner.y) as usize;
+                let rows = self.sidebar_rows();
+                match rows.get(index) {
+                    Some(SidebarRow::Thread { id, .. }) => {
+                        let id = id.clone();
+                        self.sidebar_selected = index;
+                        if self.current_thread_id.as_deref() != Some(id.as_str()) {
+                            self.open_thread(&id);
+                        }
+                        if self.focus == Focus::Sidebar {
+                            self.focus = Focus::Chat;
+                        }
+                    }
+                    Some(SidebarRow::Header { section, .. }) => {
+                        self.sidebar_selected = index;
+                        self.toggle_section(*section);
+                    }
+                    None => {}
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.focus == Focus::Sidebar {
+                    self.focus = Focus::Chat;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn on_insert_key(&mut self, key: KeyEvent) {
@@ -1462,7 +1544,11 @@ pub async fn run(origin: String, token: String) -> Result<()> {
     let mut app = App::new(handle, events_tx.clone());
 
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
+    );
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
 
@@ -1485,6 +1571,7 @@ pub async fn run(origin: String, token: String) -> Result<()> {
         };
         match event {
             AppEvent::Terminal(Event::Key(key)) => app.on_key(key),
+            AppEvent::Terminal(Event::Mouse(mouse)) => app.on_mouse(mouse),
             AppEvent::Terminal(Event::Paste(text)) => {
                 if app.mode == Mode::Insert {
                     app.composer.insert_str(&text);
@@ -1516,7 +1603,11 @@ pub async fn run(origin: String, token: String) -> Result<()> {
         }
     };
 
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }

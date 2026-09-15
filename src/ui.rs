@@ -47,6 +47,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if let Some(sidebar_area) = sidebar_area {
         draw_sidebar(frame, app, sidebar_area);
+    } else {
+        app.sidebar_inner = None;
     }
 
     let pending = app
@@ -84,6 +86,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     .areas(main_area);
 
     draw_header(frame, app, header);
+    app.chat_area = chat;
     draw_chat(frame, app, chat);
     if let Some(first) = pending.first() {
         draw_approval(frame, first, pending.len(), approvals);
@@ -128,6 +131,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         )]));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    app.sidebar_inner = Some(inner);
 
     let rows = app.sidebar_rows();
     let width = inner.width as usize;
@@ -208,17 +212,17 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let mut state = ListState::default();
-    if !rows.is_empty() {
-        let selected = if focused {
-            app.sidebar_selected.min(rows.len() - 1)
-        } else {
-            rows.iter()
-                .position(|row| matches!(row, SidebarRow::Thread { id, .. } if Some(id) == app.current_thread_id.as_ref()))
-                .unwrap_or(app.sidebar_selected.min(rows.len() - 1))
-        };
-        state.select(Some(selected));
-    }
+    // Selection is drawn by hand so the wheel can scroll the list without the
+    // selected row dragging the viewport back.
+    let selected = if rows.is_empty() {
+        None
+    } else if focused {
+        Some(app.sidebar_selected.min(rows.len() - 1))
+    } else {
+        rows.iter().position(
+            |row| matches!(row, SidebarRow::Thread { id, .. } if Some(id) == app.current_thread_id.as_ref()),
+        )
+    };
     let highlight = if focused {
         Style::default()
             .bg(Color::DarkGray)
@@ -226,7 +230,33 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM)
     };
-    let list = List::new(items).highlight_style(highlight);
+    let items: Vec<ListItem> = items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            if Some(i) == selected {
+                item.style(highlight)
+            } else {
+                item
+            }
+        })
+        .collect();
+
+    let height = inner.height as usize;
+    let max_offset = rows.len().saturating_sub(height);
+    app.sidebar_offset = app.sidebar_offset.min(max_offset);
+    if app.sidebar_reveal {
+        app.sidebar_reveal = false;
+        if let Some(sel) = selected {
+            if sel < app.sidebar_offset {
+                app.sidebar_offset = sel;
+            } else if height > 0 && sel >= app.sidebar_offset + height {
+                app.sidebar_offset = sel + 1 - height;
+            }
+        }
+    }
+    let mut state = ListState::default().with_offset(app.sidebar_offset);
+    let list = List::new(items);
     frame.render_stateful_widget(list, inner, &mut state);
 }
 
