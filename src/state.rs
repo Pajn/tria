@@ -115,8 +115,99 @@ pub struct ApprovalOption {
 
 #[derive(Debug, Clone)]
 pub struct PendingUserInput {
-    pub request_id: Option<String>,
-    pub questions: Vec<String>,
+    pub request_id: String,
+    pub questions: Vec<Question>,
+    /// Message-mode questions can be closed without a reply; native callbacks cannot.
+    pub dismissible: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Question {
+    pub id: String,
+    pub header: String,
+    pub text: String,
+    pub options: Vec<QuestionOption>,
+    pub allow_custom: bool,
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+    /// The wire value for this option: `value` when present, otherwise the label.
+    pub value: String,
+}
+
+fn parse_questions(value: Option<&Value>) -> Vec<Question> {
+    let Some(questions) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    questions
+        .iter()
+        .filter_map(|q| {
+            let text = q
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let id = q
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| text.clone());
+            if id.is_empty() {
+                return None;
+            }
+            let options: Vec<QuestionOption> = q
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|opts| {
+                    opts.iter()
+                        .filter_map(|o| {
+                            let label = o.get("label").and_then(Value::as_str)?.to_string();
+                            let value = o
+                                .get("value")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| label.clone());
+                            Some(QuestionOption {
+                                label,
+                                description: o
+                                    .get("description")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                value,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let allow_custom = q
+                .get("allowCustomAnswer")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if options.is_empty() && !allow_custom {
+                return None;
+            }
+            Some(Question {
+                id,
+                header: q
+                    .get("header")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Question")
+                    .to_string(),
+                text,
+                options,
+                allow_custom,
+                multi_select: q
+                    .get("multiSelect")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -328,31 +419,41 @@ impl ThreadState {
     }
 
     pub fn pending_user_input(&self) -> Option<PendingUserInput> {
-        let mut pending: Option<PendingUserInput> = None;
+        let mut pending: Vec<PendingUserInput> = Vec::new();
         for activity in &self.detail.activities {
             match activity.kind.as_str() {
                 "user-input.requested" => {
-                    let questions = activity
-                        .payload
-                        .get("questions")
-                        .and_then(Value::as_array)
-                        .map(|qs| {
-                            qs.iter()
-                                .filter_map(|q| q.get("question").and_then(Value::as_str))
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    pending = Some(PendingUserInput {
-                        request_id: activity.str("requestId").map(str::to_string),
+                    let Some(request_id) = activity.str("requestId") else {
+                        continue;
+                    };
+                    let questions = parse_questions(activity.payload.get("questions"));
+                    if questions.is_empty() {
+                        continue;
+                    }
+                    pending.retain(|p| p.request_id != request_id);
+                    pending.push(PendingUserInput {
+                        request_id: request_id.to_string(),
                         questions,
+                        dismissible: activity.str("responseMode") == Some("message"),
                     });
                 }
-                "user-input.resolved" | "user-input.answer-submitted" => pending = None,
+                "user-input.resolved" => {
+                    if let Some(request_id) = activity.str("requestId") {
+                        pending.retain(|p| p.request_id != request_id);
+                    }
+                }
+                "provider.user-input.respond.failed" => {
+                    let detail = activity.str("detail").unwrap_or("").to_lowercase();
+                    if (detail.contains("stale pending") || detail.contains("unknown pending"))
+                        && let Some(request_id) = activity.str("requestId")
+                    {
+                        pending.retain(|p| p.request_id != request_id);
+                    }
+                }
                 _ => {}
             }
         }
-        pending
+        pending.into_iter().next()
     }
 
     /// Latest plan steps for the active turn, if any.
@@ -467,5 +568,27 @@ mod tests {
         .unwrap();
         state.apply_event(resolved);
         assert!(state.pending_approvals().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod question_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_questions_with_defaults() {
+        let questions = parse_questions(Some(&json!([
+            {"id": "Which color?", "header": "Color", "question": "Which color?",
+             "options": [{"label": "Red", "description": "warm"}, {"label": "Blue", "description": "", "value": "b"}]},
+            {"question": "Anything else?", "options": [], "allowCustomAnswer": true, "multiSelect": true},
+            {"question": "dropped", "options": [], "allowCustomAnswer": false}
+        ])));
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].options[0].value, "Red");
+        assert_eq!(questions[0].options[1].value, "b");
+        assert!(questions[0].allow_custom);
+        assert_eq!(questions[1].id, "Anything else?");
+        assert!(questions[1].multi_select);
     }
 }

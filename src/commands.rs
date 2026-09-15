@@ -88,6 +88,17 @@ pub fn approval_respond(thread_id: &str, request_id: &str, decision: &str) -> Va
     })
 }
 
+pub fn user_input_respond(thread_id: &str, request_id: &str, answers: Value) -> Value {
+    json!({
+        "type": "thread.user-input.respond",
+        "commandId": new_id(),
+        "threadId": thread_id,
+        "requestId": request_id,
+        "answers": answers,
+        "createdAt": now_iso(),
+    })
+}
+
 pub fn user_input_dismiss(thread_id: &str, request_id: &str) -> Value {
     json!({
         "type": "thread.user-input.dismiss",

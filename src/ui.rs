@@ -65,7 +65,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     let question_rows = user_input
         .as_ref()
-        .map(|q| 2 + q.questions.len().min(4) as u16)
+        .map(|q| question_panel_rows(app, q, main_area.width))
         .unwrap_or(0);
     let composer_rows = app
         .composer
@@ -88,7 +88,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_approval(frame, first, pending.len(), approvals);
     }
     if let Some(question) = &user_input {
-        draw_question(frame, question, questions);
+        draw_question(frame, app, question, questions);
     }
     draw_composer(frame, app, composer);
     draw_status(frame, app, status);
@@ -429,33 +429,171 @@ fn draw_approval(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_question(frame: &mut Frame, question: &crate::state::PendingUserInput, area: Rect) {
-    let style = Style::default().fg(Color::Yellow);
+fn question_panel_rows(app: &App, pending: &crate::state::PendingUserInput, width: u16) -> u16 {
+    let index = app
+        .question
+        .as_ref()
+        .filter(|d| d.request_id == pending.request_id)
+        .map(|d| d.index)
+        .unwrap_or(0);
+    let Some(question) = pending.questions.get(index) else {
+        return 0;
+    };
+    let text_rows = Paragraph::new(question.text.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width.saturating_sub(4)) as u16;
+    // border + question text + options + custom line + hint line
+    (1 + text_rows + question.options.len() as u16 + 2).min(16)
+}
+
+fn draw_question(
+    frame: &mut Frame,
+    app: &App,
+    pending: &crate::state::PendingUserInput,
+    area: Rect,
+) {
+    let active = matches!(app.mode, Mode::Question | Mode::QuestionCustom);
+    let draft = app
+        .question
+        .as_ref()
+        .filter(|d| d.request_id == pending.request_id);
+    let index = draft.map(|d| d.index).unwrap_or(0);
+    let Some(question) = pending.questions.get(index) else {
+        return;
+    };
+    let accent = if active {
+        Style::default().fg(Color::Magenta)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+
+    let mut title = format!(" {} ", question.header);
+    if pending.questions.len() > 1 {
+        title.push_str(&format!("· {}/{} ", index + 1, pending.questions.len()));
+    }
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(style)
+        .border_style(accent)
         .title(Line::from(Span::styled(
-            " the agent asked a question ",
-            style.add_modifier(Modifier::BOLD),
+            title,
+            accent.add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let mut lines: Vec<Line> = question
-        .questions
-        .iter()
-        .take(4)
-        .map(|q| {
-            Line::from(Span::styled(
-                format!("  {q}"),
-                Style::default().fg(Color::Gray),
-            ))
-        })
-        .collect();
+
+    let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
-        "  answer it from the desktop or mobile app, or :dismiss",
+        format!("  {}", question.text),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    let selected = draft
+        .map(|d| d.current_answer().selected.clone())
+        .unwrap_or_default();
+    let highlight = draft.map(|d| d.highlight).unwrap_or(usize::MAX);
+    let custom = draft
+        .map(|d| d.current_answer().custom.clone())
+        .unwrap_or_default();
+    for (i, option) in question.options.iter().enumerate() {
+        let is_selected = selected.contains(&i) && custom.trim().is_empty();
+        let marker = match (question.multi_select, is_selected) {
+            (true, true) => "[x]",
+            (true, false) => "[ ]",
+            (false, true) => "(•)",
+            (false, false) => "( )",
+        };
+        let row_style = if active && highlight == i {
+            Style::default().bg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        let mut spans = vec![
+            Span::styled(format!("  {} ", i + 1), accent.add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{marker} "),
+                if is_selected {
+                    accent
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::styled(option.label.clone(), row_style),
+        ];
+        if !option.description.is_empty() {
+            spans.push(Span::styled(
+                format!(
+                    "  {}",
+                    fit(
+                        &option.description,
+                        inner
+                            .width
+                            .saturating_sub(option.label.chars().count() as u16 + 12)
+                            as usize
+                    )
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans).style(row_style));
+    }
+    if question.allow_custom {
+        if app.mode == Mode::QuestionCustom {
+            lines.push(Line::from(vec![
+                Span::styled("  c ", accent.add_modifier(Modifier::BOLD)),
+                Span::styled("> ", accent),
+                Span::raw(app.custom_answer.clone()),
+            ]));
+        } else if !custom.trim().is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  c ", accent.add_modifier(Modifier::BOLD)),
+                Span::styled("(•) ", accent),
+                Span::raw(custom.clone()),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  c ", accent.add_modifier(Modifier::BOLD)),
+                Span::styled("( ) ", Style::default().fg(Color::DarkGray)),
+                Span::styled("type a custom answer", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+    let hint = if !active {
+        "  a or Enter to answer".to_string()
+    } else if app.mode == Mode::QuestionCustom {
+        "  Enter confirm · Esc back".to_string()
+    } else {
+        let mut parts = vec![if question.multi_select {
+            "digits/Space toggle · Enter next"
+        } else {
+            "digit picks · Enter next"
+        }];
+        if question.allow_custom {
+            parts.push("c custom");
+        }
+        if index > 0 {
+            parts.push("h back");
+        }
+        if pending.dismissible {
+            parts.push("d dismiss");
+        }
+        parts.push("Esc leave");
+        format!("  {}", parts.join(" · "))
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
         Style::default().fg(Color::DarkGray),
     )));
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+
+    if app.mode == Mode::QuestionCustom {
+        let row = 1 + question.options.len() as u16;
+        let x = inner.x + 6 + app.custom_answer.chars().count() as u16;
+        if row < inner.height {
+            frame.set_cursor_position((
+                x.min(inner.x + inner.width.saturating_sub(1)),
+                inner.y + row,
+            ));
+        }
+    }
 }
 
 fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
@@ -528,6 +666,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         (Mode::Help, _) => (
             " HELP ",
             Style::default().bg(Color::Blue).fg(Color::Black).bold(),
+        ),
+        (Mode::Question | Mode::QuestionCustom, _) => (
+            " ANSWER ",
+            Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
         ),
         (_, Focus::Sidebar) => (
             " THREADS ",
@@ -701,6 +843,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  i / Enter               write a message"),
         Line::from("  za  zR  zM              toggle / expand all / collapse all tool groups"),
         Line::from("  1..9                    answer a pending approval"),
+        Line::from(
+            "  a                       answer the agent's question (digits, Space, c custom, Enter)",
+        ),
         Line::from("  y                       yank last assistant message (OSC 52)"),
         Line::from("  s                       toggle sidebar"),
         Line::from("  Ctrl-c                  interrupt the running turn"),
@@ -714,7 +859,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  :new [project]  :model  :effort [level]  :mode plan|default"),
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
-        Line::from("  :stop  :older  :dismiss  :sidebar  :help  :q"),
+        Line::from("  :stop  :older  :answer  :dismiss  :sidebar  :help  :q"),
         Line::from(""),
         Line::from(Span::styled(
             "  press Esc to close",

@@ -240,16 +240,16 @@ credential or a `/pair#token=` URL and performs the exchange. Keychain storage i
 option, not v1.
 
 **Explicitly out of scope for v1.** Attachments and image paste, composer context chips,
-answering `user-input.requested` questions (render read-only with a hint to use another
-client), archived thread browsing, thread search, multiple environments, worktree or branch
+attachments on question answers, archived thread browsing, thread search, multiple environments, worktree or branch
 selection on thread creation, diffs, terminals, PR views, settings.
 
 ## 3. Milestones
 
 Status: M0 through M2 are implemented and verified against a live server (pairing, streaming,
-approvals derivation, interrupt, new thread with bootstrap, rename, archive). M3 items shipped so
-far: model and effort pickers, `:` commands, prompt history, yank, config file. Not yet done:
-a recent-thread cache for instant back navigation, packaging.
+approvals derivation, interrupt, new thread with bootstrap, rename, archive, answering agent
+questions including multi-select and custom text). M3 items shipped so far: model and effort
+pickers, `:` commands, prompt history, yank, config file. Not yet done: a recent-thread cache
+for instant back navigation, packaging.
 
 **M0, spike (proves auth and framing).** CLI binary, no UI. Read `server-runtime.json`,
 exchange a pairing credential, fetch a ticket, open the socket, call `server.getConfig`, run

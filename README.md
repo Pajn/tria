@@ -59,6 +59,7 @@ Press `?` inside the app for the full list.
 | `i` or `Enter` | write a message |
 | `za` `zR` `zM` | toggle / expand all / collapse all tool groups |
 | `1`..`9` | answer a pending approval |
+| `a` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `y` | copy the last assistant message (OSC 52) |
 | `Ctrl-c` | interrupt the running turn |
 
@@ -71,7 +72,7 @@ Press `?` inside the app for the full list.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `archive`, `delete!`, `stop`,
-`older`, `dismiss`, `sidebar`, `help`, `q`.
+`older`, `answer`, `dismiss`, `sidebar`, `help`, `q`.
 
 ## Other subcommands
 

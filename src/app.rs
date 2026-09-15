@@ -16,6 +16,7 @@ use crate::{
     commands,
     composer::Composer,
     model::{Id, ModelSelection, ServerConfig, ShellItem, ThreadDetailSnapshot, ThreadItem},
+    question::QuestionDraft,
     session::{self, Handle, Status, Update},
     state::{ApprovalOption, PendingApproval, Shell, ThreadState},
     ui,
@@ -32,6 +33,10 @@ pub enum Mode {
     Command,
     Picker,
     Help,
+    /// Answering an agent question: digits pick options, Enter advances.
+    Question,
+    /// Typing a free-text answer to the current question.
+    QuestionCustom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +142,8 @@ pub struct App {
     pub composer: Composer,
     pub command_line: String,
     pub picker: Option<Picker>,
+    pub question: Option<QuestionDraft>,
+    pub custom_answer: String,
     pub sidebar_visible: bool,
     pub sidebar_selected: usize,
     pub scroll: Scroll,
@@ -167,6 +174,8 @@ impl App {
             composer: Composer::new(),
             command_line: String::new(),
             picker: None,
+            question: None,
+            custom_answer: String::new(),
             sidebar_visible: true,
             sidebar_selected: 0,
             scroll: Scroll::Follow,
@@ -199,6 +208,10 @@ impl App {
         self.current_thread_id = Some(thread_id.to_string());
         self.thread = None;
         self.draft = None;
+        self.question = None;
+        if matches!(self.mode, Mode::Question | Mode::QuestionCustom) {
+            self.mode = Mode::Normal;
+        }
         self.scroll = Scroll::Follow;
         self.expanded.clear();
         self.handle.open_thread(thread_id);
@@ -376,6 +389,177 @@ impl App {
             commands::approval_respond(thread.id(), &approval.request_id, &option.decision);
         self.dispatch(command);
         self.toast(option.label.to_string(), false);
+    }
+
+    // ── Agent questions ────────────────────────────────────────────────
+
+    /// Enter question mode for the pending question, if any.
+    fn begin_answering(&mut self) -> bool {
+        let Some(pending) = self.thread.as_ref().and_then(|t| t.pending_user_input()) else {
+            return false;
+        };
+        let stale = self
+            .question
+            .as_ref()
+            .is_none_or(|q| q.request_id != pending.request_id);
+        if stale {
+            self.question = Some(QuestionDraft::new(&pending));
+        }
+        self.mode = Mode::Question;
+        true
+    }
+
+    /// Called after every thread change: keep the draft in step with the pending question.
+    fn reconcile_question(&mut self) {
+        let pending = self.thread.as_ref().and_then(|t| t.pending_user_input());
+        match (&self.question, &pending) {
+            (Some(draft), Some(pending)) if draft.request_id == pending.request_id => {}
+            (Some(_), _) => {
+                // Answered elsewhere or superseded: drop the draft.
+                self.question = None;
+                if matches!(self.mode, Mode::Question | Mode::QuestionCustom) {
+                    self.mode = Mode::Normal;
+                }
+            }
+            (None, Some(_)) => {
+                // A new question arrived. Open it unless the user is mid-typing.
+                let idle = matches!(self.mode, Mode::Normal)
+                    || (self.mode == Mode::Insert && self.composer.is_empty());
+                if idle {
+                    self.begin_answering();
+                } else {
+                    self.toast("the agent asked a question · press a to answer", false);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    fn submit_answers(&mut self) {
+        let Some(draft) = self.question.as_mut() else {
+            return;
+        };
+        match draft.advance() {
+            Some(answers) => {
+                let request_id = draft.request_id.clone();
+                let Some(thread_id) = self.thread.as_ref().map(|t| t.id().to_string()) else {
+                    return;
+                };
+                self.dispatch(commands::user_input_respond(
+                    &thread_id,
+                    &request_id,
+                    answers,
+                ));
+                self.mode = Mode::Normal;
+                self.toast("answers sent", false);
+            }
+            None => {
+                if !draft.is_answered(draft.index) {
+                    self.toast("pick an option or type a custom answer (c)", false);
+                }
+            }
+        }
+    }
+
+    fn dismiss_question(&mut self) {
+        let Some(thread) = &self.thread else { return };
+        let Some(pending) = thread.pending_user_input() else {
+            return;
+        };
+        if !pending.dismissible {
+            self.toast(
+                "this question blocks the agent and cannot be dismissed; answer it or Ctrl-c",
+                true,
+            );
+            return;
+        }
+        self.dispatch(commands::user_input_dismiss(
+            thread.id(),
+            &pending.request_id,
+        ));
+        self.question = None;
+        self.mode = Mode::Normal;
+    }
+
+    fn on_question_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(draft) = self.question.as_mut() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Char(c @ '1'..='9') => {
+                let index = c as usize - '1' as usize;
+                let single = !draft.current().multi_select;
+                draft.choose(index);
+                if single && draft.current().options.len() > index {
+                    self.submit_answers();
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => draft.move_highlight(1),
+            KeyCode::Char('k') | KeyCode::Up => draft.move_highlight(-1),
+            KeyCode::Char('n') if ctrl => draft.move_highlight(1),
+            KeyCode::Char('p') if ctrl => draft.move_highlight(-1),
+            KeyCode::Char(' ') | KeyCode::Char('x') => {
+                let highlight = draft.highlight;
+                draft.choose(highlight);
+            }
+            KeyCode::Enter => {
+                if !draft.is_answered(draft.index) && !draft.current().options.is_empty() {
+                    let highlight = draft.highlight;
+                    draft.choose(highlight);
+                }
+                self.submit_answers();
+            }
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => draft.back(),
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => {
+                if draft.is_answered(draft.index) && !draft.is_last() {
+                    draft.index += 1;
+                    draft.highlight = 0;
+                }
+            }
+            KeyCode::Char('c') | KeyCode::Char('i') | KeyCode::Char('/') => {
+                if draft.current().allow_custom {
+                    self.custom_answer = draft.current_answer().custom.clone();
+                    self.mode = Mode::QuestionCustom;
+                } else {
+                    self.toast("this question does not accept a custom answer", false);
+                }
+            }
+            KeyCode::Char('d') => self.dismiss_question(),
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            _ => {}
+        }
+    }
+
+    fn on_question_custom_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.custom_answer.clear();
+                self.mode = Mode::Question;
+            }
+            KeyCode::Enter => {
+                let text = std::mem::take(&mut self.custom_answer);
+                if let Some(draft) = self.question.as_mut() {
+                    draft.set_custom(text);
+                }
+                self.mode = Mode::Question;
+                self.submit_answers();
+            }
+            KeyCode::Backspace => {
+                self.custom_answer.pop();
+            }
+            KeyCode::Char('u') if ctrl => self.custom_answer.clear(),
+            KeyCode::Char('w') if ctrl => {
+                let trimmed = self.custom_answer.trim_end().to_string();
+                let cut = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
+                self.custom_answer.truncate(cut);
+            }
+            KeyCode::Char(c) if !ctrl => self.custom_answer.push(c),
+            _ => {}
+        }
     }
 
     fn yank_last_assistant(&mut self) {
@@ -645,11 +829,10 @@ impl App {
             "stop" | "interrupt" => self.interrupt(),
             "sidebar" => self.sidebar_visible = !self.sidebar_visible,
             "older" => self.load_older(),
-            "dismiss" => {
-                if let Some(thread) = &self.thread
-                    && let Some(request_id) = thread.pending_user_input().and_then(|p| p.request_id)
-                {
-                    self.dispatch(commands::user_input_dismiss(thread.id(), &request_id));
+            "dismiss" => self.dismiss_question(),
+            "answer" | "a" => {
+                if !self.begin_answering() {
+                    self.toast("no pending question", false);
                 }
             }
             _ => self.toast(format!("unknown command :{name}"), true),
@@ -746,6 +929,8 @@ impl App {
             Mode::Insert => self.on_insert_key(key),
             Mode::Command => self.on_command_key(key),
             Mode::Picker => self.on_picker_key(key),
+            Mode::Question => self.on_question_key(key),
+            Mode::QuestionCustom => self.on_question_custom_key(key),
             Mode::Help => {
                 if matches!(
                     key.code,
@@ -831,6 +1016,22 @@ impl App {
             KeyCode::Char('/') | KeyCode::Char(' ') => self.open_picker(PickerKind::Thread),
             KeyCode::Char('n') => self.open_picker(PickerKind::Project),
             KeyCode::Char('m') => self.open_picker(PickerKind::Model),
+            KeyCode::Char('a')
+                if self
+                    .thread
+                    .as_ref()
+                    .is_some_and(|t| t.pending_user_input().is_some()) =>
+            {
+                self.begin_answering();
+            }
+            KeyCode::Enter
+                if self
+                    .thread
+                    .as_ref()
+                    .is_some_and(|t| t.pending_user_input().is_some()) =>
+            {
+                self.begin_answering();
+            }
             KeyCode::Char('i') | KeyCode::Char('o') | KeyCode::Enter | KeyCode::Char('a') => {
                 if self.thread.is_some() || self.draft.is_some() {
                     self.mode = Mode::Insert;
@@ -1026,6 +1227,7 @@ impl App {
                     (Some(thread), item) => thread.apply(item),
                     (None, _) => {}
                 }
+                self.reconcile_question();
             }
             Update::OlderPage {
                 thread_id,

@@ -5,6 +5,7 @@ mod composer;
 mod config;
 mod discovery;
 mod model;
+mod question;
 mod rpc;
 mod session;
 mod state;
