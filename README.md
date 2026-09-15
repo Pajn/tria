@@ -66,6 +66,7 @@ Press `?` inside the app for the full list.
 | `Ctrl-c` | interrupt the running turn |
 | mouse wheel | scroll the conversation, or the thread list when the pointer is over it |
 | left click | in the thread list: open a thread, or fold and unfold a section |
+| drag | select text in the conversation; releasing copies it (OSC 52) |
 
 | Insert mode | |
 | --- | --- |

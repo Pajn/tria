@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
@@ -86,7 +86,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     .areas(main_area);
 
     draw_header(frame, app, header);
-    app.chat_area = chat;
     draw_chat(frame, app, chat);
     if let Some(first) = pending.first() {
         draw_approval(frame, first, pending.len(), approvals);
@@ -96,11 +95,55 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_composer(frame, app, composer);
     draw_status(frame, app, status);
+    let chat_inner = app.chat_area;
+    apply_selection(frame, app, chat_inner);
 
     match app.mode {
         Mode::Picker => draw_picker(frame, app, area),
         Mode::Help => draw_help(frame, area),
         _ => {}
+    }
+}
+
+/// Highlight the mouse selection over the drawn chat cells and, when a drag has just ended,
+/// collect the selected text so the event loop can copy it.
+fn apply_selection(frame: &mut Frame, app: &mut App, chat: Rect) {
+    let Some(selection) = app.selection else {
+        return;
+    };
+    let (start, end) = selection.ordered();
+    let want_text = app.clipboard_pending.is_some();
+    let buffer = frame.buffer_mut();
+    let mut text = String::new();
+    for y in start.y..=end.y {
+        if y < chat.y || y >= chat.y + chat.height {
+            continue;
+        }
+        let from = if y == start.y { start.x } else { chat.x };
+        let to = if y == end.y {
+            end.x
+        } else {
+            chat.x + chat.width.saturating_sub(1)
+        };
+        let mut row = String::new();
+        for x in from.max(chat.x)..=to.min(chat.x + chat.width.saturating_sub(1)) {
+            if let Some(cell) = buffer.cell_mut(Position::new(x, y)) {
+                if want_text {
+                    // Continuation cells of wide characters carry an empty symbol.
+                    row.push_str(cell.symbol());
+                }
+                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+        }
+        if want_text {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(row.trim_end());
+        }
+    }
+    if want_text {
+        app.clipboard_pending = Some(text);
     }
 }
 
@@ -356,6 +399,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         width: area.width.saturating_sub(2),
         height: area.height,
     };
+    app.chat_area = inner;
     let Some(thread) = &app.thread else {
         let text = if app.draft.is_some() {
             "Type your first message below and press Enter."
@@ -975,6 +1019,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  y                       yank last assistant message (OSC 52)"),
         Line::from("  s / S                   toggle sidebar / settled shelf"),
         Line::from("  gx                      open the thread's pull request in the browser"),
+        Line::from("  mouse drag              select chat text; released, it is copied"),
         Line::from("  Ctrl-c                  interrupt the running turn"),
         Line::from(""),
         Line::from(Span::styled("Insert", Style::default().bold())),

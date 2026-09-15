@@ -171,6 +171,10 @@ pub struct App {
     /// Screen regions from the last frame, for mouse hit testing.
     pub sidebar_inner: Option<Rect>,
     pub chat_area: Rect,
+    /// Mouse selection in the chat, in screen cells.
+    pub selection: Option<Selection>,
+    /// Text to push to the clipboard after the next frame is drawn.
+    pub clipboard_pending: Option<String>,
     pub work_ranges: Vec<(usize, usize, String)>,
     quit: bool,
 }
@@ -208,6 +212,8 @@ impl App {
             sidebar_reveal: false,
             sidebar_inner: None,
             chat_area: Rect::default(),
+            selection: None,
+            clipboard_pending: None,
             work_ranges: Vec::new(),
             quit: false,
         }
@@ -705,11 +711,8 @@ impl App {
             self.toast("no assistant message to yank", true);
             return;
         };
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(message.text.as_bytes());
-        let mut out = std::io::stdout();
-        let _ = write!(out, "\x1b]52;c;{encoded}\x07");
-        let _ = out.flush();
+        let text = message.text.clone();
+        copy_to_clipboard(&text);
         self.toast("yanked last assistant message to clipboard", false);
     }
 
@@ -1098,6 +1101,7 @@ impl App {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return;
         }
+        self.selection = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Global chords.
         if ctrl && key.code == KeyCode::Char('q') {
@@ -1308,8 +1312,57 @@ impl App {
                 if self.focus == Focus::Sidebar {
                     self.focus = Focus::Chat;
                 }
+                self.selection = if self.chat_area.contains(at) {
+                    Some(Selection {
+                        anchor: at,
+                        head: at,
+                        dragging: true,
+                    })
+                } else {
+                    None
+                };
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(sel) = self.selection.as_mut()
+                    && sel.dragging
+                {
+                    sel.head = clamp_to(self.chat_area, at);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(sel) = self.selection.as_mut()
+                    && sel.dragging
+                {
+                    sel.dragging = false;
+                    if sel.anchor == sel.head {
+                        // A plain click: nothing to copy.
+                        self.selection = None;
+                    } else {
+                        // The renderer fills `clipboard_pending` from the drawn cells.
+                        self.clipboard_pending = Some(String::new());
+                    }
+                }
             }
             _ => {}
+        }
+    }
+
+    /// Called by the event loop once the frame that resolved a selection has been drawn.
+    pub fn flush_clipboard(&mut self) {
+        if let Some(text) = self.clipboard_pending.take() {
+            if text.trim().is_empty() {
+                return;
+            }
+            let lines = text.lines().count();
+            copy_to_clipboard(&text);
+            self.toast(
+                if lines == 1 {
+                    "copied selection".to_string()
+                } else {
+                    format!("copied {lines} lines")
+                },
+                false,
+            );
         }
     }
 
@@ -1545,6 +1598,45 @@ pub fn approval_options(approval: &PendingApproval) -> Vec<ApprovalOption> {
     ]
 }
 
+/// A drag selection over the chat, in screen coordinates. `anchor` is where the button went
+/// down and `head` follows the pointer; either may come first in reading order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: Position,
+    pub head: Position,
+    pub dragging: bool,
+}
+
+impl Selection {
+    /// Start and end in reading order (row-major), both inclusive.
+    pub fn ordered(&self) -> (Position, Position) {
+        if (self.anchor.y, self.anchor.x) <= (self.head.y, self.head.x) {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+}
+
+fn clamp_to(area: Rect, at: Position) -> Position {
+    if area.width == 0 || area.height == 0 {
+        return at;
+    }
+    Position::new(
+        at.x.clamp(area.x, area.x + area.width - 1),
+        at.y.clamp(area.y, area.y + area.height - 1),
+    )
+}
+
+/// Push text to the system clipboard through OSC 52, which the terminal forwards.
+pub fn copy_to_clipboard(text: &str) {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]52;c;{encoded}\x07");
+    let _ = out.flush();
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Pinned,
@@ -1597,6 +1689,7 @@ pub async fn run(origin: String, token: String) -> Result<()> {
         if let Err(err) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
             break Err(err.into());
         }
+        app.flush_clipboard();
         let event = tokio::select! {
             ev = input.next() => match ev {
                 Some(Ok(ev)) => AppEvent::Terminal(ev),
