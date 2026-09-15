@@ -44,10 +44,7 @@ pub enum FromServer {
     },
     Pong,
     /// Server-initiated request (unused by this client); kept so decoding never fails.
-    Request {
-        #[serde(default)]
-        tag: String,
-    },
+    Request {},
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,7 +75,11 @@ pub fn describe_failure(cause: &[CauseEntry]) -> String {
                     .or_else(|| error.get("reason"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if message.is_empty() { tag.to_string() } else { format!("{tag}: {message}") }
+                if message.is_empty() {
+                    tag.to_string()
+                } else {
+                    format!("{tag}: {message}")
+                }
             }
             CauseEntry::Die { defect } => format!("defect: {defect}"),
             CauseEntry::Interrupt {} => "interrupted".to_string(),

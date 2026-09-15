@@ -32,7 +32,11 @@ enum Command {
     /// Connect and print the server config plus the project and thread list, then exit.
     Probe,
     /// Open a thread through the supervisor and print reduced state for a few seconds.
-    Dump { thread_id: String, #[arg(long, default_value_t = 5)] seconds: u64 },
+    Dump {
+        thread_id: String,
+        #[arg(long, default_value_t = 5)]
+        seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -54,14 +58,17 @@ async fn main() -> Result<()> {
         }
         Some(Command::Probe) => probe(&origin, &cfg).await,
         None => {
-            let token = cfg
-                .token
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("no token stored; run `tria pair <credential>` first (mint one with `t3 pair`)"))?;
+            let token = cfg.token.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no token stored; run `tria pair <credential>` first (mint one with `t3 pair`)"
+                )
+            })?;
             init_logging()?;
             app::run(origin, token).await
         }
-        Some(Command::Dump { thread_id, seconds }) => dump(&origin, &cfg, &thread_id, seconds).await,
+        Some(Command::Dump { thread_id, seconds }) => {
+            dump(&origin, &cfg, &thread_id, seconds).await
+        }
     }
 }
 
@@ -72,8 +79,13 @@ async fn probe(origin: &str, cfg: &config::Config) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no token stored; run `tria pair <credential>` first"))?;
     let ticket = auth::websocket_ticket(origin, token).await?;
     let client = rpc::RpcClient::connect(origin, &ticket).await?;
-    let config: serde_json::Value = client.call("server.getConfig", serde_json::json!({})).await?;
-    println!("server config keys: {:?}", config.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+    let config: serde_json::Value = client
+        .call("server.getConfig", serde_json::json!({}))
+        .await?;
+    println!(
+        "server config keys: {:?}",
+        config.as_object().map(|o| o.keys().collect::<Vec<_>>())
+    );
     if let Some(path) = std::env::var_os("TRIA_DUMP_CONFIG") {
         std::fs::write(path, serde_json::to_string_pretty(&config)?)?;
     }
@@ -89,10 +101,20 @@ async fn probe(origin: &str, cfg: &config::Config) -> Result<()> {
         match kind {
             "snapshot" => {
                 let snap = &item["snapshot"];
-                println!("projects: {}", snap["projects"].as_array().map_or(0, |a| a.len()));
-                println!("threads:  {}", snap["threads"].as_array().map_or(0, |a| a.len()));
+                println!(
+                    "projects: {}",
+                    snap["projects"].as_array().map_or(0, |a| a.len())
+                );
+                println!(
+                    "threads:  {}",
+                    snap["threads"].as_array().map_or(0, |a| a.len())
+                );
                 for t in snap["threads"].as_array().into_iter().flatten().take(10) {
-                    println!("  - {}  [{}]", t["title"].as_str().unwrap_or(""), t["session"]["status"].as_str().unwrap_or(""));
+                    println!(
+                        "  - {}  [{}]",
+                        t["title"].as_str().unwrap_or(""),
+                        t["session"]["status"].as_str().unwrap_or("")
+                    );
                 }
             }
             "synchronized" => {
@@ -106,7 +128,10 @@ async fn probe(origin: &str, cfg: &config::Config) -> Result<()> {
 }
 
 async fn dump(origin: &str, cfg: &config::Config, thread_id: &str, seconds: u64) -> Result<()> {
-    let token = cfg.token.clone().ok_or_else(|| anyhow::anyhow!("no token stored; run `tria pair <credential>` first"))?;
+    let token = cfg
+        .token
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no token stored; run `tria pair <credential>` first"))?;
     let (handle, mut updates) = session::spawn(origin.to_string(), token);
     let mut shell = state::Shell::default();
     let mut thread: Option<state::ThreadState> = None;
@@ -119,41 +144,84 @@ async fn dump(origin: &str, cfg: &config::Config, thread_id: &str, seconds: u64)
         };
         match update {
             session::Update::Status(status) => println!("status: {status:?}"),
-            session::Update::Config(config) => println!("config: {} providers, pagination={}", config.providers.len(), config.thread_snapshot_pagination),
+            session::Update::Config(config) => println!(
+                "config: {} providers, pagination={}",
+                config.providers.len(),
+                config.thread_snapshot_pagination
+            ),
             session::Update::Shell(item) => {
                 shell.apply(item);
-                if shell.synchronized { println!("shell: {} projects, {} threads, seq {:?}", shell.projects.len(), shell.threads.len(), shell.last_sequence); }
+                if shell.synchronized {
+                    println!(
+                        "shell: {} projects, {} threads, seq {:?}",
+                        shell.projects.len(),
+                        shell.threads.len(),
+                        shell.last_sequence
+                    );
+                }
             }
             session::Update::Thread { item, .. } => match (&mut thread, item) {
                 (None, model::ThreadItem::Snapshot { snapshot }) => {
                     let t = state::ThreadState::from_snapshot(snapshot);
-                    println!("thread snapshot: {} messages, {} activities, has_more={}, seq {}", t.detail.messages.len(), t.detail.activities.len(), t.has_more, t.last_sequence);
-                    println!("  running={} pending approvals={} plan steps={}", t.is_running(), t.pending_approvals().len(), t.active_plan().len());
+                    println!(
+                        "thread snapshot: {} messages, {} activities, has_more={}, seq {}",
+                        t.detail.messages.len(),
+                        t.detail.activities.len(),
+                        t.has_more,
+                        t.last_sequence
+                    );
+                    println!(
+                        "  running={} pending approvals={} plan steps={}",
+                        t.is_running(),
+                        t.pending_approvals().len(),
+                        t.active_plan().len()
+                    );
                     thread = Some(t);
                 }
                 (Some(t), item) => {
-                    if let model::ThreadItem::Event { event } = &item { println!("event {} seq {}", event.kind, event.sequence); }
+                    if let model::ThreadItem::Event { event } = &item {
+                        println!("event {} seq {}", event.kind, event.sequence);
+                    }
                     t.apply(item);
                 }
                 (None, _) => {}
             },
-            session::Update::OlderPage { snapshot, .. } => println!("older page: {} messages", snapshot.thread.messages.len()),
-            session::Update::ThreadStreamError { error, .. } => println!("thread stream error: {error}"),
+            session::Update::OlderPage { snapshot, .. } => {
+                println!("older page: {} messages", snapshot.thread.messages.len())
+            }
+            session::Update::ThreadStreamError { error } => {
+                println!("thread stream error: {error}")
+            }
             session::Update::Error(error) => println!("error: {error}"),
         }
     }
-    if let Some(t) = &thread {
-        if let Some(last) = t.detail.messages.last() { println!("last message ({}): {:?}", last.role, last.text.chars().take(120).collect::<String>()); }
+    if let Some(last) = thread.as_ref().and_then(|t| t.detail.messages.last()) {
+        println!(
+            "last message ({}): {:?}",
+            last.role,
+            last.text.chars().take(120).collect::<String>()
+        );
     }
     Ok(())
 }
 
 /// Log to a file under the state directory; the terminal is owned by the UI.
 fn init_logging() -> Result<()> {
-    let dir = config::Config::path()?.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let dir = config::Config::path()?
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
     std::fs::create_dir_all(&dir)?;
-    let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("tria.log"))?;
-    let filter = tracing_subscriber::EnvFilter::try_from_env("TRIA_LOG").unwrap_or_else(|_| "info".into());
-    tracing_subscriber::fmt().with_env_filter(filter).with_writer(file).with_ansi(false).init();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("tria.log"))?;
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_env("TRIA_LOG").unwrap_or_else(|_| "info".into());
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(file)
+        .with_ansi(false)
+        .init();
     Ok(())
 }

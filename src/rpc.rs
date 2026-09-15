@@ -56,7 +56,9 @@ impl Subscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        let _ = self.outbound.send(FromClient::Interrupt { request_id: self.id });
+        let _ = self.outbound.send(FromClient::Interrupt {
+            request_id: self.id,
+        });
     }
 }
 
@@ -68,7 +70,8 @@ impl RpcClient {
             "https" => "wss",
             other => bail!("unsupported origin scheme {other}"),
         };
-        url.set_scheme(scheme).map_err(|_| anyhow!("cannot set websocket scheme"))?;
+        url.set_scheme(scheme)
+            .map_err(|_| anyhow!("cannot set websocket scheme"))?;
         url.set_path("/ws");
         url.query_pairs_mut()
             .append_pair("wsTicket", ticket)
@@ -169,7 +172,12 @@ impl RpcClient {
             reader_closed.notify_waiters();
         });
 
-        Ok(Self { outbound, shared, next_id: Arc::new(AtomicU64::new(1)), closed })
+        Ok(Self {
+            outbound,
+            shared,
+            next_id: Arc::new(AtomicU64::new(1)),
+            closed,
+        })
     }
 
     /// Resolves when the socket has closed for any reason.
@@ -180,9 +188,18 @@ impl RpcClient {
     pub async fn call<T: DeserializeOwned>(&self, tag: &str, payload: Value) -> Result<T> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.shared.pending.lock().unwrap().insert(id, Pending::Call(tx));
+        self.shared
+            .pending
+            .lock()
+            .unwrap()
+            .insert(id, Pending::Call(tx));
         self.outbound
-            .send(FromClient::Request { id, tag: tag.to_string(), payload, headers: vec![] })
+            .send(FromClient::Request {
+                id,
+                tag: tag.to_string(),
+                payload,
+                headers: vec![],
+            })
             .map_err(|_| anyhow!("connection closed"))?;
         let value = rx.await.map_err(|_| anyhow!("connection closed"))??;
         serde_json::from_value(value).with_context(|| format!("decoding {tag} result"))
@@ -191,15 +208,32 @@ impl RpcClient {
     pub async fn subscribe(&self, tag: &str, payload: Value) -> Result<Subscription> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
-        self.shared.pending.lock().unwrap().insert(id, Pending::Stream(tx));
+        self.shared
+            .pending
+            .lock()
+            .unwrap()
+            .insert(id, Pending::Stream(tx));
         self.outbound
-            .send(FromClient::Request { id, tag: tag.to_string(), payload, headers: vec![] })
+            .send(FromClient::Request {
+                id,
+                tag: tag.to_string(),
+                payload,
+                headers: vec![],
+            })
             .map_err(|_| anyhow!("connection closed"))?;
-        Ok(Subscription { id, rx, outbound: self.outbound.clone() })
+        Ok(Subscription {
+            id,
+            rx,
+            outbound: self.outbound.clone(),
+        })
     }
 }
 
-fn handle_message(shared: &Shared, outbound: &mpsc::UnboundedSender<FromClient>, message: FromServer) {
+fn handle_message(
+    shared: &Shared,
+    outbound: &mpsc::UnboundedSender<FromClient>,
+    message: FromServer,
+) {
     match message {
         FromServer::Chunk { request_id, values } => {
             // Ack first: the server withholds the next chunk until it sees this.

@@ -21,7 +21,10 @@ pub struct Composer {
 
 impl Composer {
     pub fn new() -> Self {
-        Self { lines: vec![String::new()], ..Default::default() }
+        Self {
+            lines: vec![String::new()],
+            ..Default::default()
+        }
     }
 
     pub fn text(&self) -> String {
@@ -77,7 +80,9 @@ impl Composer {
     }
 
     pub fn history_next(&mut self) {
-        let Some(index) = self.history_index else { return };
+        let Some(index) = self.history_index else {
+            return;
+        };
         if index + 1 < self.history.len() {
             self.history_index = Some(index + 1);
             let text = self.history[index + 1].clone();
@@ -94,7 +99,10 @@ impl Composer {
     }
 
     fn byte_index(line: &str, col: usize) -> usize {
-        line.char_indices().nth(col).map(|(i, _)| i).unwrap_or(line.len())
+        line.char_indices()
+            .nth(col)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len())
     }
 
     pub fn insert_char(&mut self, ch: char) {
@@ -253,7 +261,11 @@ impl Composer {
     /// Number of screen rows needed at `width`, between 1 and `max`.
     pub fn height(&self, width: u16, max: u16) -> u16 {
         let width = width.max(1) as usize;
-        let rows: usize = self.lines.iter().map(|l| char_len(l).max(1).div_ceil(width).max(1)).sum();
+        let rows: usize = self
+            .lines
+            .iter()
+            .map(|l| char_len(l).max(1).div_ceil(width).max(1))
+            .sum();
         (rows as u16).clamp(1, max)
     }
 
@@ -269,19 +281,35 @@ impl Composer {
                 let start = chunk * width;
                 let end = ((chunk + 1) * width).min(chars.len());
                 let text: String = chars[start..end].iter().collect();
-                if row_index == self.row && self.col >= start && (self.col < end || (self.col == end && chunk == chunks - 1)) {
+                if row_index == self.row
+                    && self.col >= start
+                    && (self.col < end || (self.col == end && chunk == chunks - 1))
+                {
                     cursor = ((self.col - start) as u16, rows.len() as u16);
                 }
                 rows.push(Line::from(text));
             }
         }
         if self.is_empty() && self.lines.len() == 1 {
-            rows[0] = Line::from(Span::styled(placeholder.to_string(), Style::default().fg(Color::DarkGray)));
+            rows[0] = Line::from(Span::styled(
+                placeholder.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
         }
         let height = area.height.max(1);
         let scroll = cursor.1.saturating_sub(height - 1);
-        let visible: Vec<Line<'static>> = rows.into_iter().skip(scroll as usize).take(height as usize).collect();
-        (visible, (area.x + cursor.0.min(area.width.saturating_sub(1)), area.y + cursor.1 - scroll))
+        let visible: Vec<Line<'static>> = rows
+            .into_iter()
+            .skip(scroll as usize)
+            .take(height as usize)
+            .collect();
+        (
+            visible,
+            (
+                area.x + cursor.0.min(area.width.saturating_sub(1)),
+                area.y + cursor.1 - scroll,
+            ),
+        )
     }
 }
 
@@ -302,7 +330,12 @@ mod tests {
         assert_eq!(c.text(), "hello Xwörld");
         c.newline();
         c.insert_str("two");
-        assert_eq!(c.text(), "hello X\nwörldtwo".replace("wörldtwo", "wörld").replace("X\n", "X\ntwo"));
+        assert_eq!(
+            c.text(),
+            "hello X\nwörldtwo"
+                .replace("wörldtwo", "wörld")
+                .replace("X\n", "X\ntwo")
+        );
         c.backspace();
         c.backspace();
         c.backspace();

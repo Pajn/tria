@@ -23,7 +23,11 @@ impl Shell {
         match item {
             ShellItem::Synchronized => self.synchronized = true,
             ShellItem::Snapshot { snapshot } => {
-                self.projects = snapshot.projects.into_iter().map(|p| (p.id.clone(), p)).collect();
+                self.projects = snapshot
+                    .projects
+                    .into_iter()
+                    .map(|p| (p.id.clone(), p))
+                    .collect();
                 self.threads = snapshot
                     .threads
                     .into_iter()
@@ -38,7 +42,10 @@ impl Shell {
                     self.projects.insert(project.id.clone(), project);
                 }
             }
-            ShellItem::ProjectRemoved { sequence, project_id } => {
+            ShellItem::ProjectRemoved {
+                sequence,
+                project_id,
+            } => {
                 if self.advance(sequence) {
                     self.projects.remove(&project_id);
                 }
@@ -52,7 +59,10 @@ impl Shell {
                     }
                 }
             }
-            ShellItem::ThreadRemoved { sequence, thread_id } => {
+            ShellItem::ThreadRemoved {
+                sequence,
+                thread_id,
+            } => {
                 if self.advance(sequence) {
                     self.threads.remove(&thread_id);
                 }
@@ -82,7 +92,10 @@ impl Shell {
     }
 
     pub fn project_title(&self, project_id: &str) -> &str {
-        self.projects.get(project_id).map(|p| p.title.as_str()).unwrap_or("?")
+        self.projects
+            .get(project_id)
+            .map(|p| p.title.as_str())
+            .unwrap_or("?")
     }
 }
 
@@ -92,7 +105,6 @@ pub struct PendingApproval {
     pub request_kind: String,
     pub detail: Option<String>,
     pub options: Vec<ApprovalOption>,
-    pub created_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -167,26 +179,43 @@ impl ThreadState {
         self.last_sequence = event.sequence;
         match event.kind.as_str() {
             "thread.message-sent" => {
-                let Ok(incoming) = serde_json::from_value::<MessageSent>(event.payload) else { return };
+                let Ok(incoming) = serde_json::from_value::<MessageSent>(event.payload) else {
+                    return;
+                };
                 self.apply_message(incoming);
             }
             "thread.activity-appended" => {
-                let Some(activity) = event.payload.get("activity").cloned() else { return };
-                let Ok(activity) = serde_json::from_value::<Activity>(activity) else { return };
+                let Some(activity) = event.payload.get("activity").cloned() else {
+                    return;
+                };
+                let Ok(activity) = serde_json::from_value::<Activity>(activity) else {
+                    return;
+                };
                 if !self.detail.activities.iter().any(|a| a.id == activity.id) {
                     self.detail.activities.push(activity);
                 }
             }
             "thread.session-set" => {
-                let Some(session) = event.payload.get("session").cloned() else { return };
+                let Some(session) = event.payload.get("session").cloned() else {
+                    return;
+                };
                 if let Ok(session) = serde_json::from_value::<Session>(session) {
                     self.detail.shell.session = Some(session);
                 }
             }
             "thread.proposed-plan-upserted" => {
-                let Some(plan) = event.payload.get("proposedPlan").cloned() else { return };
-                let Ok(plan) = serde_json::from_value::<ProposedPlan>(plan) else { return };
-                match self.detail.proposed_plans.iter_mut().find(|p| p.id == plan.id) {
+                let Some(plan) = event.payload.get("proposedPlan").cloned() else {
+                    return;
+                };
+                let Ok(plan) = serde_json::from_value::<ProposedPlan>(plan) else {
+                    return;
+                };
+                match self
+                    .detail
+                    .proposed_plans
+                    .iter_mut()
+                    .find(|p| p.id == plan.id)
+                {
                     Some(existing) => *existing = plan,
                     None => self.detail.proposed_plans.push(plan),
                 }
@@ -198,7 +227,12 @@ impl ThreadState {
     }
 
     fn apply_message(&mut self, incoming: MessageSent) {
-        if let Some(existing) = self.detail.messages.iter_mut().find(|m| m.id == incoming.message_id) {
+        if let Some(existing) = self
+            .detail
+            .messages
+            .iter_mut()
+            .find(|m| m.id == incoming.message_id)
+        {
             if incoming.streaming {
                 existing.text.push_str(&incoming.text);
             } else if !incoming.text.is_empty() {
@@ -252,7 +286,9 @@ impl ThreadState {
         for activity in &self.detail.activities {
             match activity.kind.as_str() {
                 "approval.requested" => {
-                    let Some(request_id) = activity.str("requestId") else { continue };
+                    let Some(request_id) = activity.str("requestId") else {
+                        continue;
+                    };
                     let options = activity
                         .payload
                         .get("options")
@@ -278,7 +314,6 @@ impl ThreadState {
                             .to_string(),
                         detail: activity.str("detail").map(str::to_string),
                         options,
-                        created_at: activity.created_at.clone(),
                     });
                 }
                 "approval.resolved" => {

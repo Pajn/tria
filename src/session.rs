@@ -20,9 +20,14 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 pub enum Request {
     OpenThread(Id),
     CloseThread,
-    Dispatch { command: Value, reply: oneshot::Sender<Result<u64>> },
+    Dispatch {
+        command: Value,
+        reply: oneshot::Sender<Result<u64>>,
+    },
     /// Load older turns for the open thread (windowed snapshot).
-    LoadOlder { before_cursor: String },
+    LoadOlder {
+        before_cursor: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,11 +42,19 @@ pub enum Update {
     Status(Status),
     Config(Box<ServerConfig>),
     Shell(ShellItem),
-    Thread { thread_id: Id, item: ThreadItem },
+    Thread {
+        thread_id: Id,
+        item: ThreadItem,
+    },
     /// A windowed snapshot of older turns requested with `LoadOlder`.
-    OlderPage { thread_id: Id, snapshot: crate::model::ThreadDetailSnapshot },
+    OlderPage {
+        thread_id: Id,
+        snapshot: crate::model::ThreadDetailSnapshot,
+    },
     /// The open thread's stream failed; the supervisor resubscribes on its own.
-    ThreadStreamError { thread_id: Id, error: String },
+    ThreadStreamError {
+        error: String,
+    },
     Error(String),
 }
 
@@ -61,7 +74,9 @@ impl Handle {
     }
 
     pub fn load_older(&self, before_cursor: &str) {
-        let _ = self.tx.send(Request::LoadOlder { before_cursor: before_cursor.to_string() });
+        let _ = self.tx.send(Request::LoadOlder {
+            before_cursor: before_cursor.to_string(),
+        });
     }
 
     pub async fn dispatch(&self, command: Value) -> Result<u64> {
@@ -69,7 +84,8 @@ impl Handle {
         self.tx
             .send(Request::Dispatch { command, reply })
             .map_err(|_| anyhow!("connection supervisor stopped"))?;
-        rx.await.map_err(|_| anyhow!("connection supervisor stopped"))?
+        rx.await
+            .map_err(|_| anyhow!("connection supervisor stopped"))?
     }
 }
 
@@ -118,14 +134,20 @@ async fn run(
                     return;
                 }
                 attempt += 1;
-                let _ = updates.send(Update::Status(Status::Reconnecting { attempt, error: message }));
+                let _ = updates.send(Update::Status(Status::Reconnecting {
+                    attempt,
+                    error: message,
+                }));
                 tokio::time::sleep(backoff(attempt)).await;
                 continue;
             }
         };
 
         // Config first: it tells us whether pagination and completion markers are supported.
-        match client.call::<ServerConfig>("server.getConfig", json!({})).await {
+        match client
+            .call::<ServerConfig>("server.getConfig", json!({}))
+            .await
+        {
             Ok(config) => {
                 pagination = config.thread_snapshot_pagination;
                 let _ = updates.send(Update::Config(Box::new(config)));
@@ -139,13 +161,18 @@ async fn run(
             Ok(sub) => sub,
             Err(err) => {
                 attempt += 1;
-                let _ = updates.send(Update::Status(Status::Reconnecting { attempt, error: err.to_string() }));
+                let _ = updates.send(Update::Status(Status::Reconnecting {
+                    attempt,
+                    error: err.to_string(),
+                }));
                 tokio::time::sleep(backoff(attempt)).await;
                 continue;
             }
         };
         if let Some(open) = open.as_mut() {
-            open.subscription = subscribe_thread(&client, &open.id, open.last_sequence, pagination).await.ok();
+            open.subscription = subscribe_thread(&client, &open.id, open.last_sequence, pagination)
+                .await
+                .ok();
         }
         attempt = 0;
         let _ = updates.send(Update::Status(Status::Connected));
@@ -183,10 +210,10 @@ async fn run(
                                 // Older turns come as a one-shot windowed subscription; take its snapshot only.
                                 match client.subscribe("orchestration.subscribeThread", payload).await {
                                     Ok(mut sub) => {
-                                        if let Some(Ok(item)) = sub.next().await {
-                                            if let Ok(ThreadItem::Snapshot { snapshot }) = serde_json::from_value::<ThreadItem>(item) {
-                                                let _ = updates.send(Update::OlderPage { thread_id: o.id.clone(), snapshot });
-                                            }
+                                        if let Some(Ok(item)) = sub.next().await
+                                            && let Ok(ThreadItem::Snapshot { snapshot }) = serde_json::from_value::<ThreadItem>(item)
+                                        {
+                                            let _ = updates.send(Update::OlderPage { thread_id: o.id.clone(), snapshot });
                                         }
                                     }
                                     Err(err) => { let _ = updates.send(Update::Error(err.to_string())); }
@@ -240,7 +267,7 @@ async fn run(
                     match item {
                         Some(Ok(value)) => forward_thread_item(&updates, &o.id, value, &mut o.last_sequence),
                         Some(Err(err)) => {
-                            let _ = updates.send(Update::ThreadStreamError { thread_id: o.id.clone(), error: err.to_string() });
+                            let _ = updates.send(Update::ThreadStreamError { error: err.to_string() });
                             o.subscription = subscribe_thread(&client, &o.id, o.last_sequence, pagination).await.ok();
                         }
                         None => {
@@ -252,7 +279,10 @@ async fn run(
         }
 
         attempt += 1;
-        let _ = updates.send(Update::Status(Status::Reconnecting { attempt, error: "connection lost".into() }));
+        let _ = updates.send(Update::Status(Status::Reconnecting {
+            attempt,
+            error: "connection lost".into(),
+        }));
         if let Some(o) = open.as_mut() {
             o.subscription = None;
         }
@@ -269,11 +299,16 @@ fn forward_thread_item(
     match serde_json::from_value::<ThreadItem>(value) {
         Ok(item) => {
             match &item {
-                ThreadItem::Snapshot { snapshot } => *last_sequence = Some(snapshot.snapshot_sequence),
+                ThreadItem::Snapshot { snapshot } => {
+                    *last_sequence = Some(snapshot.snapshot_sequence)
+                }
                 ThreadItem::Event { event } => *last_sequence = Some(event.sequence),
                 _ => {}
             }
-            let _ = updates.send(Update::Thread { thread_id: thread_id.to_string(), item });
+            let _ = updates.send(Update::Thread {
+                thread_id: thread_id.to_string(),
+                item,
+            });
         }
         Err(err) => tracing::warn!(?err, "undecodable thread item"),
     }
@@ -289,7 +324,9 @@ async fn subscribe_shell(client: &RpcClient, after: Option<u64>) -> Result<Subsc
     if let Some(after) = after {
         payload["afterSequence"] = json!(after);
     }
-    client.subscribe("orchestration.subscribeShell", payload).await
+    client
+        .subscribe("orchestration.subscribeShell", payload)
+        .await
 }
 
 async fn subscribe_thread(
@@ -304,7 +341,9 @@ async fn subscribe_thread(
     } else if pagination {
         payload["turnLimit"] = json!(THREAD_TURN_LIMIT);
     }
-    client.subscribe("orchestration.subscribeThread", payload).await
+    client
+        .subscribe("orchestration.subscribeThread", payload)
+        .await
 }
 
 fn backoff(attempt: u32) -> Duration {

@@ -15,7 +15,9 @@ impl Config {
     pub fn path() -> Result<PathBuf> {
         let dir = match std::env::var_os("XDG_CONFIG_HOME") {
             Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-            _ => dirs::home_dir().context("no home directory")?.join(".config"),
+            _ => dirs::home_dir()
+                .context("no home directory")?
+                .join(".config"),
         };
         Ok(dir.join("tria").join("config.toml"))
     }
@@ -23,7 +25,9 @@ impl Config {
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
         match fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display())),
+            Ok(text) => {
+                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
         }

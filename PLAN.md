@@ -212,7 +212,8 @@ resubscribe shell and open thread with `afterSequence`. A stream failure with
 
 **Rendering.** `ratatui` with `crossterm`. Markdown through `tui-markdown` first; swap to a
 custom `pulldown-cmark` renderer with `syntect` code highlighting only if `tui-markdown` proves
-limiting. Layout is a left thread list (toggleable) and a right chat column with a fixed
+limiting. The composer is a small in-tree editor: `tui-textarea` pins ratatui 0.29 and does not
+link against 0.30. Layout is a left thread list (toggleable) and a right chat column with a fixed
 composer at the bottom and a one-line status bar (connection, provider/model, runtime mode,
 session status). Each turn renders as: user bubble, a collapsed one-line-per-tool activity
 group ("Read foo.rs", "Ran cargo test ... ok"), the assistant markdown, and an optional plan
@@ -226,16 +227,17 @@ digit keys. Streaming appends deltas and re-renders at most every 16 ms.
   the cursor, `zM`/`zR` collapse or expand all, `i` or `Enter` to insert, `Esc` clear,
   `Ctrl-c` interrupt the running turn, `y` yank the assistant message under the cursor,
   `1`..`9` answer a pending approval.
-- *Insert*: `tui-textarea` composer. `Enter` sends, `Shift-Enter` or `Alt-Enter` inserts a
-  newline, `Esc` returns to normal, `Ctrl-p`/`Ctrl-n` recall prompt history.
+- *Insert*: the composer. `Enter` sends, `Alt-Enter` or `Ctrl-j` inserts a newline, `Esc`
+  returns to normal, `Up`/`Down` or `Ctrl-p`/`Ctrl-n` recall prompt history.
 - *Command line* (`:`): `:new [project]`, `:model`, `:mode plan|default`,
   `:perm full-access|auto|approval-required`, `:rename <title>`, `:archive`, `:delete`, `:q`.
 
 Model and project pickers open as a centered fuzzy list, reused for `/` thread filtering.
 
-**Configuration.** `~/.config/tria/config.toml` with `url` and a bearer token, file mode 0600.
-First run without a token prompts for a pairing credential or a `/pair#token=` URL and performs
-the exchange. Keychain storage is a later option, not v1.
+**Configuration.** `$XDG_CONFIG_HOME/tria/config.toml` (default `~/.config/tria/config.toml`)
+with `url` and a bearer token, file mode 0600. `tria pair <credential>` accepts a raw pairing
+credential or a `/pair#token=` URL and performs the exchange. Keychain storage is a later
+option, not v1.
 
 **Explicitly out of scope for v1.** Attachments and image paste, composer context chips,
 answering `user-input.requested` questions (render read-only with a hint to use another
@@ -243,6 +245,11 @@ client), archived thread browsing, thread search, multiple environments, worktre
 selection on thread creation, diffs, terminals, PR views, settings.
 
 ## 3. Milestones
+
+Status: M0 through M2 are implemented and verified against a live server (pairing, streaming,
+approvals derivation, interrupt, new thread with bootstrap, rename, archive). M3 items shipped so
+far: model and effort pickers, `:` commands, prompt history, yank, config file. Not yet done:
+a recent-thread cache for instant back navigation, packaging.
 
 **M0, spike (proves auth and framing).** CLI binary, no UI. Read `server-runtime.json`,
 exchange a pairing credential, fetch a ticket, open the socket, call `server.getConfig`, run
@@ -277,7 +284,6 @@ prompt history, yank, config file and first-run pairing flow, packaging.
 | --- | --- | --- |
 | `ratatui` | 0.30 | UI |
 | `crossterm` | 0.29 | terminal backend, key events |
-| `tui-textarea` | 0.7 | composer |
 | `tui-markdown` | 0.3 | markdown to `Text` |
 | `tokio`, `tokio-tungstenite` | 0.30 | async runtime, WebSocket |
 | `reqwest` | current | token exchange, tickets |

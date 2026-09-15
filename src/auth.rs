@@ -9,7 +9,6 @@ const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 pub struct AccessToken {
     pub access_token: String,
     pub token_type: String,
-    pub expires_in: f64,
     pub scope: String,
 }
 
@@ -20,12 +19,12 @@ struct WebSocketTicket {
 
 /// Accepts a raw pairing credential or a `/pair#token=...` URL.
 fn extract_credential(input: &str) -> String {
-    if let Ok(url) = url::Url::parse(input) {
-        if let Some(fragment) = url.fragment() {
-            for (key, value) in url::form_urlencoded::parse(fragment.as_bytes()) {
-                if key == "token" {
-                    return value.into_owned();
-                }
+    if let Ok(url) = url::Url::parse(input)
+        && let Some(fragment) = url.fragment()
+    {
+        for (key, value) in url::form_urlencoded::parse(fragment.as_bytes()) {
+            if key == "token" {
+                return value.into_owned();
             }
         }
     }
@@ -56,7 +55,10 @@ pub async fn exchange_pairing_credential(origin: &str, input: &str) -> Result<Ac
     }
     let token: AccessToken = serde_json::from_str(&body).context("decoding token response")?;
     if token.token_type != "Bearer" {
-        bail!("server issued a {} token; only Bearer is supported", token.token_type);
+        bail!(
+            "server issued a {} token; only Bearer is supported",
+            token.token_type
+        );
     }
     Ok(token)
 }

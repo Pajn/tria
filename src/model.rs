@@ -1,6 +1,7 @@
 //! Wire types for the subset of the T3 Code contracts a chat client needs.
 //! Decoding is lenient on purpose: unknown fields are ignored, optional fields
 //! default, and open string unions stay `String`.
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -110,7 +111,10 @@ fn default_interaction_mode() -> String {
 
 impl ThreadShell {
     pub fn is_running(&self) -> bool {
-        matches!(self.latest_turn.as_ref().map(|t| t.state.as_str()), Some("running"))
+        matches!(
+            self.latest_turn.as_ref().map(|t| t.state.as_str()),
+            Some("running")
+        )
     }
 }
 
@@ -212,6 +216,7 @@ pub struct ShellSnapshot {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[allow(clippy::large_enum_variant)]
 pub enum ShellItem {
     Synchronized,
     Snapshot {
@@ -256,10 +261,15 @@ pub struct Event {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[allow(clippy::large_enum_variant)]
 pub enum ThreadItem {
     Synchronized,
-    Snapshot { snapshot: ThreadDetailSnapshot },
-    Event { event: Event },
+    Snapshot {
+        snapshot: ThreadDetailSnapshot,
+    },
+    Event {
+        event: Event,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -352,7 +362,10 @@ pub struct Model {
 
 impl Model {
     pub fn option_descriptors(&self) -> &[OptionDescriptor] {
-        self.capabilities.as_ref().map(|c| c.option_descriptors.as_slice()).unwrap_or(&[])
+        self.capabilities
+            .as_ref()
+            .map(|c| c.option_descriptors.as_slice())
+            .unwrap_or(&[])
     }
 }
 

@@ -30,6 +30,7 @@ pub struct Block {
 #[derive(Debug, Clone)]
 struct WorkEntry {
     key: String,
+    turn_id: Option<String>,
     icon: &'static str,
     title: String,
     detail: Option<String>,
@@ -52,40 +53,82 @@ fn item_time<'a>(item: &'a Item<'a>) -> &'a str {
 }
 
 /// Build the ordered blocks for a thread. `expanded` holds work-group keys shown in full.
-pub fn build(thread: &ThreadState, expanded: &HashSet<String>, expand_all: bool, width: u16) -> Vec<Block> {
+pub fn build(
+    thread: &ThreadState,
+    expanded: &HashSet<String>,
+    expand_all: bool,
+    width: u16,
+) -> Vec<Block> {
     let detail = &thread.detail;
-    let mut items: Vec<Item<'_>> = Vec::with_capacity(detail.messages.len() + detail.activities.len());
+    let mut items: Vec<Item<'_>> =
+        Vec::with_capacity(detail.messages.len() + detail.activities.len());
     items.extend(detail.messages.iter().map(Item::Message));
-    items.extend(detail.activities.iter().filter(|a| is_visible_activity(a)).map(Item::Activity));
+    items.extend(
+        detail
+            .activities
+            .iter()
+            .filter(|a| is_visible_activity(a))
+            .map(Item::Activity),
+    );
     items.extend(detail.proposed_plans.iter().map(Item::Plan));
     items.sort_by(|a, b| item_time(a).cmp(item_time(b)));
 
+    let active_turn: Option<&str> = if thread.is_running() {
+        detail
+            .shell
+            .latest_turn
+            .as_ref()
+            .map(|t| t.turn_id.as_str())
+    } else {
+        None
+    };
     let mut blocks: Vec<Block> = Vec::new();
     let mut pending_work: Vec<WorkEntry> = Vec::new();
     let mut work_group_index = 0usize;
     let mut work_anchor: Option<String> = None;
 
-    let flush_work = |blocks: &mut Vec<Block>, pending: &mut Vec<WorkEntry>, anchor: &mut Option<String>, index: &mut usize| {
+    let flush_work = |blocks: &mut Vec<Block>,
+                      pending: &mut Vec<WorkEntry>,
+                      anchor: &mut Option<String>,
+                      index: &mut usize| {
         if pending.is_empty() {
             return;
         }
         let key = anchor.take().unwrap_or_else(|| format!("work-{index}"));
         *index += 1;
         let is_expanded = expand_all || expanded.contains(&key);
-        blocks.push(Block { key: BlockKey::Work(key), text: render_work(pending, is_expanded, width) });
+        // Providers do not always emit a completion for every parallel call. Once the
+        // turn that owned an entry is over, "in progress" can only be stale.
+        for entry in pending.iter_mut() {
+            if entry.status == "inProgress" && entry.turn_id.as_deref() != active_turn {
+                entry.status = "completed".to_string();
+            }
+        }
+        blocks.push(Block {
+            key: BlockKey::Work(key),
+            text: render_work(pending, is_expanded, width),
+        });
         pending.clear();
     };
 
     for item in items {
         match item {
             Item::Message(message) => {
-                flush_work(&mut blocks, &mut pending_work, &mut work_anchor, &mut work_group_index);
+                flush_work(
+                    &mut blocks,
+                    &mut pending_work,
+                    &mut work_anchor,
+                    &mut work_group_index,
+                );
                 let text = match message.role.as_str() {
                     "user" => render_user(&message.text),
                     "system" => render_system(&message.text),
                     _ => render_assistant(&message.text, message.streaming),
                 };
-                blocks.push(Block { key: BlockKey::Message(message.id.clone()), text });
+                blocks.push(Block {
+                    key: BlockKey::Message(message.id.clone()),
+                    text,
+                });
             }
             Item::Activity(activity) => {
                 if work_anchor.is_none() {
@@ -94,15 +137,31 @@ pub fn build(thread: &ThreadState, expanded: &HashSet<String>, expand_all: bool,
                 merge_work(&mut pending_work, activity);
             }
             Item::Plan(plan) => {
-                flush_work(&mut blocks, &mut pending_work, &mut work_anchor, &mut work_group_index);
-                blocks.push(Block { key: BlockKey::Plan(plan.id.clone()), text: render_plan(plan) });
+                flush_work(
+                    &mut blocks,
+                    &mut pending_work,
+                    &mut work_anchor,
+                    &mut work_group_index,
+                );
+                blocks.push(Block {
+                    key: BlockKey::Plan(plan.id.clone()),
+                    text: render_plan(plan),
+                });
             }
         }
     }
-    flush_work(&mut blocks, &mut pending_work, &mut work_anchor, &mut work_group_index);
+    flush_work(
+        &mut blocks,
+        &mut pending_work,
+        &mut work_anchor,
+        &mut work_group_index,
+    );
 
     if thread.is_running() {
-        blocks.push(Block { key: BlockKey::Working, text: render_working(thread) });
+        blocks.push(Block {
+            key: BlockKey::Working,
+            text: render_working(thread),
+        });
     }
     blocks
 }
@@ -143,6 +202,7 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             let (icon, title) = tool_presentation(item_type, activity);
             WorkEntry {
                 key,
+                turn_id: activity.turn_id.clone(),
                 icon,
                 title,
                 detail: tool_detail(item_type, activity),
@@ -151,7 +211,10 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             }
         }
         "task.started" | "task.completed" => {
-            let key = activity.str("taskId").map(|id| format!("task:{id}")).unwrap_or_else(|| activity.id.clone());
+            let key = activity
+                .str("taskId")
+                .map(|id| format!("task:{id}"))
+                .unwrap_or_else(|| activity.id.clone());
             let status = if activity.kind == "task.completed" {
                 activity.str("status").unwrap_or("completed").to_string()
             } else {
@@ -159,6 +222,7 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             };
             WorkEntry {
                 key,
+                turn_id: activity.turn_id.clone(),
                 icon: "⤷",
                 title: format!("agent: {}", activity.str("title").unwrap_or("task")),
                 detail: activity.str("role").map(str::to_string),
@@ -167,7 +231,11 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             }
         }
         "approval.requested" => WorkEntry {
-            key: format!("approval:{}", activity.str("requestId").unwrap_or(&activity.id)),
+            key: format!(
+                "approval:{}",
+                activity.str("requestId").unwrap_or(&activity.id)
+            ),
+            turn_id: activity.turn_id.clone(),
             icon: "?",
             title: activity.summary.clone(),
             detail: activity.str("detail").map(str::to_string),
@@ -175,15 +243,23 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             tone: "approval".into(),
         },
         "approval.resolved" => WorkEntry {
-            key: format!("approval:{}", activity.str("requestId").unwrap_or(&activity.id)),
+            key: format!(
+                "approval:{}",
+                activity.str("requestId").unwrap_or(&activity.id)
+            ),
+            turn_id: activity.turn_id.clone(),
             icon: "?",
-            title: format!("Approval {}", activity.str("decision").unwrap_or("resolved")),
+            title: format!(
+                "Approval {}",
+                activity.str("decision").unwrap_or("resolved")
+            ),
             detail: None,
             status: "completed".into(),
             tone: "approval".into(),
         },
         "user-input.requested" => WorkEntry {
             key: activity.id.clone(),
+            turn_id: activity.turn_id.clone(),
             icon: "?",
             title: "Agent asked a question".into(),
             detail: None,
@@ -192,6 +268,7 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
         },
         "context-compaction" => WorkEntry {
             key: activity.id.clone(),
+            turn_id: activity.turn_id.clone(),
             icon: "⇣",
             title: "Context compacted".into(),
             detail: None,
@@ -200,13 +277,22 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
         },
         _ => WorkEntry {
             key: activity.id.clone(),
-            icon: if activity.tone == "error" { "✗" } else { "·" },
+            turn_id: activity.turn_id.clone(),
+            icon: if activity.tone == "error" {
+                "✗"
+            } else {
+                "·"
+            },
             title: activity.summary.clone(),
             detail: activity
                 .str("message")
                 .or_else(|| activity.str("detail"))
                 .map(str::to_string),
-            status: if activity.tone == "error" { "failed".into() } else { "completed".into() },
+            status: if activity.tone == "error" {
+                "failed".into()
+            } else {
+                "completed".into()
+            },
             tone: activity.tone.clone(),
         },
     };
@@ -230,20 +316,36 @@ fn tool_presentation(item_type: &str, activity: &Activity) -> (&'static str, Str
     let data = &activity.payload["data"];
     let title = activity.str("title").unwrap_or("").to_string();
     match item_type {
-        "command_execution" => ("$", data.get("description").and_then(Value::as_str).map(str::to_string).unwrap_or(title)),
+        "command_execution" => (
+            "$",
+            data.get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or(title),
+        ),
         "file_change" => ("✎", title),
         "web_search" => ("⌕", title),
         "image_view" => ("▣", title),
         "collab_agent_tool_call" => ("⤷", title),
         "mcp_tool_call" | "dynamic_tool_call" => ("⚙", title),
-        _ => ("·", if title.is_empty() { activity.summary.clone() } else { title }),
+        _ => (
+            "·",
+            if title.is_empty() {
+                activity.summary.clone()
+            } else {
+                title
+            },
+        ),
     }
 }
 
 fn tool_detail(item_type: &str, activity: &Activity) -> Option<String> {
     let data = &activity.payload["data"];
     let detail = match item_type {
-        "command_execution" => data.get("command").and_then(Value::as_str).map(str::to_string),
+        "command_execution" => data
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         "file_change" => data
             .get("path")
             .or_else(|| data.get("filePath"))
@@ -274,29 +376,48 @@ fn status_style(entry: &WorkEntry) -> Style {
 
 fn render_work(entries: &[WorkEntry], expanded: bool, width: u16) -> Text<'static> {
     let running = entries.iter().filter(|e| e.status == "inProgress").count();
-    let failed = entries.iter().filter(|e| e.status == "failed" || e.tone == "error").count();
+    let failed = entries
+        .iter()
+        .filter(|e| e.status == "failed" || e.tone == "error")
+        .count();
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut header = vec![
-        Span::styled(if expanded { "▾ " } else { "▸ " }, Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{} tool call{}", entries.len(), if entries.len() == 1 { "" } else { "s" }),
+            if expanded { "▾ " } else { "▸ " },
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!(
+                "{} tool call{}",
+                entries.len(),
+                if entries.len() == 1 { "" } else { "s" }
+            ),
             Style::default().fg(Color::DarkGray),
         ),
     ];
     if running > 0 {
-        header.push(Span::styled(format!("  {running} running"), Style::default().fg(Color::Cyan)));
+        header.push(Span::styled(
+            format!("  {running} running"),
+            Style::default().fg(Color::Cyan),
+        ));
     }
     if failed > 0 {
-        header.push(Span::styled(format!("  {failed} failed"), Style::default().fg(Color::Red)));
+        header.push(Span::styled(
+            format!("  {failed} failed"),
+            Style::default().fg(Color::Red),
+        ));
     }
-    if !expanded {
-        if let Some(last) = entries.last() {
-            let mut summary = format!("  {} {}", last.icon, last.title);
-            if let Some(detail) = &last.detail {
-                summary.push_str(&format!(": {detail}"));
-            }
-            header.push(Span::styled(truncate(&summary, width.saturating_sub(24) as usize), Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)));
+    if !expanded && let Some(last) = entries.last() {
+        let mut summary = format!("  {} {}", last.icon, last.title);
+        if let Some(detail) = &last.detail {
+            summary.push_str(&format!(": {detail}"));
         }
+        header.push(Span::styled(
+            truncate(&summary, width.saturating_sub(24) as usize),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
     }
     lines.push(Line::from(header));
     if expanded {
@@ -304,11 +425,20 @@ fn render_work(entries: &[WorkEntry], expanded: bool, width: u16) -> Text<'stati
             let mut spans = vec![
                 Span::raw("  "),
                 Span::styled(format!("{} ", entry.icon), status_style(entry)),
-                Span::styled(entry.title.clone(), status_style(entry).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    entry.title.clone(),
+                    status_style(entry).add_modifier(Modifier::BOLD),
+                ),
             ];
             if let Some(detail) = &entry.detail {
                 spans.push(Span::styled(
-                    format!("  {}", truncate(detail, width.saturating_sub(entry.title.len() as u16 + 8) as usize)),
+                    format!(
+                        "  {}",
+                        truncate(
+                            detail,
+                            width.saturating_sub(entry.title.len() as u16 + 8) as usize
+                        )
+                    ),
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -339,7 +469,10 @@ fn render_user(text: &str) -> Text<'static> {
         Span::styled(" you", style.add_modifier(Modifier::BOLD)),
     ])];
     for line in text.lines() {
-        lines.push(Line::from(vec![Span::styled(USER_MARK, style), Span::raw(format!(" {line}"))]));
+        lines.push(Line::from(vec![
+            Span::styled(USER_MARK, style),
+            Span::raw(format!(" {line}")),
+        ]));
     }
     if text.is_empty() {
         lines.push(Line::from(Span::styled(USER_MARK, style)));
@@ -351,7 +484,12 @@ fn render_user(text: &str) -> Text<'static> {
 fn render_system(text: &str) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = text
         .lines()
-        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::DarkGray).italic())))
+        .map(|l| {
+            Line::from(Span::styled(
+                l.to_string(),
+                Style::default().fg(Color::DarkGray).italic(),
+            ))
+        })
         .collect();
     lines.push(Line::default());
     Text::from(lines)
@@ -376,7 +514,11 @@ fn render_plan(plan: &crate::model::ProposedPlan) -> Text<'static> {
         Span::styled("▌ ", style),
         Span::styled("Proposed plan", style.add_modifier(Modifier::BOLD)),
         Span::styled(
-            if plan.implemented_at.is_some() { "  (implemented)" } else { "" },
+            if plan.implemented_at.is_some() {
+                "  (implemented)"
+            } else {
+                ""
+            },
             Style::default().fg(Color::DarkGray),
         ),
     ])];
@@ -408,7 +550,10 @@ fn render_working(thread: &ThreadState) -> Text<'static> {
                 "inProgress" => ("…", style),
                 _ => ("○", Style::default().fg(Color::DarkGray)),
             };
-            lines.push(Line::from(vec![Span::styled(format!("{mark} "), st), Span::styled(step.step, st)]));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{mark} "), st),
+                Span::styled(step.step, st),
+            ]));
         }
     }
     Text::from(lines)
@@ -425,7 +570,10 @@ pub fn markdown(text: &str) -> Text<'static> {
                 spans: line
                     .spans
                     .into_iter()
-                    .map(|span| Span { content: span.content.into_owned().into(), style: span.style })
+                    .map(|span| Span {
+                        content: span.content.into_owned().into(),
+                        style: span.style,
+                    })
                     .collect(),
                 style: line.style,
                 alignment: line.alignment,

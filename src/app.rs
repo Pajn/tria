@@ -119,7 +119,7 @@ pub enum Scroll {
 pub enum AppEvent {
     Terminal(Event),
     Tick,
-    Update(Update),
+    Update(Box<Update>),
     Dispatched(Result<(), String>),
 }
 
@@ -202,7 +202,12 @@ impl App {
         self.scroll = Scroll::Follow;
         self.expanded.clear();
         self.handle.open_thread(thread_id);
-        if let Some(index) = self.shell.sorted_threads().iter().position(|t| t.id == thread_id) {
+        if let Some(index) = self
+            .shell
+            .sorted_threads()
+            .iter()
+            .position(|t| t.id == thread_id)
+        {
             self.sidebar_selected = index;
         }
     }
@@ -236,7 +241,12 @@ impl App {
         self.draft = Some(NewThreadDraft {
             project_id: project_id.to_string(),
             model_selection,
-            runtime_mode: self.config.settings.default_runtime_mode.clone().unwrap_or_else(|| "full-access".into()),
+            runtime_mode: self
+                .config
+                .settings
+                .default_runtime_mode
+                .clone()
+                .unwrap_or_else(|| "full-access".into()),
             interaction_mode: "default".into(),
         });
         self.current_thread_id = None;
@@ -248,10 +258,22 @@ impl App {
     }
 
     fn first_usable_model(&self) -> Option<ModelSelection> {
-        self.config.providers.iter().filter(|p| p.is_usable()).find_map(|provider| {
-            let model = provider.models.iter().find(|m| m.is_default).or_else(|| provider.models.first())?;
-            Some(ModelSelection { instance_id: provider.instance_id.clone(), model: model.slug.clone(), options: vec![] })
-        })
+        self.config
+            .providers
+            .iter()
+            .filter(|p| p.is_usable())
+            .find_map(|provider| {
+                let model = provider
+                    .models
+                    .iter()
+                    .find(|m| m.is_default)
+                    .or_else(|| provider.models.first())?;
+                Some(ModelSelection {
+                    instance_id: provider.instance_id.clone(),
+                    model: model.slug.clone(),
+                    options: vec![],
+                })
+            })
     }
 
     // ── Dispatch ───────────────────────────────────────────────────────
@@ -260,7 +282,11 @@ impl App {
         let handle = self.handle.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
-            let result = handle.dispatch(command).await.map(|_| ()).map_err(|e| e.to_string());
+            let result = handle
+                .dispatch(command)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
             let _ = events.send(AppEvent::Dispatched(result));
         });
     }
@@ -272,7 +298,13 @@ impl App {
         }
         if let Some(draft) = self.draft.take() {
             let thread_id = commands::new_id();
-            let title: String = text.lines().next().unwrap_or("New thread").chars().take(60).collect();
+            let title: String = text
+                .lines()
+                .next()
+                .unwrap_or("New thread")
+                .chars()
+                .take(60)
+                .collect();
             let command = commands::turn_start(
                 &thread_id,
                 &text,
@@ -303,7 +335,10 @@ impl App {
             );
             self.dispatch(command);
         } else {
-            self.toast("no thread open; press n for a new thread or / to pick one", true);
+            self.toast(
+                "no thread open; press n for a new thread or / to pick one",
+                true,
+            );
             return;
         }
         self.composer.push_history(text);
@@ -317,7 +352,12 @@ impl App {
             self.toast("nothing running", false);
             return;
         }
-        let turn_id = thread.detail.shell.latest_turn.as_ref().map(|t| t.turn_id.clone());
+        let turn_id = thread
+            .detail
+            .shell
+            .latest_turn
+            .as_ref()
+            .map(|t| t.turn_id.clone());
         self.dispatch(commands::turn_interrupt(thread.id(), turn_id.as_deref()));
         self.toast("interrupting…", false);
     }
@@ -325,17 +365,28 @@ impl App {
     fn respond_approval(&mut self, index: usize) {
         let Some(thread) = &self.thread else { return };
         let pending = thread.pending_approvals();
-        let Some(approval) = pending.first() else { return };
+        let Some(approval) = pending.first() else {
+            return;
+        };
         let options = approval_options(approval);
-        let Some(option) = options.get(index) else { return };
-        let command = commands::approval_respond(thread.id(), &approval.request_id, &option.decision);
+        let Some(option) = options.get(index) else {
+            return;
+        };
+        let command =
+            commands::approval_respond(thread.id(), &approval.request_id, &option.decision);
         self.dispatch(command);
-        self.toast(format!("{}", option.label), false);
+        self.toast(option.label.to_string(), false);
     }
 
     fn yank_last_assistant(&mut self) {
         let Some(thread) = &self.thread else { return };
-        let Some(message) = thread.detail.messages.iter().rev().find(|m| m.role == "assistant") else {
+        let Some(message) = thread
+            .detail
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+        else {
             self.toast("no assistant message to yank", true);
             return;
         };
@@ -357,7 +408,11 @@ impl App {
                 .iter()
                 .map(|t| PickerItem {
                     label: t.title.clone(),
-                    detail: format!("{} · {}", self.shell.project_title(&t.project_id), thread_status(t)),
+                    detail: format!(
+                        "{} · {}",
+                        self.shell.project_title(&t.project_id),
+                        thread_status(t)
+                    ),
                     key: t.id.clone(),
                 })
                 .collect(),
@@ -366,7 +421,11 @@ impl App {
                 projects.sort_by(|a, b| a.title.cmp(&b.title));
                 projects
                     .into_iter()
-                    .map(|p| PickerItem { label: p.title.clone(), detail: p.workspace_root.clone(), key: p.id.clone() })
+                    .map(|p| PickerItem {
+                        label: p.title.clone(),
+                        detail: p.workspace_root.clone(),
+                        key: p.id.clone(),
+                    })
                     .collect()
             }
             PickerKind::Model => self
@@ -375,11 +434,14 @@ impl App {
                 .iter()
                 .filter(|p| p.is_usable())
                 .flat_map(|p| {
-                    p.models.iter().filter(|m| !m.is_legacy).map(move |m| PickerItem {
-                        label: format!("{} · {}", p.label(), m.name),
-                        detail: m.slug.clone(),
-                        key: format!("{}\t{}", p.instance_id, m.slug),
-                    })
+                    p.models
+                        .iter()
+                        .filter(|m| !m.is_legacy)
+                        .map(move |m| PickerItem {
+                            label: format!("{} · {}", p.label(), m.name),
+                            detail: m.slug.clone(),
+                            key: format!("{}\t{}", p.instance_id, m.slug),
+                        })
                 })
                 .collect(),
             PickerKind::Effort => {
@@ -390,7 +452,11 @@ impl App {
                 descriptor
                     .options
                     .iter()
-                    .map(|o| PickerItem { label: o.label.clone(), detail: String::new(), key: o.id.clone() })
+                    .map(|o| PickerItem {
+                        label: o.label.clone(),
+                        detail: String::new(),
+                        key: o.id.clone(),
+                    })
                     .collect()
             }
         };
@@ -398,29 +464,41 @@ impl App {
             self.toast("nothing to pick from", true);
             return;
         }
-        self.picker = Some(Picker { kind, query: String::new(), selected: 0, items });
+        self.picker = Some(Picker {
+            kind,
+            query: String::new(),
+            selected: 0,
+            items,
+        });
         self.mode = Mode::Picker;
     }
 
     fn current_model_selection(&self) -> Option<&ModelSelection> {
-        self.draft
-            .as_ref()
-            .map(|d| &d.model_selection)
-            .or_else(|| self.thread.as_ref().map(|t| &t.detail.shell.model_selection))
+        self.draft.as_ref().map(|d| &d.model_selection).or_else(|| {
+            self.thread
+                .as_ref()
+                .map(|t| &t.detail.shell.model_selection)
+        })
     }
 
     fn effort_descriptor(&self) -> Option<&crate::model::OptionDescriptor> {
         let selection = self.current_model_selection()?;
-        let provider = self.config.providers.iter().find(|p| p.instance_id == selection.instance_id)?;
-        let model = provider.models.iter().find(|m| m.slug == selection.model)?;
-        model
-            .option_descriptors()
+        let provider = self
+            .config
+            .providers
             .iter()
-            .find(|d| d.kind == "select" && (d.id == "effort" || d.id == "reasoningEffort" || d.id == "variant"))
+            .find(|p| p.instance_id == selection.instance_id)?;
+        let model = provider.models.iter().find(|m| m.slug == selection.model)?;
+        model.option_descriptors().iter().find(|d| {
+            d.kind == "select"
+                && (d.id == "effort" || d.id == "reasoningEffort" || d.id == "variant")
+        })
     }
 
     fn picker_select(&mut self) {
-        let Some(picker) = self.picker.take() else { return };
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
         let Some(item) = picker.filtered().get(picker.selected).map(|i| (*i).clone()) else {
             self.mode = Mode::Normal;
             return;
@@ -431,14 +509,26 @@ impl App {
             PickerKind::Project => self.start_new_thread(&item.key),
             PickerKind::Model => {
                 let (instance_id, slug) = item.key.split_once('\t').unwrap_or((&item.key, ""));
-                let selection = ModelSelection { instance_id: instance_id.into(), model: slug.into(), options: vec![] };
+                let selection = ModelSelection {
+                    instance_id: instance_id.into(),
+                    model: slug.into(),
+                    options: vec![],
+                };
                 self.set_model(selection);
             }
             PickerKind::Effort => {
-                let Some(mut selection) = self.current_model_selection().cloned() else { return };
-                let id = self.effort_descriptor().map(|d| d.id.clone()).unwrap_or_else(|| "effort".into());
+                let Some(mut selection) = self.current_model_selection().cloned() else {
+                    return;
+                };
+                let id = self
+                    .effort_descriptor()
+                    .map(|d| d.id.clone())
+                    .unwrap_or_else(|| "effort".into());
                 selection.options.retain(|o| o.id != id);
-                selection.options.push(crate::model::OptionSelection { id, value: Value::String(item.key) });
+                selection.options.push(crate::model::OptionSelection {
+                    id,
+                    value: Value::String(item.key),
+                });
                 self.set_model(selection);
             }
         }
@@ -471,7 +561,12 @@ impl App {
                     self.open_picker(PickerKind::Project);
                 } else {
                     let needle = arg.to_lowercase();
-                    let found = self.shell.projects.values().find(|p| p.title.to_lowercase().contains(&needle)).map(|p| p.id.clone());
+                    let found = self
+                        .shell
+                        .projects
+                        .values()
+                        .find(|p| p.title.to_lowercase().contains(&needle))
+                        .map(|p| p.id.clone());
                     match found {
                         Some(id) => self.start_new_thread(&id),
                         None => self.toast(format!("no project matching {arg:?}"), true),
@@ -483,15 +578,25 @@ impl App {
                 if arg.is_empty() {
                     self.open_picker(PickerKind::Effort);
                 } else {
-                    let Some(mut selection) = self.current_model_selection().cloned() else { return };
-                    let id = self.effort_descriptor().map(|d| d.id.clone()).unwrap_or_else(|| "effort".into());
+                    let Some(mut selection) = self.current_model_selection().cloned() else {
+                        return;
+                    };
+                    let id = self
+                        .effort_descriptor()
+                        .map(|d| d.id.clone())
+                        .unwrap_or_else(|| "effort".into());
                     selection.options.retain(|o| o.id != id);
-                    selection.options.push(crate::model::OptionSelection { id, value: Value::String(arg.into()) });
+                    selection.options.push(crate::model::OptionSelection {
+                        id,
+                        value: Value::String(arg.into()),
+                    });
                     self.set_model(selection);
                 }
             }
             "mode" => match (arg, thread_id.as_deref()) {
-                ("plan" | "default", Some(id)) => self.dispatch(commands::interaction_mode_set(id, arg)),
+                ("plan" | "default", Some(id)) => {
+                    self.dispatch(commands::interaction_mode_set(id, arg))
+                }
                 ("plan" | "default", None) => {
                     if let Some(d) = self.draft.as_mut() {
                         d.interaction_mode = arg.into();
@@ -500,7 +605,12 @@ impl App {
                 _ => self.toast("usage: :mode plan|default", true),
             },
             "perm" | "permissions" => {
-                let valid = ["approval-required", "auto-accept-edits", "auto", "full-access"];
+                let valid = [
+                    "approval-required",
+                    "auto-accept-edits",
+                    "auto",
+                    "full-access",
+                ];
                 if !valid.contains(&arg) {
                     self.toast(format!("usage: :perm {}", valid.join("|")), true);
                 } else if let Some(id) = thread_id.as_deref() {
@@ -536,10 +646,10 @@ impl App {
             "sidebar" => self.sidebar_visible = !self.sidebar_visible,
             "older" => self.load_older(),
             "dismiss" => {
-                if let Some(thread) = &self.thread {
-                    if let Some(request_id) = thread.pending_user_input().and_then(|p| p.request_id) {
-                        self.dispatch(commands::user_input_dismiss(thread.id(), &request_id));
-                    }
+                if let Some(thread) = &self.thread
+                    && let Some(request_id) = thread.pending_user_input().and_then(|p| p.request_id)
+                {
+                    self.dispatch(commands::user_input_dismiss(thread.id(), &request_id));
                 }
             }
             _ => self.toast(format!("unknown command :{name}"), true),
@@ -568,7 +678,11 @@ impl App {
             Scroll::Offset(o) => o.min(max_offset),
         };
         let next = (current as isize + delta).clamp(0, max_offset as isize) as usize;
-        self.scroll = if next >= max_offset { Scroll::Follow } else { Scroll::Offset(next) };
+        self.scroll = if next >= max_offset {
+            Scroll::Follow
+        } else {
+            Scroll::Offset(next)
+        };
         if next == 0 && delta < 0 {
             // Reached the top: pull in older turns if the server has them.
             if self.thread.as_ref().is_some_and(|t| t.has_more) {
@@ -588,13 +702,18 @@ impl App {
             .work_ranges
             .iter()
             .find(|(start, end, _)| *start <= middle && middle < *end)
-            .or_else(|| self.work_ranges.iter().rev().find(|(start, _, _)| *start < offset + height))
+            .or_else(|| {
+                self.work_ranges
+                    .iter()
+                    .rev()
+                    .find(|(start, _, _)| *start < offset + height)
+            })
             .or_else(|| self.work_ranges.last())
             .map(|(_, _, key)| key.clone());
-        if let Some(key) = key {
-            if !self.expanded.remove(&key) {
-                self.expanded.insert(key);
-            }
+        if let Some(key) = key
+            && !self.expanded.remove(&key)
+        {
+            self.expanded.insert(key);
         }
     }
 
@@ -628,7 +747,10 @@ impl App {
             Mode::Command => self.on_command_key(key),
             Mode::Picker => self.on_picker_key(key),
             Mode::Help => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter) {
+                if matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter
+                ) {
                     self.mode = Mode::Normal;
                 }
             }
@@ -650,9 +772,16 @@ impl App {
                 KeyCode::Char('k') | KeyCode::Up => self.sidebar_move(-1),
                 KeyCode::Char('g') if prefix == Some('g') => self.sidebar_selected = 0,
                 KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
-                KeyCode::Char('G') => self.sidebar_selected = self.shell.threads.len().saturating_sub(1),
+                KeyCode::Char('G') => {
+                    self.sidebar_selected = self.shell.threads.len().saturating_sub(1)
+                }
                 KeyCode::Enter | KeyCode::Char('l') => {
-                    if let Some(id) = self.shell.sorted_threads().get(self.sidebar_selected).map(|t| t.id.clone()) {
+                    if let Some(id) = self
+                        .shell
+                        .sorted_threads()
+                        .get(self.sidebar_selected)
+                        .map(|t| t.id.clone())
+                    {
                         self.open_thread(&id);
                         self.focus = Focus::Chat;
                     }
@@ -730,7 +859,8 @@ impl App {
         if len == 0 {
             return;
         }
-        self.sidebar_selected = (self.sidebar_selected as isize + delta).clamp(0, len as isize - 1) as usize;
+        self.sidebar_selected =
+            (self.sidebar_selected as isize + delta).clamp(0, len as isize - 1) as usize;
     }
 
     fn on_insert_key(&mut self, key: KeyEvent) {
@@ -794,7 +924,9 @@ impl App {
                     self.mode = Mode::Normal;
                 }
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => self.command_line.clear(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.command_line.clear()
+            }
             KeyCode::Char(c) => self.command_line.push(c),
             _ => {}
         }
@@ -810,14 +942,24 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.picker = None;
-                self.mode = if self.draft.is_some() { Mode::Insert } else { Mode::Normal };
+                self.mode = if self.draft.is_some() {
+                    Mode::Insert
+                } else {
+                    Mode::Normal
+                };
             }
             KeyCode::Enter => self.picker_select(),
-            KeyCode::Down | KeyCode::Tab => picker.selected = (picker.selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Tab => {
+                picker.selected = (picker.selected + 1).min(count.saturating_sub(1))
+            }
             KeyCode::Up | KeyCode::BackTab => picker.selected = picker.selected.saturating_sub(1),
-            KeyCode::Char('n') if ctrl => picker.selected = (picker.selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Char('n') if ctrl => {
+                picker.selected = (picker.selected + 1).min(count.saturating_sub(1))
+            }
             KeyCode::Char('p') if ctrl => picker.selected = picker.selected.saturating_sub(1),
-            KeyCode::Char('j') if ctrl => picker.selected = (picker.selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Char('j') if ctrl => {
+                picker.selected = (picker.selected + 1).min(count.saturating_sub(1))
+            }
             KeyCode::Char('k') if ctrl => picker.selected = picker.selected.saturating_sub(1),
             KeyCode::Backspace => {
                 picker.query.pop();
@@ -840,19 +982,19 @@ impl App {
     fn on_update(&mut self, update: Update) {
         match update {
             Update::Status(status) => {
-                if let Status::Reconnecting { attempt, error } = &status {
-                    if *attempt == 1 {
-                        self.toast(format!("disconnected: {error}"), true);
-                    }
+                if let Status::Reconnecting { attempt, error } = &status
+                    && *attempt == 1
+                {
+                    self.toast(format!("disconnected: {error}"), true);
                 }
                 self.status = status;
             }
             Update::Config(config) => self.config = *config,
             Update::Shell(item) => {
-                if let ShellItem::ThreadUpserted { thread, .. } = &item {
-                    if let Some(open) = self.thread.as_mut().filter(|t| t.id() == thread.id) {
-                        open.sync_shell(thread);
-                    }
+                if let ShellItem::ThreadUpserted { thread, .. } = &item
+                    && let Some(open) = self.thread.as_mut().filter(|t| t.id() == thread.id)
+                {
+                    open.sync_shell(thread);
                 }
                 let removed = matches!(&item, ShellItem::ThreadRemoved { thread_id, .. } if Some(thread_id) == self.current_thread_id.as_ref());
                 self.shell.apply(item);
@@ -861,10 +1003,12 @@ impl App {
                     self.current_thread_id = None;
                     self.toast("thread was removed", false);
                 }
-                if self.current_thread_id.is_none() && self.draft.is_none() && self.shell.synchronized {
-                    if let Some(first) = self.shell.sorted_threads().first().map(|t| t.id.clone()) {
-                        self.open_thread(&first);
-                    }
+                if self.current_thread_id.is_none()
+                    && self.draft.is_none()
+                    && self.shell.synchronized
+                    && let Some(first) = self.shell.sorted_threads().first().map(|t| t.id.clone())
+                {
+                    self.open_thread(&first);
                 }
             }
             Update::Thread { thread_id, item } => {
@@ -883,14 +1027,19 @@ impl App {
                     (None, _) => {}
                 }
             }
-            Update::OlderPage { thread_id, snapshot } => {
-                if self.current_thread_id.as_deref() == Some(thread_id.as_str()) {
-                    if let Some(thread) = self.thread.as_mut() {
-                        prepend_page(thread, snapshot);
-                    }
+            Update::OlderPage {
+                thread_id,
+                snapshot,
+            } => {
+                if self.current_thread_id.as_deref() == Some(thread_id.as_str())
+                    && let Some(thread) = self.thread.as_mut()
+                {
+                    prepend_page(thread, snapshot);
                 }
             }
-            Update::ThreadStreamError { error, .. } => self.toast(format!("stream error, resubscribing: {error}"), true),
+            Update::ThreadStreamError { error } => {
+                self.toast(format!("stream error, resubscribing: {error}"), true)
+            }
             Update::Error(error) => self.toast(error, true),
         }
     }
@@ -930,9 +1079,18 @@ pub fn approval_options(approval: &PendingApproval) -> Vec<ApprovalOption> {
         return approval.options.clone();
     }
     vec![
-        ApprovalOption { decision: "accept".into(), label: "Allow".into() },
-        ApprovalOption { decision: "acceptForSession".into(), label: "Allow for session".into() },
-        ApprovalOption { decision: "decline".into(), label: "Deny".into() },
+        ApprovalOption {
+            decision: "accept".into(),
+            label: "Allow".into(),
+        },
+        ApprovalOption {
+            decision: "acceptForSession".into(),
+            label: "Allow for session".into(),
+        },
+        ApprovalOption {
+            decision: "decline".into(),
+            label: "Deny".into(),
+        },
     ]
 }
 
@@ -976,7 +1134,7 @@ pub async fn run(origin: String, token: String) -> Result<()> {
                 None => break Ok(()),
             },
             update = updates.recv() => match update {
-                Some(update) => AppEvent::Update(update),
+                Some(update) => AppEvent::Update(Box::new(update)),
                 None => break Ok(()),
             },
             Some(ev) = events.recv() => ev,
@@ -998,11 +1156,15 @@ pub async fn run(origin: String, token: String) -> Result<()> {
             AppEvent::Terminal(_) => {}
             AppEvent::Tick => {
                 app.spinner = app.spinner.wrapping_add(1);
-                if app.toast.as_ref().is_some_and(|(_, at, _)| at.elapsed() > TOAST_TTL) {
+                if app
+                    .toast
+                    .as_ref()
+                    .is_some_and(|(_, at, _)| at.elapsed() > TOAST_TTL)
+                {
                     app.toast = None;
                 }
             }
-            AppEvent::Update(update) => app.on_update(update),
+            AppEvent::Update(update) => app.on_update(*update),
             AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
             AppEvent::Dispatched(Ok(())) => {}
         }
