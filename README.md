@@ -84,10 +84,11 @@ threads are ones the server has parked after their turn finished; they render gr
 shelf that starts folded (113 of them is normal). Press `S`, `:settled`, or `Enter` on the shelf
 header to unfold it. `J`/`K` and the picker only cycle through visible threads.
 
-Each row shows a status on the right when it needs attention: `approval`, `question`, `working`,
-`monitoring` (background work still running after the turn), `plan ready`, or `failed`.
-Otherwise it shows the project. `:settle` and `:unsettle` move the current thread between the
-active list and the shelf; `:wake` ends a snooze.
+Each row shows the project on the right and a status glyph on the left: `!` needs an approval
+or an answer, a spinner is working, `◔` is monitoring (background work still running after the
+turn), `▤` has a plan ready, `✗` failed. The status bar spells the status out for the open
+thread. `:settle` and `:unsettle` move the current thread between the active list and the
+shelf; `:wake` ends a snooze.
 
 ## Other subcommands
 

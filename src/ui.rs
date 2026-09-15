@@ -178,19 +178,9 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     ThreadStatus::Done | ThreadStatus::Idle => ("·", dim),
                 };
                 let is_current = app.current_thread_id.as_ref() == Some(id);
-                // Parked (settled or snoozed) rows recede; a notable status replaces the project.
-                let right = if *parked {
-                    app.shell.project_title(&t.project_id).to_string()
-                } else if status.is_notable() {
-                    status.label().to_string()
-                } else {
-                    app.shell.project_title(&t.project_id).to_string()
-                };
-                let right_style = if !*parked && status.is_notable() {
-                    status_style(status)
-                } else {
-                    dim
-                };
+                // The glyph carries the status; the right column always names the project.
+                let right = app.shell.project_title(&t.project_id).to_string();
+                let right_style = dim;
                 let right_width = right.chars().count().min(12);
                 let title_width = width.saturating_sub(right_width + 4);
                 let title = fit(&t.title, title_width);
