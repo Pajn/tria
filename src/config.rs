@@ -3,7 +3,8 @@ use std::{fs, path::PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Client configuration stored at `~/.config/tria/config.toml` (mode 0600).
+/// Client configuration stored at `$XDG_CONFIG_HOME/tria/config.toml`, defaulting to
+/// `~/.config/tria/config.toml` (mode 0600).
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     pub url: Option<String>,
@@ -12,7 +13,10 @@ pub struct Config {
 
 impl Config {
     pub fn path() -> Result<PathBuf> {
-        let dir = dirs::config_dir().context("no config directory for this platform")?;
+        let dir = match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => dirs::home_dir().context("no home directory")?.join(".config"),
+        };
         Ok(dir.join("tria").join("config.toml"))
     }
 

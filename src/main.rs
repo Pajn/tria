@@ -1,7 +1,11 @@
 mod auth;
+mod commands;
 mod config;
 mod discovery;
+mod model;
 mod rpc;
+mod session;
+mod state;
 mod wire;
 
 use anyhow::Result;
@@ -23,6 +27,8 @@ enum Command {
     Pair { credential: String },
     /// Connect and print the server config plus the project and thread list, then exit.
     Probe,
+    /// Open a thread through the supervisor and print reduced state for a few seconds.
+    Dump { thread_id: String, #[arg(long, default_value_t = 5)] seconds: u64 },
 }
 
 #[tokio::main]
@@ -43,6 +49,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Probe) | None => probe(&origin, &cfg).await,
+        Some(Command::Dump { thread_id, seconds }) => dump(&origin, &cfg, &thread_id, seconds).await,
     }
 }
 
@@ -55,6 +62,9 @@ async fn probe(origin: &str, cfg: &config::Config) -> Result<()> {
     let client = rpc::RpcClient::connect(origin, &ticket).await?;
     let config: serde_json::Value = client.call("server.getConfig", serde_json::json!({})).await?;
     println!("server config keys: {:?}", config.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+    if let Some(path) = std::env::var_os("TRIA_DUMP_CONFIG") {
+        std::fs::write(path, serde_json::to_string_pretty(&config)?)?;
+    }
     let mut shell = client
         .subscribe(
             "orchestration.subscribeShell",
@@ -79,6 +89,48 @@ async fn probe(origin: &str, cfg: &config::Config) -> Result<()> {
             }
             other => println!("shell event: {other}"),
         }
+    }
+    Ok(())
+}
+
+async fn dump(origin: &str, cfg: &config::Config, thread_id: &str, seconds: u64) -> Result<()> {
+    let token = cfg.token.clone().ok_or_else(|| anyhow::anyhow!("no token stored; run `tria pair <credential>` first"))?;
+    let (handle, mut updates) = session::spawn(origin.to_string(), token);
+    let mut shell = state::Shell::default();
+    let mut thread: Option<state::ThreadState> = None;
+    handle.open_thread(thread_id);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    loop {
+        let update = tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            update = updates.recv() => match update { Some(u) => u, None => break },
+        };
+        match update {
+            session::Update::Status(status) => println!("status: {status:?}"),
+            session::Update::Config(config) => println!("config: {} providers, pagination={}", config.providers.len(), config.thread_snapshot_pagination),
+            session::Update::Shell(item) => {
+                shell.apply(item);
+                if shell.synchronized { println!("shell: {} projects, {} threads, seq {:?}", shell.projects.len(), shell.threads.len(), shell.last_sequence); }
+            }
+            session::Update::Thread { item, .. } => match (&mut thread, item) {
+                (None, model::ThreadItem::Snapshot { snapshot }) => {
+                    let t = state::ThreadState::from_snapshot(snapshot);
+                    println!("thread snapshot: {} messages, {} activities, has_more={}, seq {}", t.detail.messages.len(), t.detail.activities.len(), t.has_more, t.last_sequence);
+                    println!("  running={} pending approvals={} plan steps={}", t.is_running(), t.pending_approvals().len(), t.active_plan().len());
+                    thread = Some(t);
+                }
+                (Some(t), item) => {
+                    if let model::ThreadItem::Event { event } = &item { println!("event {} seq {}", event.kind, event.sequence); }
+                    t.apply(item);
+                }
+                (None, _) => {}
+            },
+            session::Update::ThreadStreamError { error, .. } => println!("thread stream error: {error}"),
+            session::Update::Error(error) => println!("error: {error}"),
+        }
+    }
+    if let Some(t) = &thread {
+        if let Some(last) = t.detail.messages.last() { println!("last message ({}): {:?}", last.role, last.text.chars().take(120).collect::<String>()); }
     }
     Ok(())
 }
