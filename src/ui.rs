@@ -273,8 +273,56 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ));
         if let Some(branch) = &shell.branch {
             spans.push(Span::styled(
-                format!("  {branch}"),
+                format!("   {branch}"),
                 Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if let Some(pr) = shell.primary_pull_request() {
+            let state_style = match pr.state.as_deref() {
+                Some("merged") => Style::default().fg(Color::Magenta),
+                Some("closed") => Style::default().fg(Color::Red),
+                _ if pr.is_draft => Style::default().fg(Color::DarkGray),
+                _ => Style::default().fg(Color::Green),
+            };
+            let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+            let room = (area.width as usize).saturating_sub(used + 28).max(12);
+            spans.push(Span::styled(format!("  #{}", pr.number), state_style));
+            if let Some(title) = &pr.title {
+                spans.push(Span::styled(
+                    format!(" {}", fit(title, room)),
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+            let mut tags: Vec<&str> = Vec::new();
+            if pr.is_draft {
+                tags.push("draft");
+            }
+            match pr.state.as_deref() {
+                Some("merged") => tags.push("merged"),
+                Some("closed") => tags.push("closed"),
+                _ => {}
+            }
+            let checks = match pr.checks_state.as_deref() {
+                Some("passing") => Some(("✓", Color::Green)),
+                Some("failing") => Some(("✗", Color::Red)),
+                Some("pending") => Some(("○", Color::Yellow)),
+                _ => None,
+            };
+            if !tags.is_empty() {
+                spans.push(Span::styled(
+                    format!(" ({})", tags.join(", ")),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if let Some((glyph, color)) = checks {
+                spans.push(Span::styled(
+                    format!(" {glyph}"),
+                    Style::default().fg(color),
+                ));
+            }
+            spans.push(Span::styled(
+                "  gx opens",
+                Style::default().fg(Color::DarkGray).dim(),
             ));
         }
         if thread.has_more {
@@ -855,6 +903,7 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         PickerKind::Model => " models ",
         PickerKind::Project => " new thread in project ",
         PickerKind::Effort => " effort ",
+        PickerKind::PullRequest => " pull requests ",
     };
     let block = Block::bordered()
         .border_style(Style::default().fg(Color::Magenta))
@@ -925,6 +974,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         Line::from("  y                       yank last assistant message (OSC 52)"),
         Line::from("  s / S                   toggle sidebar / settled shelf"),
+        Line::from("  gx                      open the thread's pull request in the browser"),
         Line::from("  Ctrl-c                  interrupt the running turn"),
         Line::from(""),
         Line::from(Span::styled("Insert", Style::default().bold())),
@@ -937,7 +987,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :settle  :unsettle  :wake  :settled  :stop  :older  :answer  :dismiss  :sidebar  :q",
+            "  :pr  :settle  :unsettle  :wake  :settled  :stop  :older  :answer  :dismiss  :sidebar  :q",
         ),
         Line::from(""),
         Line::from(Span::styled(

@@ -79,6 +79,12 @@ pub struct ThreadShell {
     pub interaction_mode: String,
     #[serde(default)]
     pub branch: Option<String>,
+    /// Pull requests linked to the thread, by the agent or by hand.
+    #[serde(default)]
+    pub pull_requests: Vec<PullRequest>,
+    /// The pull request whose head is the thread's branch, when the server knows one.
+    #[serde(default)]
+    pub branch_pull_request: Option<BranchPullRequest>,
     #[serde(default)]
     pub latest_turn: Option<LatestTurn>,
     #[serde(default)]
@@ -122,6 +128,69 @@ fn default_runtime_mode() -> String {
 
 fn default_interaction_mode() -> String {
     "default".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequest {
+    pub repository: String,
+    pub number: u64,
+    pub url: String,
+    #[serde(default)]
+    pub snapshot: Option<PullRequestSnapshot>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestSnapshot {
+    /// open | closed | merged
+    pub state: String,
+    pub title: String,
+    #[serde(default)]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub checks_state: Option<String>,
+    #[serde(default)]
+    pub review_decision: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchPullRequest {
+    pub repository: String,
+    pub number: u64,
+    pub url: String,
+}
+
+/// What the UI shows for a thread's pull request.
+#[derive(Debug, Clone)]
+pub struct PullRequestRef {
+    pub number: u64,
+    pub url: String,
+    pub title: Option<String>,
+    pub state: Option<String>,
+    pub is_draft: bool,
+    pub checks_state: Option<String>,
+}
+
+impl PullRequestRef {
+    fn from_linked(pr: &PullRequest) -> Self {
+        Self {
+            number: pr.number,
+            url: pr.url.clone(),
+            title: pr.snapshot.as_ref().map(|s| s.title.clone()),
+            state: pr.snapshot.as_ref().map(|s| s.state.clone()),
+            is_draft: pr.snapshot.as_ref().is_some_and(|s| s.is_draft),
+            checks_state: pr.snapshot.as_ref().and_then(|s| s.checks_state.clone()),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match &self.title {
+            Some(title) => format!("#{} {}", self.number, title),
+            None => format!("#{}", self.number),
+        }
+    }
 }
 
 /// Sidebar status for a thread, ordered by priority (first match wins).
@@ -170,6 +239,45 @@ impl ThreadShell {
             self.session.as_ref().map(|s| s.status.as_str()),
             Some("running") | Some("starting")
         )
+    }
+
+    /// The pull request to surface: the one on the thread's branch, else the first open
+    /// linked one, else the most recently linked.
+    pub fn primary_pull_request(&self) -> Option<PullRequestRef> {
+        if let Some(branch_pr) = &self.branch_pull_request {
+            return Some(
+                self.pull_requests
+                    .iter()
+                    .find(|pr| {
+                        pr.number == branch_pr.number && pr.repository == branch_pr.repository
+                    })
+                    .map(PullRequestRef::from_linked)
+                    .unwrap_or(PullRequestRef {
+                        number: branch_pr.number,
+                        url: branch_pr.url.clone(),
+                        title: None,
+                        state: None,
+                        is_draft: false,
+                        checks_state: None,
+                    }),
+            );
+        }
+        self.pull_requests
+            .iter()
+            .find(|pr| pr.snapshot.as_ref().is_some_and(|s| s.state == "open"))
+            .or(self.pull_requests.last())
+            .map(PullRequestRef::from_linked)
+    }
+
+    /// Every linked pull request, primary first, without duplicates.
+    pub fn all_pull_requests(&self) -> Vec<PullRequestRef> {
+        let mut out: Vec<PullRequestRef> = self.primary_pull_request().into_iter().collect();
+        for pr in &self.pull_requests {
+            if !out.iter().any(|p| p.url == pr.url) {
+                out.push(PullRequestRef::from_linked(pr));
+            }
+        }
+        out
     }
 
     pub fn is_settled(&self) -> bool {

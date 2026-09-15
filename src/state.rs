@@ -407,6 +407,19 @@ impl ThreadState {
         mine.plan_progress = shell.plan_progress.clone();
         mine.has_pending_approvals = shell.has_pending_approvals;
         mine.has_pending_user_input = shell.has_pending_user_input;
+        mine.has_actionable_proposed_plan = shell.has_actionable_proposed_plan;
+        mine.background_liveness = shell.background_liveness.clone();
+        mine.session = shell.session.clone();
+        mine.branch = shell.branch.clone();
+        mine.pull_requests = shell.pull_requests.clone();
+        mine.branch_pull_request = shell.branch_pull_request.clone();
+        mine.settled_at = shell.settled_at.clone();
+        mine.settled_override = shell.settled_override.clone();
+        mine.unsettled_at = shell.unsettled_at.clone();
+        mine.snoozed_until = shell.snoozed_until.clone();
+        mine.pinned_at = shell.pinned_at.clone();
+        mine.pin_order_key = shell.pin_order_key.clone();
+        mine.archived_at = shell.archived_at.clone();
         mine.updated_at = shell.updated_at.clone();
         self.revision += 1;
     }

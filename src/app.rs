@@ -53,6 +53,7 @@ pub enum Focus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
+    PullRequest,
     Thread,
     Model,
     Project,
@@ -712,6 +713,31 @@ impl App {
         self.toast("yanked last assistant message to clipboard", false);
     }
 
+    // ── Pull requests ──────────────────────────────────────────────────
+
+    /// `gx` and `:pr`: open the thread's pull request in the browser. With several linked
+    /// pull requests, `:pr` offers a picker.
+    fn open_pull_request(&mut self, pick: bool) {
+        let Some(shell) = self.thread.as_ref().map(|t| &t.detail.shell) else {
+            self.toast("no thread open", true);
+            return;
+        };
+        let prs = shell.all_pull_requests();
+        match prs.as_slice() {
+            [] => self.toast("no pull request linked to this thread", true),
+            [_] => self.open_url(&prs[0].url.clone()),
+            _ if pick => self.open_picker(PickerKind::PullRequest),
+            _ => self.open_url(&prs[0].url.clone()),
+        }
+    }
+
+    fn open_url(&mut self, url: &str) {
+        match open::that_detached(url) {
+            Ok(()) => self.toast(format!("opened {url}"), false),
+            Err(err) => self.toast(format!("could not open browser: {err}"), true),
+        }
+    }
+
     // ── Pickers ────────────────────────────────────────────────────────
 
     fn open_picker(&mut self, kind: PickerKind) {
@@ -760,6 +786,18 @@ impl App {
                             detail: m.slug.clone(),
                             key: format!("{}\t{}", p.instance_id, m.slug),
                         })
+                })
+                .collect(),
+            PickerKind::PullRequest => self
+                .thread
+                .as_ref()
+                .map(|t| t.detail.shell.all_pull_requests())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|pr| PickerItem {
+                    label: pr.label(),
+                    detail: pr.state.clone().unwrap_or_default(),
+                    key: pr.url,
                 })
                 .collect(),
             PickerKind::Effort => {
@@ -824,6 +862,7 @@ impl App {
         self.mode = Mode::Normal;
         match picker.kind {
             PickerKind::Thread => self.open_thread(&item.key),
+            PickerKind::PullRequest => self.open_url(&item.key),
             PickerKind::Project => self.start_new_thread(&item.key),
             PickerKind::Model => {
                 let (instance_id, slug) = item.key.split_once('\t').unwrap_or((&item.key, ""));
@@ -962,6 +1001,7 @@ impl App {
             "delete" => self.toast("use :delete! to confirm deleting this thread", true),
             "stop" | "interrupt" => self.interrupt(),
             "sidebar" => self.sidebar_visible = !self.sidebar_visible,
+            "pr" | "pull" => self.open_pull_request(true),
             "settled" => self.show_settled = !self.show_settled,
             "settle" => {
                 if let Some(id) = thread_id.as_deref() {
@@ -1145,6 +1185,7 @@ impl App {
                     self.load_older();
                 }
             }
+            KeyCode::Char('x') if prefix == Some('g') => self.open_pull_request(false),
             KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
             KeyCode::Char('G') => self.scroll = Scroll::Follow,
             KeyCode::Char('z') => self.pending_prefix = Some(('z', Instant::now())),

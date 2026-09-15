@@ -136,6 +136,12 @@ advertised.
   branch, session, latestTurn, hasPendingApprovals, hasPendingUserInput, planProgress,
   pinnedAt, pinOrderKey, archivedAt, settledAt, settledOverride, unsettledAt, snoozedUntil,
   backgroundLiveness, hasActionableProposedPlan, updatedAt, ... }`.
+- **Pull requests**: `pullRequests[]` on the shell, each `{ host, repository, number, url,
+  source, linkedAt, snapshot?: { state: open|closed|merged, title, headBranch, baseBranch,
+  isDraft, checksState, reviewDecision, mergeability, ... } }`, plus `branchPullRequest`
+  (`{ repository, number, url }`) for the one whose head is the thread's branch. Changes
+  arrive as `thread-upserted` shell items and as `thread.pull-request-linked|unlinked|synced`
+  thread events; tria relies on the shell upserts.
 - **Sidebar sections** (as the desktop app derives them): *settled* when `settledAt` is set
   (the server parks a thread after its turn finishes; `thread.settle` and `thread.unsettle`
   move it by hand), *snoozed* when `snoozedUntil` is in the future, *pinned* when `pinnedAt`
@@ -261,7 +267,7 @@ approvals derivation, interrupt, new thread with bootstrap, rename, archive, ans
 questions including multi-select and custom text). M3 items shipped so far: model and effort
 pickers, `:` commands, prompt history, yank, config file, sectioned sidebar (pinned, active,
 snoozed, folded gray settled shelf) with per-thread status labels and settle/unsettle/wake
-commands. Not yet done: a recent-thread cache for instant back navigation, packaging.
+commands, branch and pull request in the header with `gx` / `:pr` to open it. Not yet done: a recent-thread cache for instant back navigation, packaging.
 
 **M0, spike (proves auth and framing).** CLI binary, no UI. Read `server-runtime.json`,
 exchange a pairing credential, fetch a ticket, open the socket, call `server.getConfig`, run
