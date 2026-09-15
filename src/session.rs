@@ -38,6 +38,8 @@ pub enum Update {
     Config(Box<ServerConfig>),
     Shell(ShellItem),
     Thread { thread_id: Id, item: ThreadItem },
+    /// A windowed snapshot of older turns requested with `LoadOlder`.
+    OlderPage { thread_id: Id, snapshot: crate::model::ThreadDetailSnapshot },
     /// The open thread's stream failed; the supervisor resubscribes on its own.
     ThreadStreamError { thread_id: Id, error: String },
     Error(String),
@@ -182,7 +184,9 @@ async fn run(
                                 match client.subscribe("orchestration.subscribeThread", payload).await {
                                     Ok(mut sub) => {
                                         if let Some(Ok(item)) = sub.next().await {
-                                            forward_thread_item(&updates, &o.id, item, &mut None);
+                                            if let Ok(ThreadItem::Snapshot { snapshot }) = serde_json::from_value::<ThreadItem>(item) {
+                                                let _ = updates.send(Update::OlderPage { thread_id: o.id.clone(), snapshot });
+                                            }
                                         }
                                     }
                                     Err(err) => { let _ = updates.send(Update::Error(err.to_string())); }

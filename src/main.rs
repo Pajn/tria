@@ -1,11 +1,15 @@
+mod app;
 mod auth;
 mod commands;
+mod composer;
 mod config;
 mod discovery;
 mod model;
 mod rpc;
 mod session;
 mod state;
+mod timeline;
+mod ui;
 mod wire;
 
 use anyhow::Result;
@@ -48,7 +52,15 @@ async fn main() -> Result<()> {
             println!("Paired with {origin}; scopes: {}", token.scope);
             Ok(())
         }
-        Some(Command::Probe) | None => probe(&origin, &cfg).await,
+        Some(Command::Probe) => probe(&origin, &cfg).await,
+        None => {
+            let token = cfg
+                .token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no token stored; run `tria pair <credential>` first (mint one with `t3 pair`)"))?;
+            init_logging()?;
+            app::run(origin, token).await
+        }
         Some(Command::Dump { thread_id, seconds }) => dump(&origin, &cfg, &thread_id, seconds).await,
     }
 }
@@ -125,6 +137,7 @@ async fn dump(origin: &str, cfg: &config::Config, thread_id: &str, seconds: u64)
                 }
                 (None, _) => {}
             },
+            session::Update::OlderPage { snapshot, .. } => println!("older page: {} messages", snapshot.thread.messages.len()),
             session::Update::ThreadStreamError { error, .. } => println!("thread stream error: {error}"),
             session::Update::Error(error) => println!("error: {error}"),
         }
@@ -132,5 +145,15 @@ async fn dump(origin: &str, cfg: &config::Config, thread_id: &str, seconds: u64)
     if let Some(t) = &thread {
         if let Some(last) = t.detail.messages.last() { println!("last message ({}): {:?}", last.role, last.text.chars().take(120).collect::<String>()); }
     }
+    Ok(())
+}
+
+/// Log to a file under the state directory; the terminal is owned by the UI.
+fn init_logging() -> Result<()> {
+    let dir = config::Config::path()?.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("tria.log"))?;
+    let filter = tracing_subscriber::EnvFilter::try_from_env("TRIA_LOG").unwrap_or_else(|_| "info".into());
+    tracing_subscriber::fmt().with_env_filter(filter).with_writer(file).with_ansi(false).init();
     Ok(())
 }

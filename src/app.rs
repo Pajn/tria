@@ -1,0 +1,1017 @@
+//! Application state, key handling, and the main event loop.
+
+use std::{
+    collections::HashSet,
+    io::Write,
+    time::{Duration, Instant},
+};
+
+use anyhow::Result;
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use futures_util::StreamExt;
+use serde_json::Value;
+use tokio::sync::mpsc;
+
+use crate::{
+    commands,
+    composer::Composer,
+    model::{Id, ModelSelection, ServerConfig, ShellItem, ThreadDetailSnapshot, ThreadItem},
+    session::{self, Handle, Status, Update},
+    state::{ApprovalOption, PendingApproval, Shell, ThreadState},
+    ui,
+};
+
+const TICK: Duration = Duration::from_millis(120);
+const TOAST_TTL: Duration = Duration::from_secs(6);
+const PREFIX_TTL: Duration = Duration::from_millis(1200);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    Insert,
+    Command,
+    Picker,
+    Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Chat,
+    Sidebar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerKind {
+    Thread,
+    Model,
+    Project,
+    Effort,
+}
+
+#[derive(Debug, Clone)]
+pub struct PickerItem {
+    pub label: String,
+    pub detail: String,
+    pub key: String,
+}
+
+#[derive(Debug)]
+pub struct Picker {
+    pub kind: PickerKind,
+    pub query: String,
+    pub selected: usize,
+    pub items: Vec<PickerItem>,
+}
+
+impl Picker {
+    pub fn filtered(&self) -> Vec<&PickerItem> {
+        let query = self.query.to_lowercase();
+        let mut scored: Vec<(i64, &PickerItem)> = self
+            .items
+            .iter()
+            .filter_map(|item| fuzzy_score(&query, &item.label, &item.detail).map(|s| (s, item)))
+            .collect();
+        if !query.is_empty() {
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+        }
+        scored.into_iter().map(|(_, item)| item).collect()
+    }
+}
+
+fn fuzzy_score(query: &str, label: &str, detail: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let haystack = format!("{} {}", label.to_lowercase(), detail.to_lowercase());
+    if let Some(pos) = haystack.find(query) {
+        return Some(1000 - pos as i64);
+    }
+    // Subsequence match for typo-tolerant filtering.
+    let mut chars = haystack.chars();
+    let mut score = 0i64;
+    for q in query.chars() {
+        loop {
+            let c = chars.next()?;
+            score -= 1;
+            if c == q {
+                break;
+            }
+        }
+    }
+    Some(score)
+}
+
+/// A thread being composed that does not exist on the server yet.
+#[derive(Debug, Clone)]
+pub struct NewThreadDraft {
+    pub project_id: Id,
+    pub model_selection: ModelSelection,
+    pub runtime_mode: String,
+    pub interaction_mode: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scroll {
+    Follow,
+    Offset(usize),
+}
+
+pub enum AppEvent {
+    Terminal(Event),
+    Tick,
+    Update(Update),
+    Dispatched(Result<(), String>),
+}
+
+pub struct App {
+    pub handle: Handle,
+    events: mpsc::UnboundedSender<AppEvent>,
+    pub shell: Shell,
+    pub config: ServerConfig,
+    pub status: Status,
+    pub thread: Option<ThreadState>,
+    pub current_thread_id: Option<Id>,
+    pub draft: Option<NewThreadDraft>,
+    pub mode: Mode,
+    pub focus: Focus,
+    pub composer: Composer,
+    pub command_line: String,
+    pub picker: Option<Picker>,
+    pub sidebar_visible: bool,
+    pub sidebar_selected: usize,
+    pub scroll: Scroll,
+    pub expanded: HashSet<String>,
+    pub expand_all: bool,
+    pub toast: Option<(String, Instant, bool)>,
+    pub spinner: usize,
+    pending_prefix: Option<(char, Instant)>,
+    /// Filled by the renderer each frame so key handling can page correctly.
+    pub chat_viewport: (usize, usize),
+    pub work_ranges: Vec<(usize, usize, String)>,
+    quit: bool,
+}
+
+impl App {
+    pub fn new(handle: Handle, events: mpsc::UnboundedSender<AppEvent>) -> Self {
+        Self {
+            handle,
+            events,
+            shell: Shell::default(),
+            config: ServerConfig::default(),
+            status: Status::Connecting,
+            thread: None,
+            current_thread_id: None,
+            draft: None,
+            mode: Mode::Normal,
+            focus: Focus::Chat,
+            composer: Composer::new(),
+            command_line: String::new(),
+            picker: None,
+            sidebar_visible: true,
+            sidebar_selected: 0,
+            scroll: Scroll::Follow,
+            expanded: HashSet::new(),
+            expand_all: false,
+            toast: None,
+            spinner: 0,
+            pending_prefix: None,
+            chat_viewport: (0, 0),
+            work_ranges: Vec::new(),
+            quit: false,
+        }
+    }
+
+    pub fn toast(&mut self, message: impl Into<String>, is_error: bool) {
+        self.toast = Some((message.into(), Instant::now(), is_error));
+    }
+
+    pub fn spinner_frame(&self) -> &'static str {
+        const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        FRAMES[self.spinner % FRAMES.len()]
+    }
+
+    // ── Navigation ─────────────────────────────────────────────────────
+
+    pub fn open_thread(&mut self, thread_id: &str) {
+        if self.current_thread_id.as_deref() == Some(thread_id) && self.draft.is_none() {
+            return;
+        }
+        self.current_thread_id = Some(thread_id.to_string());
+        self.thread = None;
+        self.draft = None;
+        self.scroll = Scroll::Follow;
+        self.expanded.clear();
+        self.handle.open_thread(thread_id);
+        if let Some(index) = self.shell.sorted_threads().iter().position(|t| t.id == thread_id) {
+            self.sidebar_selected = index;
+        }
+    }
+
+    fn open_relative(&mut self, delta: isize) {
+        let threads = self.shell.sorted_threads();
+        if threads.is_empty() {
+            return;
+        }
+        let current = self
+            .current_thread_id
+            .as_ref()
+            .and_then(|id| threads.iter().position(|t| &t.id == id))
+            .map(|i| i as isize)
+            .unwrap_or(-1);
+        let next = (current + delta).clamp(0, threads.len() as isize - 1) as usize;
+        let id = threads[next].id.clone();
+        self.open_thread(&id);
+    }
+
+    fn start_new_thread(&mut self, project_id: &str) {
+        let project = self.shell.projects.get(project_id);
+        let model_selection = project
+            .and_then(|p| p.default_model_selection.clone())
+            .or_else(|| self.config.settings.default_model_selection.clone())
+            .or_else(|| self.first_usable_model());
+        let Some(model_selection) = model_selection else {
+            self.toast("no usable provider or model configured on the server", true);
+            return;
+        };
+        self.draft = Some(NewThreadDraft {
+            project_id: project_id.to_string(),
+            model_selection,
+            runtime_mode: self.config.settings.default_runtime_mode.clone().unwrap_or_else(|| "full-access".into()),
+            interaction_mode: "default".into(),
+        });
+        self.current_thread_id = None;
+        self.thread = None;
+        self.handle.close_thread();
+        self.scroll = Scroll::Follow;
+        self.mode = Mode::Insert;
+        self.focus = Focus::Chat;
+    }
+
+    fn first_usable_model(&self) -> Option<ModelSelection> {
+        self.config.providers.iter().filter(|p| p.is_usable()).find_map(|provider| {
+            let model = provider.models.iter().find(|m| m.is_default).or_else(|| provider.models.first())?;
+            Some(ModelSelection { instance_id: provider.instance_id.clone(), model: model.slug.clone(), options: vec![] })
+        })
+    }
+
+    // ── Dispatch ───────────────────────────────────────────────────────
+
+    fn dispatch(&self, command: Value) {
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result = handle.dispatch(command).await.map(|_| ()).map_err(|e| e.to_string());
+            let _ = events.send(AppEvent::Dispatched(result));
+        });
+    }
+
+    fn send_message(&mut self) {
+        let text = self.composer.text().trim_end().to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+        if let Some(draft) = self.draft.take() {
+            let thread_id = commands::new_id();
+            let title: String = text.lines().next().unwrap_or("New thread").chars().take(60).collect();
+            let command = commands::turn_start(
+                &thread_id,
+                &text,
+                &draft.model_selection,
+                &draft.runtime_mode,
+                &draft.interaction_mode,
+                Some(commands::NewThread {
+                    project_id: &draft.project_id,
+                    title: title.trim(),
+                    model_selection: &draft.model_selection,
+                    runtime_mode: &draft.runtime_mode,
+                    interaction_mode: &draft.interaction_mode,
+                }),
+            );
+            self.dispatch(command);
+            self.current_thread_id = Some(thread_id.clone());
+            self.thread = None;
+            self.handle.open_thread(&thread_id);
+        } else if let Some(thread) = &self.thread {
+            let shell = &thread.detail.shell;
+            let command = commands::turn_start(
+                thread.id(),
+                &text,
+                &shell.model_selection,
+                &shell.runtime_mode,
+                &shell.interaction_mode,
+                None,
+            );
+            self.dispatch(command);
+        } else {
+            self.toast("no thread open; press n for a new thread or / to pick one", true);
+            return;
+        }
+        self.composer.push_history(text);
+        self.composer.clear();
+        self.scroll = Scroll::Follow;
+    }
+
+    fn interrupt(&mut self) {
+        let Some(thread) = &self.thread else { return };
+        if !thread.is_running() {
+            self.toast("nothing running", false);
+            return;
+        }
+        let turn_id = thread.detail.shell.latest_turn.as_ref().map(|t| t.turn_id.clone());
+        self.dispatch(commands::turn_interrupt(thread.id(), turn_id.as_deref()));
+        self.toast("interrupting…", false);
+    }
+
+    fn respond_approval(&mut self, index: usize) {
+        let Some(thread) = &self.thread else { return };
+        let pending = thread.pending_approvals();
+        let Some(approval) = pending.first() else { return };
+        let options = approval_options(approval);
+        let Some(option) = options.get(index) else { return };
+        let command = commands::approval_respond(thread.id(), &approval.request_id, &option.decision);
+        self.dispatch(command);
+        self.toast(format!("{}", option.label), false);
+    }
+
+    fn yank_last_assistant(&mut self) {
+        let Some(thread) = &self.thread else { return };
+        let Some(message) = thread.detail.messages.iter().rev().find(|m| m.role == "assistant") else {
+            self.toast("no assistant message to yank", true);
+            return;
+        };
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(message.text.as_bytes());
+        let mut out = std::io::stdout();
+        let _ = write!(out, "\x1b]52;c;{encoded}\x07");
+        let _ = out.flush();
+        self.toast("yanked last assistant message to clipboard", false);
+    }
+
+    // ── Pickers ────────────────────────────────────────────────────────
+
+    fn open_picker(&mut self, kind: PickerKind) {
+        let items: Vec<PickerItem> = match kind {
+            PickerKind::Thread => self
+                .shell
+                .sorted_threads()
+                .iter()
+                .map(|t| PickerItem {
+                    label: t.title.clone(),
+                    detail: format!("{} · {}", self.shell.project_title(&t.project_id), thread_status(t)),
+                    key: t.id.clone(),
+                })
+                .collect(),
+            PickerKind::Project => {
+                let mut projects: Vec<_> = self.shell.projects.values().collect();
+                projects.sort_by(|a, b| a.title.cmp(&b.title));
+                projects
+                    .into_iter()
+                    .map(|p| PickerItem { label: p.title.clone(), detail: p.workspace_root.clone(), key: p.id.clone() })
+                    .collect()
+            }
+            PickerKind::Model => self
+                .config
+                .providers
+                .iter()
+                .filter(|p| p.is_usable())
+                .flat_map(|p| {
+                    p.models.iter().filter(|m| !m.is_legacy).map(move |m| PickerItem {
+                        label: format!("{} · {}", p.label(), m.name),
+                        detail: m.slug.clone(),
+                        key: format!("{}\t{}", p.instance_id, m.slug),
+                    })
+                })
+                .collect(),
+            PickerKind::Effort => {
+                let Some(descriptor) = self.effort_descriptor() else {
+                    self.toast("current model has no effort option", true);
+                    return;
+                };
+                descriptor
+                    .options
+                    .iter()
+                    .map(|o| PickerItem { label: o.label.clone(), detail: String::new(), key: o.id.clone() })
+                    .collect()
+            }
+        };
+        if items.is_empty() {
+            self.toast("nothing to pick from", true);
+            return;
+        }
+        self.picker = Some(Picker { kind, query: String::new(), selected: 0, items });
+        self.mode = Mode::Picker;
+    }
+
+    fn current_model_selection(&self) -> Option<&ModelSelection> {
+        self.draft
+            .as_ref()
+            .map(|d| &d.model_selection)
+            .or_else(|| self.thread.as_ref().map(|t| &t.detail.shell.model_selection))
+    }
+
+    fn effort_descriptor(&self) -> Option<&crate::model::OptionDescriptor> {
+        let selection = self.current_model_selection()?;
+        let provider = self.config.providers.iter().find(|p| p.instance_id == selection.instance_id)?;
+        let model = provider.models.iter().find(|m| m.slug == selection.model)?;
+        model
+            .option_descriptors()
+            .iter()
+            .find(|d| d.kind == "select" && (d.id == "effort" || d.id == "reasoningEffort" || d.id == "variant"))
+    }
+
+    fn picker_select(&mut self) {
+        let Some(picker) = self.picker.take() else { return };
+        let Some(item) = picker.filtered().get(picker.selected).map(|i| (*i).clone()) else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.mode = Mode::Normal;
+        match picker.kind {
+            PickerKind::Thread => self.open_thread(&item.key),
+            PickerKind::Project => self.start_new_thread(&item.key),
+            PickerKind::Model => {
+                let (instance_id, slug) = item.key.split_once('\t').unwrap_or((&item.key, ""));
+                let selection = ModelSelection { instance_id: instance_id.into(), model: slug.into(), options: vec![] };
+                self.set_model(selection);
+            }
+            PickerKind::Effort => {
+                let Some(mut selection) = self.current_model_selection().cloned() else { return };
+                let id = self.effort_descriptor().map(|d| d.id.clone()).unwrap_or_else(|| "effort".into());
+                selection.options.retain(|o| o.id != id);
+                selection.options.push(crate::model::OptionSelection { id, value: Value::String(item.key) });
+                self.set_model(selection);
+            }
+        }
+    }
+
+    fn set_model(&mut self, selection: ModelSelection) {
+        if let Some(draft) = self.draft.as_mut() {
+            draft.model_selection = selection;
+            self.mode = Mode::Insert;
+        } else if let Some(thread) = &self.thread {
+            self.dispatch(commands::meta_update_model(thread.id(), &selection));
+        }
+    }
+
+    // ── Commands (`:`) ─────────────────────────────────────────────────
+
+    fn run_command(&mut self, line: &str) {
+        let line = line.trim();
+        let (name, arg) = match line.split_once(char::is_whitespace) {
+            Some((n, a)) => (n, a.trim()),
+            None => (line, ""),
+        };
+        let thread_id = self.thread.as_ref().map(|t| t.id().to_string());
+        match name {
+            "" => {}
+            "q" | "quit" | "q!" => self.quit = true,
+            "help" | "h" => self.mode = Mode::Help,
+            "new" | "n" => {
+                if arg.is_empty() {
+                    self.open_picker(PickerKind::Project);
+                } else {
+                    let needle = arg.to_lowercase();
+                    let found = self.shell.projects.values().find(|p| p.title.to_lowercase().contains(&needle)).map(|p| p.id.clone());
+                    match found {
+                        Some(id) => self.start_new_thread(&id),
+                        None => self.toast(format!("no project matching {arg:?}"), true),
+                    }
+                }
+            }
+            "model" | "m" => self.open_picker(PickerKind::Model),
+            "effort" | "e" => {
+                if arg.is_empty() {
+                    self.open_picker(PickerKind::Effort);
+                } else {
+                    let Some(mut selection) = self.current_model_selection().cloned() else { return };
+                    let id = self.effort_descriptor().map(|d| d.id.clone()).unwrap_or_else(|| "effort".into());
+                    selection.options.retain(|o| o.id != id);
+                    selection.options.push(crate::model::OptionSelection { id, value: Value::String(arg.into()) });
+                    self.set_model(selection);
+                }
+            }
+            "mode" => match (arg, thread_id.as_deref()) {
+                ("plan" | "default", Some(id)) => self.dispatch(commands::interaction_mode_set(id, arg)),
+                ("plan" | "default", None) => {
+                    if let Some(d) = self.draft.as_mut() {
+                        d.interaction_mode = arg.into();
+                    }
+                }
+                _ => self.toast("usage: :mode plan|default", true),
+            },
+            "perm" | "permissions" => {
+                let valid = ["approval-required", "auto-accept-edits", "auto", "full-access"];
+                if !valid.contains(&arg) {
+                    self.toast(format!("usage: :perm {}", valid.join("|")), true);
+                } else if let Some(id) = thread_id.as_deref() {
+                    self.dispatch(commands::runtime_mode_set(id, arg));
+                } else if let Some(d) = self.draft.as_mut() {
+                    d.runtime_mode = arg.into();
+                }
+            }
+            "rename" | "title" => match thread_id.as_deref() {
+                Some(id) if arg.is_empty() => self.dispatch(commands::meta_regenerate_title(id)),
+                Some(id) => self.dispatch(commands::meta_update_title(id, arg)),
+                None => self.toast("no thread open", true),
+            },
+            "archive" => {
+                if let Some(id) = thread_id.as_deref() {
+                    self.dispatch(commands::simple("thread.archive", id));
+                    self.toast("archived", false);
+                    self.current_thread_id = None;
+                    self.thread = None;
+                    self.handle.close_thread();
+                }
+            }
+            "delete!" => {
+                if let Some(id) = thread_id.as_deref() {
+                    self.dispatch(commands::simple("thread.delete", id));
+                    self.current_thread_id = None;
+                    self.thread = None;
+                    self.handle.close_thread();
+                }
+            }
+            "delete" => self.toast("use :delete! to confirm deleting this thread", true),
+            "stop" | "interrupt" => self.interrupt(),
+            "sidebar" => self.sidebar_visible = !self.sidebar_visible,
+            "older" => self.load_older(),
+            "dismiss" => {
+                if let Some(thread) = &self.thread {
+                    if let Some(request_id) = thread.pending_user_input().and_then(|p| p.request_id) {
+                        self.dispatch(commands::user_input_dismiss(thread.id(), &request_id));
+                    }
+                }
+            }
+            _ => self.toast(format!("unknown command :{name}"), true),
+        }
+    }
+
+    fn load_older(&mut self) {
+        if let Some(thread) = &self.thread {
+            match (&thread.before_cursor, thread.has_more) {
+                (Some(cursor), true) => {
+                    self.handle.load_older(cursor);
+                    self.toast("loading older turns…", false);
+                }
+                _ => self.toast("no older turns", false),
+            }
+        }
+    }
+
+    // ── Scrolling ──────────────────────────────────────────────────────
+
+    fn scroll_by(&mut self, delta: isize) {
+        let (height, total) = self.chat_viewport;
+        let max_offset = total.saturating_sub(height);
+        let current = match self.scroll {
+            Scroll::Follow => max_offset,
+            Scroll::Offset(o) => o.min(max_offset),
+        };
+        let next = (current as isize + delta).clamp(0, max_offset as isize) as usize;
+        self.scroll = if next >= max_offset { Scroll::Follow } else { Scroll::Offset(next) };
+        if next == 0 && delta < 0 {
+            // Reached the top: pull in older turns if the server has them.
+            if self.thread.as_ref().is_some_and(|t| t.has_more) {
+                self.load_older();
+            }
+        }
+    }
+
+    fn toggle_work_group(&mut self) {
+        let (height, total) = self.chat_viewport;
+        let offset = match self.scroll {
+            Scroll::Follow => total.saturating_sub(height),
+            Scroll::Offset(o) => o,
+        };
+        let middle = offset + height / 2;
+        let key = self
+            .work_ranges
+            .iter()
+            .find(|(start, end, _)| *start <= middle && middle < *end)
+            .or_else(|| self.work_ranges.iter().rev().find(|(start, _, _)| *start < offset + height))
+            .or_else(|| self.work_ranges.last())
+            .map(|(_, _, key)| key.clone());
+        if let Some(key) = key {
+            if !self.expanded.remove(&key) {
+                self.expanded.insert(key);
+            }
+        }
+    }
+
+    // ── Key handling ───────────────────────────────────────────────────
+
+    fn on_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+            return;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Global chords.
+        if ctrl && key.code == KeyCode::Char('q') {
+            self.quit = true;
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char('c') {
+            if self.thread.as_ref().is_some_and(|t| t.is_running()) {
+                self.interrupt();
+            } else if self.mode == Mode::Normal {
+                self.toast("nothing running · :q to quit", false);
+            } else {
+                self.mode = Mode::Normal;
+                self.picker = None;
+                self.command_line.clear();
+            }
+            return;
+        }
+        match self.mode {
+            Mode::Normal => self.on_normal_key(key),
+            Mode::Insert => self.on_insert_key(key),
+            Mode::Command => self.on_command_key(key),
+            Mode::Picker => self.on_picker_key(key),
+            Mode::Help => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter) {
+                    self.mode = Mode::Normal;
+                }
+            }
+        }
+    }
+
+    fn take_prefix(&mut self) -> Option<char> {
+        let (prefix, at) = self.pending_prefix.take()?;
+        (at.elapsed() < PREFIX_TTL).then_some(prefix)
+    }
+
+    fn on_normal_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let prefix = self.take_prefix();
+        let (height, _) = self.chat_viewport;
+        if self.focus == Focus::Sidebar {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.sidebar_move(1),
+                KeyCode::Char('k') | KeyCode::Up => self.sidebar_move(-1),
+                KeyCode::Char('g') if prefix == Some('g') => self.sidebar_selected = 0,
+                KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
+                KeyCode::Char('G') => self.sidebar_selected = self.shell.threads.len().saturating_sub(1),
+                KeyCode::Enter | KeyCode::Char('l') => {
+                    if let Some(id) = self.shell.sorted_threads().get(self.sidebar_selected).map(|t| t.id.clone()) {
+                        self.open_thread(&id);
+                        self.focus = Focus::Chat;
+                    }
+                }
+                KeyCode::Esc | KeyCode::Tab | KeyCode::Char('h') => self.focus = Focus::Chat,
+                KeyCode::Char('/') => self.open_picker(PickerKind::Thread),
+                KeyCode::Char('n') => self.open_picker(PickerKind::Project),
+                KeyCode::Char(':') => {
+                    self.mode = Mode::Command;
+                    self.command_line.clear();
+                }
+                KeyCode::Char('?') => self.mode = Mode::Help,
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
+            KeyCode::Char('d') if ctrl => self.scroll_by(height as isize / 2),
+            KeyCode::Char('u') if ctrl => self.scroll_by(-(height as isize / 2)),
+            KeyCode::Char('f') if ctrl => self.scroll_by(height as isize),
+            KeyCode::Char('b') if ctrl => self.scroll_by(-(height as isize)),
+            KeyCode::PageDown => self.scroll_by(height as isize),
+            KeyCode::PageUp => self.scroll_by(-(height as isize)),
+            KeyCode::Char('g') if prefix == Some('g') => {
+                self.scroll = Scroll::Offset(0);
+                if self.thread.as_ref().is_some_and(|t| t.has_more) {
+                    self.load_older();
+                }
+            }
+            KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
+            KeyCode::Char('G') => self.scroll = Scroll::Follow,
+            KeyCode::Char('z') => self.pending_prefix = Some(('z', Instant::now())),
+            KeyCode::Char('a') if prefix == Some('z') => self.toggle_work_group(),
+            KeyCode::Char('R') if prefix == Some('z') => self.expand_all = true,
+            KeyCode::Char('M') if prefix == Some('z') => {
+                self.expand_all = false;
+                self.expanded.clear();
+            }
+            KeyCode::Char('J') => self.open_relative(1),
+            KeyCode::Char('K') => self.open_relative(-1),
+            KeyCode::Tab => {
+                self.sidebar_visible = true;
+                self.focus = Focus::Sidebar;
+            }
+            KeyCode::Char('/') | KeyCode::Char(' ') => self.open_picker(PickerKind::Thread),
+            KeyCode::Char('n') => self.open_picker(PickerKind::Project),
+            KeyCode::Char('m') => self.open_picker(PickerKind::Model),
+            KeyCode::Char('i') | KeyCode::Char('o') | KeyCode::Enter | KeyCode::Char('a') => {
+                if self.thread.is_some() || self.draft.is_some() {
+                    self.mode = Mode::Insert;
+                } else {
+                    self.toast("open a thread first (/ or Tab), or n for a new one", false);
+                }
+            }
+            KeyCode::Char(':') => {
+                self.mode = Mode::Command;
+                self.command_line.clear();
+            }
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('y') => self.yank_last_assistant(),
+            KeyCode::Char('s') => self.sidebar_visible = !self.sidebar_visible,
+            KeyCode::Char(c @ '1'..='9') => self.respond_approval(c as usize - '1' as usize),
+            KeyCode::Esc => {
+                self.toast = None;
+                self.scroll = Scroll::Follow;
+            }
+            _ => {}
+        }
+    }
+
+    fn sidebar_move(&mut self, delta: isize) {
+        let len = self.shell.threads.len();
+        if len == 0 {
+            return;
+        }
+        self.sidebar_selected = (self.sidebar_selected as isize + delta).clamp(0, len as isize - 1) as usize;
+    }
+
+    fn on_insert_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter if alt || shift || ctrl => self.composer.newline(),
+            KeyCode::Char('j') if ctrl => self.composer.newline(),
+            KeyCode::Enter => self.send_message(),
+            KeyCode::Backspace if alt || ctrl => self.composer.kill_word_back(),
+            KeyCode::Backspace => self.composer.backspace(),
+            KeyCode::Delete => self.composer.delete(),
+            KeyCode::Left if alt || ctrl => self.composer.word_left(),
+            KeyCode::Right if alt || ctrl => self.composer.word_right(),
+            KeyCode::Left => self.composer.left(),
+            KeyCode::Right => self.composer.right(),
+            KeyCode::Up => {
+                if !self.composer.up() {
+                    self.composer.history_prev();
+                }
+            }
+            KeyCode::Down => {
+                if !self.composer.down() {
+                    self.composer.history_next();
+                }
+            }
+            KeyCode::Home => self.composer.home(),
+            KeyCode::End => self.composer.end(),
+            KeyCode::PageUp => self.scroll_by(-(self.chat_viewport.0 as isize)),
+            KeyCode::PageDown => self.scroll_by(self.chat_viewport.0 as isize),
+            KeyCode::Char('a') if ctrl => self.composer.home(),
+            KeyCode::Char('e') if ctrl => self.composer.end(),
+            KeyCode::Char('b') if alt => self.composer.word_left(),
+            KeyCode::Char('f') if alt => self.composer.word_right(),
+            KeyCode::Char('w') if ctrl => self.composer.kill_word_back(),
+            KeyCode::Char('k') if ctrl => self.composer.kill_to_end(),
+            KeyCode::Char('u') if ctrl => self.composer.kill_to_start(),
+            KeyCode::Char('p') if ctrl => self.composer.history_prev(),
+            KeyCode::Char('n') if ctrl => self.composer.history_next(),
+            KeyCode::Tab => self.composer.insert_str("    "),
+            KeyCode::Char(c) if !ctrl => self.composer.insert_char(c),
+            _ => {}
+        }
+    }
+
+    fn on_command_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.command_line.clear();
+            }
+            KeyCode::Enter => {
+                let line = std::mem::take(&mut self.command_line);
+                self.mode = Mode::Normal;
+                self.run_command(&line);
+            }
+            KeyCode::Backspace => {
+                if self.command_line.pop().is_none() {
+                    self.mode = Mode::Normal;
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => self.command_line.clear(),
+            KeyCode::Char(c) => self.command_line.push(c),
+            _ => {}
+        }
+    }
+
+    fn on_picker_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(picker) = self.picker.as_mut() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let count = picker.filtered().len();
+        match key.code {
+            KeyCode::Esc => {
+                self.picker = None;
+                self.mode = if self.draft.is_some() { Mode::Insert } else { Mode::Normal };
+            }
+            KeyCode::Enter => self.picker_select(),
+            KeyCode::Down | KeyCode::Tab => picker.selected = (picker.selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Up | KeyCode::BackTab => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Char('n') if ctrl => picker.selected = (picker.selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Char('p') if ctrl => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Char('j') if ctrl => picker.selected = (picker.selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Char('k') if ctrl => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.selected = 0;
+            }
+            KeyCode::Char('u') if ctrl => {
+                picker.query.clear();
+                picker.selected = 0;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                picker.query.push(c);
+                picker.selected = 0;
+            }
+            _ => {}
+        }
+    }
+
+    // ── Server updates ─────────────────────────────────────────────────
+
+    fn on_update(&mut self, update: Update) {
+        match update {
+            Update::Status(status) => {
+                if let Status::Reconnecting { attempt, error } = &status {
+                    if *attempt == 1 {
+                        self.toast(format!("disconnected: {error}"), true);
+                    }
+                }
+                self.status = status;
+            }
+            Update::Config(config) => self.config = *config,
+            Update::Shell(item) => {
+                if let ShellItem::ThreadUpserted { thread, .. } = &item {
+                    if let Some(open) = self.thread.as_mut().filter(|t| t.id() == thread.id) {
+                        open.sync_shell(thread);
+                    }
+                }
+                let removed = matches!(&item, ShellItem::ThreadRemoved { thread_id, .. } if Some(thread_id) == self.current_thread_id.as_ref());
+                self.shell.apply(item);
+                if removed {
+                    self.thread = None;
+                    self.current_thread_id = None;
+                    self.toast("thread was removed", false);
+                }
+                if self.current_thread_id.is_none() && self.draft.is_none() && self.shell.synchronized {
+                    if let Some(first) = self.shell.sorted_threads().first().map(|t| t.id.clone()) {
+                        self.open_thread(&first);
+                    }
+                }
+            }
+            Update::Thread { thread_id, item } => {
+                if self.current_thread_id.as_deref() != Some(thread_id.as_str()) {
+                    return;
+                }
+                match (&mut self.thread, item) {
+                    (None, ThreadItem::Snapshot { snapshot }) => {
+                        let mut state = ThreadState::from_snapshot(snapshot);
+                        if let Some(shell) = self.shell.threads.get(&thread_id) {
+                            state.sync_shell(shell);
+                        }
+                        self.thread = Some(state);
+                    }
+                    (Some(thread), item) => thread.apply(item),
+                    (None, _) => {}
+                }
+            }
+            Update::OlderPage { thread_id, snapshot } => {
+                if self.current_thread_id.as_deref() == Some(thread_id.as_str()) {
+                    if let Some(thread) = self.thread.as_mut() {
+                        prepend_page(thread, snapshot);
+                    }
+                }
+            }
+            Update::ThreadStreamError { error, .. } => self.toast(format!("stream error, resubscribing: {error}"), true),
+            Update::Error(error) => self.toast(error, true),
+        }
+    }
+}
+
+fn prepend_page(thread: &mut ThreadState, snapshot: ThreadDetailSnapshot) {
+    let page = snapshot.page;
+    let older = snapshot.thread;
+    let mut messages = older.messages;
+    messages.retain(|m| !thread.detail.messages.iter().any(|e| e.id == m.id));
+    messages.append(&mut thread.detail.messages);
+    thread.detail.messages = messages;
+    let mut activities = older.activities;
+    activities.retain(|a| !thread.detail.activities.iter().any(|e| e.id == a.id));
+    activities.append(&mut thread.detail.activities);
+    thread.detail.activities = activities;
+    for plan in older.proposed_plans {
+        if !thread.detail.proposed_plans.iter().any(|p| p.id == plan.id) {
+            thread.detail.proposed_plans.insert(0, plan);
+        }
+    }
+    match page {
+        Some(page) => {
+            thread.has_more = page.has_more;
+            thread.before_cursor = page.before_cursor;
+        }
+        None => {
+            thread.has_more = false;
+            thread.before_cursor = None;
+        }
+    }
+    thread.revision += 1;
+}
+
+pub fn approval_options(approval: &PendingApproval) -> Vec<ApprovalOption> {
+    if !approval.options.is_empty() {
+        return approval.options.clone();
+    }
+    vec![
+        ApprovalOption { decision: "accept".into(), label: "Allow".into() },
+        ApprovalOption { decision: "acceptForSession".into(), label: "Allow for session".into() },
+        ApprovalOption { decision: "decline".into(), label: "Deny".into() },
+    ]
+}
+
+pub fn thread_status(thread: &crate::model::ThreadShell) -> &'static str {
+    if thread.has_pending_approvals {
+        "needs approval"
+    } else if thread.has_pending_user_input {
+        "asked a question"
+    } else if thread.is_running() {
+        "running"
+    } else {
+        match thread.latest_turn.as_ref().map(|t| t.state.as_str()) {
+            Some("error") => "error",
+            Some("interrupted") => "interrupted",
+            Some("completed") => "done",
+            _ => "idle",
+        }
+    }
+}
+
+// ── Event loop ─────────────────────────────────────────────────────────
+
+pub async fn run(origin: String, token: String) -> Result<()> {
+    let (handle, mut updates) = session::spawn(origin, token);
+    let (events_tx, mut events) = mpsc::unbounded_channel::<AppEvent>();
+    let mut app = App::new(handle, events_tx.clone());
+
+    let mut terminal = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    let mut input = EventStream::new();
+    let mut tick = tokio::time::interval(TICK);
+
+    let result: Result<()> = loop {
+        if let Err(err) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
+            break Err(err.into());
+        }
+        let event = tokio::select! {
+            ev = input.next() => match ev {
+                Some(Ok(ev)) => AppEvent::Terminal(ev),
+                Some(Err(err)) => break Err(err.into()),
+                None => break Ok(()),
+            },
+            update = updates.recv() => match update {
+                Some(update) => AppEvent::Update(update),
+                None => break Ok(()),
+            },
+            Some(ev) = events.recv() => ev,
+            _ = tick.tick() => AppEvent::Tick,
+        };
+        match event {
+            AppEvent::Terminal(Event::Key(key)) => app.on_key(key),
+            AppEvent::Terminal(Event::Paste(text)) => {
+                if app.mode == Mode::Insert {
+                    app.composer.insert_str(&text);
+                } else if app.mode == Mode::Picker {
+                    if let Some(p) = app.picker.as_mut() {
+                        p.query.push_str(text.trim());
+                    }
+                } else if app.mode == Mode::Command {
+                    app.command_line.push_str(text.trim());
+                }
+            }
+            AppEvent::Terminal(_) => {}
+            AppEvent::Tick => {
+                app.spinner = app.spinner.wrapping_add(1);
+                if app.toast.as_ref().is_some_and(|(_, at, _)| at.elapsed() > TOAST_TTL) {
+                    app.toast = None;
+                }
+            }
+            AppEvent::Update(update) => app.on_update(update),
+            AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
+            AppEvent::Dispatched(Ok(())) => {}
+        }
+        if app.quit {
+            break Ok(());
+        }
+    };
+
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    ratatui::restore();
+    result
+}
