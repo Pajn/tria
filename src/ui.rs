@@ -846,11 +846,11 @@ fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
     let placeholder = if insert {
         "type a message · Enter sends · Alt-Enter newline · Esc normal"
     } else {
-        "press i to write"
+        "i to write · d c y w b f t motions edit"
     };
     let (lines, cursor) = app.composer.render(text_area, placeholder);
     frame.render_widget(Paragraph::new(lines), text_area);
-    if insert {
+    if insert || (app.mode == Mode::Normal && app.focus == Focus::Composer) {
         frame.set_cursor_position(cursor);
     }
 }
@@ -892,6 +892,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         ),
     };
     let mut spans = vec![Span::styled(mode_label, mode_style), Span::raw(" ")];
+    if app.mode == Mode::Normal && app.focus == Focus::Composer && app.composer.vim_pending() {
+        spans.push(Span::styled(
+            format!("{} ", app.composer.vim_pending_label()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     let (dot, dot_style, conn_label) = match &app.status {
         Status::Connected => ("●", Style::default().fg(Color::Green), String::new()),
         Status::Connecting => (
@@ -1058,11 +1064,21 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  m                       change model"),
         Line::from("  i / Enter               write a message"),
         Line::from("  za  zR  zM              toggle / expand all / collapse all tool groups"),
-        Line::from("  1..9                    answer a pending approval"),
+        Line::from("  1..9                    answer a pending approval (otherwise a count)"),
         Line::from(
-            "  a                       answer the agent's question (digits, Space, c custom, Enter)",
+            "  ga                      answer the agent's question (digits, Space, c custom, Enter)",
         ),
-        Line::from("  y                       yank last assistant message (OSC 52)"),
+        Line::from("  gy                      yank last assistant message (OSC 52)"),
+        Line::from("  Ctrl-e Ctrl-y Ctrl-d Ctrl-u  scroll the conversation by line / half page"),
+        Line::from(""),
+        Line::from("  composer (normal mode, Vim):"),
+        Line::from("  h j k l w b e W B E 0 ^ $ gg G f F t T ; ,   motions, with counts"),
+        Line::from(
+            "  d c y + motion or iw aw i\" a( ...   operators and text objects; dd cc yy D C Y x X",
+        ),
+        Line::from(
+            "  i a I A o O   insert · p P paste · r replace · ~ case · u / Ctrl-r undo / redo",
+        ),
         Line::from("  s / S                   toggle sidebar / settled shelf"),
         Line::from("  gx                      open the thread's pull request in the browser"),
         Line::from(

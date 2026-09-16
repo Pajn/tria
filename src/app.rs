@@ -23,7 +23,7 @@ use crate::{
     question::QuestionDraft,
     session::{self, Handle, Status, Update},
     state::{ApprovalOption, PendingApproval, Shell, ThreadState},
-    ui,
+    ui, vim,
 };
 
 /// Rows moved per mouse wheel notch.
@@ -47,7 +47,8 @@ pub enum Mode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
-    Chat,
+    /// Keys edit the composer with Vim motions; the chat scrolls with Ctrl keys.
+    Composer,
     Sidebar,
 }
 
@@ -191,7 +192,7 @@ impl App {
             current_thread_id: None,
             draft: None,
             mode: Mode::Normal,
-            focus: Focus::Chat,
+            focus: Focus::Composer,
             composer: Composer::new(),
             command_line: String::new(),
             picker: None,
@@ -329,7 +330,7 @@ impl App {
             Some(SidebarRow::Thread { id, .. }) => {
                 let id = id.clone();
                 self.open_thread(&id);
-                self.focus = Focus::Chat;
+                self.focus = Focus::Composer;
             }
             Some(SidebarRow::Header { section, .. }) => self.toggle_section(*section),
             None => {}
@@ -404,7 +405,7 @@ impl App {
         self.handle.close_thread();
         self.scroll = Scroll::Follow;
         self.mode = Mode::Insert;
-        self.focus = Focus::Chat;
+        self.focus = Focus::Composer;
     }
 
     fn first_usable_model(&self) -> Option<ModelSelection> {
@@ -1249,7 +1250,7 @@ impl App {
                 }
                 KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char(' ') => self.sidebar_activate(),
                 KeyCode::Char('S') => self.show_settled = !self.show_settled,
-                KeyCode::Esc | KeyCode::Tab | KeyCode::Char('h') => self.focus = Focus::Chat,
+                KeyCode::Esc | KeyCode::Tab | KeyCode::Char('h') => self.focus = Focus::Composer,
                 KeyCode::Char('/') => self.open_picker(PickerKind::Thread),
                 KeyCode::Char('n') => self.open_picker(PickerKind::Project),
                 KeyCode::Char(':') => {
@@ -1261,78 +1262,113 @@ impl App {
             }
             return;
         }
+        let question_pending = self
+            .thread
+            .as_ref()
+            .is_some_and(|t| t.pending_user_input().is_some());
+        let approval_pending = self
+            .thread
+            .as_ref()
+            .is_some_and(|t| !t.pending_approvals().is_empty());
+        // Chat and app keys first; whatever is left edits the composer.
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
-            KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
-            KeyCode::Char('d') if ctrl => self.scroll_by(height as isize / 2),
-            KeyCode::Char('u') if ctrl => self.scroll_by(-(height as isize / 2)),
-            KeyCode::Char('f') if ctrl => self.scroll_by(height as isize),
-            KeyCode::Char('b') if ctrl => self.scroll_by(-(height as isize)),
-            KeyCode::PageDown => self.scroll_by(height as isize),
-            KeyCode::PageUp => self.scroll_by(-(height as isize)),
-            KeyCode::Char('g') if prefix == Some('g') => {
-                self.scroll = Scroll::Offset(0);
-                if self.thread.as_ref().is_some_and(|t| t.has_more) {
-                    self.load_older();
+            KeyCode::Char('d') if ctrl => return self.scroll_by(height as isize / 2),
+            KeyCode::Char('u') if ctrl => return self.scroll_by(-(height as isize / 2)),
+            KeyCode::Char('f') if ctrl => return self.scroll_by(height as isize),
+            KeyCode::Char('b') if ctrl => return self.scroll_by(-(height as isize)),
+            KeyCode::Char('e') if ctrl => return self.scroll_by(1),
+            KeyCode::Char('y') if ctrl => return self.scroll_by(-1),
+            KeyCode::PageDown => return self.scroll_by(height as isize),
+            KeyCode::PageUp => return self.scroll_by(-(height as isize)),
+            KeyCode::Char('g') if prefix == Some('g') => return self.composer.vim_top(),
+            KeyCode::Char('x') if prefix == Some('g') => return self.open_pull_request(false),
+            KeyCode::Char('t') if prefix == Some('g') => return self.switch_tmux_session(),
+            KeyCode::Char('y') if prefix == Some('g') => return self.yank_last_assistant(),
+            KeyCode::Char('a') if prefix == Some('g') => {
+                if question_pending {
+                    self.begin_answering();
+                } else {
+                    self.toast("no question pending", false);
                 }
+                return;
             }
-            KeyCode::Char('x') if prefix == Some('g') => self.open_pull_request(false),
-            KeyCode::Char('t') if prefix == Some('g') => self.switch_tmux_session(),
-            KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
-            KeyCode::Char('G') => self.scroll = Scroll::Follow,
-            KeyCode::Char('z') => self.pending_prefix = Some(('z', Instant::now())),
-            KeyCode::Char('a') if prefix == Some('z') => self.toggle_work_group(),
-            KeyCode::Char('R') if prefix == Some('z') => self.expand_all = true,
+            KeyCode::Char('g') if !self.composer.vim_pending() => {
+                self.pending_prefix = Some(('g', Instant::now()));
+                return;
+            }
+            KeyCode::Char('z') => {
+                self.pending_prefix = Some(('z', Instant::now()));
+                return;
+            }
+            KeyCode::Char('a') if prefix == Some('z') => return self.toggle_work_group(),
+            KeyCode::Char('R') if prefix == Some('z') => return self.expand_all = true,
             KeyCode::Char('M') if prefix == Some('z') => {
                 self.expand_all = false;
                 self.expanded.clear();
+                return;
             }
-            KeyCode::Char('J') => self.open_relative(1),
-            KeyCode::Char('K') => self.open_relative(-1),
+            KeyCode::Char('J') => return self.open_relative(1),
+            KeyCode::Char('K') => return self.open_relative(-1),
             KeyCode::Tab => {
                 self.sidebar_visible = true;
                 self.focus = Focus::Sidebar;
+                return;
             }
-            KeyCode::Char('/') | KeyCode::Char(' ') => self.open_picker(PickerKind::Thread),
-            KeyCode::Char('n') => self.open_picker(PickerKind::Project),
-            KeyCode::Char('m') => self.open_picker(PickerKind::Model),
-            KeyCode::Char('a')
-                if self
-                    .thread
-                    .as_ref()
-                    .is_some_and(|t| t.pending_user_input().is_some()) =>
-            {
+            KeyCode::Char('/') => return self.open_picker(PickerKind::Thread),
+            KeyCode::Char('n') => return self.open_picker(PickerKind::Project),
+            KeyCode::Char('m') => return self.open_picker(PickerKind::Model),
+            KeyCode::Enter if question_pending => {
                 self.begin_answering();
+                return;
             }
-            KeyCode::Enter
-                if self
-                    .thread
-                    .as_ref()
-                    .is_some_and(|t| t.pending_user_input().is_some()) =>
-            {
-                self.begin_answering();
+            KeyCode::Enter => {
+                if self.thread.is_some() || self.draft.is_some() {
+                    self.composer.checkpoint();
+                    self.mode = Mode::Insert;
+                } else {
+                    self.toast("open a thread first (/ or Tab), or n for a new one", false);
+                }
+                return;
             }
-            KeyCode::Char('i') | KeyCode::Char('o') | KeyCode::Enter | KeyCode::Char('a') => {
+            KeyCode::Char(':') => {
+                self.mode = Mode::Command;
+                self.command_line.clear();
+                return;
+            }
+            KeyCode::Char('?') => return self.mode = Mode::Help,
+            KeyCode::Char('s') if !self.composer.vim_pending() => {
+                return self.sidebar_visible = !self.sidebar_visible;
+            }
+            KeyCode::Char('S') if !self.composer.vim_pending() => {
+                return self.show_settled = !self.show_settled;
+            }
+            KeyCode::Char(c @ '1'..='9') if approval_pending && !self.composer.vim_pending() => {
+                return self.respond_approval(c as usize - '1' as usize);
+            }
+            KeyCode::Esc => {
+                self.toast = None;
+                self.scroll = Scroll::Follow;
+                self.composer.vim_cancel();
+                return;
+            }
+            _ => {}
+        }
+        match self.composer.vim_key(key) {
+            vim::Effect::None => {}
+            vim::Effect::EnterInsert => {
                 if self.thread.is_some() || self.draft.is_some() {
                     self.mode = Mode::Insert;
                 } else {
                     self.toast("open a thread first (/ or Tab), or n for a new one", false);
                 }
             }
-            KeyCode::Char(':') => {
-                self.mode = Mode::Command;
-                self.command_line.clear();
+            vim::Effect::Yanked(text) => {
+                copy_to_clipboard(&text);
+                let lines = text.lines().count();
+                if lines > 1 {
+                    self.toast(format!("yanked {lines} lines"), false);
+                }
             }
-            KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('y') => self.yank_last_assistant(),
-            KeyCode::Char('s') => self.sidebar_visible = !self.sidebar_visible,
-            KeyCode::Char('S') => self.show_settled = !self.show_settled,
-            KeyCode::Char(c @ '1'..='9') => self.respond_approval(c as usize - '1' as usize),
-            KeyCode::Esc => {
-                self.toast = None;
-                self.scroll = Scroll::Follow;
-            }
-            _ => {}
         }
     }
 
@@ -1386,7 +1422,7 @@ impl App {
                             self.open_thread(&id);
                         }
                         if self.focus == Focus::Sidebar {
-                            self.focus = Focus::Chat;
+                            self.focus = Focus::Composer;
                         }
                     }
                     Some(SidebarRow::Header { section, .. }) => {
@@ -1398,7 +1434,7 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.focus == Focus::Sidebar {
-                    self.focus = Focus::Chat;
+                    self.focus = Focus::Composer;
                 }
                 self.selection = if self.chat_area.contains(at) {
                     Some(Selection {
@@ -1466,7 +1502,10 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
-            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.composer.leave_insert();
+            }
             KeyCode::Enter if alt || shift || ctrl => self.composer.newline(),
             KeyCode::Char('j') if ctrl => self.composer.newline(),
             KeyCode::Enter => self.send_message(),

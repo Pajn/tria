@@ -10,10 +10,11 @@ const MAX_HISTORY: usize = 200;
 
 #[derive(Debug, Default)]
 pub struct Composer {
-    lines: Vec<String>,
-    row: usize,
+    pub(crate) lines: Vec<String>,
+    pub(crate) row: usize,
     /// Cursor column in characters.
-    col: usize,
+    pub(crate) col: usize,
+    pub(crate) vim: crate::vim::VimState,
     history: Vec<String>,
     history_index: Option<usize>,
     draft: String,

@@ -11,6 +11,7 @@ mod session;
 mod state;
 mod timeline;
 mod ui;
+mod vim;
 mod wire;
 
 use anyhow::Result;

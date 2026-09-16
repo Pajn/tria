@@ -50,24 +50,31 @@ Press `?` inside the app for the full list.
 
 | Normal mode | |
 | --- | --- |
-| `j` `k` `Ctrl-d` `Ctrl-u` `gg` `G` | scroll the conversation |
+| `Ctrl-d` `Ctrl-u` `Ctrl-f` `Ctrl-b` `Ctrl-e` `Ctrl-y` | scroll the conversation: half page, page, line |
 | `J` `K` | next / previous thread |
-| `/` or `Space` | fuzzy thread picker |
+| `/` | fuzzy thread picker |
 | `Tab` | focus the thread list; `j`/`k`, `Enter` opens a thread or folds a section, `Esc` |
 | `s` `S` | toggle the sidebar / the settled shelf |
 | `n` | new thread (pick a project) |
 | `m` | change model |
-| `i` or `Enter` | write a message |
+| `i` `a` `I` `A` `o` `O` or `Enter` | write a message (Vim insert entry) |
 | `za` `zR` `zM` | toggle / expand all / collapse all tool groups; `za` on a tool row inside an open group expands that row |
-| `1`..`9` | answer a pending approval |
-| `a` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
-| `y` | copy the last assistant message (OSC 52) |
+| `1`..`9` | answer a pending approval; otherwise a count for the next motion |
+| `ga` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
+| `gy` | copy the last assistant message (OSC 52) |
 | `gx` | open the thread's pull request in the browser |
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
 | `Ctrl-c` | interrupt the running turn |
 | mouse wheel | scroll the conversation, or the thread list when the pointer is over it |
 | left click | in the thread list: open a thread, or fold and unfold a section; in the chat: fold and unfold a tool group or row |
 | drag | select text in the conversation; releasing copies it (OSC 52) |
+
+Every other key in normal mode edits the composer with Vim semantics. Motions: `h j k l w b e
+W B E 0 ^ $ gg G f F t T ; ,`, all taking counts. Operators `d c y` combine with a motion or a
+text object (`iw aw iW aW`, `i" a"`, `i( a( i[ a[ i{ a{ i< a<`), plus `dd cc yy D C Y x X`. `p P`
+paste from the single register, `r` replaces a character, `~` toggles case, `u` and `Ctrl-r`
+undo and redo. Yanks also go to the system clipboard. The status bar shows a partially typed
+command.
 
 | Insert mode | |
 | --- | --- |

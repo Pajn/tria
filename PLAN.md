@@ -243,12 +243,15 @@ digit keys. Streaming appends deltas and re-renders at most every 16 ms.
 
 **Vim model.** Two modes plus a command line.
 
-- *Normal* (default): `j`/`k` scroll, `Ctrl-d`/`Ctrl-u` half page, `gg`/`G`, `J`/`K` next and
-  previous thread, `Tab` focus thread list, `/` filter threads, `za` toggle the tool group under
-  the cursor, `zM`/`zR` collapse or expand all, `i` or `Enter` to insert, `Esc` clear,
-  `Ctrl-c` interrupt the running turn, `y` yank the assistant message under the cursor,
-  `1`..`9` answer a pending approval. The mouse wheel scrolls whichever pane it is over and
-  a left click in the thread list opens a thread or folds a section. Dragging over the
+- *Normal* (default): one mode, two foci. With the composer focused, app keys come first
+  (`Ctrl-d`/`Ctrl-u`/`Ctrl-e`/`Ctrl-y` scroll the chat, `J`/`K` threads, `Tab` sidebar, `/`
+  picker, `z` folds, `g` prefix for `ga` answer, `gy` yank, `gx`, `gt`), and every other key
+  is a Vim command on the composer text: motions with counts, `d c y` operators with motions
+  and text objects, `f F t T ; ,`, `p P`, `r`, `~`, `u`/`Ctrl-r`, and the insert entries
+  `i a I A o O`. Digits answer a pending approval when there is one, else they are counts.
+  `Ctrl-c` interrupts the running turn. The mouse wheel scrolls whichever pane it is over and
+  a left click in the thread list opens a thread or folds a section. A chat cursor with
+  visual mode is the natural next step once the chat owns its line wrapping. Dragging over the
   conversation selects screen cells in reading order and copies them through OSC 52 on
   release, so wrapped lines copy exactly as displayed.
 - *Insert*: the composer. `Enter` sends, `Alt-Enter` or `Ctrl-j` inserts a newline, `Esc`
