@@ -53,7 +53,7 @@ Press `?` inside the app for the full list.
 | `Ctrl-d` `Ctrl-u` `Ctrl-f` `Ctrl-b` `Ctrl-e` `Ctrl-y` | scroll the conversation: half page, page, line |
 | `J` `K` | next / previous thread |
 | `/` | fuzzy thread picker |
-| `Tab` | focus the thread list; `j`/`k`, `Enter` opens a thread or folds a section, `Esc` |
+| `Tab` / `Shift-Tab` | cycle focus: composer, chat, thread list. `Esc` returns to the composer |
 | `s` `S` | toggle the sidebar / the settled shelf |
 | `n` | new thread (pick a project) |
 | `m` | change model |
@@ -69,7 +69,16 @@ Press `?` inside the app for the full list.
 | left click | in the thread list: open a thread, or fold and unfold a section; in the chat: fold and unfold a tool group or row |
 | drag | select text in the conversation; releasing copies it (OSC 52) |
 
-Every other key in normal mode edits the composer with Vim semantics. Motions: `h j k l w b e
+With the chat focused, a line cursor moves through the conversation: `j` `k` with counts,
+`{` `}` to the previous or next message, `gg` and `G` (which also resumes following new
+output), `Ctrl-d` `Ctrl-u` `Ctrl-f` `Ctrl-b` `Ctrl-e` `Ctrl-y` to scroll with the cursor.
+`za`, `Enter`, or `Space` folds the tool group or row under the cursor. `V` starts a linewise
+selection and `y` copies it; `yy` or `3y` copy from the cursor. Clicking a chat line focuses
+the chat and moves the cursor there.
+
+In the thread list, `j`/`k` move, `Enter` opens a thread or folds a section.
+
+Every other key in normal mode with the composer focused edits it with Vim semantics. Motions: `h j k l w b e
 W B E 0 ^ $ gg G f F t T ; ,`, all taking counts. Operators `d c y` combine with a motion or a
 text object (`iw aw iW aW`, `i" a"`, `i( a( i[ a[ i{ a{ i< a<`), plus `dd cc yy D C Y x X`. `p P`
 paste from the single register, `r` replaces a character, `~` toggles case, `u` and `Ctrl-r`

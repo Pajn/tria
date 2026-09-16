@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap},
 };
 
 use crate::{
@@ -104,6 +104,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_composer(frame, app, composer);
     draw_status(frame, app, status);
     let chat_inner = app.chat_area;
+    apply_chat_cursor(frame, app, chat_inner);
     apply_selection(frame, app, chat_inner);
 
     match app.mode {
@@ -111,6 +112,80 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Help => draw_help(frame, area),
         _ => {}
     }
+}
+
+/// Highlight the chat line cursor and the linewise visual range when the chat has focus.
+fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
+    if app.focus != Focus::Chat || app.thread.is_none() || chat.height == 0 {
+        return;
+    }
+    let offset = app.chat_offset();
+    let buffer = frame.buffer_mut();
+    let paint = |buffer: &mut ratatui::buffer::Buffer, line: usize, style: Style| {
+        if line < offset || line >= offset + chat.height as usize {
+            return;
+        }
+        let y = chat.y + (line - offset) as u16;
+        for x in chat.x..chat.x + chat.width {
+            if let Some(cell) = buffer.cell_mut(Position::new(x, y)) {
+                cell.set_style(style);
+            }
+        }
+    };
+    if let Some(anchor) = app.chat_visual {
+        let (start, end) = (anchor.min(app.chat_cursor), anchor.max(app.chat_cursor));
+        for line in start..=end {
+            paint(
+                buffer,
+                line,
+                Style::default().bg(Color::Blue).fg(Color::White),
+            );
+        }
+    }
+    paint(
+        buffer,
+        app.chat_cursor,
+        Style::default().add_modifier(Modifier::REVERSED),
+    );
+}
+
+/// Text of the chat's content lines `start..=end`, as displayed after wrapping. Renders the
+/// covering blocks off screen so lines outside the viewport are available too.
+pub fn chat_text(start: usize, end: usize) -> Option<String> {
+    CACHE.with(|cache| {
+        let cache = cache.borrow();
+        let width = cache.key.as_ref()?.2;
+        let mut out: Vec<String> = Vec::new();
+        let mut y = 0usize;
+        for cached in &cache.blocks {
+            let block_start = y;
+            let block_end = y + cached.height;
+            y = block_end;
+            if block_end <= start || block_start > end {
+                continue;
+            }
+            let area = Rect::new(0, 0, width, cached.height.min(u16::MAX as usize) as u16);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            Paragraph::new(cached.block.text.clone())
+                .wrap(Wrap { trim: false })
+                .render(area, &mut buffer);
+            for line in start.max(block_start)..=end.min(block_end - 1) {
+                let row = (line - block_start) as u16;
+                let mut text = String::new();
+                for x in 0..width {
+                    if let Some(cell) = buffer.cell(Position::new(x, row)) {
+                        text.push_str(cell.symbol());
+                    }
+                }
+                out.push(text.trim_end().to_string());
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out.join("\n"))
+        }
+    })
 }
 
 /// Highlight the mouse selection over the drawn chat cells and, when a drag has just ended,
@@ -508,6 +583,14 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         };
         app.chat_viewport = (height, cache.total);
         app.work_ranges.clear();
+        app.message_starts.clear();
+        if app.focus == Focus::Chat {
+            app.chat_cursor = if app.scroll == Scroll::Follow {
+                cache.total.saturating_sub(1)
+            } else {
+                app.chat_cursor.min(cache.total.saturating_sub(1))
+            };
+        }
 
         let mut y = 0usize;
         let mut cursor = inner.y;
@@ -521,6 +604,9 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             let start = y;
             let end = y + block_height;
             y = end;
+            if matches!(block.key, BlockKey::Message(_)) {
+                app.message_starts.push(start);
+            }
             if let BlockKey::Work(key) = &block.key {
                 app.work_ranges.push((start, end, key.clone()));
                 for (row_start, row_end, row_key) in rows {
@@ -886,6 +972,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             " THREADS ",
             Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
         ),
+        (_, Focus::Chat) if app.chat_visual.is_some() => (
+            " VISUAL ",
+            Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
+        ),
+        (_, Focus::Chat) => (
+            " CHAT ",
+            Style::default().bg(Color::Yellow).fg(Color::Black).bold(),
+        ),
         _ => (
             " NORMAL ",
             Style::default().bg(Color::Blue).fg(Color::Black).bold(),
@@ -1054,12 +1148,17 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_help(frame: &mut Frame, area: Rect) {
     let text = Text::from(vec![
         Line::from(Span::styled("Normal", Style::default().bold())),
-        Line::from("  j/k  Ctrl-d/u  gg/G      scroll chat"),
+        Line::from("  Tab / Shift-Tab         cycle focus: composer → chat → threads · Esc back"),
         Line::from("  J/K                     next / previous thread"),
-        Line::from("  /  or  Space            fuzzy thread picker"),
+        Line::from("  /                       fuzzy thread picker"),
+        Line::from(""),
+        Line::from("  chat (focused):"),
+        Line::from("  j k  { }  gg G  Ctrl-d/u/f/b/e/y   line cursor / by message / scroll"),
         Line::from(
-            "  Tab                     focus thread list (j/k, Enter opens or folds a section)",
+            "  za or Enter             fold or unfold the tool group or row under the cursor",
         ),
+        Line::from("  V then y  ·  yy  ·  Ny  yank lines to the clipboard"),
+        Line::from(""),
         Line::from("  n                       new thread (pick project)"),
         Line::from("  m                       change model"),
         Line::from("  i / Enter               write a message"),
@@ -1071,7 +1170,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  gy                      yank last assistant message (OSC 52)"),
         Line::from("  Ctrl-e Ctrl-y Ctrl-d Ctrl-u  scroll the conversation by line / half page"),
         Line::from(""),
-        Line::from("  composer (normal mode, Vim):"),
+        Line::from("  composer (focused, Vim):"),
         Line::from("  h j k l w b e W B E 0 ^ $ gg G f F t T ; ,   motions, with counts"),
         Line::from(
             "  d c y + motion or iw aw i\" a( ...   operators and text objects; dd cc yy D C Y x X",

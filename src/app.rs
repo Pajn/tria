@@ -49,6 +49,8 @@ pub enum Mode {
 pub enum Focus {
     /// Keys edit the composer with Vim motions; the chat scrolls with Ctrl keys.
     Composer,
+    /// A line cursor moves through the conversation.
+    Chat,
     Sidebar,
 }
 
@@ -172,6 +174,15 @@ pub struct App {
     /// Screen regions from the last frame, for mouse hit testing.
     pub sidebar_inner: Option<Rect>,
     pub chat_area: Rect,
+    /// Line cursor in the chat, as a content line index. Tracks the last line while the
+    /// view follows new output.
+    pub chat_cursor: usize,
+    /// Anchor line of a linewise visual selection in the chat.
+    pub chat_visual: Option<usize>,
+    /// Count typed before a chat motion.
+    chat_count: Option<usize>,
+    /// First content line of every message block, for `{` and `}`.
+    pub message_starts: Vec<usize>,
     /// Mouse selection in the chat, in screen cells.
     pub selection: Option<Selection>,
     /// Text to push to the clipboard after the next frame is drawn.
@@ -213,6 +224,10 @@ impl App {
             sidebar_reveal: false,
             sidebar_inner: None,
             chat_area: Rect::default(),
+            chat_cursor: 0,
+            chat_visual: None,
+            chat_count: None,
+            message_starts: Vec::new(),
             selection: None,
             clipboard_pending: None,
             work_ranges: Vec::new(),
@@ -1116,6 +1131,230 @@ impl App {
         }
     }
 
+    // ── Chat cursor ────────────────────────────────────────────────────
+
+    /// Lines kept between the cursor and the viewport edge while moving.
+    const SCROLLOFF: usize = 3;
+
+    fn focus_chat(&mut self) {
+        if self.thread.is_none() {
+            self.toast("open a thread first (/ or Tab), or n for a new one", false);
+            return;
+        }
+        self.focus = Focus::Chat;
+        let (height, total) = self.chat_viewport;
+        if self.scroll == Scroll::Follow {
+            self.chat_cursor = total.saturating_sub(1);
+        } else {
+            let offset = self.chat_offset();
+            self.chat_cursor = self
+                .chat_cursor
+                .clamp(offset, (offset + height).saturating_sub(1).max(offset));
+        }
+    }
+
+    /// Place the cursor and scroll just enough to keep it in view with a margin. Landing on
+    /// the last line resumes following new output.
+    fn set_chat_cursor(&mut self, line: usize) {
+        let (height, total) = self.chat_viewport;
+        if total == 0 || height == 0 {
+            return;
+        }
+        let line = line.min(total - 1);
+        self.chat_cursor = line;
+        let max_offset = total.saturating_sub(height);
+        let mut offset = self.chat_offset();
+        let margin = Self::SCROLLOFF.min(height.saturating_sub(1) / 2);
+        if line < offset + margin {
+            offset = line.saturating_sub(margin);
+        } else if line + margin >= offset + height {
+            offset = (line + margin + 1).saturating_sub(height);
+        }
+        let offset = offset.min(max_offset);
+        self.scroll = if line == total - 1 || offset >= max_offset && line + 1 >= total {
+            Scroll::Follow
+        } else {
+            Scroll::Offset(offset)
+        };
+    }
+
+    /// Scroll the view and carry the cursor along, like Vim's Ctrl-d and Ctrl-u.
+    fn chat_scroll_by(&mut self, delta: isize) {
+        let (height, total) = self.chat_viewport;
+        let before = self.chat_offset();
+        self.scroll_by(delta);
+        let after = self.chat_offset();
+        let moved = after as isize - before as isize;
+        let target = (self.chat_cursor as isize + if moved == 0 { delta } else { moved })
+            .clamp(0, total.saturating_sub(1) as isize) as usize;
+        self.chat_cursor = target.clamp(after, (after + height).saturating_sub(1).max(after));
+        if self.chat_cursor + 1 >= total {
+            self.scroll = Scroll::Follow;
+        }
+    }
+
+    fn take_chat_count(&mut self) -> usize {
+        self.chat_count.take().unwrap_or(1).max(1)
+    }
+
+    fn on_chat_key(&mut self, key: KeyEvent, prefix: Option<char>) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let (height, total) = self.chat_viewport;
+        let cursor = self.chat_cursor;
+        match key.code {
+            KeyCode::Char(c @ '0'..='9') if c != '0' || self.chat_count.is_some() => {
+                let current = self.chat_count.unwrap_or(0);
+                self.chat_count = Some((current * 10 + (c as usize - '0' as usize)).min(100_000));
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let n = self.take_chat_count();
+                self.set_chat_cursor(cursor + n);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let n = self.take_chat_count();
+                self.set_chat_cursor(cursor.saturating_sub(n));
+            }
+            KeyCode::Char('d') if ctrl => self.chat_scroll_by(height as isize / 2),
+            KeyCode::Char('u') if ctrl => self.chat_scroll_by(-(height as isize / 2)),
+            KeyCode::Char('f') if ctrl => self.chat_scroll_by(height as isize),
+            KeyCode::Char('b') if ctrl => self.chat_scroll_by(-(height as isize)),
+            KeyCode::PageDown => self.chat_scroll_by(height as isize),
+            KeyCode::PageUp => self.chat_scroll_by(-(height as isize)),
+            KeyCode::Char('e') if ctrl => self.chat_scroll_by(1),
+            KeyCode::Char('y') if ctrl => self.chat_scroll_by(-1),
+            KeyCode::Char('g') if prefix == Some('g') => {
+                self.chat_count = None;
+                self.set_chat_cursor(0);
+                self.scroll = Scroll::Offset(0);
+                if self.thread.as_ref().is_some_and(|t| t.has_more) {
+                    self.load_older();
+                }
+            }
+            KeyCode::Char('x') if prefix == Some('g') => self.open_pull_request(false),
+            KeyCode::Char('t') if prefix == Some('g') => self.switch_tmux_session(),
+            KeyCode::Char('y') if prefix == Some('g') => self.yank_last_assistant(),
+            KeyCode::Char('a') if prefix == Some('g') => {
+                self.begin_answering();
+            }
+            KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
+            KeyCode::Char('G') => {
+                self.chat_count = None;
+                self.chat_cursor = total.saturating_sub(1);
+                self.scroll = Scroll::Follow;
+            }
+            KeyCode::Char('{') => {
+                let n = self.take_chat_count();
+                let mut target = cursor;
+                for _ in 0..n {
+                    match self.message_starts.iter().rev().find(|&&s| s < target) {
+                        Some(&s) => target = s,
+                        None => break,
+                    }
+                }
+                self.set_chat_cursor(target);
+            }
+            KeyCode::Char('}') => {
+                let n = self.take_chat_count();
+                let mut target = cursor;
+                for _ in 0..n {
+                    match self.message_starts.iter().find(|&&s| s > target) {
+                        Some(&s) => target = s,
+                        None => {
+                            target = total.saturating_sub(1);
+                            break;
+                        }
+                    }
+                }
+                self.set_chat_cursor(target);
+            }
+            KeyCode::Char('z') => self.pending_prefix = Some(('z', Instant::now())),
+            KeyCode::Char('a') if prefix == Some('z') => {
+                if let Some(key) = self.toggle_key_at(cursor) {
+                    self.toggle_expanded(key);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(key) = self.toggle_key_at(cursor) {
+                    self.toggle_expanded(key);
+                } else {
+                    self.toast("nothing to fold here", false);
+                }
+            }
+            KeyCode::Char('R') if prefix == Some('z') => self.expand_all = true,
+            KeyCode::Char('M') if prefix == Some('z') => {
+                self.expand_all = false;
+                self.expanded.clear();
+            }
+            KeyCode::Char('V') | KeyCode::Char('v') => {
+                self.chat_visual = match self.chat_visual {
+                    Some(_) => None,
+                    None => Some(cursor),
+                };
+            }
+            KeyCode::Char('y') => {
+                let (start, end) = match self.chat_visual.take() {
+                    Some(anchor) => (anchor.min(cursor), anchor.max(cursor)),
+                    None => {
+                        // `yy`: the current line, or `Ny` for several.
+                        let n = self.take_chat_count();
+                        (cursor, (cursor + n - 1).min(total.saturating_sub(1)))
+                    }
+                };
+                match ui::chat_text(start, end) {
+                    Some(text) if !text.trim().is_empty() => {
+                        copy_to_clipboard(&text);
+                        let lines = end - start + 1;
+                        self.toast(
+                            if lines == 1 {
+                                "yanked line".to_string()
+                            } else {
+                                format!("yanked {lines} lines")
+                            },
+                            false,
+                        );
+                    }
+                    _ => self.toast("nothing to yank", true),
+                }
+            }
+            KeyCode::Esc if self.chat_visual.is_some() || self.chat_count.is_some() => {
+                self.chat_visual = None;
+                self.chat_count = None;
+            }
+            KeyCode::Esc => {
+                self.toast = None;
+                self.focus = Focus::Composer;
+            }
+            KeyCode::Tab => {
+                self.chat_visual = None;
+                self.sidebar_visible = true;
+                self.focus = Focus::Sidebar;
+            }
+            KeyCode::BackTab => {
+                self.chat_visual = None;
+                self.focus = Focus::Composer;
+            }
+            KeyCode::Char('i') => {
+                self.chat_visual = None;
+                self.focus = Focus::Composer;
+                self.composer.checkpoint();
+                self.mode = Mode::Insert;
+            }
+            KeyCode::Char('J') => self.open_relative(1),
+            KeyCode::Char('K') => self.open_relative(-1),
+            KeyCode::Char('/') => self.open_picker(PickerKind::Thread),
+            KeyCode::Char('n') => self.open_picker(PickerKind::Project),
+            KeyCode::Char('m') => self.open_picker(PickerKind::Model),
+            KeyCode::Char('s') => self.sidebar_visible = !self.sidebar_visible,
+            KeyCode::Char('S') => self.show_settled = !self.show_settled,
+            KeyCode::Char(':') => {
+                self.mode = Mode::Command;
+                self.command_line.clear();
+            }
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            _ => {}
+        }
+    }
+
     // ── Scrolling ──────────────────────────────────────────────────────
 
     fn scroll_by(&mut self, delta: isize) {
@@ -1140,7 +1379,7 @@ impl App {
     }
 
     /// First content line shown in the chat viewport.
-    fn chat_offset(&self) -> usize {
+    pub fn chat_offset(&self) -> usize {
         let (height, total) = self.chat_viewport;
         match self.scroll {
             Scroll::Follow => total.saturating_sub(height),
@@ -1251,6 +1490,7 @@ impl App {
                 KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char(' ') => self.sidebar_activate(),
                 KeyCode::Char('S') => self.show_settled = !self.show_settled,
                 KeyCode::Esc | KeyCode::Tab | KeyCode::Char('h') => self.focus = Focus::Composer,
+                KeyCode::BackTab => self.focus_chat(),
                 KeyCode::Char('/') => self.open_picker(PickerKind::Thread),
                 KeyCode::Char('n') => self.open_picker(PickerKind::Project),
                 KeyCode::Char(':') => {
@@ -1260,6 +1500,10 @@ impl App {
                 KeyCode::Char('?') => self.mode = Mode::Help,
                 _ => {}
             }
+            return;
+        }
+        if self.focus == Focus::Chat {
+            self.on_chat_key(key, prefix);
             return;
         }
         let question_pending = self
@@ -1310,6 +1554,10 @@ impl App {
             KeyCode::Char('J') => return self.open_relative(1),
             KeyCode::Char('K') => return self.open_relative(-1),
             KeyCode::Tab => {
+                self.focus_chat();
+                return;
+            }
+            KeyCode::BackTab => {
                 self.sidebar_visible = true;
                 self.focus = Focus::Sidebar;
                 return;
@@ -1464,6 +1712,11 @@ impl App {
                         self.selection = None;
                         if self.chat_area.contains(at) {
                             let line = self.chat_offset() + (at.y - self.chat_area.y) as usize;
+                            if self.thread.is_some() {
+                                self.focus = Focus::Chat;
+                                self.chat_visual = None;
+                                self.set_chat_cursor(line);
+                            }
                             if let Some(key) = self.toggle_key_at(line) {
                                 self.toggle_expanded(key);
                             }

@@ -250,8 +250,12 @@ digit keys. Streaming appends deltas and re-renders at most every 16 ms.
   and text objects, `f F t T ; ,`, `p P`, `r`, `~`, `u`/`Ctrl-r`, and the insert entries
   `i a I A o O`. Digits answer a pending approval when there is one, else they are counts.
   `Ctrl-c` interrupts the running turn. The mouse wheel scrolls whichever pane it is over and
-  a left click in the thread list opens a thread or folds a section. A chat cursor with
-  visual mode is the natural next step once the chat owns its line wrapping. Dragging over the
+  a left click in the thread list opens a thread or folds a section, or focuses the chat
+  and places its line cursor.
+- *Chat focus*: a line cursor over the wrapped content lines (`j k`, `{ }` between message
+  blocks, `gg G`, Ctrl scrolling carries the cursor), fold under the cursor, linewise `V`
+  plus `y`. Yanked text is read back from an off-screen render of the covering blocks, so it
+  matches what is displayed. Charwise motions would need tria to own the wrapping. Dragging over the
   conversation selects screen cells in reading order and copies them through OSC 52 on
   release, so wrapped lines copy exactly as displayed.
 - *Insert*: the composer. `Enter` sends, `Alt-Enter` or `Ctrl-j` inserts a newline, `Esc`
