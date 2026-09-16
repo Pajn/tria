@@ -66,8 +66,11 @@ async fn main() -> Result<()> {
                 )
             })?;
             init_logging()?;
-            let git_command = cfg.git_command();
-            app::run(origin, token, git_command).await
+            let launch = app::Launch {
+                git_command: cfg.git_command(),
+                editor: cfg.editor(),
+            };
+            app::run(origin, token, launch).await
         }
         Some(Command::Dump { thread_id, seconds }) => {
             dump(&origin, &cfg, &thread_id, seconds).await

@@ -38,6 +38,7 @@ pub struct CachedBlock {
     height: usize,
     /// Toggle regions in wrapped content lines relative to the block start.
     rows: Vec<(usize, usize, String)>,
+    exports: Vec<(String, String)>,
 }
 
 thread_local! {
@@ -150,6 +151,32 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
         app.chat_cursor,
         Style::default().add_modifier(Modifier::REVERSED),
     );
+}
+
+/// Plain text of a block or tool row by export key.
+pub fn chat_export(key: &str) -> Option<String> {
+    CACHE.with(|cache| {
+        cache
+            .borrow()
+            .blocks
+            .iter()
+            .flat_map(|b| b.exports.iter())
+            .find(|(k, _)| k == key)
+            .map(|(_, text)| text.clone())
+    })
+}
+
+/// Plain text of the whole conversation as currently loaded.
+pub fn chat_export_all() -> String {
+    CACHE.with(|cache| {
+        cache
+            .borrow()
+            .blocks
+            .iter()
+            .filter_map(|b| b.exports.first().map(|(_, text)| text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
 }
 
 /// Every content line of the chat as displayed, rendered off screen once per rebuild.
@@ -604,7 +631,8 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             let mut total = 0usize;
             let blocks: Vec<CachedBlock> = blocks
                 .into_iter()
-                .map(|block| {
+                .map(|mut block| {
+                    let exports = std::mem::take(&mut block.exports);
                     let height = Paragraph::new(block.text.clone())
                         .wrap(Wrap { trim: false })
                         .line_count(inner.width);
@@ -638,6 +666,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
                         block,
                         height,
                         rows,
+                        exports,
                     }
                 })
                 .collect();
@@ -655,6 +684,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         };
         app.chat_viewport = (height, cache.total);
         app.work_ranges.clear();
+        app.block_ranges.clear();
         app.message_starts.clear();
         if app.focus == Focus::Chat {
             app.chat_cursor = if app.scroll == Scroll::Follow {
@@ -671,6 +701,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             block,
             height: block_height,
             rows,
+            exports,
         } in &cache.blocks
         {
             let start = y;
@@ -678,6 +709,9 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             y = end;
             if matches!(block.key, BlockKey::Message(_)) {
                 app.message_starts.push(start);
+            }
+            if let Some((key, _)) = exports.first() {
+                app.block_ranges.push((start, end, key.clone()));
             }
             if let BlockKey::Work(key) = &block.key {
                 app.work_ranges.push((start, end, key.clone()));

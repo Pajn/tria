@@ -12,11 +12,31 @@ pub struct Config {
     /// Shell command `gl` and `:git` run in the thread's directory. Defaults to `lazygit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_command: Option<String>,
+    /// Editor for `ge` and `gE`. Defaults to `$VISUAL`, then `$EDITOR`, then `nvim`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
 }
 
 pub const DEFAULT_GIT_COMMAND: &str = "lazygit";
 
 impl Config {
+    pub fn editor(&self) -> String {
+        self.editor
+            .clone()
+            .filter(|e| !e.trim().is_empty())
+            .or_else(|| {
+                std::env::var("VISUAL")
+                    .ok()
+                    .filter(|e| !e.trim().is_empty())
+            })
+            .or_else(|| {
+                std::env::var("EDITOR")
+                    .ok()
+                    .filter(|e| !e.trim().is_empty())
+            })
+            .unwrap_or_else(|| "nvim".to_string())
+    }
+
     pub fn git_command(&self) -> String {
         self.git_command
             .clone()

@@ -204,8 +204,14 @@ pub struct App {
     pub search_input: Option<SearchInput>,
     /// Command for `gl` and `:git`, from the config file.
     pub git_command: String,
+    /// Editor for `ge` and `gE`.
+    pub editor: String,
     /// A program to run in the terminal in tria's place; the event loop picks it up.
     pub pending_external: Option<ExternalCommand>,
+    /// A tmux popup still running, with what to do when it closes.
+    popup: Option<(std::process::Child, Option<FollowUp>)>,
+    /// Content-line range of every block with its export key.
+    pub block_ranges: Vec<(usize, usize, String)>,
     /// Mouse selection in the chat, in screen cells.
     pub selection: Option<Selection>,
     /// Text to push to the clipboard after the next frame is drawn.
@@ -254,7 +260,10 @@ impl App {
             search: None,
             search_input: None,
             git_command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
+            editor: "nvim".to_string(),
             pending_external: None,
+            popup: None,
+            block_ranges: Vec::new(),
             selection: None,
             clipboard_pending: None,
             work_ranges: Vec::new(),
@@ -799,7 +808,17 @@ impl App {
             return;
         };
         let command = self.git_command.clone();
+        self.launch_external(command, dir, None);
+    }
+
+    /// Run a program that needs the terminal. Inside tmux it goes into a popup and tria
+    /// polls for it to close; elsewhere the event loop hands the terminal over.
+    fn launch_external(&mut self, command: String, dir: String, then: Option<FollowUp>) {
         if std::env::var_os("TMUX").is_some() {
+            if self.popup.is_some() {
+                self.toast("a popup is already open", true);
+                return;
+            }
             let spawned = std::process::Command::new("tmux")
                 .args([
                     "display-popup",
@@ -816,12 +835,142 @@ impl App {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn();
-            if let Err(err) = spawned {
-                self.toast(format!("could not run tmux: {err}"), true);
+            match spawned {
+                Ok(child) => self.popup = Some((child, then)),
+                Err(err) => self.toast(format!("could not run tmux: {err}"), true),
             }
             return;
         }
-        self.pending_external = Some(ExternalCommand { command, dir });
+        self.pending_external = Some(ExternalCommand { command, dir, then });
+    }
+
+    /// Called on every tick: when the tmux popup has closed, run its follow-up.
+    fn poll_popup(&mut self) {
+        let done = match self.popup.as_mut() {
+            Some((child, _)) => matches!(child.try_wait(), Ok(Some(_)) | Err(_)),
+            None => return,
+        };
+        if done
+            && let Some((_, then)) = self.popup.take()
+            && let Some(then) = then
+        {
+            self.follow_up(then);
+        }
+    }
+
+    pub fn follow_up(&mut self, then: FollowUp) {
+        match then {
+            FollowUp::LoadComposer(path) => {
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        self.toast(format!("could not read editor file: {err}"), true);
+                        return;
+                    }
+                };
+                let _ = std::fs::remove_file(&path);
+                let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
+                if text == self.composer.text() {
+                    return;
+                }
+                self.composer.checkpoint();
+                self.composer.set_text(&text);
+                self.composer.leave_insert();
+                self.toast("composer updated from the editor", false);
+            }
+        }
+    }
+
+    // ── Editor ─────────────────────────────────────────────────────────
+
+    /// The editor over a temp file; `-R` for editors that understand it when read only.
+    fn editor_command(&self, path: &std::path::Path, read_only: bool) -> String {
+        let editor = self.editor.clone();
+        let program = editor
+            .split_whitespace()
+            .next()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let vimlike = matches!(program.as_str(), "vim" | "nvim" | "vi" | "view" | "gvim");
+        let flag = if read_only && vimlike { " -R" } else { "" };
+        format!("{editor}{flag} '{}'", path.display())
+    }
+
+    fn external_dir(&self) -> String {
+        self.thread_directory().unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        })
+    }
+
+    /// `ge` in the composer: edit the draft in the editor; the file is read back on exit.
+    fn edit_composer(&mut self) {
+        let path = match write_temp_file("draft", "md", &self.composer.text()) {
+            Ok(path) => path,
+            Err(err) => {
+                self.toast(format!("could not write temp file: {err}"), true);
+                return;
+            }
+        };
+        let command = self.editor_command(&path, false);
+        let dir = self.external_dir();
+        self.launch_external(command, dir, Some(FollowUp::LoadComposer(path)));
+    }
+
+    /// View text read only in the editor.
+    fn view_in_editor(&mut self, name: &str, text: &str) {
+        if text.trim().is_empty() {
+            self.toast("nothing to show", true);
+            return;
+        }
+        let path = match write_temp_file(name, "md", text) {
+            Ok(path) => path,
+            Err(err) => {
+                self.toast(format!("could not write temp file: {err}"), true);
+                return;
+            }
+        };
+        let command = self.editor_command(&path, true);
+        let dir = self.external_dir();
+        self.launch_external(command, dir, None);
+    }
+
+    /// `gE`: the whole conversation as loaded.
+    fn view_conversation(&mut self) {
+        if self.thread.is_none() {
+            self.toast("no thread open", true);
+            return;
+        }
+        let text = ui::chat_export_all();
+        self.view_in_editor("thread", &text);
+    }
+
+    /// `ge` in the chat: the message, plan, tool row, or tool group under the cursor.
+    fn view_at_cursor(&mut self) {
+        let line = self.chat_cursor;
+        // A tool row is more specific than its group, which is more specific than a block.
+        let key = self
+            .work_ranges
+            .iter()
+            .filter(|(start, end, _)| *start <= line && line < *end)
+            .min_by_key(|(start, end, _)| end - start)
+            .map(|(_, _, key)| key.clone())
+            .or_else(|| {
+                self.block_ranges
+                    .iter()
+                    .find(|(start, end, _)| *start <= line && line < *end)
+                    .map(|(_, _, key)| key.clone())
+            });
+        let Some(key) = key else {
+            self.toast("nothing under the cursor", true);
+            return;
+        };
+        match ui::chat_export(&key) {
+            Some(text) => self.view_in_editor("block", &text),
+            None => self.toast("nothing under the cursor", true),
+        }
     }
 
     // ── tmux ───────────────────────────────────────────────────────────
@@ -1183,6 +1332,8 @@ impl App {
             "pr" | "pull" => self.open_pull_request(true),
             "tmux" => self.switch_tmux_session(),
             "git" | "lazygit" => self.open_git(),
+            "edit" => self.edit_composer(),
+            "view" => self.view_conversation(),
             "settled" => self.show_settled = !self.show_settled,
             "settle" => {
                 if let Some(id) = thread_id.as_deref() {
@@ -1331,6 +1482,8 @@ impl App {
                 self.toggle_settled(id);
             }
             KeyCode::Char('l') if prefix == Some('g') => self.open_git(),
+            KeyCode::Char('e') if prefix == Some('g') => self.view_at_cursor(),
+            KeyCode::Char('E') if prefix == Some('g') => self.view_conversation(),
             KeyCode::Char('a') if prefix == Some('g') => {
                 self.begin_answering();
             }
@@ -1780,6 +1933,8 @@ impl App {
                 return;
             }
             KeyCode::Char('l') if prefix == Some('g') => return self.open_git(),
+            KeyCode::Char('e') if prefix == Some('g') => return self.edit_composer(),
+            KeyCode::Char('E') if prefix == Some('g') => return self.view_conversation(),
             KeyCode::Char('a') if prefix == Some('g') => {
                 if question_pending {
                     self.begin_answering();
@@ -2314,6 +2469,26 @@ pub fn match_ranges(line: &str, query: &str) -> Vec<(usize, usize)> {
 pub struct ExternalCommand {
     pub command: String,
     pub dir: String,
+    pub then: Option<FollowUp>,
+}
+
+/// What to do once an external program exits.
+#[derive(Debug, Clone)]
+pub enum FollowUp {
+    /// Read the file back into the composer.
+    LoadComposer(std::path::PathBuf),
+}
+
+/// Write `contents` to a fresh private file in the temp directory.
+fn write_temp_file(name: &str, ext: &str, contents: &str) -> std::io::Result<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(format!("tria-{name}-{}.{ext}", commands::new_id()));
+    std::fs::write(&path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(path)
 }
 
 /// Hand the terminal to `external`, wait for it, and take the terminal back.
@@ -2416,11 +2591,18 @@ pub enum SidebarRow {
 
 // ── Event loop ─────────────────────────────────────────────────────────
 
-pub async fn run(origin: String, token: String, git_command: String) -> Result<()> {
+/// External programs tria hands the terminal to, from the config file.
+pub struct Launch {
+    pub git_command: String,
+    pub editor: String,
+}
+
+pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     let (handle, mut updates) = session::spawn(origin, token);
     let (events_tx, mut events) = mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new(handle, events_tx.clone());
-    app.git_command = git_command;
+    app.git_command = launch.git_command;
+    app.editor = launch.editor;
 
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(
@@ -2466,6 +2648,7 @@ pub async fn run(origin: String, token: String, git_command: String) -> Result<(
             AppEvent::Terminal(_) => {}
             AppEvent::Tick => {
                 app.spinner = app.spinner.wrapping_add(1);
+                app.poll_popup();
                 if app
                     .toast
                     .as_ref()
@@ -2478,10 +2661,13 @@ pub async fn run(origin: String, token: String, git_command: String) -> Result<(
             AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
             AppEvent::Dispatched(Ok(())) => {}
         }
-        if let Some(external) = app.pending_external.take()
-            && let Err(err) = run_external(&mut terminal, &external)
-        {
-            app.toast(format!("{}: {err}", external.command), true);
+        if let Some(external) = app.pending_external.take() {
+            if let Err(err) = run_external(&mut terminal, &external) {
+                app.toast(format!("{}: {err}", external.command), true);
+            }
+            if let Some(then) = external.then {
+                app.follow_up(then);
+            }
         }
         if app.quit {
             break Ok(());

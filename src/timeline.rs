@@ -28,6 +28,10 @@ pub struct Block {
     /// Toggleable regions as `(first line, end line exclusive, expand key)`, in text-line
     /// indices before wrapping. Work groups list their header and each tool row.
     pub rows: Vec<(usize, usize, String)>,
+    /// Plain-text renderings keyed for export to an editor: the block itself under its
+    /// primary key (`msg:<id>`, the work group key, `plan:<id>`) and, for work groups, each
+    /// tool row under its expand key.
+    pub exports: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,10 +134,17 @@ pub fn build(
             }
         }
         let (text, rows) = render_work(pending, is_expanded, expanded, &key, width);
+        let mut exports = vec![(key.clone(), export_group(pending))];
+        exports.extend(
+            pending
+                .iter()
+                .map(|entry| (row_key(&key, entry), export_entry(entry))),
+        );
         blocks.push(Block {
             key: BlockKey::Work(key),
             text,
             rows,
+            exports,
         });
         pending.clear();
     };
@@ -152,10 +163,19 @@ pub fn build(
                     "system" => render_system(&message.text),
                     _ => render_assistant(&message.text, message.streaming),
                 };
+                let role = if message.role == "user" {
+                    "you"
+                } else {
+                    message.role.as_str()
+                };
                 blocks.push(Block {
                     key: BlockKey::Message(message.id.clone()),
                     text,
                     rows: Vec::new(),
+                    exports: vec![(
+                        format!("msg:{}", message.id),
+                        format!("## {role}\n\n{}\n", message.text.trim_end()),
+                    )],
                 });
             }
             Item::Activity(activity) => {
@@ -175,6 +195,10 @@ pub fn build(
                     key: BlockKey::Plan(plan.id.clone()),
                     text: render_plan(plan),
                     rows: Vec::new(),
+                    exports: vec![(
+                        format!("plan:{}", plan.id),
+                        format!("## proposed plan\n\n{}\n", plan.plan_markdown.trim_end()),
+                    )],
                 });
             }
         }
@@ -191,6 +215,7 @@ pub fn build(
             key: BlockKey::Working,
             text: render_working(thread),
             rows: Vec::new(),
+            exports: Vec::new(),
         });
     }
     blocks
@@ -496,6 +521,52 @@ fn status_style(entry: &WorkEntry) -> Style {
 }
 
 type Rows = Vec<(usize, usize, String)>;
+
+/// Plain text for one tool call: title, status, the input the server kept, the output
+/// summary, and changed files.
+fn export_entry(entry: &WorkEntry) -> String {
+    let mut out = format!("{} {}", entry.icon, entry.title);
+    if entry.status != "completed" {
+        out.push_str(&format!(" ({})", entry.status));
+    }
+    out.push('\n');
+    if let Some(input) = &entry.input {
+        out.push('\n');
+        out.push_str(input.trim_end());
+        out.push('\n');
+    } else if let Some(detail) = &entry.detail {
+        out.push('\n');
+        out.push_str(detail);
+        out.push('\n');
+    }
+    if let Some(output) = &entry.output {
+        out.push_str("\n→ ");
+        out.push_str(output.trim_end());
+        out.push('\n');
+    }
+    if !entry.files.is_empty() {
+        out.push('\n');
+        for file in &entry.files {
+            out.push_str("✎ ");
+            out.push_str(file);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn export_group(entries: &[WorkEntry]) -> String {
+    let mut out = format!(
+        "## {} tool call{}\n",
+        entries.len(),
+        if entries.len() == 1 { "" } else { "s" }
+    );
+    for entry in entries {
+        out.push('\n');
+        out.push_str(&export_entry(entry));
+    }
+    out
+}
 
 fn render_work(
     entries: &[WorkEntry],
