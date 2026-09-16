@@ -70,11 +70,11 @@ Press `?` inside the app for the full list.
 | `g!` | a shell in the popup, in the thread's directory |
 | `ge` | composer focused: edit the draft in your editor, read back on exit. Chat focused: view the message, plan, tool row, or tool group under the cursor |
 | `gE` | view the whole conversation in your editor |
-| `gx` | open the thread's pull request in the browser |
+| `gx` | open the link on the cursor's line, else the thread's pull request |
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
 | `Ctrl-c` | interrupt the running turn |
 | mouse wheel | scroll the conversation, or the thread list when the pointer is over it |
-| left click | in the thread list: open a thread, or fold and unfold a section; in the chat: fold and unfold a tool group or row |
+| left click | in the thread list: open a thread, or fold and unfold a section; in the chat: open a link, or fold and unfold a tool group or row |
 | drag | select text in the conversation; releasing copies it (OSC 52) |
 
 With the chat focused, a line cursor moves through the conversation: `j` `k` with counts,
@@ -161,6 +161,17 @@ queries a full-screen program sends on startup, so nothing waits on a timeout.
 `g!` or `:shell` opens a plain shell in the same popup, in the thread's directory. Exiting it,
 with `Ctrl-d` or `exit`, closes the popup. Both of these are scratch sessions: tria closes the
 ones it opened and leaves the desktop app's own alone.
+
+## Links
+
+URLs in the conversation are underlined, and clicking one opens it in the browser. With the
+chat focused, `gx` opens the link on the cursor's line, falling back to the thread's pull
+request when the line has none.
+
+Links are found on the drawn screen rather than in the message text, so one that wraps across
+two lines is still whole, and the same goes for a URL inside a tool row or a plan. Trailing
+sentence punctuation is left out of the link; brackets are kept when the URL opened them
+itself.
 
 ## Background tasks
 

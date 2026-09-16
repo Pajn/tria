@@ -260,6 +260,8 @@ pub struct App {
     /// Project directory and base branch for a new thread's worktree, resolved as the
     /// message is sent.
     draft_worktree: Option<(String, String)>,
+    /// Links on screen, rebuilt each draw, so a click knows what it landed on.
+    pub links: Vec<Link>,
     /// Command for `gl` and `:git`, from the config file.
     pub git_command: String,
     /// Editor for `ge` and `gE`.
@@ -329,6 +331,7 @@ impl App {
             vcs_refreshed: Instant::now(),
             new_thread_model: None,
             draft_worktree: None,
+            links: Vec::new(),
             drafts: HashMap::new(),
             git_command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
             editor: "nvim".to_string(),
@@ -1247,6 +1250,27 @@ impl App {
         true
     }
 
+    /// The link drawn at a screen position, if any.
+    fn link_at(&self, at: Position) -> Option<String> {
+        self.links
+            .iter()
+            .find(|link| link.row == at.y && at.x >= link.start && at.x < link.end)
+            .map(|link| link.url.clone())
+    }
+
+    /// The links on the cursor's line, for opening one without the mouse.
+    fn link_at_cursor(&self) -> Option<String> {
+        if self.focus != Focus::Chat {
+            return None;
+        }
+        let offset = self.chat_offset();
+        let row = self.chat_area.y + self.chat_cursor.checked_sub(offset)? as u16;
+        self.links
+            .iter()
+            .find(|link| link.row == row)
+            .map(|link| link.url.clone())
+    }
+
     /// `gw`: start the new thread in a fresh worktree, or in the project's checkout.
     fn toggle_draft_worktree(&mut self) {
         let Some(draft) = self.draft.as_mut() else {
@@ -1668,8 +1692,18 @@ impl App {
 
     // ── Pull requests ──────────────────────────────────────────────────
 
-    /// `gx` and `:pr`: open the thread's pull request in the browser. With several linked
-    /// pull requests, `:pr` offers a picker.
+    /// `gx`: the link under the chat cursor when there is one, else the thread's pull
+    /// request. Vim opens the link under the cursor with this key, and a chat line with a
+    /// link on it is the case where that is what you meant.
+    fn open_under_cursor(&mut self, pick: bool) {
+        match self.link_at_cursor() {
+            Some(url) => self.open_url(&url),
+            None => self.open_pull_request(pick),
+        }
+    }
+
+    /// Open the thread's pull request in the browser. With several linked pull requests,
+    /// `:pr` offers a picker.
     fn open_pull_request(&mut self, pick: bool) {
         let Some(shell) = self.thread.as_ref().map(|t| &t.detail.shell) else {
             self.toast("no thread open", true);
@@ -2106,7 +2140,7 @@ impl App {
                     self.load_older();
                 }
             }
-            KeyCode::Char('x') if prefix == Some('g') => self.open_pull_request(false),
+            KeyCode::Char('x') if prefix == Some('g') => self.open_under_cursor(false),
             KeyCode::Char('t') if prefix == Some('g') => self.switch_tmux_session(),
             KeyCode::Char('y') if prefix == Some('g') => self.yank_last_assistant(),
             KeyCode::Char('s') if prefix == Some('g') => {
@@ -2581,7 +2615,7 @@ impl App {
             KeyCode::PageDown => return self.scroll_by(height as isize),
             KeyCode::PageUp => return self.scroll_by(-(height as isize)),
             KeyCode::Char('g') if prefix == Some('g') => return self.composer.vim_top(),
-            KeyCode::Char('x') if prefix == Some('g') => return self.open_pull_request(false),
+            KeyCode::Char('x') if prefix == Some('g') => return self.open_under_cursor(false),
             KeyCode::Char('t') if prefix == Some('g') => return self.switch_tmux_session(),
             KeyCode::Char('y') if prefix == Some('g') => return self.yank_last_assistant(),
             KeyCode::Char('s') if prefix == Some('g') => {
@@ -2789,7 +2823,10 @@ impl App {
                                 self.chat_visual = None;
                                 self.set_chat_cursor(line);
                             }
-                            if let Some(key) = self.toggle_key_at(line) {
+                            // A link takes the click; folding would be a surprise.
+                            if let Some(url) = self.link_at(at) {
+                                self.open_url(&url);
+                            } else if let Some(key) = self.toggle_key_at(line) {
                                 self.toggle_expanded(key);
                             }
                         }
@@ -3094,6 +3131,68 @@ pub fn approval_options(approval: &PendingApproval) -> Vec<ApprovalOption> {
 }
 
 /// A drag selection over the chat, in screen coordinates. `anchor` is where the button went
+/// A link as drawn: the row and columns it occupies on screen, and where it points.
+/// A link that wraps occupies one of these per screen row.
+#[derive(Debug, Clone)]
+pub struct Link {
+    pub row: u16,
+    pub start: u16,
+    pub end: u16,
+    pub url: String,
+}
+
+/// The http links in a line of text, as byte ranges.
+///
+/// Trailing punctuation is left out, since a URL at the end of a sentence is usually
+/// followed by one, and a closing bracket only counts when the URL opened it.
+pub fn link_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at < text.len() {
+        let Some(found) = text[at..]
+            .find("http://")
+            .into_iter()
+            .chain(text[at..].find("https://"))
+            .min()
+        else {
+            break;
+        };
+        let start = at + found;
+        let mut end = start;
+        while end < text.len() {
+            let byte = bytes[end];
+            if byte.is_ascii_whitespace() || matches!(byte, b'<' | b'>' | b'"' | b'`' | b'|') {
+                break;
+            }
+            end += 1;
+        }
+        while end > start {
+            let last = bytes[end - 1];
+            let trailing = match last {
+                b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\'' => true,
+                b')' => count(&text[start..end], b')') > count(&text[start..end], b'('),
+                b']' => count(&text[start..end], b']') > count(&text[start..end], b'['),
+                _ => false,
+            };
+            if !trailing {
+                break;
+            }
+            end -= 1;
+        }
+        // Nothing past the scheme is not a link.
+        if text[start..end].len() > "https://".len() {
+            ranges.push((start, end));
+        }
+        at = end.max(start + 1);
+    }
+    ranges
+}
+
+fn count(text: &str, byte: u8) -> usize {
+    text.bytes().filter(|b| *b == byte).count()
+}
+
 /// down and `head` follows the pointer; either may come first in reading order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
@@ -3414,5 +3513,50 @@ mod tests {
         );
         assert_eq!(tmux_session_name("/home/me/work/app.v2/"), "app_v2");
         assert_eq!(tmux_session_name("main"), "main");
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::link_ranges;
+
+    fn links(text: &str) -> Vec<&str> {
+        link_ranges(text)
+            .into_iter()
+            .map(|(from, to)| &text[from..to])
+            .collect()
+    }
+
+    #[test]
+    fn a_bare_url_is_a_link() {
+        assert_eq!(
+            links("see https://example.com/a for more"),
+            ["https://example.com/a"]
+        );
+        assert_eq!(links("no links here"), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn sentence_punctuation_is_not_part_of_it() {
+        assert_eq!(links("at http://example.com/a."), ["http://example.com/a"]);
+        assert_eq!(links("(https://example.com/a)"), ["https://example.com/a"]);
+        // A bracket the URL opened itself stays.
+        assert_eq!(
+            links("https://example.com/a_(b)"),
+            ["https://example.com/a_(b)"]
+        );
+    }
+
+    #[test]
+    fn several_on_one_line_are_found() {
+        assert_eq!(
+            links("https://a.example/x and https://b.example/y"),
+            ["https://a.example/x", "https://b.example/y"]
+        );
+    }
+
+    #[test]
+    fn a_scheme_on_its_own_is_not_a_link() {
+        assert_eq!(links("https://"), Vec::<&str>::new());
     }
 }

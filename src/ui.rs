@@ -107,6 +107,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_composer(frame, app, composer);
     draw_status(frame, app, status);
     let chat_inner = app.chat_area;
+    apply_links(frame, app, chat_inner);
     apply_chat_cursor(frame, app, chat_inner);
     apply_search_highlights(frame, app, chat_inner);
     apply_selection(frame, app, chat_inner);
@@ -215,6 +216,80 @@ pub fn chat_lines() -> Vec<String> {
 
 /// Paint search matches on the visible chat rows, reading the drawn cells so highlights land
 /// on the right columns regardless of wrapping or wide characters.
+/// Underline the links on screen and record where they are, so a click can open one.
+/// This reads the drawn cells rather than the source text, so it covers everything the
+/// chat shows without each renderer having to care.
+fn apply_links(frame: &mut Frame, app: &mut App, chat: Rect) {
+    app.links.clear();
+    if app.thread.is_none() || chat.height == 0 {
+        return;
+    }
+    let buffer = frame.buffer_mut();
+    // Read the visible rows as text, keeping the column each byte came from.
+    let mut rows: Vec<(String, Vec<(usize, u16)>)> = Vec::new();
+    for y in chat.y..chat.y + chat.height {
+        let mut text = String::new();
+        let mut columns: Vec<(usize, u16)> = Vec::new();
+        for x in chat.x..chat.x + chat.width {
+            if let Some(cell) = buffer.cell(Position::new(x, y)) {
+                let symbol = cell.symbol();
+                if !symbol.is_empty() {
+                    columns.push((text.len(), x));
+                }
+                text.push_str(symbol);
+            }
+        }
+        rows.push((text, columns));
+    }
+
+    let mut links: Vec<crate::app::Link> = Vec::new();
+    for index in 0..rows.len() {
+        for (from, to) in crate::app::link_ranges(&rows[index].0) {
+            // A link that runs to the end of its row carries on below, one row at a time.
+            let mut url = rows[index].0[from..to].to_string();
+            let mut spans = vec![(index, from, to)];
+            let mut row = index;
+            let mut end = to;
+            while end == rows[row].0.trim_end().len() && row + 1 < rows.len() {
+                let next = &rows[row + 1].0;
+                let run = next.find(char::is_whitespace).unwrap_or(next.len());
+                if run == 0 {
+                    break;
+                }
+                url.push_str(&next[..run]);
+                spans.push((row + 1, 0, run));
+                row += 1;
+                end = run;
+            }
+            for (row, from, to) in spans {
+                let y = chat.y + row as u16;
+                let mut first = None;
+                let mut last = None;
+                for &(byte, x) in &rows[row].1 {
+                    if byte < from || byte >= to {
+                        continue;
+                    }
+                    first.get_or_insert(x);
+                    last = Some(x);
+                    if let Some(cell) = buffer.cell_mut(Position::new(x, y)) {
+                        let style = cell.style().add_modifier(Modifier::UNDERLINED);
+                        cell.set_style(style);
+                    }
+                }
+                if let (Some(first), Some(last)) = (first, last) {
+                    links.push(crate::app::Link {
+                        row: y,
+                        start: first,
+                        end: last + 1,
+                        url: url.clone(),
+                    });
+                }
+            }
+        }
+    }
+    app.links = links;
+}
+
 fn apply_search_highlights(frame: &mut Frame, app: &App, chat: Rect) {
     let query = match (&app.search_input, &app.search) {
         (Some(input), _) if app.mode == Mode::Search => input.query.as_str(),
@@ -1658,7 +1733,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  gw                      new thread: fresh worktree or the project checkout"),
         Line::from("  gl                      lazygit in the thread's terminal pane"),
         Line::from("  g!                      a shell in the pane"),
-        Line::from("  gx                      open the thread's pull request in the browser"),
+        Line::from(
+            "  gx                      open the link under the cursor, else the pull request",
+        ),
+        Line::from("  click a link            open it in the browser"),
         Line::from(
             "  gt                      switch to the tmux session for the thread's directory",
         ),
