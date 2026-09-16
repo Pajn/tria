@@ -1551,10 +1551,11 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             "  ga                      answer the agent's question (digits, Space, c custom, Enter)",
         ),
         Line::from("  gy                      yank last assistant message (OSC 52)"),
-        Line::from("  gl                      lazygit in the thread's directory"),
+        Line::from("  gl                      lazygit in the thread's terminal pane"),
         Line::from("  gT                      background tasks still running in this thread"),
         Line::from("  gS                      terminals for this thread: Enter attaches,"),
         Line::from("                          c opens a new one, x closes, r restarts"),
+        Line::from("  in the pane             every key goes to the shell · Ctrl-\\ detaches"),
         Line::from(
             "  ge                      composer: edit the draft · chat: view the block under the cursor",
         ),
@@ -1571,7 +1572,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         Line::from("  s / S                   toggle sidebar / settled shelf"),
         Line::from("  gs                      settle the thread, or bring a settled one back"),
-        Line::from("  gl                      lazygit for the thread's directory (tmux popup)"),
+        Line::from("  gl                      lazygit in the thread's terminal pane"),
         Line::from("  gx                      open the thread's pull request in the browser"),
         Line::from(
             "  gt                      switch to the tmux session for the thread's directory",

@@ -30,6 +30,9 @@ use crate::{
 const TERMINAL_COLS: u16 = 120;
 const TERMINAL_ROWS: u16 = 30;
 
+/// The terminal `gl` reuses, one per thread, so the git command keeps its place.
+const GIT_TERMINAL_ID: &str = "tria-git";
+
 /// Draft key for a thread that does not exist yet.
 const NEW_THREAD_DRAFT_KEY: &str = "\0new-thread";
 
@@ -229,6 +232,8 @@ pub struct App {
     pub terminal_selected: usize,
     /// The attached terminal, when one is open.
     pub pane: Option<crate::term::Pane>,
+    /// A command to type into the pane once its shell reports for duty, for `gl`.
+    pending_pane_command: Option<String>,
     /// Command for `gl` and `:git`, from the config file.
     pub git_command: String,
     /// Editor for `ge` and `gE`.
@@ -289,6 +294,7 @@ impl App {
             terminals: Vec::new(),
             terminal_selected: 0,
             pane: None,
+            pending_pane_command: None,
             drafts: HashMap::new(),
             git_command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
             editor: "nvim".to_string(),
@@ -1012,13 +1018,23 @@ impl App {
             self.toast("no terminal selected", true);
             return;
         };
-        let (cols, rows) = self.pane_size();
-        self.handle
-            .attach_terminal(&terminal.thread_id, &terminal.terminal_id, cols, rows);
-        self.pane = Some(crate::term::Pane::new(
+        self.open_pane(
             terminal.thread_id,
             terminal.terminal_id,
             terminal.label,
+            terminal.cwd,
+        );
+    }
+
+    /// Attach and show the pane. The server opens or revives the terminal as needed.
+    fn open_pane(&mut self, thread_id: String, terminal_id: String, label: String, cwd: String) {
+        let (cols, rows) = self.pane_size();
+        self.handle
+            .attach_terminal(&thread_id, &terminal_id, &cwd, cols, rows);
+        self.pane = Some(crate::term::Pane::new(
+            thread_id,
+            terminal_id,
+            label,
             cols,
             rows,
         ));
@@ -1052,6 +1068,14 @@ impl App {
             Event::Snapshot { snapshot } | Event::Restarted { snapshot } => {
                 pane.label = snapshot.label;
                 pane.reset(&snapshot.history);
+                let terminal_id = pane.terminal_id.clone();
+                // Only type the queued command into a shell that is sitting idle: an
+                // existing session already running it should be left alone.
+                if let Some(command) = self.pending_pane_command.take()
+                    && !self.terminal_busy(&terminal_id)
+                {
+                    self.write_to_pane(command);
+                }
             }
             Event::Output { data } => pane.feed(&data),
             Event::Cleared => pane.reset(""),
@@ -1069,6 +1093,7 @@ impl App {
                 self.toast("terminal closed", false);
                 self.detach_terminal();
             }
+            Event::Activity { label } => pane.label = label,
             Event::Error { message } => self.toast(message, true),
             Event::Unknown => {}
         }
@@ -1094,16 +1119,30 @@ impl App {
         let Some(data) = crate::term::encode_key(&key, app_cursor) else {
             return;
         };
-        let (thread_id, terminal_id) = (pane.thread_id.clone(), pane.terminal_id.clone());
+        self.write_to_pane(data);
+    }
+
+    /// Send bytes to the attached terminal.
+    fn write_to_pane(&self, data: String) {
+        let Some(pane) = self.pane.as_ref() else {
+            return;
+        };
+        let payload = json!({
+            "threadId": pane.thread_id,
+            "terminalId": pane.terminal_id,
+            "data": data,
+        });
         let handle = self.handle.clone();
         tokio::spawn(async move {
-            let payload = json!({
-                "threadId": thread_id,
-                "terminalId": terminal_id,
-                "data": data,
-            });
             let _ = handle.call("terminal.write", payload).await;
         });
+    }
+
+    /// Whether that terminal has a command running, as the metadata stream last said.
+    fn terminal_busy(&self, terminal_id: &str) -> bool {
+        self.terminals
+            .iter()
+            .any(|t| t.terminal_id == terminal_id && t.has_running_subprocess)
     }
 
     /// Tell the server the pane's size after a redraw changed it.
@@ -1165,13 +1204,20 @@ impl App {
     /// `gl` and `:git`: run the git command in the thread's directory. Inside tmux it opens
     /// as a popup over the pane and tria keeps running; elsewhere tria steps aside until
     /// the command exits.
+    /// `gl` and `:git`: run the git command in the thread's own terminal, in the pane.
+    /// Reuses one terminal per thread, so leaving and coming back finds it where it was.
     fn open_git(&mut self) {
         let Some(dir) = self.thread_directory() else {
             self.toast("no thread open", true);
             return;
         };
+        let Some(thread_id) = self.current_thread_id.clone() else {
+            self.toast("no thread open", true);
+            return;
+        };
         let command = self.git_command.clone();
-        self.launch_external(command, dir, None);
+        self.pending_pane_command = Some(format!("{command}\r"));
+        self.open_pane(thread_id, GIT_TERMINAL_ID.to_string(), command, dir);
     }
 
     /// Run a program that needs the terminal. Inside tmux it goes into a popup and tria
@@ -2688,8 +2734,14 @@ impl App {
                     && let Some(pane) = &self.pane
                 {
                     let (cols, rows) = pane.size();
-                    self.handle
-                        .attach_terminal(&pane.thread_id, &pane.terminal_id, cols, rows);
+                    let cwd = self.thread_directory().unwrap_or_default();
+                    self.handle.attach_terminal(
+                        &pane.thread_id,
+                        &pane.terminal_id,
+                        &cwd,
+                        cols,
+                        rows,
+                    );
                 }
                 self.status = status;
             }

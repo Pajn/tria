@@ -65,7 +65,7 @@ Press `?` inside the app for the full list.
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
 | `gT` | list the agent's background tasks that are still running |
 | `gS` | list the thread's terminals; attach to one, or close, restart, open a new one |
-| `gl` | open lazygit in the thread's directory: a tmux popup, or in tria's place outside tmux |
+| `gl` | open lazygit in the thread's terminal pane |
 | `ge` | composer focused: edit the draft in your editor, read back on exit. Chat focused: view the message, plan, tool row, or tool group under the cursor |
 | `gE` | view the whole conversation in your editor |
 | `gx` | open the thread's pull request in the browser |
@@ -118,10 +118,13 @@ offers a picker when several pull requests are linked.
 
 ## Git
 
-`gl` or `:git` runs `lazygit` in the thread's working directory. Inside tmux it opens as a
-popup over the pane while tria keeps running; close lazygit to return. Outside tmux, tria
-steps aside, runs the command in the same terminal, and redraws when it exits. Set
-`git_command` in the config file to run something else, for example `tig` or `git status`.
+`gl` or `:git` runs `lazygit` in a terminal of the thread's own, in the pane. The terminal is
+reused, one per thread, so `Ctrl-\` while lazygit is up and `gl` again comes back to it exactly
+as it was; once it has exited, `gl` starts it again. Set `git_command` in the config file to run
+something else, for example `tig` or `git status`.
+
+The terminal belongs to the server, so this works the same whether the server is on this
+machine or another one, and lazygit runs where the repository is.
 
 ## Background tasks
 

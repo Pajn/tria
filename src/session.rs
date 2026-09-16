@@ -28,10 +28,12 @@ pub enum Request {
     LoadOlder {
         before_cursor: String,
     },
-    /// Attach to a terminal: replaces any current attachment.
+    /// Attach to a terminal: replaces any current attachment. The server opens the
+    /// terminal when it does not exist, and restarts it when its shell has exited.
     Attach {
         thread_id: Id,
         terminal_id: String,
+        cwd: String,
         cols: u16,
         rows: u16,
     },
@@ -113,10 +115,18 @@ impl Handle {
     }
 
     /// Attach to a terminal. Output arrives as `Update::TerminalStream`.
-    pub fn attach_terminal(&self, thread_id: &str, terminal_id: &str, cols: u16, rows: u16) {
+    pub fn attach_terminal(
+        &self,
+        thread_id: &str,
+        terminal_id: &str,
+        cwd: &str,
+        cols: u16,
+        rows: u16,
+    ) {
         let _ = self.tx.send(Request::Attach {
             thread_id: thread_id.to_string(),
             terminal_id: terminal_id.to_string(),
+            cwd: cwd.to_string(),
             cols,
             rows,
         });
@@ -273,10 +283,11 @@ async fn run(
                             open = Some(OpenThread { id, last_sequence: None, subscription });
                         }
                         Request::CloseThread => open = None,
-                        Request::Attach { thread_id, terminal_id, cols, rows } => {
+                        Request::Attach { thread_id, terminal_id, cwd, cols, rows } => {
                             let payload = json!({
                                 "threadId": thread_id,
                                 "terminalId": terminal_id,
+                                "cwd": cwd,
                                 "cols": cols,
                                 "rows": rows,
                                 "restartIfNotRunning": true,

@@ -289,7 +289,11 @@ pub enum TerminalStreamEvent {
     Error {
         message: String,
     },
-    /// `activity`, and anything a newer server adds; the metadata stream covers it.
+    /// The server's own title for the session: the shell, or the command it is running.
+    Activity {
+        label: String,
+    },
+    /// Anything a newer server adds.
     #[serde(other)]
     Unknown,
 }
