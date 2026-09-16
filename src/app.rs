@@ -753,6 +753,35 @@ impl App {
         self.toast("yanked last assistant message to clipboard", false);
     }
 
+    // ── Settling ───────────────────────────────────────────────────────
+
+    /// `gs`: park an active thread on the settled shelf, or bring a settled one back.
+    fn toggle_settled(&mut self, thread_id: Option<String>) {
+        let Some(id) = thread_id else {
+            self.toast("no thread selected", true);
+            return;
+        };
+        let Some(shell) = self.shell.threads.get(&id) else {
+            return;
+        };
+        let title = shell.title.clone();
+        if shell.is_settled() {
+            self.dispatch(commands::unsettle(&id));
+            self.toast(format!("un-settled: {title}"), false);
+        } else {
+            self.dispatch(commands::simple("thread.settle", &id));
+            self.toast(format!("settled: {title}"), false);
+        }
+    }
+
+    /// Thread under the sidebar selection, when a thread row is selected.
+    fn sidebar_selected_thread(&self) -> Option<String> {
+        match self.sidebar_rows().get(self.sidebar_selected) {
+            Some(SidebarRow::Thread { id, .. }) => Some(id.clone()),
+            _ => None,
+        }
+    }
+
     // ── tmux ───────────────────────────────────────────────────────────
 
     /// Directory the current thread works in: its worktree, else the project root.
@@ -1254,6 +1283,10 @@ impl App {
             KeyCode::Char('x') if prefix == Some('g') => self.open_pull_request(false),
             KeyCode::Char('t') if prefix == Some('g') => self.switch_tmux_session(),
             KeyCode::Char('y') if prefix == Some('g') => self.yank_last_assistant(),
+            KeyCode::Char('s') if prefix == Some('g') => {
+                let id = self.current_thread_id.clone();
+                self.toggle_settled(id);
+            }
             KeyCode::Char('a') if prefix == Some('g') => {
                 self.begin_answering();
             }
@@ -1646,6 +1679,10 @@ impl App {
                     self.sidebar_selected = 0;
                     self.sidebar_reveal = true;
                 }
+                KeyCode::Char('s') if prefix == Some('g') => {
+                    let id = self.sidebar_selected_thread();
+                    self.toggle_settled(id);
+                }
                 KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
                 KeyCode::Char('G') => {
                     self.sidebar_selected = self.sidebar_rows().len().saturating_sub(1);
@@ -1692,6 +1729,11 @@ impl App {
             KeyCode::Char('x') if prefix == Some('g') => return self.open_pull_request(false),
             KeyCode::Char('t') if prefix == Some('g') => return self.switch_tmux_session(),
             KeyCode::Char('y') if prefix == Some('g') => return self.yank_last_assistant(),
+            KeyCode::Char('s') if prefix == Some('g') => {
+                let id = self.current_thread_id.clone();
+                self.toggle_settled(id);
+                return;
+            }
             KeyCode::Char('a') if prefix == Some('g') => {
                 if question_pending {
                     self.begin_answering();

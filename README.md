@@ -62,6 +62,7 @@ Press `?` inside the app for the full list.
 | `1`..`9` | answer a pending approval; otherwise a count for the next motion |
 | `ga` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `gy` | copy the last assistant message (OSC 52) |
+| `gs` | toggle the thread between settled and active; in the thread list, the selected row |
 | `gx` | open the thread's pull request in the browser |
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
 | `Ctrl-c` | interrupt the running turn |

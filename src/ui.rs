@@ -1264,6 +1264,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             "  i a I A o O   insert · p P paste · r replace · ~ case · u / Ctrl-r undo / redo",
         ),
         Line::from("  s / S                   toggle sidebar / settled shelf"),
+        Line::from("  gs                      settle the thread, or bring a settled one back"),
         Line::from("  gx                      open the thread's pull request in the browser"),
         Line::from(
             "  gt                      switch to the tmux session for the thread's directory",
