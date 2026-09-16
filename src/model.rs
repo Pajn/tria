@@ -249,6 +249,35 @@ pub enum TerminalEvent {
     Unknown,
 }
 
+/// The checkout a thread works in, as `subscribeVcsStatus` reports it. The thread list
+/// only carries a branch for threads the server created one for, so this is where the
+/// branch comes from for everything else.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VcsLocal {
+    pub is_repo: bool,
+    /// The checked-out branch, absent on a detached head.
+    pub ref_name: Option<String>,
+    #[serde(default)]
+    pub is_default_ref: bool,
+    #[serde(default)]
+    pub has_working_tree_changes: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "_tag", rename_all = "camelCase")]
+pub enum VcsEvent {
+    Snapshot {
+        local: VcsLocal,
+    },
+    LocalUpdated {
+        local: VcsLocal,
+    },
+    /// Remote state: ahead, behind, and the pull request, which the thread list carries too.
+    #[serde(other)]
+    Unknown,
+}
+
 /// A terminal session with its scrollback, as `terminal.attach` and `terminal.open` return it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

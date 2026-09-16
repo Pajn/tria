@@ -498,9 +498,22 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             format!("  {}", app.shell.project_title(&shell.project_id)),
             Style::default().fg(Color::DarkGray),
         ));
-        if let Some(branch) = &shell.branch {
+        // The thread list carries a branch only for threads the server made one for;
+        // for the rest it comes from watching the checkout.
+        let branch = shell
+            .branch
+            .clone()
+            .or_else(|| app.vcs.as_ref().and_then(|vcs| vcs.ref_name.clone()));
+        if let Some(branch) = branch {
             spans.push(Span::styled(
                 format!("   {branch}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        // Only worth naming when the thread has a checkout of its own.
+        if let Some(worktree) = shell.worktree_path.as_deref().and_then(worktree_name) {
+            spans.push(Span::styled(
+                format!("  ⌂ {worktree}"),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -1369,6 +1382,11 @@ fn draw_terminal_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.set_cursor_position(Position::new(inner.x + col, inner.y + row));
         }
     }
+}
+
+/// The last component of a worktree path, which is what identifies it.
+fn worktree_name(path: &str) -> Option<&str> {
+    path.rsplit('/').find(|part| !part.is_empty())
 }
 
 /// vt100 colors, with the terminal's own default for `Default`.

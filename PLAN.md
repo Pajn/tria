@@ -210,6 +210,17 @@ Slash commands need no encoding: a provider command works when it is the first t
 text. File mentions can be plain `@path` text. Attachments and the `t3-context://` chip format
 are out of scope.
 
+### Checkout state
+
+`subscribeVcsStatus` takes a `cwd` and streams `{ _tag: "snapshot", local, remote }` followed
+by `localUpdated` and `remoteUpdated`. `local` carries `isRepo`, `refName` (null on a detached
+head), `isDefaultRef`, `hasWorkingTreeChanges` and a per-file working tree summary; `remote`
+carries `hasUpstream`, ahead and behind counts, and a pull request.
+
+This is where a branch comes from. `ThreadShell.branch` is set only for threads the server
+created a branch for, and is null for the rest, including every thread working in a project's
+own checkout.
+
 ### Terminals
 
 Terminals are a subsystem of their own, outside `orchestration.dispatchCommand` and outside the

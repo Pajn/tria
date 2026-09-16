@@ -39,6 +39,10 @@ pub enum Request {
     },
     /// Drop the terminal attachment, which stops the server sending its output.
     Detach,
+    /// Watch the checkout at `cwd`, or stop watching when it is `None`.
+    WatchVcs {
+        cwd: Option<String>,
+    },
     /// Any other RPC, for the calls that are not orchestration commands.
     Call {
         tag: String,
@@ -72,6 +76,8 @@ pub enum Update {
     Terminals(crate::model::TerminalEvent),
     /// Output from the attached terminal.
     TerminalStream(crate::model::TerminalStreamEvent),
+    /// The watched checkout's state.
+    Vcs(crate::model::VcsEvent),
     /// The open thread's stream failed; the supervisor resubscribes on its own.
     ThreadStreamError {
         error: String,
@@ -136,6 +142,11 @@ impl Handle {
         let _ = self.tx.send(Request::Detach);
     }
 
+    /// Follow the branch of a checkout. One at a time: this is for the open thread.
+    pub fn watch_vcs(&self, cwd: Option<String>) {
+        let _ = self.tx.send(Request::WatchVcs { cwd });
+    }
+
     pub async fn dispatch(&self, command: Value) -> Result<u64> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -168,6 +179,8 @@ async fn run(
 ) {
     let mut shell_sequence: Option<u64> = None;
     let mut open: Option<OpenThread> = None;
+    // Kept across reconnects so the watch resumes with the socket.
+    let mut watched_cwd: Option<String> = None;
     let mut attempt: u32 = 0;
     let mut pagination = false;
 
@@ -240,6 +253,13 @@ async fn run(
         };
         // Attachments belong to one socket; a reconnect drops it and the UI re-attaches.
         let mut attached: Option<Subscription> = None;
+        let mut vcs: Option<Subscription> = None;
+        if let Some(cwd) = watched_cwd.clone() {
+            vcs = client
+                .subscribe("subscribeVcsStatus", json!({ "cwd": cwd }))
+                .await
+                .ok();
+        }
         if let Some(open) = open.as_mut() {
             open.subscription = subscribe_thread(&client, &open.id, open.last_sequence, pagination)
                 .await
@@ -266,6 +286,12 @@ async fn run(
             };
             let attached_next = async {
                 match attached.as_mut() {
+                    Some(sub) => sub.next().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let vcs_next = async {
+                match vcs.as_mut() {
                     Some(sub) => sub.next().await,
                     None => std::future::pending().await,
                 }
@@ -301,6 +327,18 @@ async fn run(
                             }
                         }
                         Request::Detach => attached = None,
+                        Request::WatchVcs { cwd } => {
+                            watched_cwd = cwd.clone();
+                            vcs = match cwd {
+                                // Not every thread directory is a checkout; the stream
+                                // says so itself and a failure is not worth reporting.
+                                Some(cwd) => client
+                                    .subscribe("subscribeVcsStatus", json!({ "cwd": cwd }))
+                                    .await
+                                    .ok(),
+                                None => None,
+                            };
+                        }
                         Request::LoadOlder { before_cursor } => {
                             if let Some(o) = open.as_ref() {
                                 let payload = json!({
@@ -364,6 +402,19 @@ async fn run(
                                 Err(_) => break,
                             }
                         }
+                    }
+                }
+                item = vcs_next => {
+                    match item {
+                        Some(Ok(value)) => match serde_json::from_value::<crate::model::VcsEvent>(value) {
+                            Ok(event) => { let _ = updates.send(Update::Vcs(event)); }
+                            Err(err) => tracing::warn!(?err, "undecodable vcs event"),
+                        },
+                        Some(Err(err)) => {
+                            tracing::info!(%err, "vcs status stream ended");
+                            vcs = None;
+                        }
+                        None => vcs = None,
                     }
                 }
                 item = attached_next => {
