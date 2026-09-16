@@ -254,8 +254,10 @@ digit keys. Streaming appends deltas and re-renders at most every 16 ms.
   and places its line cursor.
 - *Chat focus*: a line cursor over the wrapped content lines (`j k`, `{ }` between message
   blocks, `gg G`, Ctrl scrolling carries the cursor), fold under the cursor, linewise `V`
-  plus `y`. Yanked text is read back from an off-screen render of the covering blocks, so it
-  matches what is displayed. Charwise motions would need tria to own the wrapping. Dragging over the
+  plus `y`, and `/` `?` `n` `N` search over the displayed lines with smartcase and
+  incremental preview. Yanked and searched text is read back from an off-screen render of
+  the covering blocks, so it matches what is displayed. Charwise motions would need tria to
+  own the wrapping. Dragging over the
   conversation selects screen cells in reading order and copies them through OSC 52 on
   release, so wrapped lines copy exactly as displayed.
 - *Insert*: the composer. `Enter` sends, `Alt-Enter` or `Ctrl-j` inserts a newline, `Esc`

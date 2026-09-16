@@ -76,6 +76,12 @@ output), `Ctrl-d` `Ctrl-u` `Ctrl-f` `Ctrl-b` `Ctrl-e` `Ctrl-y` to scroll with th
 selection and `y` copies it; `yy` or `3y` copy from the cursor. Clicking a chat line focuses
 the chat and moves the cursor there.
 
+`/` and `?` search the conversation forward or backward. The cursor previews the first match
+while you type, `Enter` accepts, `Esc` goes back to where you were. `n` and `N` step to the
+next and previous match, wrapping around with a notice. Matches are highlighted while the
+chat has focus. Queries are case-insensitive unless they contain an uppercase letter. In the
+chat, `?` searches; help is `?` from the composer or `:help`.
+
 In the thread list, `j`/`k` move, `Enter` opens a thread or folds a section.
 
 Every other key in normal mode with the composer focused edits it with Vim semantics. Motions: `h j k l w b e

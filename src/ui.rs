@@ -28,6 +28,8 @@ pub struct ChatCache {
     key: Option<(String, u64, u16, u64, bool, usize)>,
     blocks: Vec<CachedBlock>,
     total: usize,
+    /// Every content line as displayed, filled on demand for search.
+    lines: Option<Vec<String>>,
 }
 
 pub struct CachedBlock {
@@ -105,6 +107,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_status(frame, app, status);
     let chat_inner = app.chat_area;
     apply_chat_cursor(frame, app, chat_inner);
+    apply_search_highlights(frame, app, chat_inner);
     apply_selection(frame, app, chat_inner);
 
     match app.mode {
@@ -147,6 +150,74 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
         app.chat_cursor,
         Style::default().add_modifier(Modifier::REVERSED),
     );
+}
+
+/// Every content line of the chat as displayed, rendered off screen once per rebuild.
+pub fn chat_lines() -> Vec<String> {
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.lines.is_none() {
+            let Some(width) = cache.key.as_ref().map(|k| k.2) else {
+                return Vec::new();
+            };
+            let mut lines = Vec::with_capacity(cache.total);
+            for cached in &cache.blocks {
+                let area = Rect::new(0, 0, width, cached.height.min(u16::MAX as usize) as u16);
+                let mut buffer = ratatui::buffer::Buffer::empty(area);
+                Paragraph::new(cached.block.text.clone())
+                    .wrap(Wrap { trim: false })
+                    .render(area, &mut buffer);
+                for row in 0..area.height {
+                    let mut text = String::new();
+                    for x in 0..width {
+                        if let Some(cell) = buffer.cell(Position::new(x, row)) {
+                            text.push_str(cell.symbol());
+                        }
+                    }
+                    lines.push(text.trim_end().to_string());
+                }
+            }
+            cache.lines = Some(lines);
+        }
+        cache.lines.clone().unwrap_or_default()
+    })
+}
+
+/// Paint search matches on the visible chat rows, reading the drawn cells so highlights land
+/// on the right columns regardless of wrapping or wide characters.
+fn apply_search_highlights(frame: &mut Frame, app: &App, chat: Rect) {
+    let query = match (&app.search_input, &app.search) {
+        (Some(input), _) if app.mode == Mode::Search => input.query.as_str(),
+        (_, Some(search)) if app.focus == Focus::Chat => search.query.as_str(),
+        _ => return,
+    };
+    if query.is_empty() || app.thread.is_none() {
+        return;
+    }
+    let buffer = frame.buffer_mut();
+    for y in chat.y..chat.y + chat.height {
+        let mut text = String::new();
+        let mut starts: Vec<(usize, u16)> = Vec::new();
+        for x in chat.x..chat.x + chat.width {
+            if let Some(cell) = buffer.cell(Position::new(x, y)) {
+                let symbol = cell.symbol();
+                if !symbol.is_empty() {
+                    starts.push((text.len(), x));
+                }
+                text.push_str(symbol);
+            }
+        }
+        for (from, to) in crate::app::match_ranges(&text, query) {
+            for &(byte, x) in &starts {
+                if byte >= from
+                    && byte < to
+                    && let Some(cell) = buffer.cell_mut(Position::new(x, y))
+                {
+                    cell.set_style(Style::default().bg(Color::Yellow).fg(Color::Black));
+                }
+            }
+        }
+    }
 }
 
 /// Text of the chat's content lines `start..=end`, as displayed after wrapping. Renders the
@@ -573,6 +644,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             cache.blocks = blocks;
             cache.total = total;
             cache.key = Some(key);
+            cache.lines = None;
         }
 
         let height = inner.height as usize;
@@ -951,6 +1023,18 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         frame.set_cursor_position((area.x + 1 + app.command_line.chars().count() as u16, area.y));
         return;
     }
+    if app.mode == Mode::Search
+        && let Some(input) = &app.search_input
+    {
+        let prompt = if input.backward { "?" } else { "/" };
+        let line = Line::from(vec![
+            Span::styled(prompt, Style::default().fg(Color::Yellow)),
+            Span::raw(input.query.clone()),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        frame.set_cursor_position((area.x + 1 + input.query.chars().count() as u16, area.y));
+        return;
+    }
     let (mode_label, mode_style) = match (app.mode, app.focus) {
         (Mode::Insert, _) => (
             " INSERT ",
@@ -1158,6 +1242,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             "  za or Enter             fold or unfold the tool group or row under the cursor",
         ),
         Line::from("  V then y  ·  yy  ·  Ny  yank lines to the clipboard"),
+        Line::from("  / ?  n N               search forward / backward, next / previous match"),
         Line::from(""),
         Line::from("  n                       new thread (pick project)"),
         Line::from("  m                       change model"),

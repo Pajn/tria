@@ -43,6 +43,23 @@ pub enum Mode {
     Question,
     /// Typing a free-text answer to the current question.
     QuestionCustom,
+    /// Typing a `/` or `?` search over the chat; the cursor follows the first match.
+    Search,
+}
+
+/// An accepted chat search, reused by `n` and `N` and for highlighting.
+#[derive(Debug, Clone)]
+pub struct Search {
+    pub query: String,
+    pub backward: bool,
+}
+
+/// A search being typed: the query so far, its direction, and where the cursor was.
+#[derive(Debug, Clone)]
+pub struct SearchInput {
+    pub query: String,
+    pub backward: bool,
+    origin: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +200,8 @@ pub struct App {
     chat_count: Option<usize>,
     /// First content line of every message block, for `{` and `}`.
     pub message_starts: Vec<usize>,
+    pub search: Option<Search>,
+    pub search_input: Option<SearchInput>,
     /// Mouse selection in the chat, in screen cells.
     pub selection: Option<Selection>,
     /// Text to push to the clipboard after the next frame is drawn.
@@ -228,6 +247,8 @@ impl App {
             chat_visual: None,
             chat_count: None,
             message_starts: Vec::new(),
+            search: None,
+            search_input: None,
             selection: None,
             clipboard_pending: None,
             work_ranges: Vec::new(),
@@ -1341,8 +1362,10 @@ impl App {
             }
             KeyCode::Char('J') => self.open_relative(1),
             KeyCode::Char('K') => self.open_relative(-1),
-            KeyCode::Char('/') => self.open_picker(PickerKind::Thread),
-            KeyCode::Char('n') => self.open_picker(PickerKind::Project),
+            KeyCode::Char('/') => self.start_search(false),
+            KeyCode::Char('?') => self.start_search(true),
+            KeyCode::Char('n') => self.search_next(false),
+            KeyCode::Char('N') => self.search_next(true),
             KeyCode::Char('m') => self.open_picker(PickerKind::Model),
             KeyCode::Char('s') => self.sidebar_visible = !self.sidebar_visible,
             KeyCode::Char('S') => self.show_settled = !self.show_settled,
@@ -1350,8 +1373,148 @@ impl App {
                 self.mode = Mode::Command;
                 self.command_line.clear();
             }
-            KeyCode::Char('?') => self.mode = Mode::Help,
             _ => {}
+        }
+    }
+
+    // ── Chat search ────────────────────────────────────────────────────
+
+    fn start_search(&mut self, backward: bool) {
+        self.chat_count = None;
+        self.search_input = Some(SearchInput {
+            query: String::new(),
+            backward,
+            origin: self.chat_cursor,
+        });
+        self.mode = Mode::Search;
+    }
+
+    fn on_search_key(&mut self, key: KeyEvent) {
+        let Some(input) = self.search_input.as_mut() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                let origin = input.origin;
+                self.search_input = None;
+                self.mode = Mode::Normal;
+                self.set_chat_cursor(origin);
+            }
+            KeyCode::Enter => {
+                let input = self.search_input.take().unwrap();
+                self.mode = Mode::Normal;
+                if input.query.is_empty() {
+                    // Bare Enter repeats the last search, as in Vim.
+                    self.search_next(false);
+                    return;
+                }
+                let search = Search {
+                    query: input.query,
+                    backward: input.backward,
+                };
+                self.search = Some(search.clone());
+                self.jump_to_match(&search, input.origin, false);
+            }
+            KeyCode::Backspace => {
+                input.query.pop();
+                self.incremental_search();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.query.clear();
+                self.incremental_search();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.query.push(c);
+                self.incremental_search();
+            }
+            _ => {}
+        }
+    }
+
+    /// While typing, the cursor previews the first match from where the search started.
+    fn incremental_search(&mut self) {
+        let Some(input) = self.search_input.clone() else {
+            return;
+        };
+        if input.query.is_empty() {
+            self.set_chat_cursor(input.origin);
+            return;
+        }
+        let search = Search {
+            query: input.query,
+            backward: input.backward,
+        };
+        if let Some((line, _)) = self.find_match(&search, input.origin) {
+            self.set_chat_cursor(line);
+        }
+    }
+
+    /// `n` and `N`: continue the last search from the cursor, `N` against its direction.
+    fn search_next(&mut self, reverse: bool) {
+        self.chat_count = None;
+        let Some(mut search) = self.search.clone() else {
+            self.toast("no previous search", true);
+            return;
+        };
+        if reverse {
+            search.backward = !search.backward;
+        }
+        let from = self.chat_cursor;
+        self.jump_to_match(&search, from, true);
+    }
+
+    fn jump_to_match(&mut self, search: &Search, from: usize, silent_hit: bool) {
+        match self.find_match(search, from) {
+            Some((line, wrapped)) => {
+                self.set_chat_cursor(line);
+                if wrapped {
+                    self.toast(
+                        if search.backward {
+                            "search hit TOP, continuing at BOTTOM"
+                        } else {
+                            "search hit BOTTOM, continuing at TOP"
+                        },
+                        false,
+                    );
+                } else if !silent_hit {
+                    self.toast = None;
+                }
+            }
+            None => self.toast(format!("pattern not found: {}", search.query), true),
+        }
+    }
+
+    /// The next matching content line after (or before) `from`, wrapping around the
+    /// conversation. Returns the line and whether the search wrapped.
+    fn find_match(&self, search: &Search, from: usize) -> Option<(usize, bool)> {
+        let lines = ui::chat_lines();
+        if lines.is_empty() || search.query.is_empty() {
+            return None;
+        }
+        let matches = |line: &str| line_matches(line, &search.query);
+        let len = lines.len();
+        if search.backward {
+            let from = from.min(len);
+            (0..from)
+                .rev()
+                .find(|&i| matches(&lines[i]))
+                .map(|i| (i, false))
+                .or_else(|| {
+                    (from..len)
+                        .rev()
+                        .find(|&i| matches(&lines[i]))
+                        .map(|i| (i, true))
+                })
+        } else {
+            (from + 1..len)
+                .find(|&i| matches(&lines[i]))
+                .map(|i| (i, false))
+                .or_else(|| {
+                    (0..=from.min(len - 1))
+                        .find(|&i| matches(&lines[i]))
+                        .map(|i| (i, true))
+                })
         }
     }
 
@@ -1451,6 +1614,7 @@ impl App {
             Mode::Normal => self.on_normal_key(key),
             Mode::Insert => self.on_insert_key(key),
             Mode::Command => self.on_command_key(key),
+            Mode::Search => self.on_search_key(key),
             Mode::Picker => self.on_picker_key(key),
             Mode::Question => self.on_question_key(key),
             Mode::QuestionCustom => self.on_question_custom_key(key),
@@ -2005,6 +2169,58 @@ impl Selection {
     }
 }
 
+/// Substring match; case-insensitive unless the query has an uppercase letter (smartcase).
+pub fn line_matches(line: &str, query: &str) -> bool {
+    if query.chars().any(char::is_uppercase) {
+        line.contains(query)
+    } else {
+        line.to_lowercase().contains(query)
+    }
+}
+
+/// Byte ranges of every match in `line`, with the same case rule as `line_matches`.
+pub fn match_ranges(line: &str, query: &str) -> Vec<(usize, usize)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let smart = !query.chars().any(char::is_uppercase);
+    let haystack = if smart {
+        line.to_lowercase()
+    } else {
+        line.to_string()
+    };
+    if haystack.len() != line.len() {
+        // Lowercasing changed byte lengths; fall back to char-wise matching.
+        let hay: Vec<char> = haystack.chars().collect();
+        let needle: Vec<char> = query.chars().collect();
+        let mut out = Vec::new();
+        let byte_offsets: Vec<usize> = line.char_indices().map(|(i, _)| i).collect();
+        let mut i = 0;
+        while i + needle.len() <= hay.len() {
+            if hay[i..i + needle.len()] == needle[..] {
+                let start = byte_offsets[i];
+                let end = byte_offsets
+                    .get(i + needle.len())
+                    .copied()
+                    .unwrap_or(line.len());
+                out.push((start, end));
+                i += needle.len();
+            } else {
+                i += 1;
+            }
+        }
+        return out;
+    }
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find(query) {
+        let start = from + pos;
+        out.push((start, start + query.len()));
+        from = start + query.len().max(1);
+    }
+    out
+}
+
 /// tmux session name for a directory: its last path component, with the characters tmux
 /// reserves for target syntax replaced.
 pub fn tmux_session_name(dir: &str) -> String {
@@ -2149,6 +2365,16 @@ pub async fn run(origin: String, token: String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::tmux_session_name;
+
+    #[test]
+    fn search_matching_is_smartcase() {
+        use super::{line_matches, match_ranges};
+        assert!(line_matches("Nx cache", "nx"));
+        assert!(!line_matches("nx cache", "Nx"));
+        assert_eq!(match_ranges("a nx b NX", "nx"), vec![(2, 4), (7, 9)]);
+        assert_eq!(match_ranges("ÄÖ nx", "nx"), vec![(5, 7)]);
+        assert!(match_ranges("abc", "").is_empty());
+    }
 
     #[test]
     fn session_name_is_the_directory_basename() {
