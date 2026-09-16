@@ -148,6 +148,21 @@ fn anchor(thread: &ThreadShell) -> &str {
         .unwrap_or(thread.created_at.as_str())
 }
 
+/// A background task with no reported end, for the `:tasks` view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningTask {
+    pub id: String,
+    pub title: String,
+    /// Provider task type, such as `local_bash`.
+    pub task_type: String,
+    /// `background` for monitors and backgrounded commands.
+    pub agent_kind: String,
+    pub started_at: String,
+    pub turn_id: Option<String>,
+    /// A foreground command that was moved to the background.
+    pub backgrounded: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingApproval {
     pub request_id: String,
@@ -435,6 +450,57 @@ impl ThreadState {
                 .is_some_and(|s| s.status == "running" || s.status == "starting")
     }
 
+    /// Background tasks the agent started that have not reported an end. A task is done
+    /// once any of its activities carries a status or an `endedAt`; monitors and
+    /// backgrounded commands outlive their turn, so the turn is not used to settle them.
+    pub fn running_tasks(&self) -> Vec<RunningTask> {
+        let mut open: Vec<RunningTask> = Vec::new();
+        for activity in &self.detail.activities {
+            if !activity.kind.starts_with("task.") {
+                continue;
+            }
+            let Some(id) = activity.str("taskId") else {
+                continue;
+            };
+            let payload = &activity.payload;
+            let ended = activity.kind == "task.completed"
+                || payload.get("status").is_some_and(|v| !v.is_null())
+                || payload.get("endedAt").is_some_and(|v| !v.is_null());
+            if ended {
+                open.retain(|task| task.id != id);
+                continue;
+            }
+            match open.iter_mut().find(|task| task.id == id) {
+                Some(task) => {
+                    if let Some(title) = activity.str("title") {
+                        task.title = title.to_string();
+                    }
+                    task.backgrounded |= payload
+                        .get("isBackgrounded")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                }
+                None => open.push(RunningTask {
+                    id: id.to_string(),
+                    title: activity
+                        .str("title")
+                        .or_else(|| activity.str("detail"))
+                        .unwrap_or("background task")
+                        .to_string(),
+                    task_type: activity.str("taskType").unwrap_or("").to_string(),
+                    agent_kind: activity.str("agentKind").unwrap_or("").to_string(),
+                    started_at: activity.created_at.clone(),
+                    turn_id: activity.turn_id.clone(),
+                    backgrounded: payload
+                        .get("isBackgrounded")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                }),
+            }
+        }
+        open
+    }
+
     pub fn pending_approvals(&self) -> Vec<PendingApproval> {
         let mut pending: Vec<PendingApproval> = Vec::new();
         for activity in &self.detail.activities {
@@ -588,6 +654,64 @@ mod tests {
                         "turnId": "turn", "streaming": streaming, "createdAt": "", "updatedAt": ""}
         }))
         .unwrap()
+    }
+
+    fn task_event(sequence: u64, kind: &str, payload: serde_json::Value) -> Event {
+        serde_json::from_value(json!({
+            "sequence": sequence, "eventId": format!("e{sequence}"),
+            "type": "thread.activity-appended",
+            "payload": {"threadId": "t1", "activity": {
+                "id": format!("a{sequence}"), "tone": "info", "kind": kind,
+                "summary": "", "payload": payload, "turnId": "turn",
+                "createdAt": "2026-01-01T00:00:00Z"
+            }}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn running_tasks_track_unfinished_background_work() {
+        let mut state = thread();
+        state.apply_event(task_event(
+            11,
+            "task.started",
+            json!({"taskId": "t-1", "title": "watch build", "taskType": "local_bash",
+                   "agentKind": "background"}),
+        ));
+        state.apply_event(task_event(
+            12,
+            "task.started",
+            json!({"taskId": "t-2", "title": "run tests", "taskType": "local_bash",
+                   "agentKind": "background"}),
+        ));
+        let running = state.running_tasks();
+        assert_eq!(running.len(), 2);
+        assert_eq!(running[0].title, "watch build");
+        assert!(!running[0].backgrounded);
+
+        // An update without an end keeps it running and can refine the title.
+        state.apply_event(task_event(
+            13,
+            "task.updated",
+            json!({"taskId": "t-1", "title": "watch build (rebuilding)", "isBackgrounded": true}),
+        ));
+        let running = state.running_tasks();
+        assert_eq!(running.len(), 2);
+        assert_eq!(running[0].title, "watch build (rebuilding)");
+        assert!(running[0].backgrounded);
+
+        // An update carrying a status and an end settles it, as does task.completed.
+        state.apply_event(task_event(
+            14,
+            "task.updated",
+            json!({"taskId": "t-1", "status": "completed", "endedAt": "2026-01-01T00:05:00Z"}),
+        ));
+        state.apply_event(task_event(
+            15,
+            "task.completed",
+            json!({"taskId": "t-2", "status": "failed"}),
+        ));
+        assert!(state.running_tasks().is_empty());
     }
 
     #[test]

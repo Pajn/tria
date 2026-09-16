@@ -48,6 +48,8 @@ pub enum Mode {
     QuestionCustom,
     /// Typing a `/` or `?` search over the chat; the cursor follows the first match.
     Search,
+    /// Listing the agent's background tasks that have not reported an end.
+    Tasks,
 }
 
 /// An accepted chat search, reused by `n` and `N` and for highlighting.
@@ -839,6 +841,25 @@ impl App {
         }
     }
 
+    // ── Background tasks ───────────────────────────────────────────────
+
+    /// Tasks the agent started that have not reported an end: monitors and backgrounded
+    /// commands, which outlive the turn that started them.
+    pub fn running_tasks(&self) -> Vec<crate::state::RunningTask> {
+        self.thread
+            .as_ref()
+            .map(|t| t.running_tasks())
+            .unwrap_or_default()
+    }
+
+    fn open_tasks(&mut self) {
+        if self.thread.is_none() {
+            self.toast("no thread open", true);
+            return;
+        }
+        self.mode = Mode::Tasks;
+    }
+
     // ── Git popup ──────────────────────────────────────────────────────
 
     /// `gl` and `:git`: run the git command in the thread's directory. Inside tmux it opens
@@ -1374,6 +1395,7 @@ impl App {
             "pr" | "pull" => self.open_pull_request(true),
             "tmux" => self.switch_tmux_session(),
             "git" | "lazygit" => self.open_git(),
+            "tasks" | "jobs" => self.open_tasks(),
             "edit" => self.edit_composer(),
             "view" => self.view_conversation(),
             "settled" => self.show_settled = !self.show_settled,
@@ -1524,6 +1546,7 @@ impl App {
                 self.toggle_settled(id);
             }
             KeyCode::Char('l') if prefix == Some('g') => self.open_git(),
+            KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
             KeyCode::Char('e') if prefix == Some('g') => self.view_at_cursor(),
             KeyCode::Char('E') if prefix == Some('g') => self.view_conversation(),
             KeyCode::Char('a') if prefix == Some('g') => {
@@ -1887,6 +1910,14 @@ impl App {
             Mode::Insert => self.on_insert_key(key),
             Mode::Command => self.on_command_key(key),
             Mode::Search => self.on_search_key(key),
+            Mode::Tasks => {
+                if matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('T')
+                ) {
+                    self.mode = Mode::Normal;
+                }
+            }
             Mode::Picker => self.on_picker_key(key),
             Mode::Question => self.on_question_key(key),
             Mode::QuestionCustom => self.on_question_custom_key(key),
@@ -1923,6 +1954,7 @@ impl App {
                     self.toggle_settled(id);
                 }
                 KeyCode::Char('l') if prefix == Some('g') => self.open_git(),
+                KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
                 KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
                 KeyCode::Char('G') => {
                     self.sidebar_selected = self.sidebar_rows().len().saturating_sub(1);
@@ -1975,6 +2007,7 @@ impl App {
                 return;
             }
             KeyCode::Char('l') if prefix == Some('g') => return self.open_git(),
+            KeyCode::Char('T') if prefix == Some('g') => return self.open_tasks(),
             KeyCode::Char('e') if prefix == Some('g') => return self.edit_composer(),
             KeyCode::Char('E') if prefix == Some('g') => return self.view_conversation(),
             KeyCode::Char('a') if prefix == Some('g') => {

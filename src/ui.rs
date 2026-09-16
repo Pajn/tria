@@ -114,6 +114,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::Picker => draw_picker(frame, app, area),
         Mode::Help => draw_help(frame, area),
+        Mode::Tasks => draw_tasks(frame, app, area),
         _ => {}
     }
 }
@@ -1163,6 +1164,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::styled(label, status_style(status)));
             }
         }
+        let tasks = thread.running_tasks().len();
+        if tasks > 0 {
+            spans.push(Span::styled(
+                format!("  ⚙ {tasks} bg"),
+                Style::default().fg(Color::Blue),
+            ));
+        }
     } else if let Some(draft) = &app.draft {
         spans.push(Span::styled(
             format!(
@@ -1263,6 +1271,91 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, list_area, &mut state);
 }
 
+/// The agent's unfinished background tasks. Informational: the protocol has no per-task
+/// stop, so the panel points at the turn-level interrupt instead.
+fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
+    let tasks = app.running_tasks();
+    let now = crate::commands::now_iso();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if tasks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no background tasks running",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let width = 76.min(area.width) as usize;
+    for task in &tasks {
+        let elapsed = elapsed_label(&task.started_at, &now);
+        let mut tags: Vec<&str> = Vec::new();
+        if task.agent_kind == "background" {
+            tags.push("background");
+        }
+        if task.backgrounded {
+            tags.push("backgrounded");
+        }
+        if !task.task_type.is_empty() {
+            tags.push(task.task_type.as_str());
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", app.spinner_frame()),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                fit(
+                    &task.title,
+                    width.saturating_sub(elapsed.chars().count() + 6),
+                ),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {elapsed}"), Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("   {}", tags.join(" · ")),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Ctrl-c interrupts the turn · no per-task stop exists · Esc to close",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let text = Text::from(lines);
+    let width = 76.min(area.width);
+    let height = (text.lines.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" background tasks ({}) ", tasks.len()));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
+}
+
+/// Rough "how long ago" for two RFC 3339 timestamps, for example `3m` or `2h04`.
+pub fn elapsed_label(since: &str, now: &str) -> String {
+    let parse = |text: &str| {
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()
+    };
+    let (Some(start), Some(now)) = (parse(since), parse(now)) else {
+        return String::new();
+    };
+    let seconds = (now - start).whole_seconds().max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h{:02}", seconds / 3600, (seconds % 3600) / 60)
+    }
+}
+
 fn draw_help(frame: &mut Frame, area: Rect) {
     let text = Text::from(vec![
         Line::from(Span::styled("Normal", Style::default().bold())),
@@ -1288,6 +1381,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         Line::from("  gy                      yank last assistant message (OSC 52)"),
         Line::from("  gl                      lazygit in the thread's directory"),
+        Line::from("  gT                      background tasks still running in this thread"),
         Line::from(
             "  ge                      composer: edit the draft · chat: view the block under the cursor",
         ),
@@ -1322,7 +1416,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :pr  :tmux  :settle  :unsettle  :wake  :settled  :stop  :older  :answer  :dismiss  :sidebar  :q",
+            "  :pr  :tasks  :tmux  :settle  :unsettle  :wake  :settled  :stop  :older  :answer  :dismiss  :sidebar  :q",
         ),
         Line::from(""),
         Line::from(Span::styled(

@@ -169,6 +169,12 @@ advertised.
   meaningful line (84 characters) or an `N lines` count; MCP results become
   `result.content` summaries; `detail` is cut at 180 characters. Full payloads stay in the
   server's database only. A tool row can expand to show exactly this much.
+- **Background tasks**: `task.started`, `task.updated`, `task.completed` activities keyed by
+  `taskId`, carrying `title`, `taskType` (`local_bash`), `agentKind` (`background`),
+  `toolUseId`, and sometimes `isBackgrounded`. A task has ended once an activity carries a
+  `status` or an `endedAt`; monitors outlive their turn, so the turn cannot settle them.
+  There is no per-task stop command: `thread.turn.interrupt` and `thread.session.stop` are
+  the only stops a client can dispatch.
 - **Reasoning is not on the wire.** Only assistant text becomes messages; reasoning items are
   filtered server-side. Nothing to render.
 - **Session**: `{ status: idle|starting|running|ready|interrupted|stopped|error,

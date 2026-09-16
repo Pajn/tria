@@ -63,6 +63,7 @@ Press `?` inside the app for the full list.
 | `ga` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `gy` | copy the last assistant message (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
+| `gT` | list the agent's background tasks that are still running |
 | `gl` | open lazygit in the thread's directory: a tmux popup, or in tria's place outside tmux |
 | `ge` | composer focused: edit the draft in your editor, read back on exit. Chat focused: view the message, plan, tool row, or tool group under the cursor |
 | `gE` | view the whole conversation in your editor |
@@ -104,7 +105,7 @@ command.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `archive`, `delete!`, `stop`,
-`older`, `answer`, `dismiss`, `pr`, `git`, `edit`, `view`, `tmux`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
+`older`, `answer`, `dismiss`, `pr`, `git`, `edit`, `view`, `tasks`, `tmux`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
 
 ## Branch and pull request
 
@@ -120,6 +121,13 @@ offers a picker when several pull requests are linked.
 popup over the pane while tria keeps running; close lazygit to return. Outside tmux, tria
 steps aside, runs the command in the same terminal, and redraws when it exits. Set
 `git_command` in the config file to run something else, for example `tig` or `git status`.
+
+## Background tasks
+
+The agent runs monitors and background commands that outlive the turn that started them.
+`gT` or `:tasks` lists the ones with no reported end, with how long each has been running,
+and the status bar shows a count. There is no per-task stop in the protocol, so stopping
+means interrupting the turn with `Ctrl-c`.
 
 ## Editor
 
