@@ -28,6 +28,15 @@ pub enum Request {
     LoadOlder {
         before_cursor: String,
     },
+    /// Attach to a terminal: replaces any current attachment.
+    Attach {
+        thread_id: Id,
+        terminal_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// Drop the terminal attachment, which stops the server sending its output.
+    Detach,
     /// Any other RPC, for the calls that are not orchestration commands.
     Call {
         tag: String,
@@ -59,6 +68,8 @@ pub enum Update {
     },
     /// The terminal list changed. Absent entirely when the token lacks `terminal:operate`.
     Terminals(crate::model::TerminalEvent),
+    /// Output from the attached terminal.
+    TerminalStream(crate::model::TerminalStreamEvent),
     /// The open thread's stream failed; the supervisor resubscribes on its own.
     ThreadStreamError {
         error: String,
@@ -99,6 +110,20 @@ impl Handle {
             .map_err(|_| anyhow!("connection supervisor stopped"))?;
         rx.await
             .map_err(|_| anyhow!("connection supervisor stopped"))?
+    }
+
+    /// Attach to a terminal. Output arrives as `Update::TerminalStream`.
+    pub fn attach_terminal(&self, thread_id: &str, terminal_id: &str, cols: u16, rows: u16) {
+        let _ = self.tx.send(Request::Attach {
+            thread_id: thread_id.to_string(),
+            terminal_id: terminal_id.to_string(),
+            cols,
+            rows,
+        });
+    }
+
+    pub fn detach_terminal(&self) {
+        let _ = self.tx.send(Request::Detach);
     }
 
     pub async fn dispatch(&self, command: Value) -> Result<u64> {
@@ -203,6 +228,8 @@ async fn run(
                 None
             }
         };
+        // Attachments belong to one socket; a reconnect drops it and the UI re-attaches.
+        let mut attached: Option<Subscription> = None;
         if let Some(open) = open.as_mut() {
             open.subscription = subscribe_thread(&client, &open.id, open.last_sequence, pagination)
                 .await
@@ -227,6 +254,12 @@ async fn run(
                     None => std::future::pending().await,
                 }
             };
+            let attached_next = async {
+                match attached.as_mut() {
+                    Some(sub) => sub.next().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 _ = &mut closed => break,
                 request = requests.recv() => {
@@ -240,6 +273,23 @@ async fn run(
                             open = Some(OpenThread { id, last_sequence: None, subscription });
                         }
                         Request::CloseThread => open = None,
+                        Request::Attach { thread_id, terminal_id, cols, rows } => {
+                            let payload = json!({
+                                "threadId": thread_id,
+                                "terminalId": terminal_id,
+                                "cols": cols,
+                                "rows": rows,
+                                "restartIfNotRunning": true,
+                            });
+                            match client.subscribe("terminal.attach", payload).await {
+                                Ok(sub) => attached = Some(sub),
+                                Err(err) => {
+                                    attached = None;
+                                    let _ = updates.send(Update::Error(err.to_string()));
+                                }
+                            }
+                        }
+                        Request::Detach => attached = None,
                         Request::LoadOlder { before_cursor } => {
                             if let Some(o) = open.as_ref() {
                                 let payload = json!({
@@ -303,6 +353,19 @@ async fn run(
                                 Err(_) => break,
                             }
                         }
+                    }
+                }
+                item = attached_next => {
+                    match item {
+                        Some(Ok(value)) => match serde_json::from_value::<crate::model::TerminalStreamEvent>(value) {
+                            Ok(event) => { let _ = updates.send(Update::TerminalStream(event)); }
+                            Err(err) => tracing::warn!(?err, "undecodable terminal stream event"),
+                        },
+                        Some(Err(err)) => {
+                            attached = None;
+                            let _ = updates.send(Update::Error(format!("terminal detached: {err}")));
+                        }
+                        None => attached = None,
                     }
                 }
                 item = terminal_next => {

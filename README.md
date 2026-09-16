@@ -1,9 +1,9 @@
 # tria
 
 A terminal chat client for [T3 Code](https://github.com/pingdotgg/t3code), written in Rust
-with ratatui. It does one thing: a thread picker, a chat view, and a composer, driven with
-Vim-style keys. No diff viewer, terminal, browser, or settings. Use the desktop, web, or mobile
-app for those.
+with ratatui. It stays small: a thread picker, a chat view, a composer, and the thread's
+terminals, driven with Vim-style keys. No diff viewer, browser, or settings. Use the desktop,
+web, or mobile app for those.
 
 ## Requirements
 
@@ -64,7 +64,7 @@ Press `?` inside the app for the full list.
 | `gy` | copy the last assistant message (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
 | `gT` | list the agent's background tasks that are still running |
-| `gS` | list the thread's terminals; close or restart one |
+| `gS` | list the thread's terminals; attach to one, or close, restart, open a new one |
 | `gl` | open lazygit in the thread's directory: a tmux popup, or in tria's place outside tmux |
 | `ge` | composer focused: edit the draft in your editor, read back on exit. Chat focused: view the message, plan, tool row, or tool group under the cursor |
 | `gE` | view the whole conversation in your editor |
@@ -134,9 +134,18 @@ means interrupting the turn with `Ctrl-c`.
 
 Each thread can have shells running on the server, the same ones the desktop app shows in its
 terminal tabs. `gS` or `:terminals` lists them with their status, working directory, process
-id, and whether a command is running right now. `x` closes the selected one and `r` restarts
-it in the same directory. tria does not draw the terminal contents; it lists and controls the
-sessions.
+id, and whether a command is running right now. `x` closes the selected one, `r` restarts
+it in the same directory, and `c` opens a new one in the thread's working directory.
+
+`Enter` attaches: the shell takes over the screen and every key goes to it, `Ctrl-c` included.
+`Ctrl-\` detaches and leaves the shell running. The mouse wheel moves through the scrollback,
+and typing returns to the live screen. Resizing the window resizes the pty. The pane is a real
+terminal emulator, so full-screen programs work: this is the other way to reach lazygit, and
+unlike `gl` it stays inside tria and survives detaching.
+
+The server owns the pty, so a shell you start here also appears in the desktop app's terminal
+tabs, keeps running after you detach or quit, and picks up where it left off when you attach
+again.
 
 ## Editor
 

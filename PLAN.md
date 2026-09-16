@@ -1,8 +1,8 @@
 # tria — a terminal chat client for T3 Code
 
 Rust + ratatui client that talks to a running T3 Code server. Scope is deliberately narrow:
-a thread picker, a chat view, a composer, and Vim-style navigation. No diff viewer, terminal
-pane, browser, file explorer, or settings UI.
+a thread picker, a chat view, a composer, and Vim-style navigation, plus the thread's terminals
+because the server already runs them. No diff viewer, browser, file explorer, or settings UI.
 
 This document records the protocol findings the design rests on and the decisions taken.
 Upstream references are paths inside the [t3code repository](https://github.com/pingdotgg/t3code)
@@ -222,9 +222,15 @@ terminal }`, and `{ type: "remove", threadId, terminalId }`. A terminal carries 
 `subscribeTerminalEvents`, which streams output chunks and needs a VT parser to render.
 
 The calls are `terminal.open` (`threadId`, `terminalId`, `cwd`, `cols`, `rows`; the client mints
-the id and gets back the summary plus a `history` string), `terminal.attach`, `terminal.write`,
-`terminal.resize`, `terminal.clear`, `terminal.restart` (same shape as open), and
+the id and gets back the summary plus a `history` string), `terminal.write` (`data`, at most
+64 KiB), `terminal.resize`, `terminal.clear`, `terminal.restart` (same shape as open), and
 `terminal.close`.
+
+`terminal.attach` is a stream, not a call: it takes the same fields as open plus
+`restartIfNotRunning`, and yields `{ type: "snapshot", snapshot }` with the scrollback first,
+then the same event union. Feed `history` and every `output` `data` to a VT parser and the
+screen is reconstructed exactly, which is why re-attaching after a client restart shows the
+session as it was.
 
 ### Stopping work
 

@@ -56,6 +56,8 @@ pub enum Mode {
     Tasks,
     /// Listing the thread's terminal sessions, with close and restart.
     Terminals,
+    /// Attached to a terminal: keys go to the shell, `Ctrl-\` comes back.
+    TerminalPane,
 }
 
 /// An accepted chat search, reused by `n` and `N` and for highlighting.
@@ -225,6 +227,8 @@ pub struct App {
     pub terminals: Vec<crate::model::TerminalSummary>,
     /// Selection in the terminal panel.
     pub terminal_selected: usize,
+    /// The attached terminal, when one is open.
+    pub pane: Option<crate::term::Pane>,
     /// Command for `gl` and `:git`, from the config file.
     pub git_command: String,
     /// Editor for `ge` and `gE`.
@@ -284,6 +288,7 @@ impl App {
             search_input: None,
             terminals: Vec::new(),
             terminal_selected: 0,
+            pane: None,
             drafts: HashMap::new(),
             git_command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
             editor: "nvim".to_string(),
@@ -872,6 +877,8 @@ impl App {
             KeyCode::Char('G') => self.terminal_selected = count.saturating_sub(1),
             KeyCode::Char('x') | KeyCode::Char('d') => self.close_terminal(),
             KeyCode::Char('r') => self.restart_terminal(),
+            KeyCode::Char('c') => self.new_terminal(),
+            KeyCode::Enter | KeyCode::Char('a') | KeyCode::Char('l') => self.attach_terminal(),
             _ => {}
         }
     }
@@ -959,6 +966,164 @@ impl App {
             }),
             format!("restarted {terminal_id}"),
         );
+    }
+
+    /// Open a new shell for the thread and attach to it.
+    fn new_terminal(&mut self) {
+        let Some(thread_id) = self.current_thread_id.clone() else {
+            self.toast("no thread open", true);
+            return;
+        };
+        let Some(cwd) = self.thread_directory() else {
+            self.toast("thread has no directory", true);
+            return;
+        };
+        let terminal_id = format!("tria-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let (cols, rows) = self.pane_size();
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        let payload = json!({
+            "threadId": thread_id,
+            "terminalId": terminal_id,
+            "cwd": cwd,
+            "cols": cols,
+            "rows": rows,
+        });
+        tokio::spawn(async move {
+            let result = handle
+                .call("terminal.open", payload)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            let _ = events.send(AppEvent::Called {
+                result,
+                ok: format!("opened {terminal_id}"),
+            });
+        });
+    }
+
+    /// Attach to the selected terminal and hand the keyboard to it.
+    fn attach_terminal(&mut self) {
+        let Some(terminal) = self
+            .thread_terminals()
+            .get(self.terminal_selected)
+            .map(|t| (*t).clone())
+        else {
+            self.toast("no terminal selected", true);
+            return;
+        };
+        let (cols, rows) = self.pane_size();
+        self.handle
+            .attach_terminal(&terminal.thread_id, &terminal.terminal_id, cols, rows);
+        self.pane = Some(crate::term::Pane::new(
+            terminal.thread_id,
+            terminal.terminal_id,
+            terminal.label,
+            cols,
+            rows,
+        ));
+        self.mode = Mode::TerminalPane;
+    }
+
+    /// Leave the pane. The shell keeps running; the server just stops streaming here.
+    fn detach_terminal(&mut self) {
+        self.handle.detach_terminal();
+        self.pane = None;
+        self.mode = Mode::Normal;
+    }
+
+    /// The size the pane will be drawn at, for the initial attach and for `terminal.open`.
+    fn pane_size(&self) -> (u16, u16) {
+        match &self.pane {
+            Some(pane) => pane.size(),
+            None => (
+                self.chat_area.width.max(20),
+                (self.chat_area.height + 4).max(10),
+            ),
+        }
+    }
+
+    fn apply_terminal_stream(&mut self, event: crate::model::TerminalStreamEvent) {
+        use crate::model::TerminalStreamEvent as Event;
+        let Some(pane) = self.pane.as_mut() else {
+            return;
+        };
+        match event {
+            Event::Snapshot { snapshot } | Event::Restarted { snapshot } => {
+                pane.label = snapshot.label;
+                pane.reset(&snapshot.history);
+            }
+            Event::Output { data } => pane.feed(&data),
+            Event::Cleared => pane.reset(""),
+            Event::Exited {
+                exit_code,
+                exit_signal,
+            } => {
+                pane.exited = Some(match (exit_code, exit_signal) {
+                    (_, Some(signal)) => format!("killed by signal {signal}"),
+                    (Some(code), _) => format!("exited with {code}"),
+                    _ => "exited".into(),
+                });
+            }
+            Event::Closed => {
+                self.toast("terminal closed", false);
+                self.detach_terminal();
+            }
+            Event::Error { message } => self.toast(message, true),
+            Event::Unknown => {}
+        }
+    }
+
+    /// Keys while attached: everything goes to the shell except the detach key.
+    fn on_pane_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl-\, which a terminal without the kitty protocol reports as Ctrl-4.
+        if ctrl && matches!(key.code, KeyCode::Char('\\') | KeyCode::Char('4')) {
+            self.detach_terminal();
+            return;
+        }
+        let Some(pane) = self.pane.as_mut() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        // Typing returns to the live screen, the way a terminal behaves.
+        if pane.scrollback() > 0 {
+            pane.scroll(isize::MIN / 2);
+        }
+        let app_cursor = pane.screen().application_cursor();
+        let Some(data) = crate::term::encode_key(&key, app_cursor) else {
+            return;
+        };
+        let (thread_id, terminal_id) = (pane.thread_id.clone(), pane.terminal_id.clone());
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            let payload = json!({
+                "threadId": thread_id,
+                "terminalId": terminal_id,
+                "data": data,
+            });
+            let _ = handle.call("terminal.write", payload).await;
+        });
+    }
+
+    /// Tell the server the pane's size after a redraw changed it.
+    pub fn sync_pane_size(&mut self, cols: u16, rows: u16) {
+        let Some(pane) = self.pane.as_mut() else {
+            return;
+        };
+        if !pane.resize(cols, rows) {
+            return;
+        }
+        let payload = json!({
+            "threadId": pane.thread_id,
+            "terminalId": pane.terminal_id,
+            "cols": cols,
+            "rows": rows,
+        });
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            let _ = handle.call("terminal.resize", payload).await;
+        });
     }
 
     /// Fire an RPC and toast the outcome.
@@ -2024,6 +2189,12 @@ impl App {
             return;
         }
         self.selection = None;
+        // The attached terminal takes every key, including Ctrl-c, before the global
+        // chords: interrupting the shell is the whole point of that key there.
+        if self.mode == Mode::TerminalPane {
+            self.on_pane_key(key);
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Global chords.
         if ctrl && key.code == KeyCode::Char('q') {
@@ -2056,6 +2227,8 @@ impl App {
                 }
             }
             Mode::Terminals => self.on_terminals_key(key),
+            // Handled above, before the global chords.
+            Mode::TerminalPane => {}
             Mode::Picker => self.on_picker_key(key),
             Mode::Question => self.on_question_key(key),
             Mode::QuestionCustom => self.on_question_custom_key(key),
@@ -2257,6 +2430,17 @@ impl App {
     fn on_mouse(&mut self, mouse: MouseEvent) {
         // Overlays own the screen; the wheel and clicks would land on hidden widgets.
         if matches!(self.mode, Mode::Picker | Mode::Help) {
+            return;
+        }
+        // The attached terminal scrolls its own scrollback and ignores the rest.
+        if self.mode == Mode::TerminalPane {
+            if let Some(pane) = self.pane.as_mut() {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => pane.scroll(MOUSE_SCROLL_LINES as isize),
+                    MouseEventKind::ScrollDown => pane.scroll(-(MOUSE_SCROLL_LINES as isize)),
+                    _ => {}
+                }
+            }
             return;
         }
         let at = Position::new(mouse.column, mouse.row);
@@ -2499,6 +2683,14 @@ impl App {
                 {
                     self.toast(format!("disconnected: {error}"), true);
                 }
+                // A reconnect drops the attachment with the socket; take it up again.
+                if status == Status::Connected
+                    && let Some(pane) = &self.pane
+                {
+                    let (cols, rows) = pane.size();
+                    self.handle
+                        .attach_terminal(&pane.thread_id, &pane.terminal_id, cols, rows);
+                }
                 self.status = status;
             }
             Update::Config(config) => self.config = *config,
@@ -2551,6 +2743,7 @@ impl App {
                 }
             }
             Update::Terminals(event) => self.apply_terminal_event(event),
+            Update::TerminalStream(event) => self.apply_terminal_stream(event),
             Update::ThreadStreamError { error } => {
                 self.toast(format!("stream error, resubscribing: {error}"), true)
             }

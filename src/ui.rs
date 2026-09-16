@@ -47,6 +47,10 @@ thread_local! {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    if app.mode == Mode::TerminalPane && app.pane.is_some() {
+        draw_terminal_pane(frame, app, area);
+        return;
+    }
     let show_sidebar = app.sidebar_visible && area.width >= MIN_WIDTH_FOR_SIDEBAR;
     let (sidebar_area, main_area) = if show_sidebar {
         let [s, m] = Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
@@ -1272,6 +1276,92 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, list_area, &mut state);
 }
 
+/// The attached terminal, drawn from the parsed screen. One status line at the
+/// bottom keeps the detach key visible; everything above is the shell's own output.
+fn draw_terminal_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    let [screen_area, status] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    app.sync_pane_size(screen_area.width, screen_area.height);
+    let Some(pane) = &app.pane else { return };
+    let screen = pane.screen();
+
+    let buffer = frame.buffer_mut();
+    for row in 0..screen_area.height {
+        for col in 0..screen_area.width {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let target = Position::new(screen_area.x + col, screen_area.y + row);
+            let Some(target) = buffer.cell_mut(target) else {
+                continue;
+            };
+            let contents = cell.contents();
+            target.set_symbol(if contents.is_empty() { " " } else { contents });
+            let mut style = Style::default()
+                .fg(vt_color(cell.fgcolor(), Color::Reset))
+                .bg(vt_color(cell.bgcolor(), Color::Reset));
+            if cell.bold() {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if cell.dim() {
+                style = style.add_modifier(Modifier::DIM);
+            }
+            if cell.italic() {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            if cell.underline() {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            if cell.inverse() {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            target.set_style(style);
+        }
+    }
+
+    if !screen.hide_cursor() && pane.scrollback() == 0 {
+        let (row, col) = screen.cursor_position();
+        if row < screen_area.height && col < screen_area.width {
+            frame.set_cursor_position(Position::new(screen_area.x + col, screen_area.y + row));
+        }
+    }
+
+    let mut left = vec![
+        Span::styled(" TERM ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::raw(format!("  {}  ", fit(&pane.label, 40))),
+    ];
+    if let Some(exited) = &pane.exited {
+        left.push(Span::styled(
+            format!("{exited}  "),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    if pane.scrollback() > 0 {
+        left.push(Span::styled(
+            format!("scrollback {}  ", pane.scrollback()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    let hint = "Ctrl-\\ detaches · wheel scrolls back";
+    let used: usize = left.iter().map(|s| s.content.chars().count()).sum();
+    let pad = (status.width as usize).saturating_sub(used + hint.chars().count() + 1);
+    left.push(Span::raw(" ".repeat(pad)));
+    left.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
+    frame.render_widget(Paragraph::new(Line::from(left)), status);
+}
+
+/// vt100 colors, with the terminal's own default for `Default`.
+fn vt_color(color: vt100::Color, fallback: Color) -> Color {
+    match color {
+        vt100::Color::Default => fallback,
+        vt100::Color::Idx(index) => Color::Indexed(index),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
 /// The thread's terminal sessions, with close and restart. These are real shells on the
 /// server, shared with the desktop app.
 fn draw_terminals(frame: &mut Frame, app: &App, area: Rect) {
@@ -1332,7 +1422,7 @@ fn draw_terminals(frame: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  j k select · x close · r restart · Esc to close this panel",
+        "  j k select · Enter attach · c new · x close · r restart · Esc",
         dim,
     )));
     let text = Text::from(lines);
@@ -1463,7 +1553,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  gy                      yank last assistant message (OSC 52)"),
         Line::from("  gl                      lazygit in the thread's directory"),
         Line::from("  gT                      background tasks still running in this thread"),
-        Line::from("  gS                      terminals for this thread (x close, r restart)"),
+        Line::from("  gS                      terminals for this thread: Enter attaches,"),
+        Line::from("                          c opens a new one, x closes, r restarts"),
         Line::from(
             "  ge                      composer: edit the draft · chat: view the block under the cursor",
         ),

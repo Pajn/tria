@@ -249,6 +249,51 @@ pub enum TerminalEvent {
     Unknown,
 }
 
+/// A terminal session with its scrollback, as `terminal.attach` and `terminal.open` return it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSessionSnapshot {
+    pub thread_id: Id,
+    pub terminal_id: String,
+    pub cwd: String,
+    pub status: String,
+    pub pid: Option<i64>,
+    /// Replayed output, escape sequences included, to feed the parser on attach.
+    #[serde(default)]
+    pub history: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+/// What `terminal.attach` streams: the scrollback first, then the live pty output.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[allow(clippy::large_enum_variant)]
+pub enum TerminalStreamEvent {
+    Snapshot {
+        snapshot: TerminalSessionSnapshot,
+    },
+    Output {
+        data: String,
+    },
+    Restarted {
+        snapshot: TerminalSessionSnapshot,
+    },
+    Cleared,
+    #[serde(rename_all = "camelCase")]
+    Exited {
+        exit_code: Option<i64>,
+        exit_signal: Option<i64>,
+    },
+    Closed,
+    Error {
+        message: String,
+    },
+    /// `activity`, and anything a newer server adds; the metadata stream covers it.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Sidebar status for a thread, ordered by priority (first match wins).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadStatus {
