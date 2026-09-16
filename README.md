@@ -64,6 +64,7 @@ Press `?` inside the app for the full list.
 | `gy` | copy the last assistant message (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
 | `gT` | list the agent's background tasks that are still running |
+| `gS` | list the thread's terminals; close or restart one |
 | `gl` | open lazygit in the thread's directory: a tmux popup, or in tria's place outside tmux |
 | `ge` | composer focused: edit the draft in your editor, read back on exit. Chat focused: view the message, plan, tool row, or tool group under the cursor |
 | `gE` | view the whole conversation in your editor |
@@ -105,7 +106,7 @@ command.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `archive`, `delete!`, `stop`,
-`older`, `answer`, `dismiss`, `pr`, `git`, `edit`, `view`, `tasks`, `tmux`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
+`older`, `answer`, `dismiss`, `pr`, `git`, `edit`, `view`, `tasks`, `terminals`, `tmux`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
 
 ## Branch and pull request
 
@@ -128,6 +129,14 @@ The agent runs monitors and background commands that outlive the turn that start
 `gT` or `:tasks` lists the ones with no reported end, with how long each has been running,
 and the status bar shows a count. There is no per-task stop in the protocol, so stopping
 means interrupting the turn with `Ctrl-c`.
+
+## Terminals
+
+Each thread can have shells running on the server, the same ones the desktop app shows in its
+terminal tabs. `gS` or `:terminals` lists them with their status, working directory, process
+id, and whether a command is running right now. `x` closes the selected one and `r` restarts
+it in the same directory. tria does not draw the terminal contents; it lists and controls the
+sessions.
 
 ## Editor
 

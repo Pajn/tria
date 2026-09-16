@@ -196,6 +196,59 @@ impl PullRequestRef {
     }
 }
 
+/// One terminal session on the server, from `subscribeTerminalMetadata`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSummary {
+    pub thread_id: Id,
+    pub terminal_id: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    /// starting | running | exited | error
+    pub status: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub exit_signal: Option<i32>,
+    /// Whether a command is executing, as opposed to an idle shell.
+    #[serde(default)]
+    pub has_running_subprocess: bool,
+    /// Server-computed title: the idle shell or the running command.
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+impl TerminalSummary {
+    pub fn is_live(&self) -> bool {
+        matches!(self.status.as_str(), "starting" | "running")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[allow(clippy::large_enum_variant)]
+pub enum TerminalEvent {
+    Snapshot {
+        terminals: Vec<TerminalSummary>,
+    },
+    Upsert {
+        terminal: TerminalSummary,
+    },
+    // `rename_all` above renames the variants; these fields need their own.
+    #[serde(rename_all = "camelCase")]
+    Remove {
+        thread_id: Id,
+        terminal_id: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
 /// Sidebar status for a thread, ordered by priority (first match wins).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadStatus {

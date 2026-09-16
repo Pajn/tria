@@ -115,6 +115,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Picker => draw_picker(frame, app, area),
         Mode::Help => draw_help(frame, area),
         Mode::Tasks => draw_tasks(frame, app, area),
+        Mode::Terminals => draw_terminals(frame, app, area),
         _ => {}
     }
 }
@@ -1271,6 +1272,86 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, list_area, &mut state);
 }
 
+/// The thread's terminal sessions, with close and restart. These are real shells on the
+/// server, shared with the desktop app.
+fn draw_terminals(frame: &mut Frame, app: &App, area: Rect) {
+    let terminals = app.thread_terminals();
+    let width = 80.min(area.width);
+    let inner_width = width.saturating_sub(4) as usize;
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if terminals.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no terminals for this thread",
+            dim,
+        )));
+    }
+    for (index, terminal) in terminals.iter().enumerate() {
+        let selected = index == app.terminal_selected.min(terminals.len() - 1);
+        let (glyph, glyph_style) = match terminal.status.as_str() {
+            _ if terminal.has_running_subprocess => {
+                (app.spinner_frame(), Style::default().fg(Color::Cyan))
+            }
+            "running" | "starting" => ("●", Style::default().fg(Color::Green)),
+            "error" => ("✗", Style::default().fg(Color::Red)),
+            _ => ("·", dim),
+        };
+        let mut title_style = Style::default();
+        if selected {
+            title_style = title_style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { " ▸ " } else { "   " },
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(format!("{glyph} "), glyph_style),
+            Span::styled(
+                fit(&terminal.label, inner_width.saturating_sub(6)),
+                title_style,
+            ),
+        ]));
+        let mut detail = format!("      {}", terminal.status);
+        if let Some(pid) = terminal.pid {
+            detail.push_str(&format!(" · pid {pid}"));
+        }
+        if terminal.has_running_subprocess {
+            detail.push_str(" · command running");
+        }
+        if let Some(code) = terminal.exit_code {
+            detail.push_str(&format!(" · exit {code}"));
+        }
+        lines.push(Line::from(Span::styled(detail, dim)));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "      {}",
+                fit(&terminal.cwd, inner_width.saturating_sub(6))
+            ),
+            dim,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  j k select · x close · r restart · Esc to close this panel",
+        dim,
+    )));
+    let text = Text::from(lines);
+    let height = (text.lines.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" terminals ({}) ", terminals.len()));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
 /// The agent's unfinished background tasks. Informational: the protocol has no per-task
 /// stop, so the panel points at the turn-level interrupt instead.
 fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
@@ -1382,6 +1463,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  gy                      yank last assistant message (OSC 52)"),
         Line::from("  gl                      lazygit in the thread's directory"),
         Line::from("  gT                      background tasks still running in this thread"),
+        Line::from("  gS                      terminals for this thread (x close, r restart)"),
         Line::from(
             "  ge                      composer: edit the draft · chat: view the block under the cursor",
         ),
@@ -1416,7 +1498,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :pr  :tasks  :tmux  :settle  :unsettle  :wake  :settled  :stop  :older  :answer  :dismiss  :sidebar  :q",
+            "  :pr  :tasks  :terminals  :tmux  :settle  :unsettle  :wake  :settled  :stop  :older  :answer  :dismiss  :sidebar  :q",
         ),
         Line::from(""),
         Line::from(Span::styled(

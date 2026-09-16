@@ -198,6 +198,7 @@ async fn dump(origin: &str, cfg: &config::Config, thread_id: &str, seconds: u64)
             session::Update::ThreadStreamError { error } => {
                 println!("thread stream error: {error}")
             }
+            session::Update::Terminals(_) => {}
             session::Update::Error(error) => println!("error: {error}"),
         }
     }

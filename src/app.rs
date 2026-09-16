@@ -13,7 +13,7 @@ use crossterm::event::{
 };
 use futures_util::StreamExt;
 use ratatui::layout::{Position, Rect};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -25,6 +25,10 @@ use crate::{
     state::{ApprovalOption, PendingApproval, Shell, ThreadState},
     ui, vim,
 };
+
+/// Size used when restarting a terminal; the desktop app resizes when it attaches.
+const TERMINAL_COLS: u16 = 120;
+const TERMINAL_ROWS: u16 = 30;
 
 /// Draft key for a thread that does not exist yet.
 const NEW_THREAD_DRAFT_KEY: &str = "\0new-thread";
@@ -50,6 +54,8 @@ pub enum Mode {
     Search,
     /// Listing the agent's background tasks that have not reported an end.
     Tasks,
+    /// Listing the thread's terminal sessions, with close and restart.
+    Terminals,
 }
 
 /// An accepted chat search, reused by `n` and `N` and for highlighting.
@@ -158,6 +164,11 @@ pub enum AppEvent {
     Tick,
     Update(Box<Update>),
     Dispatched(Result<(), String>),
+    /// A non-command RPC finished; `ok` is the toast for the success case.
+    Called {
+        result: Result<(), String>,
+        ok: String,
+    },
 }
 
 pub struct App {
@@ -210,6 +221,10 @@ pub struct App {
     /// Unsent composer text per thread, keyed by thread id, so switching threads keeps a
     /// half-written message where it belongs. New-thread drafts use `NEW_THREAD_DRAFT_KEY`.
     drafts: HashMap<String, String>,
+    /// Every terminal session the server knows about, across threads.
+    pub terminals: Vec<crate::model::TerminalSummary>,
+    /// Selection in the terminal panel.
+    pub terminal_selected: usize,
     /// Command for `gl` and `:git`, from the config file.
     pub git_command: String,
     /// Editor for `ge` and `gE`.
@@ -267,6 +282,8 @@ impl App {
             message_starts: Vec::new(),
             search: None,
             search_input: None,
+            terminals: Vec::new(),
+            terminal_selected: 0,
             drafts: HashMap::new(),
             git_command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
             editor: "nvim".to_string(),
@@ -841,6 +858,124 @@ impl App {
         }
     }
 
+    fn on_terminals_key(&mut self, key: KeyEvent) {
+        let count = self.thread_terminals().len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.terminal_selected = (self.terminal_selected + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.terminal_selected = self.terminal_selected.saturating_sub(1);
+            }
+            KeyCode::Char('g') => self.terminal_selected = 0,
+            KeyCode::Char('G') => self.terminal_selected = count.saturating_sub(1),
+            KeyCode::Char('x') | KeyCode::Char('d') => self.close_terminal(),
+            KeyCode::Char('r') => self.restart_terminal(),
+            _ => {}
+        }
+    }
+
+    // ── Terminals ──────────────────────────────────────────────────────
+
+    fn apply_terminal_event(&mut self, event: crate::model::TerminalEvent) {
+        use crate::model::TerminalEvent;
+        match event {
+            TerminalEvent::Snapshot { terminals } => self.terminals = terminals,
+            TerminalEvent::Upsert { terminal } => {
+                match self.terminals.iter_mut().find(|t| {
+                    t.terminal_id == terminal.terminal_id && t.thread_id == terminal.thread_id
+                }) {
+                    Some(existing) => *existing = terminal,
+                    None => self.terminals.push(terminal),
+                }
+            }
+            TerminalEvent::Remove {
+                thread_id,
+                terminal_id,
+            } => self
+                .terminals
+                .retain(|t| !(t.thread_id == thread_id && t.terminal_id == terminal_id)),
+            TerminalEvent::Unknown => {}
+        }
+    }
+
+    /// The open thread's terminals, live ones first.
+    pub fn thread_terminals(&self) -> Vec<&crate::model::TerminalSummary> {
+        let Some(id) = self.current_thread_id.as_deref() else {
+            return Vec::new();
+        };
+        let mut list: Vec<&crate::model::TerminalSummary> = self
+            .terminals
+            .iter()
+            .filter(|t| t.thread_id == id)
+            .collect();
+        list.sort_by_key(|t| (!t.is_live(), t.terminal_id.clone()));
+        list
+    }
+
+    fn open_terminals(&mut self) {
+        if self.thread.is_none() {
+            self.toast("no thread open", true);
+            return;
+        }
+        self.terminal_selected = 0;
+        self.mode = Mode::Terminals;
+    }
+
+    fn selected_terminal(&self) -> Option<(String, String, String)> {
+        self.thread_terminals()
+            .get(self.terminal_selected)
+            .map(|t| (t.thread_id.clone(), t.terminal_id.clone(), t.cwd.clone()))
+    }
+
+    /// Close the selected terminal. The server kills whatever is running in it.
+    fn close_terminal(&mut self) {
+        let Some((thread_id, terminal_id, _)) = self.selected_terminal() else {
+            self.toast("no terminal selected", true);
+            return;
+        };
+        self.call(
+            "terminal.close",
+            json!({"threadId": thread_id, "terminalId": terminal_id}),
+            format!("closed {terminal_id}"),
+        );
+    }
+
+    /// Restart the selected terminal: the shell is replaced, so the running command dies.
+    fn restart_terminal(&mut self) {
+        let Some((thread_id, terminal_id, cwd)) = self.selected_terminal() else {
+            self.toast("no terminal selected", true);
+            return;
+        };
+        self.call(
+            "terminal.restart",
+            json!({
+                "threadId": thread_id,
+                "terminalId": terminal_id,
+                "cwd": cwd,
+                "cols": TERMINAL_COLS,
+                "rows": TERMINAL_ROWS,
+            }),
+            format!("restarted {terminal_id}"),
+        );
+    }
+
+    /// Fire an RPC and toast the outcome.
+    fn call(&self, tag: &str, payload: Value, ok: String) {
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        let tag = tag.to_string();
+        tokio::spawn(async move {
+            let result = handle
+                .call(&tag, payload)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            let _ = events.send(AppEvent::Called { result, ok });
+        });
+    }
+
     // ── Background tasks ───────────────────────────────────────────────
 
     /// Tasks the agent started that have not reported an end: monitors and backgrounded
@@ -1396,6 +1531,7 @@ impl App {
             "tmux" => self.switch_tmux_session(),
             "git" | "lazygit" => self.open_git(),
             "tasks" | "jobs" => self.open_tasks(),
+            "terminals" | "shells" => self.open_terminals(),
             "edit" => self.edit_composer(),
             "view" => self.view_conversation(),
             "settled" => self.show_settled = !self.show_settled,
@@ -1547,6 +1683,7 @@ impl App {
             }
             KeyCode::Char('l') if prefix == Some('g') => self.open_git(),
             KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
+            KeyCode::Char('S') if prefix == Some('g') => self.open_terminals(),
             KeyCode::Char('e') if prefix == Some('g') => self.view_at_cursor(),
             KeyCode::Char('E') if prefix == Some('g') => self.view_conversation(),
             KeyCode::Char('a') if prefix == Some('g') => {
@@ -1918,6 +2055,7 @@ impl App {
                     self.mode = Mode::Normal;
                 }
             }
+            Mode::Terminals => self.on_terminals_key(key),
             Mode::Picker => self.on_picker_key(key),
             Mode::Question => self.on_question_key(key),
             Mode::QuestionCustom => self.on_question_custom_key(key),
@@ -1955,6 +2093,7 @@ impl App {
                 }
                 KeyCode::Char('l') if prefix == Some('g') => self.open_git(),
                 KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
+                KeyCode::Char('S') if prefix == Some('g') => self.open_terminals(),
                 KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
                 KeyCode::Char('G') => {
                     self.sidebar_selected = self.sidebar_rows().len().saturating_sub(1);
@@ -2008,6 +2147,7 @@ impl App {
             }
             KeyCode::Char('l') if prefix == Some('g') => return self.open_git(),
             KeyCode::Char('T') if prefix == Some('g') => return self.open_tasks(),
+            KeyCode::Char('S') if prefix == Some('g') => return self.open_terminals(),
             KeyCode::Char('e') if prefix == Some('g') => return self.edit_composer(),
             KeyCode::Char('E') if prefix == Some('g') => return self.view_conversation(),
             KeyCode::Char('a') if prefix == Some('g') => {
@@ -2410,6 +2550,7 @@ impl App {
                     prepend_page(thread, snapshot);
                 }
             }
+            Update::Terminals(event) => self.apply_terminal_event(event),
             Update::ThreadStreamError { error } => {
                 self.toast(format!("stream error, resubscribing: {error}"), true)
             }
@@ -2735,6 +2876,10 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
             AppEvent::Update(update) => app.on_update(*update),
             AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
             AppEvent::Dispatched(Ok(())) => {}
+            AppEvent::Called { result, ok } => match result {
+                Ok(()) => app.toast(ok, false),
+                Err(error) => app.toast(error, true),
+            },
         }
         if let Some(external) = app.pending_external.take() {
             if let Err(err) = run_external(&mut terminal, &external) {

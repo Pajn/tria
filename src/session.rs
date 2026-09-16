@@ -28,6 +28,12 @@ pub enum Request {
     LoadOlder {
         before_cursor: String,
     },
+    /// Any other RPC, for the calls that are not orchestration commands.
+    Call {
+        tag: String,
+        payload: Value,
+        reply: oneshot::Sender<Result<Value>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +57,8 @@ pub enum Update {
         thread_id: Id,
         snapshot: crate::model::ThreadDetailSnapshot,
     },
+    /// The terminal list changed. Absent entirely when the token lacks `terminal:operate`.
+    Terminals(crate::model::TerminalEvent),
     /// The open thread's stream failed; the supervisor resubscribes on its own.
     ThreadStreamError {
         error: String,
@@ -77,6 +85,20 @@ impl Handle {
         let _ = self.tx.send(Request::LoadOlder {
             before_cursor: before_cursor.to_string(),
         });
+    }
+
+    /// Call any RPC and return its raw result.
+    pub async fn call(&self, tag: &str, payload: Value) -> Result<Value> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Request::Call {
+                tag: tag.to_string(),
+                payload,
+                reply,
+            })
+            .map_err(|_| anyhow!("connection supervisor stopped"))?;
+        rx.await
+            .map_err(|_| anyhow!("connection supervisor stopped"))?
     }
 
     pub async fn dispatch(&self, command: Value) -> Result<u64> {
@@ -169,6 +191,18 @@ async fn run(
                 continue;
             }
         };
+        // Terminals need the `terminal:operate` scope. A token without it still works;
+        // the terminal list is simply never populated.
+        let mut terminals = match client
+            .subscribe("subscribeTerminalMetadata", json!({}))
+            .await
+        {
+            Ok(sub) => Some(sub),
+            Err(err) => {
+                tracing::info!(%err, "terminal metadata unavailable");
+                None
+            }
+        };
         if let Some(open) = open.as_mut() {
             open.subscription = subscribe_thread(&client, &open.id, open.last_sequence, pagination)
                 .await
@@ -183,6 +217,12 @@ async fn run(
         loop {
             let thread_next = async {
                 match open.as_mut().and_then(|o| o.subscription.as_mut()) {
+                    Some(sub) => sub.next().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let terminal_next = async {
+                match terminals.as_mut() {
                     Some(sub) => sub.next().await,
                     None => std::future::pending().await,
                 }
@@ -219,6 +259,9 @@ async fn run(
                                     Err(err) => { let _ = updates.send(Update::Error(err.to_string())); }
                                 }
                             }
+                        }
+                        Request::Call { tag, payload, reply } => {
+                            let _ = reply.send(client.call::<Value>(&tag, payload).await);
                         }
                         Request::Dispatch { command, reply } => {
                             let result = client
@@ -260,6 +303,20 @@ async fn run(
                                 Err(_) => break,
                             }
                         }
+                    }
+                }
+                item = terminal_next => {
+                    match item {
+                        Some(Ok(value)) => match serde_json::from_value::<crate::model::TerminalEvent>(value) {
+                            Ok(event) => { let _ = updates.send(Update::Terminals(event)); }
+                            Err(err) => tracing::warn!(?err, "undecodable terminal event"),
+                        },
+                        // The stream is a convenience; drop it rather than fight for it.
+                        Some(Err(err)) => {
+                            tracing::warn!(%err, "terminal metadata stream failed");
+                            terminals = None;
+                        }
+                        None => terminals = None,
                     }
                 }
                 item = thread_next => {
