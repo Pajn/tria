@@ -33,6 +33,9 @@ const TERMINAL_ROWS: u16 = 30;
 /// The terminal `gl` reuses, one per thread, so the git command keeps its place.
 const GIT_TERMINAL_ID: &str = "tria-git";
 
+/// The terminal `g!` reuses, one per thread.
+const SHELL_TERMINAL_ID: &str = "tria-shell";
+
 /// Draft key for a thread that does not exist yet.
 const NEW_THREAD_DRAFT_KEY: &str = "\0new-thread";
 
@@ -1077,23 +1080,43 @@ impl App {
                     self.write_to_pane(command);
                 }
             }
-            Event::Output { data } => pane.feed(&data),
+            Event::Output { data } => {
+                pane.feed(&data);
+                // A full-screen program is up, so there is nothing of the shell left to hide.
+                if pane.alternate_screen() {
+                    pane.starting = None;
+                }
+            }
             Event::Cleared => pane.reset(""),
-            Event::Exited {
-                exit_code,
-                exit_signal,
-            } => {
-                pane.exited = Some(match (exit_code, exit_signal) {
-                    (_, Some(signal)) => format!("killed by signal {signal}"),
-                    (Some(code), _) => format!("exited with {code}"),
-                    _ => "exited".into(),
-                });
+            // The program the pane was opened for is gone, so the pane goes with it.
+            Event::Exited { .. } => {
+                let label = pane.label.clone();
+                let terminal_id = pane.terminal_id.clone();
+                let thread_id = pane.thread_id.clone();
+                self.detach_terminal();
+                self.toast(format!("{label} exited"), false);
+                // Sessions tria opened are scratch; leave the desktop app's own alone.
+                if terminal_id.starts_with("tria-") {
+                    self.call(
+                        "terminal.close",
+                        json!({"threadId": thread_id, "terminalId": terminal_id}),
+                        String::new(),
+                    );
+                }
             }
             Event::Closed => {
                 self.toast("terminal closed", false);
                 self.detach_terminal();
             }
-            Event::Activity { label } => pane.label = label,
+            Event::Activity {
+                has_running_subprocess,
+                label,
+            } => {
+                pane.label = label;
+                if has_running_subprocess {
+                    pane.starting = None;
+                }
+            }
             Event::Error { message } => self.toast(message, true),
             Event::Unknown => {}
         }
@@ -1216,8 +1239,32 @@ impl App {
             return;
         };
         let command = self.git_command.clone();
-        self.pending_pane_command = Some(format!("{command}\r"));
-        self.open_pane(thread_id, GIT_TERMINAL_ID.to_string(), command, dir);
+        // `exec` replaces the shell, so quitting the command ends the session and the
+        // popup closes with it. It also means `git_command` should be interactive.
+        self.pending_pane_command = Some(format!("exec {command}\r"));
+        self.open_pane(thread_id, GIT_TERMINAL_ID.to_string(), command.clone(), dir);
+        if let Some(pane) = self.pane.as_mut() {
+            pane.starting = Some(command);
+        }
+    }
+
+    /// `g!` and `:shell`: a plain shell for the thread, in the pane. Exiting it closes
+    /// the popup, so this is a scratch shell rather than something to keep around.
+    fn open_shell(&mut self) {
+        let Some(dir) = self.thread_directory() else {
+            self.toast("no thread open", true);
+            return;
+        };
+        let Some(thread_id) = self.current_thread_id.clone() else {
+            self.toast("no thread open", true);
+            return;
+        };
+        self.open_pane(
+            thread_id,
+            SHELL_TERMINAL_ID.to_string(),
+            "shell".into(),
+            dir,
+        );
     }
 
     /// Run a program that needs the terminal. Inside tmux it goes into a popup and tria
@@ -1743,6 +1790,7 @@ impl App {
             "git" | "lazygit" => self.open_git(),
             "tasks" | "jobs" => self.open_tasks(),
             "terminals" | "shells" => self.open_terminals(),
+            "shell" => self.open_shell(),
             "edit" => self.edit_composer(),
             "view" => self.view_conversation(),
             "settled" => self.show_settled = !self.show_settled,
@@ -1893,6 +1941,7 @@ impl App {
                 self.toggle_settled(id);
             }
             KeyCode::Char('l') if prefix == Some('g') => self.open_git(),
+            KeyCode::Char('!') if prefix == Some('g') => self.open_shell(),
             KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
             KeyCode::Char('S') if prefix == Some('g') => self.open_terminals(),
             KeyCode::Char('e') if prefix == Some('g') => self.view_at_cursor(),
@@ -2311,6 +2360,7 @@ impl App {
                     self.toggle_settled(id);
                 }
                 KeyCode::Char('l') if prefix == Some('g') => self.open_git(),
+                KeyCode::Char('!') if prefix == Some('g') => self.open_shell(),
                 KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
                 KeyCode::Char('S') if prefix == Some('g') => self.open_terminals(),
                 KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
@@ -2365,6 +2415,7 @@ impl App {
                 return;
             }
             KeyCode::Char('l') if prefix == Some('g') => return self.open_git(),
+            KeyCode::Char('!') if prefix == Some('g') => return self.open_shell(),
             KeyCode::Char('T') if prefix == Some('g') => return self.open_tasks(),
             KeyCode::Char('S') if prefix == Some('g') => return self.open_terminals(),
             KeyCode::Char('e') if prefix == Some('g') => return self.edit_composer(),

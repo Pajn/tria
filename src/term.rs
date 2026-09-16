@@ -15,6 +15,9 @@ pub struct Pane {
     pub label: String,
     /// Set once the stream reports the shell exited, so the pane can say so.
     pub exited: Option<String>,
+    /// A command being started in place of the shell: the pane shows a notice instead of
+    /// the shell's prompt until the command is actually running.
+    pub starting: Option<String>,
     parser: vt100::Parser,
     size: (u16, u16),
 }
@@ -32,6 +35,7 @@ impl Pane {
             terminal_id,
             label,
             exited: None,
+            starting: None,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK),
             size: (cols, rows),
         }
@@ -76,6 +80,11 @@ impl Pane {
 
     pub fn scrollback(&self) -> usize {
         self.parser.screen().scrollback()
+    }
+
+    /// A full-screen program has taken over, so whatever the shell printed is hidden.
+    pub fn alternate_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
     }
 }
 

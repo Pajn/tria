@@ -1308,6 +1308,22 @@ fn draw_terminal_pane(frame: &mut Frame, app: &mut App, area: Rect) {
 
     app.sync_pane_size(inner.width, inner.height);
     let Some(pane) = &app.pane else { return };
+    // Until the command has taken over the shell, show a notice rather than the prompt
+    // it is about to replace.
+    if let Some(starting) = &pane.starting {
+        let notice = Paragraph::new(Line::from(Span::styled(
+            format!("starting {starting}…"),
+            Style::default().fg(Color::DarkGray),
+        )))
+        .centered();
+        let row = Rect {
+            y: inner.y + inner.height / 2,
+            height: 1.min(inner.height),
+            ..inner
+        };
+        frame.render_widget(notice, row);
+        return;
+    }
     let screen = pane.screen();
 
     let buffer = frame.buffer_mut();
@@ -1553,6 +1569,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         Line::from("  gy                      yank last assistant message (OSC 52)"),
         Line::from("  gl                      lazygit in the thread's terminal pane"),
+        Line::from("  g!                      a shell in the pane; exiting it closes the popup"),
         Line::from("  gT                      background tasks still running in this thread"),
         Line::from("  gS                      terminals for this thread: Enter attaches,"),
         Line::from("                          c opens a new one, x closes, r restarts"),
@@ -1574,6 +1591,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  s / S                   toggle sidebar / settled shelf"),
         Line::from("  gs                      settle the thread, or bring a settled one back"),
         Line::from("  gl                      lazygit in the thread's terminal pane"),
+        Line::from("  g!                      a shell in the pane"),
         Line::from("  gx                      open the thread's pull request in the browser"),
         Line::from(
             "  gt                      switch to the tmux session for the thread's directory",

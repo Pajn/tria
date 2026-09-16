@@ -290,7 +290,9 @@ pub enum TerminalStreamEvent {
         message: String,
     },
     /// The server's own title for the session: the shell, or the command it is running.
+    #[serde(rename_all = "camelCase")]
     Activity {
+        has_running_subprocess: bool,
         label: String,
     },
     /// Anything a newer server adds.

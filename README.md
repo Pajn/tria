@@ -65,7 +65,8 @@ Press `?` inside the app for the full list.
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
 | `gT` | list the agent's background tasks that are still running |
 | `gS` | list the thread's terminals; attach to one, or close, restart, open a new one |
-| `gl` | open lazygit in the thread's terminal pane |
+| `gl` | open lazygit in a terminal popup for the thread |
+| `g!` | a shell in the popup, in the thread's directory |
 | `ge` | composer focused: edit the draft in your editor, read back on exit. Chat focused: view the message, plan, tool row, or tool group under the cursor |
 | `gE` | view the whole conversation in your editor |
 | `gx` | open the thread's pull request in the browser |
@@ -106,7 +107,7 @@ command.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `archive`, `delete!`, `stop`,
-`older`, `answer`, `dismiss`, `pr`, `git`, `edit`, `view`, `tasks`, `terminals`, `tmux`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
+`older`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
 
 ## Branch and pull request
 
@@ -119,13 +120,19 @@ offers a picker when several pull requests are linked.
 ## Git
 
 `gl` or `:git` runs `lazygit` in a terminal of the thread's own, as a popup inside tria: the
-chat stays on screen around it and tria keeps running. The terminal is reused, one per thread,
-so `Ctrl-\` while lazygit is up and `gl` again comes back to it exactly as it was; once it has
-exited, `gl` starts it again. Set `git_command` in the config file to run
-something else, for example `tig` or `git status`.
+chat stays on screen around it and tria keeps running. The command replaces the shell rather
+than running inside it, so the popup goes straight to lazygit and closes again when you quit
+it. Set `git_command` in the config file to run something else, for example `tig` or `gitui`;
+it should be interactive, since a command that prints and exits takes the popup with it.
+
+While lazygit is up, `Ctrl-\` leaves it running and `gl` comes back to it exactly as it was.
 
 The terminal belongs to the server, so this works the same whether the server is on this
 machine or another one, and lazygit runs where the repository is.
+
+`g!` or `:shell` opens a plain shell in the same popup, in the thread's directory. Exiting it,
+with `Ctrl-d` or `exit`, closes the popup. Both of these are scratch sessions: tria closes the
+ones it opened and leaves the desktop app's own alone.
 
 ## Background tasks
 
