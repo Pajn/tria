@@ -63,6 +63,7 @@ Press `?` inside the app for the full list.
 | `a` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `y` | copy the last assistant message (OSC 52) |
 | `gx` | open the thread's pull request in the browser |
+| `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
 | `Ctrl-c` | interrupt the running turn |
 | mouse wheel | scroll the conversation, or the thread list when the pointer is over it |
 | left click | in the thread list: open a thread, or fold and unfold a section; in the chat: fold and unfold a tool group or row |
@@ -77,7 +78,7 @@ Press `?` inside the app for the full list.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `archive`, `delete!`, `stop`,
-`older`, `answer`, `dismiss`, `pr`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
+`older`, `answer`, `dismiss`, `pr`, `tmux`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
 
 ## Branch and pull request
 
@@ -86,6 +87,14 @@ number, title, draft or merged state, and a checks glyph (`✓` passing, `✗` f
 pending). The pull request on the thread's branch wins; otherwise the first open linked one.
 `gx` opens it in the browser through the platform's URL opener. `:pr` does the same, and
 offers a picker when several pull requests are linked.
+
+## tmux
+
+When tria runs inside tmux, `gt` or `:tmux` switches the client to the session named after
+the thread's working directory: the worktree when the thread has one, else the project root.
+The name is the directory's last path component, with `.` and `:` replaced by `_` because
+tmux reserves them. If no such session exists, tria creates it in that directory first. This
+suits a one-session-per-checkout layout.
 
 ## Tool output
 

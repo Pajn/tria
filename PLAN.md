@@ -272,7 +272,7 @@ selection on thread creation, diffs, terminals, PR views, settings.
 Status: M0 through M2 are implemented and verified against a live server (pairing, streaming,
 approvals derivation, interrupt, new thread with bootstrap, rename, archive, answering agent
 questions including multi-select and custom text). M3 items shipped so far: model and effort
-pickers, `:` commands, prompt history, yank, config file, sectioned sidebar (pinned, active,
+pickers, `:` commands, prompt history, yank, config file, `gt` tmux session switching, sectioned sidebar (pinned, active,
 snoozed, folded gray settled shelf) with per-thread status labels and settle/unsettle/wake
 commands, branch and pull request in the header with `gx` / `:pr` to open it. Not yet done: a recent-thread cache for instant back navigation, packaging.
 

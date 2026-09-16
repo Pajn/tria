@@ -411,6 +411,7 @@ impl ThreadState {
         mine.background_liveness = shell.background_liveness.clone();
         mine.session = shell.session.clone();
         mine.branch = shell.branch.clone();
+        mine.worktree_path = shell.worktree_path.clone();
         mine.pull_requests = shell.pull_requests.clone();
         mine.branch_pull_request = shell.branch_pull_request.clone();
         mine.settled_at = shell.settled_at.clone();

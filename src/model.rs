@@ -79,6 +79,9 @@ pub struct ThreadShell {
     pub interaction_mode: String,
     #[serde(default)]
     pub branch: Option<String>,
+    /// Checkout the thread works in when it runs on its own worktree.
+    #[serde(default)]
+    pub worktree_path: Option<String>,
     /// Pull requests linked to the thread, by the agent or by hand.
     #[serde(default)]
     pub pull_requests: Vec<PullRequest>,

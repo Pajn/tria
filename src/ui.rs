@@ -1065,6 +1065,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  y                       yank last assistant message (OSC 52)"),
         Line::from("  s / S                   toggle sidebar / settled shelf"),
         Line::from("  gx                      open the thread's pull request in the browser"),
+        Line::from(
+            "  gt                      switch to the tmux session for the thread's directory",
+        ),
         Line::from("  mouse drag              select chat text; released, it is copied"),
         Line::from("  Ctrl-c                  interrupt the running turn"),
         Line::from(""),
@@ -1078,7 +1081,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :pr  :settle  :unsettle  :wake  :settled  :stop  :older  :answer  :dismiss  :sidebar  :q",
+            "  :pr  :tmux  :settle  :unsettle  :wake  :settled  :stop  :older  :answer  :dismiss  :sidebar  :q",
         ),
         Line::from(""),
         Line::from(Span::styled(

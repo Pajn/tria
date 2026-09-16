@@ -716,6 +716,74 @@ impl App {
         self.toast("yanked last assistant message to clipboard", false);
     }
 
+    // ── tmux ───────────────────────────────────────────────────────────
+
+    /// Directory the current thread works in: its worktree, else the project root.
+    fn thread_directory(&self) -> Option<String> {
+        let shell = self.thread.as_ref().map(|t| &t.detail.shell)?;
+        shell.worktree_path.clone().or_else(|| {
+            self.shell
+                .projects
+                .get(&shell.project_id)
+                .map(|p| p.workspace_root.clone())
+        })
+    }
+
+    /// `gt` and `:tmux`: switch the tmux client to the session named after the thread's
+    /// directory, creating it there first when it does not exist.
+    fn switch_tmux_session(&mut self) {
+        if std::env::var_os("TMUX").is_none() {
+            self.toast("not running inside tmux", true);
+            return;
+        }
+        let Some(dir) = self.thread_directory() else {
+            self.toast("no thread open", true);
+            return;
+        };
+        let name = tmux_session_name(&dir);
+        let exists = std::process::Command::new("tmux")
+            .args(["has-session", "-t", &format!("={name}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !exists {
+            let created = std::process::Command::new("tmux")
+                .args(["new-session", "-d", "-s", &name, "-c", &dir])
+                .output();
+            match created {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    self.toast(format!("tmux new-session failed: {err}"), true);
+                    return;
+                }
+                Err(err) => {
+                    self.toast(format!("could not run tmux: {err}"), true);
+                    return;
+                }
+            }
+        }
+        let switched = std::process::Command::new("tmux")
+            .args(["switch-client", "-t", &format!("={name}")])
+            .output();
+        match switched {
+            Ok(out) if out.status.success() => self.toast(
+                if exists {
+                    format!("switched to tmux session {name}")
+                } else {
+                    format!("created tmux session {name}")
+                },
+                false,
+            ),
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                self.toast(format!("tmux switch-client failed: {err}"), true);
+            }
+            Err(err) => self.toast(format!("could not run tmux: {err}"), true),
+        }
+    }
+
     // ── Pull requests ──────────────────────────────────────────────────
 
     /// `gx` and `:pr`: open the thread's pull request in the browser. With several linked
@@ -1005,6 +1073,7 @@ impl App {
             "stop" | "interrupt" => self.interrupt(),
             "sidebar" => self.sidebar_visible = !self.sidebar_visible,
             "pr" | "pull" => self.open_pull_request(true),
+            "tmux" => self.switch_tmux_session(),
             "settled" => self.show_settled = !self.show_settled,
             "settle" => {
                 if let Some(id) = thread_id.as_deref() {
@@ -1208,6 +1277,7 @@ impl App {
                 }
             }
             KeyCode::Char('x') if prefix == Some('g') => self.open_pull_request(false),
+            KeyCode::Char('t') if prefix == Some('g') => self.switch_tmux_session(),
             KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
             KeyCode::Char('G') => self.scroll = Scroll::Follow,
             KeyCode::Char('z') => self.pending_prefix = Some(('z', Instant::now())),
@@ -1643,6 +1713,19 @@ impl Selection {
     }
 }
 
+/// tmux session name for a directory: its last path component, with the characters tmux
+/// reserves for target syntax replaced.
+pub fn tmux_session_name(dir: &str) -> String {
+    let base = std::path::Path::new(dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| dir.to_string());
+    base.chars()
+        .map(|c| if c == '.' || c == ':' { '_' } else { c })
+        .collect()
+}
+
 fn clamp_to(area: Rect, at: Position) -> Position {
     if area.width == 0 || area.height == 0 {
         return at;
@@ -1769,4 +1852,19 @@ pub async fn run(origin: String, token: String) -> Result<()> {
     );
     ratatui::restore();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tmux_session_name;
+
+    #[test]
+    fn session_name_is_the_directory_basename() {
+        assert_eq!(
+            tmux_session_name("/home/me/work/pnpm-hoisted"),
+            "pnpm-hoisted"
+        );
+        assert_eq!(tmux_session_name("/home/me/work/app.v2/"), "app_v2");
+        assert_eq!(tmux_session_name("main"), "main");
+    }
 }
