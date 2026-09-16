@@ -9,6 +9,20 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub url: Option<String>,
     pub token: Option<String>,
+    /// Shell command `gl` and `:git` run in the thread's directory. Defaults to `lazygit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_command: Option<String>,
+}
+
+pub const DEFAULT_GIT_COMMAND: &str = "lazygit";
+
+impl Config {
+    pub fn git_command(&self) -> String {
+        self.git_command
+            .clone()
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_GIT_COMMAND.to_string())
+    }
 }
 
 impl Config {

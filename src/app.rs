@@ -202,6 +202,10 @@ pub struct App {
     pub message_starts: Vec<usize>,
     pub search: Option<Search>,
     pub search_input: Option<SearchInput>,
+    /// Command for `gl` and `:git`, from the config file.
+    pub git_command: String,
+    /// A program to run in the terminal in tria's place; the event loop picks it up.
+    pub pending_external: Option<ExternalCommand>,
     /// Mouse selection in the chat, in screen cells.
     pub selection: Option<Selection>,
     /// Text to push to the clipboard after the next frame is drawn.
@@ -249,6 +253,8 @@ impl App {
             message_starts: Vec::new(),
             search: None,
             search_input: None,
+            git_command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
+            pending_external: None,
             selection: None,
             clipboard_pending: None,
             work_ranges: Vec::new(),
@@ -782,6 +788,42 @@ impl App {
         }
     }
 
+    // ── Git popup ──────────────────────────────────────────────────────
+
+    /// `gl` and `:git`: run the git command in the thread's directory. Inside tmux it opens
+    /// as a popup over the pane and tria keeps running; elsewhere tria steps aside until
+    /// the command exits.
+    fn open_git(&mut self) {
+        let Some(dir) = self.thread_directory() else {
+            self.toast("no thread open", true);
+            return;
+        };
+        let command = self.git_command.clone();
+        if std::env::var_os("TMUX").is_some() {
+            let spawned = std::process::Command::new("tmux")
+                .args([
+                    "display-popup",
+                    "-E",
+                    "-d",
+                    &dir,
+                    "-w",
+                    "90%",
+                    "-h",
+                    "90%",
+                    &command,
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            if let Err(err) = spawned {
+                self.toast(format!("could not run tmux: {err}"), true);
+            }
+            return;
+        }
+        self.pending_external = Some(ExternalCommand { command, dir });
+    }
+
     // ── tmux ───────────────────────────────────────────────────────────
 
     /// Directory the current thread works in: its worktree, else the project root.
@@ -1140,6 +1182,7 @@ impl App {
             "sidebar" => self.sidebar_visible = !self.sidebar_visible,
             "pr" | "pull" => self.open_pull_request(true),
             "tmux" => self.switch_tmux_session(),
+            "git" | "lazygit" => self.open_git(),
             "settled" => self.show_settled = !self.show_settled,
             "settle" => {
                 if let Some(id) = thread_id.as_deref() {
@@ -1287,6 +1330,7 @@ impl App {
                 let id = self.current_thread_id.clone();
                 self.toggle_settled(id);
             }
+            KeyCode::Char('l') if prefix == Some('g') => self.open_git(),
             KeyCode::Char('a') if prefix == Some('g') => {
                 self.begin_answering();
             }
@@ -1683,6 +1727,7 @@ impl App {
                     let id = self.sidebar_selected_thread();
                     self.toggle_settled(id);
                 }
+                KeyCode::Char('l') if prefix == Some('g') => self.open_git(),
                 KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
                 KeyCode::Char('G') => {
                     self.sidebar_selected = self.sidebar_rows().len().saturating_sub(1);
@@ -1734,6 +1779,7 @@ impl App {
                 self.toggle_settled(id);
                 return;
             }
+            KeyCode::Char('l') if prefix == Some('g') => return self.open_git(),
             KeyCode::Char('a') if prefix == Some('g') => {
                 if question_pending {
                     self.begin_answering();
@@ -2263,6 +2309,47 @@ pub fn match_ranges(line: &str, query: &str) -> Vec<(usize, usize)> {
     out
 }
 
+/// A program that takes over the terminal while tria waits.
+#[derive(Debug, Clone)]
+pub struct ExternalCommand {
+    pub command: String,
+    pub dir: String,
+}
+
+/// Hand the terminal to `external`, wait for it, and take the terminal back.
+fn run_external(terminal: &mut ratatui::DefaultTerminal, external: &ExternalCommand) -> Result<()> {
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
+    );
+    ratatui::restore();
+    // crossterm's reader thread may be blocked waiting for input on our behalf and would
+    // swallow the child's first keystrokes. A window-size signal wakes it with a resize
+    // event instead, and it stays idle until the event loop polls again.
+    #[cfg(unix)]
+    unsafe {
+        libc::raise(libc::SIGWINCH);
+    }
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&external.command)
+        .current_dir(&external.dir)
+        .status();
+    *terminal = ratatui::init();
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
+    );
+    terminal.clear()?;
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => anyhow::bail!("exited with {status}"),
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// tmux session name for a directory: its last path component, with the characters tmux
 /// reserves for target syntax replaced.
 pub fn tmux_session_name(dir: &str) -> String {
@@ -2329,10 +2416,11 @@ pub enum SidebarRow {
 
 // ── Event loop ─────────────────────────────────────────────────────────
 
-pub async fn run(origin: String, token: String) -> Result<()> {
+pub async fn run(origin: String, token: String, git_command: String) -> Result<()> {
     let (handle, mut updates) = session::spawn(origin, token);
     let (events_tx, mut events) = mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new(handle, events_tx.clone());
+    app.git_command = git_command;
 
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(
@@ -2389,6 +2477,11 @@ pub async fn run(origin: String, token: String) -> Result<()> {
             AppEvent::Update(update) => app.on_update(*update),
             AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
             AppEvent::Dispatched(Ok(())) => {}
+        }
+        if let Some(external) = app.pending_external.take()
+            && let Err(err) = run_external(&mut terminal, &external)
+        {
+            app.toast(format!("{}: {err}", external.command), true);
         }
         if app.quit {
             break Ok(());

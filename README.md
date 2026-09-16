@@ -63,6 +63,7 @@ Press `?` inside the app for the full list.
 | `ga` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `gy` | copy the last assistant message (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
+| `gl` | open lazygit in the thread's directory: a tmux popup, or in tria's place outside tmux |
 | `gx` | open the thread's pull request in the browser |
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
 | `Ctrl-c` | interrupt the running turn |
@@ -101,7 +102,7 @@ command.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `archive`, `delete!`, `stop`,
-`older`, `answer`, `dismiss`, `pr`, `tmux`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
+`older`, `answer`, `dismiss`, `pr`, `git`, `tmux`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
 
 ## Branch and pull request
 
@@ -110,6 +111,13 @@ number, title, draft or merged state, and a checks glyph (`✓` passing, `✗` f
 pending). The pull request on the thread's branch wins; otherwise the first open linked one.
 `gx` opens it in the browser through the platform's URL opener. `:pr` does the same, and
 offers a picker when several pull requests are linked.
+
+## Git
+
+`gl` or `:git` runs `lazygit` in the thread's working directory. Inside tmux it opens as a
+popup over the pane while tria keeps running; close lazygit to return. Outside tmux, tria
+steps aside, runs the command in the same terminal, and redraws when it exits. Set
+`git_command` in the config file to run something else, for example `tig` or `git status`.
 
 ## tmux
 
