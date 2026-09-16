@@ -226,6 +226,11 @@ the id and gets back the summary plus a `history` string), `terminal.write` (`da
 64 KiB), `terminal.resize`, `terminal.clear`, `terminal.restart` (same shape as open), and
 `terminal.close`.
 
+A client that draws a terminal has to answer the capability queries programs send on startup:
+device attributes, XTVERSION, DECRQM mode queries, the kitty keyboard flags, the text area
+size. A program that gets no answer waits out its own timeout, which is around a second, before
+it draws anything. Answers go back through `terminal.write` like keystrokes.
+
 `terminal.attach` is a stream, not a call: it takes the same fields as open plus
 `restartIfNotRunning`, and yields `{ type: "snapshot", snapshot }` with the scrollback first,
 then the same event union. Feed `history` and every `output` `data` to a VT parser and the

@@ -1081,10 +1081,14 @@ impl App {
                 }
             }
             Event::Output { data } => {
-                pane.feed(&data);
+                let replies = pane.feed(&data);
                 // A full-screen program is up, so there is nothing of the shell left to hide.
                 if pane.alternate_screen() {
                     pane.starting = None;
+                }
+                // Answers to capability queries go back the way keystrokes do.
+                for reply in replies {
+                    self.write_to_pane(reply);
                 }
             }
             Event::Cleared => pane.reset(""),

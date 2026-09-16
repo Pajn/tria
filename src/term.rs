@@ -9,6 +9,69 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// How many lines of scrollback the parser keeps beyond the visible screen.
 const SCROLLBACK: usize = 5_000;
 
+/// Answers the capability queries a program sends to the terminal it runs in.
+///
+/// These matter for startup time: a program that asks what the terminal supports
+/// waits for the reply, and a full-screen one will sit on a timeout of a second or
+/// more before drawing anything. The server's pty passes the queries through, so
+/// this side has to answer them the way a real emulator would.
+#[derive(Default)]
+struct Answers {
+    replies: Vec<String>,
+}
+
+impl vt100::Callbacks for Answers {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        let first = params.first().and_then(|p| p.first()).copied();
+        let reply = match (i1, i2, c) {
+            // Primary and secondary device attributes: a VT220 with color.
+            (None, _, 'c') => Some("\x1b[?62;22c".to_string()),
+            (Some(b'>'), _, 'c') => Some("\x1b[>1;10;0c".to_string()),
+            // XTVERSION.
+            (Some(b'>'), _, 'q') => {
+                Some(format!("\x1bP>|tria({})\x1b\\", env!("CARGO_PKG_VERSION")))
+            }
+            // Device status: ready, and the cursor position.
+            (None, _, 'n') if first == Some(5) => Some("\x1b[0n".to_string()),
+            (None, _, 'n') if first == Some(6) => {
+                let (row, col) = screen.cursor_position();
+                Some(format!("\x1b[{};{}R", row + 1, col + 1))
+            }
+            // The text area size in characters.
+            (None, _, 't') if first == Some(18) => {
+                let (rows, cols) = screen.size();
+                Some(format!("\x1b[8;{rows};{cols}t"))
+            }
+            // Key modifier options: none of the optional encodings are on.
+            (Some(b'?'), _, 'm') => first.map(|mode| format!("\x1b[>{mode};0m")),
+            // The kitty keyboard protocol, with no flags set.
+            (Some(b'?'), _, 'u') => Some("\x1b[?0u".to_string()),
+            // DECRQM: report the modes this screen actually tracks, and say the rest
+            // are not recognized so the program picks its fallback without waiting.
+            (Some(b'?'), Some(b'$'), 'p') => first.map(|mode| {
+                let set = match mode {
+                    1049 => screen.alternate_screen(),
+                    2004 => screen.bracketed_paste(),
+                    1 => screen.application_cursor(),
+                    _ => return format!("\x1b[?{mode};0$y"),
+                };
+                format!("\x1b[?{mode};{}$y", if set { 1 } else { 2 })
+            }),
+            _ => None,
+        };
+        if let Some(reply) = reply {
+            self.replies.push(reply);
+        }
+    }
+}
+
 pub struct Pane {
     pub thread_id: String,
     pub terminal_id: String,
@@ -18,7 +81,7 @@ pub struct Pane {
     /// A command being started in place of the shell: the pane shows a notice instead of
     /// the shell's prompt until the command is actually running.
     pub starting: Option<String>,
-    parser: vt100::Parser,
+    parser: vt100::Parser<Answers>,
     size: (u16, u16),
 }
 
@@ -36,7 +99,7 @@ impl Pane {
             label,
             exited: None,
             starting: None,
-            parser: vt100::Parser::new(rows, cols, SCROLLBACK),
+            parser: vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK, Answers::default()),
             size: (cols, rows),
         }
     }
@@ -49,16 +112,19 @@ impl Pane {
         self.size
     }
 
-    pub fn feed(&mut self, data: &str) {
+    /// Parse output, and hand back whatever the program asked the terminal to answer.
+    #[must_use]
+    pub fn feed(&mut self, data: &str) -> Vec<String> {
         self.parser.process(data.as_bytes());
+        std::mem::take(&mut self.parser.callbacks_mut().replies)
     }
 
     /// Replace the screen with a replayed scrollback, as after attach or restart.
     pub fn reset(&mut self, history: &str) {
         let (cols, rows) = self.size;
-        self.parser = vt100::Parser::new(rows, cols, SCROLLBACK);
+        self.parser = vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK, Answers::default());
         self.exited = None;
-        self.feed(history);
+        let _ = self.feed(history);
     }
 
     /// Returns true when the size changed and the server needs telling.
@@ -247,9 +313,22 @@ mod tests {
     }
 
     #[test]
+    fn capability_queries_are_answered() {
+        let mut pane = Pane::new("t".into(), "term-1".into(), "Terminal".into(), 80, 24);
+        // Primary device attributes, the text area size, and a mode query.
+        let replies = pane.feed("\x1b[c\x1b[18t\x1b[?2026$p");
+        assert_eq!(
+            replies,
+            vec!["\x1b[?62;22c", "\x1b[8;24;80t", "\x1b[?2026;0$y"]
+        );
+        // Plain output asks nothing.
+        assert!(pane.feed("hello").is_empty());
+    }
+
+    #[test]
     fn output_lands_on_the_screen() {
         let mut pane = Pane::new("t".into(), "term-1".into(), "Terminal".into(), 20, 4);
-        pane.feed("hello\r\nworld");
+        let _ = pane.feed("hello\r\nworld");
         assert_eq!(pane.screen().contents().trim_end(), "hello\nworld");
         assert!(pane.resize(30, 6));
         assert!(!pane.resize(30, 6));

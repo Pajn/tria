@@ -130,6 +130,9 @@ While lazygit is up, `Ctrl-\` leaves it running and `gl` comes back to it exactl
 The terminal belongs to the server, so this works the same whether the server is on this
 machine or another one, and lazygit runs where the repository is.
 
+Startup goes through your login shell, which is what it costs; the pane answers the capability
+queries a full-screen program sends on startup, so nothing waits on a timeout.
+
 `g!` or `:shell` opens a plain shell in the same popup, in the thread's directory. Exiting it,
 with `Ctrl-d` or `exit`, closes the popup. Both of these are scratch sessions: tria closes the
 ones it opened and leaves the desktop app's own alone.
