@@ -1,4 +1,5 @@
-//! A small multi-line text editor for the message composer, with prompt history.
+//! A small multi-line text editor with prompt history, behind the message composer and
+//! the one-line field a custom answer is typed into.
 
 use ratatui::{
     layout::Rect,
@@ -259,6 +260,23 @@ impl Composer {
         self.col = 0;
     }
 
+    /// What to draw in a one-line field `width` columns wide, and the column the cursor
+    /// lands on in it. The window follows the cursor and keeps some of the line ahead of
+    /// it in view where there is any, so typing at the end keeps the end in sight and
+    /// moving back through a long answer scrolls it along.
+    pub fn line_window(&self, width: usize) -> (String, usize) {
+        if width == 0 {
+            return (String::new(), 0);
+        }
+        let chars: Vec<char> = self.line().chars().collect();
+        let col = self.col.min(chars.len());
+        // The cursor sits one past the last character, so the window leaves it a column.
+        let max_offset = (chars.len() + 1).saturating_sub(width);
+        let offset = col.saturating_sub(width * 2 / 3).min(max_offset);
+        let end = (offset + width).min(chars.len());
+        (chars[offset..end].iter().collect(), col - offset)
+    }
+
     /// Number of screen rows needed at `width`, between 1 and `max`.
     pub fn height(&self, width: u16, max: u16) -> u16 {
         let width = width.max(1) as usize;
@@ -342,6 +360,46 @@ mod tests {
         c.backspace();
         c.backspace();
         assert_eq!(c.text(), "hello Xwörld");
+    }
+
+    #[test]
+    fn a_short_line_fills_the_window_from_the_start() {
+        let mut c = Composer::new();
+        c.insert_str("hej hopp");
+        assert_eq!(c.line_window(20), ("hej hopp".to_string(), 8));
+        c.home();
+        assert_eq!(c.line_window(20), ("hej hopp".to_string(), 0));
+        assert_eq!(c.line_window(0), (String::new(), 0));
+    }
+
+    #[test]
+    fn a_long_line_scrolls_to_keep_the_cursor_in_view() {
+        let mut c = Composer::new();
+        c.insert_str(&"abcdefghij".repeat(10));
+        // At the end: the last column is the cursor's, so the tail is what shows.
+        let (text, cursor) = c.line_window(30);
+        assert_eq!(cursor, 29);
+        assert_eq!(text.chars().count(), 29);
+        assert!("abcdefghij".repeat(10).ends_with(&text));
+        // Back in the middle: the window keeps a third of itself ahead of the cursor.
+        c.home();
+        for _ in 0..50 {
+            c.right();
+        }
+        let (text, cursor) = c.line_window(30);
+        assert_eq!(cursor, 20);
+        assert_eq!(text.chars().count(), 30);
+        // Near the start there is nothing to scroll to.
+        c.home();
+        c.right();
+        assert_eq!(c.line_window(30).1, 1);
+    }
+
+    #[test]
+    fn the_window_counts_characters_not_bytes() {
+        let mut c = Composer::new();
+        c.insert_str("åäöåäöåäö");
+        assert_eq!(c.line_window(5), ("öåäö".to_string(), 4));
     }
 
     #[test]

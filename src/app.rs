@@ -227,10 +227,15 @@ pub struct App {
     pub command_line: String,
     pub picker: Option<Picker>,
     pub question: Option<QuestionDraft>,
-    pub custom_answer: String,
+    /// The one-line field a custom answer is typed into.
+    pub custom_answer: Composer,
     pub sidebar_visible: bool,
     /// Index into `sidebar_rows()`.
     pub sidebar_selected: usize,
+    /// First visible line of the help, which is taller than most terminals.
+    pub help_offset: usize,
+    /// Rows the help fits and rows it has, filled by the renderer each frame.
+    pub help_viewport: (usize, usize),
     pub show_settled: bool,
     pub show_snoozed: bool,
     pub scroll: Scroll,
@@ -331,9 +336,11 @@ impl App {
             command_line: String::new(),
             picker: None,
             question: None,
-            custom_answer: String::new(),
+            custom_answer: Composer::new(),
             sidebar_visible: true,
             sidebar_selected: 0,
+            help_offset: 0,
+            help_viewport: (0, 0),
             show_settled: false,
             show_snoozed: true,
             scroll: Scroll::Follow,
@@ -882,44 +889,38 @@ impl App {
             }
             KeyCode::Char('c') | KeyCode::Char('i') | KeyCode::Char('/') => {
                 if draft.current().allow_custom {
-                    self.custom_answer = draft.current_answer().custom.clone();
+                    // Picking the field up again puts the cursor after what is there.
+                    self.custom_answer.set_text(&draft.current_answer().custom);
                     self.mode = Mode::QuestionCustom;
                 } else {
                     self.toast("this question does not accept a custom answer", false);
                 }
             }
             KeyCode::Char('d') => self.dismiss_question(),
-            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('?') => self.open_help(),
             _ => {}
         }
     }
 
     fn on_question_custom_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => {
                 self.custom_answer.clear();
                 self.mode = Mode::Question;
             }
             KeyCode::Enter => {
-                let text = std::mem::take(&mut self.custom_answer);
+                let text = self.custom_answer.text();
+                self.custom_answer.clear();
                 if let Some(draft) = self.question.as_mut() {
                     draft.set_custom(text);
                 }
                 self.mode = Mode::Question;
                 self.submit_answers();
             }
-            KeyCode::Backspace => {
-                self.custom_answer.pop();
+            // The field holds one line, so the keys that would leave it are not offered.
+            _ => {
+                edit_key(&mut self.custom_answer, key);
             }
-            KeyCode::Char('u') if ctrl => self.custom_answer.clear(),
-            KeyCode::Char('w') if ctrl => {
-                let trimmed = self.custom_answer.trim_end().to_string();
-                let cut = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
-                self.custom_answer.truncate(cut);
-            }
-            KeyCode::Char(c) if !ctrl => self.custom_answer.push(c),
-            _ => {}
         }
     }
 
@@ -2123,7 +2124,7 @@ impl App {
         match name {
             "" => {}
             "q" | "quit" | "q!" => self.quit = true,
-            "help" | "h" => self.mode = Mode::Help,
+            "help" | "h" => self.open_help(),
             "new" | "n" => {
                 if arg.is_empty() {
                     self.open_picker(PickerKind::Project);
@@ -2777,15 +2778,37 @@ impl App {
             Mode::Picker => self.on_picker_key(key),
             Mode::Question => self.on_question_key(key),
             Mode::QuestionCustom => self.on_question_custom_key(key),
-            Mode::Help => {
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter
-                ) {
-                    self.mode = Mode::Normal;
-                }
-            }
+            Mode::Help => self.on_help_key(key),
         }
+    }
+
+    fn open_help(&mut self) {
+        self.help_offset = 0;
+        self.mode = Mode::Help;
+    }
+
+    /// The help is longer than it is tall, so it scrolls with the keys the chat uses.
+    fn on_help_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let (height, total) = self.help_viewport;
+        let max = total.saturating_sub(height);
+        let by =
+            |offset: usize, delta: isize| (offset as isize + delta).clamp(0, max as isize) as usize;
+        self.help_offset = match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down => by(self.help_offset, 1),
+            KeyCode::Char('k') | KeyCode::Up => by(self.help_offset, -1),
+            KeyCode::Char('d') if ctrl => by(self.help_offset, height as isize / 2),
+            KeyCode::Char('u') if ctrl => by(self.help_offset, -(height as isize) / 2),
+            KeyCode::Char('f') | KeyCode::PageDown => by(self.help_offset, height as isize),
+            KeyCode::Char('b') | KeyCode::PageUp => by(self.help_offset, -(height as isize)),
+            KeyCode::Char('g') | KeyCode::Home => 0,
+            KeyCode::Char('G') | KeyCode::End => max,
+            _ => return,
+        };
     }
 
     fn take_prefix(&mut self) -> Option<char> {
@@ -2830,7 +2853,7 @@ impl App {
                     self.mode = Mode::Command;
                     self.command_line.clear();
                 }
-                KeyCode::Char('?') => self.mode = Mode::Help,
+                KeyCode::Char('?') => self.open_help(),
                 _ => {}
             }
             return;
@@ -2929,7 +2952,7 @@ impl App {
                 self.command_line.clear();
                 return;
             }
-            KeyCode::Char('?') => return self.mode = Mode::Help,
+            KeyCode::Char('?') => return self.open_help(),
             KeyCode::Char('s') if !self.composer.vim_pending() => {
                 return self.sidebar_visible = !self.sidebar_visible;
             }
@@ -3115,13 +3138,6 @@ impl App {
             KeyCode::Enter if alt || shift || ctrl => self.composer.newline(),
             KeyCode::Char('j') if ctrl => self.composer.newline(),
             KeyCode::Enter => self.send_message(),
-            KeyCode::Backspace if alt || ctrl => self.composer.kill_word_back(),
-            KeyCode::Backspace => self.composer.backspace(),
-            KeyCode::Delete => self.composer.delete(),
-            KeyCode::Left if alt || ctrl => self.composer.word_left(),
-            KeyCode::Right if alt || ctrl => self.composer.word_right(),
-            KeyCode::Left => self.composer.left(),
-            KeyCode::Right => self.composer.right(),
             KeyCode::Up => {
                 if !self.composer.up() {
                     self.composer.history_prev();
@@ -3132,22 +3148,14 @@ impl App {
                     self.composer.history_next();
                 }
             }
-            KeyCode::Home => self.composer.home(),
-            KeyCode::End => self.composer.end(),
             KeyCode::PageUp => self.scroll_by(-(self.chat_viewport.0 as isize)),
             KeyCode::PageDown => self.scroll_by(self.chat_viewport.0 as isize),
-            KeyCode::Char('a') if ctrl => self.composer.home(),
-            KeyCode::Char('e') if ctrl => self.composer.end(),
-            KeyCode::Char('b') if alt => self.composer.word_left(),
-            KeyCode::Char('f') if alt => self.composer.word_right(),
-            KeyCode::Char('w') if ctrl => self.composer.kill_word_back(),
-            KeyCode::Char('k') if ctrl => self.composer.kill_to_end(),
-            KeyCode::Char('u') if ctrl => self.composer.kill_to_start(),
             KeyCode::Char('p') if ctrl => self.composer.history_prev(),
             KeyCode::Char('n') if ctrl => self.composer.history_next(),
             KeyCode::Tab => self.composer.insert_str("    "),
-            KeyCode::Char(c) if !ctrl => self.composer.insert_char(c),
-            _ => {}
+            _ => {
+                edit_key(&mut self.composer, key);
+            }
         }
     }
 
@@ -3322,6 +3330,34 @@ impl App {
             }
             Update::Error(error) => self.toast(error, true),
         }
+    }
+}
+
+/// The keys that edit text wherever it is typed, so a message and a custom answer are
+/// written the same way. Keys that only make sense in one of them — a newline, prompt
+/// history, sending — belong to the caller and are handled before this.
+fn edit_key(field: &mut Composer, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Backspace if alt || ctrl => field.kill_word_back(),
+        KeyCode::Backspace => field.backspace(),
+        KeyCode::Delete => field.delete(),
+        KeyCode::Left if alt || ctrl => field.word_left(),
+        KeyCode::Right if alt || ctrl => field.word_right(),
+        KeyCode::Left => field.left(),
+        KeyCode::Right => field.right(),
+        KeyCode::Home => field.home(),
+        KeyCode::End => field.end(),
+        KeyCode::Char('a') if ctrl => field.home(),
+        KeyCode::Char('e') if ctrl => field.end(),
+        KeyCode::Char('b') if alt => field.word_left(),
+        KeyCode::Char('f') if alt => field.word_right(),
+        KeyCode::Char('w') if ctrl => field.kill_word_back(),
+        KeyCode::Char('k') if ctrl => field.kill_to_end(),
+        KeyCode::Char('u') if ctrl => field.kill_to_start(),
+        KeyCode::Char(c) if !ctrl => field.insert_char(c),
+        _ => {}
     }
 }
 

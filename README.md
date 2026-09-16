@@ -105,7 +105,13 @@ command.
 | `Enter` | send |
 | `Alt-Enter` or `Ctrl-j` | newline |
 | `Up` `Down` or `Ctrl-p` `Ctrl-n` | prompt history |
+| `←` `→` `Home` `End`, `Ctrl-a` `Ctrl-e` | move the cursor; `Alt` with an arrow, or `Alt-b` `Alt-f`, moves by word |
+| `Backspace` `Delete`, `Ctrl-w` `Ctrl-k` `Ctrl-u` | delete a character, the word before the cursor, to the end, to the start |
 | `Esc` | back to normal mode |
+
+The custom answer typed after `ga` then `c` is edited with those same keys. It is one line:
+a long answer scrolls inside its row rather than wrapping, `Enter` confirms it, and `Esc`
+goes back to the options without keeping it.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `archive`, `delete!`, `stop`,

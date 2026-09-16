@@ -115,7 +115,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     match app.mode {
         Mode::Picker => draw_picker(frame, app, area),
-        Mode::Help => draw_help(frame, area),
+        Mode::Help => draw_help(frame, app, area),
         Mode::Tasks => draw_tasks(frame, app, area),
         Mode::Agents => draw_agents(frame, app, area),
         Mode::Terminals => draw_terminals(frame, app, area),
@@ -1115,18 +1115,34 @@ fn draw_question(
         }
         lines.push(Line::from(spans).style(row_style));
     }
+    // The field is one row of the panel, so a long answer scrolls inside it rather than
+    // wrapping and pushing the hint off the bottom. `  c > ` takes the first six columns.
+    let field_width = inner.width.saturating_sub(6) as usize;
+    let mut field_cursor = None;
     if question.allow_custom {
         if app.mode == Mode::QuestionCustom {
+            let (visible, cursor) = app.custom_answer.line_window(field_width);
+            // The rows above the field are however many the question text and the
+            // options wrapped to, which is not one apiece.
+            let row: u16 = lines
+                .iter()
+                .map(|line| {
+                    Paragraph::new(line.clone())
+                        .wrap(Wrap { trim: false })
+                        .line_count(inner.width) as u16
+                })
+                .sum();
+            field_cursor = Some((row, cursor as u16));
             lines.push(Line::from(vec![
                 Span::styled("  c ", accent.add_modifier(Modifier::BOLD)),
                 Span::styled("> ", accent),
-                Span::raw(app.custom_answer.clone()),
+                Span::raw(visible),
             ]));
         } else if !custom.trim().is_empty() {
             lines.push(Line::from(vec![
                 Span::styled("  c ", accent.add_modifier(Modifier::BOLD)),
                 Span::styled("(•) ", accent),
-                Span::raw(custom.clone()),
+                Span::raw(fit(&custom, field_width)),
             ]));
         } else {
             lines.push(Line::from(vec![
@@ -1164,15 +1180,13 @@ fn draw_question(
     )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 
-    if app.mode == Mode::QuestionCustom {
-        let row = 1 + question.options.len() as u16;
-        let x = inner.x + 6 + app.custom_answer.chars().count() as u16;
-        if row < inner.height {
-            frame.set_cursor_position((
-                x.min(inner.x + inner.width.saturating_sub(1)),
-                inner.y + row,
-            ));
-        }
+    if let Some((row, cursor)) = field_cursor
+        && row < inner.height
+    {
+        frame.set_cursor_position((
+            (inner.x + 6 + cursor).min(inner.x + inner.width.saturating_sub(1)),
+            inner.y + row,
+        ));
     }
 }
 
@@ -1893,7 +1907,7 @@ pub fn elapsed_label(since: &str, now: &str) -> String {
     }
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     let text = Text::from(vec![
         Line::from(Span::styled("Normal", Style::default().bold())),
         Line::from("  Tab / Shift-Tab         cycle focus: composer → chat → threads · Esc back"),
@@ -1957,7 +1971,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(Span::styled("Insert", Style::default().bold())),
         Line::from("  Enter send · Alt-Enter / Ctrl-j newline · Esc normal"),
         Line::from("  Up/Down or Ctrl-p/n     prompt history"),
+        Line::from("  ← → Home End Ctrl-a/e  move · Alt-arrow or Alt-b/f by word"),
         Line::from("  Ctrl-w Ctrl-k Ctrl-u    kill word / to end / to start"),
+        Line::from("  the same keys edit a custom answer under ga, where Enter confirms it"),
         Line::from(""),
         Line::from(Span::styled("Commands", Style::default().bold())),
         Line::from("  :new [project]  :model  :effort [level]  :mode plan|default"),
@@ -1966,14 +1982,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(
             "  :pr  :tasks  :agents  :terminals  :tmux  :settle  :unsettle  :wake  :settled  :stop  :older  :answer  :dismiss  :sidebar  :q",
         ),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  press Esc to close",
-            Style::default().fg(Color::DarkGray),
-        )),
     ]);
     let width = 72.min(area.width);
-    let height = (text.lines.len() as u16 + 2).min(area.height);
+    // Wrapped, so a line longer than the popup is folded rather than cut off its end.
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    let total = paragraph.line_count(width.saturating_sub(2));
+    let height = (total as u16 + 2).min(area.height);
     let popup = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -1981,12 +1995,40 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         height,
     };
     frame.render_widget(Clear, popup);
+    // There is more help than there is terminal on most screens, so it scrolls.
+    let rows = popup.height.saturating_sub(2) as usize;
+    app.help_viewport = (rows, total);
+    let offset = app.help_offset.min(total.saturating_sub(rows));
+    app.help_offset = offset;
+    let more = total > rows;
     let block = Block::bordered()
         .border_style(Style::default().fg(Color::Blue))
-        .title(" keys ");
+        .title(" keys ")
+        .title_bottom(Line::from(Span::styled(
+            if more {
+                format!(
+                    " {}–{} of {total} · j k scroll · Esc ",
+                    offset + 1,
+                    (offset + rows).min(total)
+                )
+            } else {
+                " Esc to close ".to_string()
+            },
+            Style::default().fg(Color::DarkGray),
+        )));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    frame.render_widget(Paragraph::new(text), inner);
+    frame.render_widget(paragraph.scroll((offset as u16, 0)), inner);
+    if more {
+        // On the border column, so it never lands on top of the text.
+        let track = Rect {
+            x: inner.x + inner.width,
+            y: inner.y,
+            width: 1,
+            height: inner.height,
+        };
+        draw_scrollbar(frame, track, offset, total, rows);
+    }
 }
 
 fn fit(text: &str, max: usize) -> String {
