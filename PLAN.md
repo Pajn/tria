@@ -210,6 +210,32 @@ Slash commands need no encoding: a provider command works when it is the first t
 text. File mentions can be plain `@path` text. Attachments and the `t3-context://` chip format
 are out of scope.
 
+### Terminals
+
+Terminals are a subsystem of their own, outside `orchestration.dispatchCommand` and outside the
+`orchestration:read`/`operate` scopes. They need `terminal:operate`.
+
+`subscribeTerminalMetadata` streams `{ type: "snapshot", terminals }`, `{ type: "upsert",
+terminal }`, and `{ type: "remove", threadId, terminalId }`. A terminal carries `threadId`,
+`terminalId`, `cwd`, `worktreePath`, `status` (`starting`, `running`, `exited`, `error`), `pid`,
+`exitCode`, `exitSignal`, `hasRunningSubprocess`, `label`, and `updatedAt`. No contents: that is
+`subscribeTerminalEvents`, which streams output chunks and needs a VT parser to render.
+
+The calls are `terminal.open` (`threadId`, `terminalId`, `cwd`, `cols`, `rows`; the client mints
+the id and gets back the summary plus a `history` string), `terminal.attach`, `terminal.write`,
+`terminal.resize`, `terminal.clear`, `terminal.restart` (same shape as open), and
+`terminal.close`.
+
+### Stopping work
+
+There is no per-task stop. Background tasks — the `task.started`/`updated`/`completed`
+activities — carry no command to cancel one. What exists is `thread.turn.interrupt`,
+`thread.session.stop` (with an optional `onlyIfSettled`), `terminal.close` and
+`terminal.restart` for shells, and `server.signalProcess` (`SIGINT` or `SIGKILL`) for host
+processes listed by `server.getProcessDiagnostics`. The last one refuses the server's own pid,
+requires a `startTimeMs` identity match so a recycled pid cannot be hit, and only signals
+processes it classifies as `server-child`, `provider-root`, or `terminal-root`.
+
 ## 2. Decisions
 
 **Transport.** Hand-written Effect RPC framing over `tokio-tungstenite`, JSON via `serde`.
