@@ -221,6 +221,11 @@ This is where a branch comes from. `ThreadShell.branch` is set only for threads 
 created a branch for, and is null for the rest, including every thread working in a project's
 own checkout.
 
+The status behind that stream is cached and does not follow every edit on disk: a file changed
+outside the server can leave `hasWorkingTreeChanges` and the line counts stale indefinitely.
+`vcs.refreshStatus` takes the same `cwd`, re-reads, and broadcasts the result to the
+subscribers, so a client that wants current numbers has to ask.
+
 ### Terminals
 
 Terminals are a subsystem of their own, outside `orchestration.dispatchCommand` and outside the

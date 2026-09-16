@@ -115,10 +115,17 @@ The header shows the thread's branch, the name of its worktree after `⌂` when 
 its own, and, when the server has linked a pull request, its number, title, draft or merged
 state, and a checks glyph (`✓` passing, `✗` failing, `○` pending).
 
+After the branch comes the state of the checkout: `●` with `+` and `−` line counts when the
+working tree is dirty, `↑` commits ahead of the upstream and `↓` commits behind.
+
 The thread list only carries a branch for threads the server created one for, so for the rest
 tria watches the thread's checkout and shows the branch that is actually checked out there.
 Threads sharing a project's checkout therefore show the same branch, which is the truth: they
-share it. The pull request on the thread's branch wins; otherwise the first open linked one.
+share it.
+
+The server caches its git status and does not report every edit, so tria asks it to re-read the
+checkout when the thread opens, when a turn finishes, when you leave the terminal popup, and
+every twenty seconds otherwise. The pull request on the thread's branch wins; otherwise the first open linked one.
 `gx` opens it in the browser through the platform's URL opener. `:pr` does the same, and
 offers a picker when several pull requests are linked.
 

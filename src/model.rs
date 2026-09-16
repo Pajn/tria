@@ -262,6 +262,18 @@ pub struct VcsLocal {
     pub is_default_ref: bool,
     #[serde(default)]
     pub has_working_tree_changes: bool,
+    #[serde(default)]
+    pub working_tree: VcsWorkingTree,
+}
+
+/// What is uncommitted, as line counts across the changed files.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VcsWorkingTree {
+    #[serde(default)]
+    pub insertions: u32,
+    #[serde(default)]
+    pub deletions: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -269,13 +281,28 @@ pub struct VcsLocal {
 pub enum VcsEvent {
     Snapshot {
         local: VcsLocal,
+        remote: Option<VcsRemote>,
     },
     LocalUpdated {
         local: VcsLocal,
     },
-    /// Remote state: ahead, behind, and the pull request, which the thread list carries too.
+    RemoteUpdated {
+        remote: Option<VcsRemote>,
+    },
     #[serde(other)]
     Unknown,
+}
+
+/// How the checkout stands against its upstream.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VcsRemote {
+    #[serde(default)]
+    pub has_upstream: bool,
+    #[serde(default)]
+    pub ahead_count: u32,
+    #[serde(default)]
+    pub behind_count: u32,
 }
 
 /// A terminal session with its scrollback, as `terminal.attach` and `terminal.open` return it.

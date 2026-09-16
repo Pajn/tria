@@ -45,6 +45,10 @@ const TICK: Duration = Duration::from_millis(120);
 const TOAST_TTL: Duration = Duration::from_secs(6);
 const PREFIX_TTL: Duration = Duration::from_millis(1200);
 
+/// How often to re-read the open thread's checkout. The server does not report edits
+/// made outside it, so the working tree counts would otherwise sit still.
+const VCS_REFRESH: Duration = Duration::from_secs(20);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -241,8 +245,14 @@ pub struct App {
     pub pane_area: Rect,
     /// The open thread's checkout, for the branch the thread list does not carry.
     pub vcs: Option<crate::model::VcsLocal>,
+    /// How that checkout stands against its upstream.
+    pub vcs_remote: Option<crate::model::VcsRemote>,
     /// The directory the watch is on, so it only resubscribes when the thread moves.
     vcs_cwd: Option<String>,
+    /// Whether the open thread was running at the last update, to notice it finishing.
+    was_running: bool,
+    /// When the checkout was last re-read.
+    vcs_refreshed: Instant,
     /// Command for `gl` and `:git`, from the config file.
     pub git_command: String,
     /// Editor for `ge` and `gE`.
@@ -306,7 +316,10 @@ impl App {
             pending_pane_command: None,
             pane_area: Rect::default(),
             vcs: None,
+            vcs_remote: None,
             vcs_cwd: None,
+            was_running: false,
+            vcs_refreshed: Instant::now(),
             drafts: HashMap::new(),
             git_command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
             editor: "nvim".to_string(),
@@ -481,6 +494,7 @@ impl App {
         self.scroll = Scroll::Follow;
         self.expanded.clear();
         self.vcs = None;
+        self.vcs_remote = None;
         self.handle.open_thread(thread_id);
         if let Some(thread) = self.shell.threads.get(thread_id) {
             if thread.is_settled() {
@@ -1059,6 +1073,8 @@ impl App {
         self.handle.detach_terminal();
         self.pane = None;
         self.mode = Mode::Normal;
+        // Whatever ran in there probably touched the checkout.
+        self.handle.refresh_vcs();
     }
 
     /// The size the pane will be drawn at, for the initial attach and for `terminal.open`.
@@ -1159,6 +1175,16 @@ impl App {
         self.write_to_pane(data);
     }
 
+    /// Re-read the checkout every so often, so the working tree counts stay true even
+    /// when the edits came from somewhere the server is not watching.
+    fn refresh_vcs_periodically(&mut self) {
+        if self.vcs_cwd.is_none() || self.vcs_refreshed.elapsed() < VCS_REFRESH {
+            return;
+        }
+        self.vcs_refreshed = Instant::now();
+        self.handle.refresh_vcs();
+    }
+
     /// Follow the open thread's checkout, so the header can show its branch. The thread
     /// list only carries a branch for threads the server made one for.
     fn sync_vcs_watch(&mut self) {
@@ -1167,6 +1193,7 @@ impl App {
             return;
         }
         self.vcs = None;
+        self.vcs_remote = None;
         self.vcs_cwd = cwd.clone();
         self.handle.watch_vcs(cwd);
     }
@@ -2880,6 +2907,13 @@ impl App {
                 }
                 self.reconcile_question();
                 self.sync_vcs_watch();
+                // A finished turn has usually changed the checkout, and the server's
+                // own status cache can be behind the disk.
+                let running = self.thread.as_ref().is_some_and(|t| t.is_running());
+                if self.was_running && !running {
+                    self.handle.refresh_vcs();
+                }
+                self.was_running = running;
             }
             Update::OlderPage {
                 thread_id,
@@ -2896,9 +2930,12 @@ impl App {
             Update::Vcs(event) => {
                 use crate::model::VcsEvent;
                 match event {
-                    VcsEvent::Snapshot { local } | VcsEvent::LocalUpdated { local } => {
+                    VcsEvent::Snapshot { local, remote } => {
                         self.vcs = Some(local);
+                        self.vcs_remote = remote;
                     }
+                    VcsEvent::LocalUpdated { local } => self.vcs = Some(local),
+                    VcsEvent::RemoteUpdated { remote } => self.vcs_remote = remote,
                     VcsEvent::Unknown => {}
                 }
             }
@@ -3216,6 +3253,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
             AppEvent::Tick => {
                 app.spinner = app.spinner.wrapping_add(1);
                 app.poll_popup();
+                app.refresh_vcs_periodically();
                 if app
                     .toast
                     .as_ref()

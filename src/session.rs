@@ -43,6 +43,8 @@ pub enum Request {
     WatchVcs {
         cwd: Option<String>,
     },
+    /// Re-read the watched checkout, for when something outside the server changed it.
+    RefreshVcs,
     /// Any other RPC, for the calls that are not orchestration commands.
     Call {
         tag: String,
@@ -145,6 +147,12 @@ impl Handle {
     /// Follow the branch of a checkout. One at a time: this is for the open thread.
     pub fn watch_vcs(&self, cwd: Option<String>) {
         let _ = self.tx.send(Request::WatchVcs { cwd });
+    }
+
+    /// Ask the server to re-read the watched checkout. Its own cache can be behind
+    /// what is on disk, and the result reaches the watch as an update.
+    pub fn refresh_vcs(&self) {
+        let _ = self.tx.send(Request::RefreshVcs);
     }
 
     pub async fn dispatch(&self, command: Value) -> Result<u64> {
@@ -256,9 +264,10 @@ async fn run(
         let mut vcs: Option<Subscription> = None;
         if let Some(cwd) = watched_cwd.clone() {
             vcs = client
-                .subscribe("subscribeVcsStatus", json!({ "cwd": cwd }))
+                .subscribe("subscribeVcsStatus", json!({ "cwd": cwd.clone() }))
                 .await
                 .ok();
+            refresh_vcs(&client, cwd);
         }
         if let Some(open) = open.as_mut() {
             open.subscription = subscribe_thread(&client, &open.id, open.last_sequence, pagination)
@@ -332,12 +341,24 @@ async fn run(
                             vcs = match cwd {
                                 // Not every thread directory is a checkout; the stream
                                 // says so itself and a failure is not worth reporting.
-                                Some(cwd) => client
-                                    .subscribe("subscribeVcsStatus", json!({ "cwd": cwd }))
-                                    .await
-                                    .ok(),
+                                Some(cwd) => {
+                                    let sub = client
+                                        .subscribe(
+                                            "subscribeVcsStatus",
+                                            json!({ "cwd": cwd.clone() }),
+                                        )
+                                        .await
+                                        .ok();
+                                    refresh_vcs(&client, cwd);
+                                    sub
+                                }
                                 None => None,
                             };
+                        }
+                        Request::RefreshVcs => {
+                            if let Some(cwd) = watched_cwd.clone() {
+                                refresh_vcs(&client, cwd);
+                            }
                         }
                         Request::LoadOlder { before_cursor } => {
                             if let Some(o) = open.as_ref() {
@@ -509,6 +530,18 @@ async fn subscribe_shell(client: &RpcClient, after: Option<u64>) -> Result<Subsc
     client
         .subscribe("orchestration.subscribeShell", payload)
         .await
+}
+
+/// Re-read a checkout in the background. The server caches its git status and can be
+/// behind the disk; the refreshed result is broadcast to the watch, so the reply here
+/// is of no interest.
+fn refresh_vcs(client: &RpcClient, cwd: String) {
+    let client = client.clone();
+    tokio::spawn(async move {
+        let _: Result<Value> = client
+            .call("vcs.refreshStatus", json!({ "cwd": cwd }))
+            .await;
+    });
 }
 
 async fn subscribe_thread(

@@ -510,6 +510,34 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             ));
         }
+        if let Some(vcs) = &app.vcs
+            && vcs.has_working_tree_changes
+        {
+            let tree = &vcs.working_tree;
+            let counts = if tree.insertions + tree.deletions > 0 {
+                format!(" +{} −{}", tree.insertions, tree.deletions)
+            } else {
+                String::new()
+            };
+            spans.push(Span::styled(
+                format!(" ●{counts}"),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        if let Some(remote) = &app.vcs_remote {
+            if remote.ahead_count > 0 {
+                spans.push(Span::styled(
+                    format!("  ↑{}", remote.ahead_count),
+                    Style::default().fg(Color::Green),
+                ));
+            }
+            if remote.behind_count > 0 {
+                spans.push(Span::styled(
+                    format!("  ↓{}", remote.behind_count),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+        }
         // Only worth naming when the thread has a checkout of its own.
         if let Some(worktree) = shell.worktree_path.as_deref().and_then(worktree_name) {
             spans.push(Span::styled(
