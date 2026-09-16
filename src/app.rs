@@ -1,7 +1,7 @@
 //! Application state, key handling, and the main event loop.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::Write,
     time::{Duration, Instant},
 };
@@ -25,6 +25,9 @@ use crate::{
     state::{ApprovalOption, PendingApproval, Shell, ThreadState},
     ui, vim,
 };
+
+/// Draft key for a thread that does not exist yet.
+const NEW_THREAD_DRAFT_KEY: &str = "\0new-thread";
 
 /// Rows moved per mouse wheel notch.
 const MOUSE_SCROLL_LINES: usize = 3;
@@ -202,6 +205,9 @@ pub struct App {
     pub message_starts: Vec<usize>,
     pub search: Option<Search>,
     pub search_input: Option<SearchInput>,
+    /// Unsent composer text per thread, keyed by thread id, so switching threads keeps a
+    /// half-written message where it belongs. New-thread drafts use `NEW_THREAD_DRAFT_KEY`.
+    drafts: HashMap<String, String>,
     /// Command for `gl` and `:git`, from the config file.
     pub git_command: String,
     /// Editor for `ge` and `gE`.
@@ -259,6 +265,7 @@ impl App {
             message_starts: Vec::new(),
             search: None,
             search_input: None,
+            drafts: HashMap::new(),
             git_command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
             editor: "nvim".to_string(),
             pending_external: None,
@@ -390,10 +397,38 @@ impl App {
 
     // ── Navigation ─────────────────────────────────────────────────────
 
+    /// Key under which the composer text of the current view is stashed.
+    fn draft_key(&self) -> Option<String> {
+        if self.draft.is_some() {
+            Some(NEW_THREAD_DRAFT_KEY.to_string())
+        } else {
+            self.current_thread_id.clone()
+        }
+    }
+
+    /// Park the composer text for the current thread and load the target's, if any.
+    fn swap_composer_draft(&mut self, target: &str) {
+        if let Some(key) = self.draft_key() {
+            let text = self.composer.text();
+            if text.trim().is_empty() {
+                self.drafts.remove(&key);
+            } else {
+                self.drafts.insert(key, text);
+            }
+        }
+        self.composer.clear();
+        if let Some(text) = self.drafts.get(target) {
+            let text = text.clone();
+            self.composer.set_text(&text);
+            self.composer.leave_insert();
+        }
+    }
+
     pub fn open_thread(&mut self, thread_id: &str) {
         if self.current_thread_id.as_deref() == Some(thread_id) && self.draft.is_none() {
             return;
         }
+        self.swap_composer_draft(thread_id);
         self.current_thread_id = Some(thread_id.to_string());
         self.thread = None;
         self.draft = None;
@@ -440,6 +475,7 @@ impl App {
             self.toast("no usable provider or model configured on the server", true);
             return;
         };
+        self.swap_composer_draft(NEW_THREAD_DRAFT_KEY);
         self.draft = Some(NewThreadDraft {
             project_id: project_id.to_string(),
             model_selection,
@@ -498,6 +534,9 @@ impl App {
         if text.trim().is_empty() {
             return;
         }
+        // Read the slot before sending: starting a new thread moves the view to it, and the
+        // parked text belongs to the slot the message was written in.
+        let draft_key = self.draft_key();
         if let Some(draft) = self.draft.take() {
             let thread_id = commands::new_id();
             let title: String = text
@@ -545,6 +584,9 @@ impl App {
         }
         self.composer.push_history(text);
         self.composer.clear();
+        if let Some(key) = draft_key {
+            self.drafts.remove(&key);
+        }
         self.scroll = Scroll::Follow;
     }
 

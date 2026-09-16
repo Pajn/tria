@@ -1287,6 +1287,11 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             "  ga                      answer the agent's question (digits, Space, c custom, Enter)",
         ),
         Line::from("  gy                      yank last assistant message (OSC 52)"),
+        Line::from("  gl                      lazygit in the thread's directory"),
+        Line::from(
+            "  ge                      composer: edit the draft · chat: view the block under the cursor",
+        ),
+        Line::from("  gE                      view the whole conversation in your editor"),
         Line::from("  Ctrl-e Ctrl-y Ctrl-d Ctrl-u  scroll the conversation by line / half page"),
         Line::from(""),
         Line::from("  composer (focused, Vim):"),

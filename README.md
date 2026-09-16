@@ -64,6 +64,8 @@ Press `?` inside the app for the full list.
 | `gy` | copy the last assistant message (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
 | `gl` | open lazygit in the thread's directory: a tmux popup, or in tria's place outside tmux |
+| `ge` | composer focused: edit the draft in your editor, read back on exit. Chat focused: view the message, plan, tool row, or tool group under the cursor |
+| `gE` | view the whole conversation in your editor |
 | `gx` | open the thread's pull request in the browser |
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
 | `Ctrl-c` | interrupt the running turn |
@@ -102,7 +104,7 @@ command.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `archive`, `delete!`, `stop`,
-`older`, `answer`, `dismiss`, `pr`, `git`, `tmux`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
+`older`, `answer`, `dismiss`, `pr`, `git`, `edit`, `view`, `tmux`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
 
 ## Branch and pull request
 
@@ -118,6 +120,19 @@ offers a picker when several pull requests are linked.
 popup over the pane while tria keeps running; close lazygit to return. Outside tmux, tria
 steps aside, runs the command in the same terminal, and redraws when it exits. Set
 `git_command` in the config file to run something else, for example `tig` or `git status`.
+
+## Editor
+
+`ge` with the composer focused writes the draft to a private temp file, opens it in your
+editor, and reads it back when the editor exits. With the chat focused, `ge` opens the block
+under the cursor read only: a message as markdown, or a tool call with its input, output
+summary, and changed files. `gE` opens the whole loaded conversation. The editor is `editor`
+from the config file, else `$VISUAL`, else `$EDITOR`, else `nvim`; Vim-like editors get `-R`
+for read-only views. Like `gl`, this uses a tmux popup inside tmux and takes over the
+terminal otherwise. `:edit` and `:view` are the command forms.
+
+Unsent composer text stays with its thread: switch away and back and the half-written
+message is still there. New-thread drafts have a slot of their own.
 
 ## tmux
 
