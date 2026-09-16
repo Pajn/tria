@@ -118,9 +118,10 @@ offers a picker when several pull requests are linked.
 
 ## Git
 
-`gl` or `:git` runs `lazygit` in a terminal of the thread's own, in the pane. The terminal is
-reused, one per thread, so `Ctrl-\` while lazygit is up and `gl` again comes back to it exactly
-as it was; once it has exited, `gl` starts it again. Set `git_command` in the config file to run
+`gl` or `:git` runs `lazygit` in a terminal of the thread's own, as a popup inside tria: the
+chat stays on screen around it and tria keeps running. The terminal is reused, one per thread,
+so `Ctrl-\` while lazygit is up and `gl` again comes back to it exactly as it was; once it has
+exited, `gl` starts it again. Set `git_command` in the config file to run
 something else, for example `tig` or `git status`.
 
 The terminal belongs to the server, so this works the same whether the server is on this
@@ -140,8 +141,8 @@ terminal tabs. `gS` or `:terminals` lists them with their status, working direct
 id, and whether a command is running right now. `x` closes the selected one, `r` restarts
 it in the same directory, and `c` opens a new one in the thread's working directory.
 
-`Enter` attaches: the shell takes over the screen and every key goes to it, `Ctrl-c` included.
-`Ctrl-\` detaches and leaves the shell running. The mouse wheel moves through the scrollback,
+`Enter` attaches: the shell opens as a popup over the chat and every key goes to it, `Ctrl-c`
+included. `Ctrl-\` detaches and leaves the shell running. The mouse wheel moves through the scrollback,
 and typing returns to the live screen. Resizing the window resizes the pty. The pane is a real
 terminal emulator, so full-screen programs work: this is the other way to reach lazygit, and
 unlike `gl` it stays inside tria and survives detaching.

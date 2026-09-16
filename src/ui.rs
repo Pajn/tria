@@ -47,10 +47,6 @@ thread_local! {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    if app.mode == Mode::TerminalPane && app.pane.is_some() {
-        draw_terminal_pane(frame, app, area);
-        return;
-    }
     let show_sidebar = app.sidebar_visible && area.width >= MIN_WIDTH_FOR_SIDEBAR;
     let (sidebar_area, main_area) = if show_sidebar {
         let [s, m] = Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
@@ -120,6 +116,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Help => draw_help(frame, area),
         Mode::Tasks => draw_tasks(frame, app, area),
         Mode::Terminals => draw_terminals(frame, app, area),
+        Mode::TerminalPane => draw_terminal_pane(frame, app, area),
         _ => {}
     }
 }
@@ -1276,26 +1273,53 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, list_area, &mut state);
 }
 
-/// The attached terminal, drawn from the parsed screen. One status line at the
-/// bottom keeps the detach key visible; everything above is the shell's own output.
+/// The attached terminal, drawn from the parsed screen as a popup over the chat.
+/// The border carries the session's title and the detach key; everything inside is
+/// the shell's own output, so the pty is sized to the inner area.
 fn draw_terminal_pane(frame: &mut Frame, app: &mut App, area: Rect) {
-    let [screen_area, status] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
-    app.sync_pane_size(screen_area.width, screen_area.height);
+    let width = area.width.saturating_sub(6).max(20).min(area.width);
+    let height = area.height.saturating_sub(4).max(10).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    let scrollback = app.pane.as_ref().map(|p| p.scrollback()).unwrap_or(0);
+    let title = match app.pane.as_ref() {
+        Some(pane) => match &pane.exited {
+            Some(exited) => format!(" {} · {exited} ", fit(&pane.label, 40)),
+            None => format!(" {} ", fit(&pane.label, 40)),
+        },
+        None => " terminal ".into(),
+    };
+    let hint = if scrollback > 0 {
+        format!(" scrollback {scrollback} · Ctrl-\\ detaches ")
+    } else {
+        " Ctrl-\\ detaches ".into()
+    };
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title)
+        .title_bottom(Line::from(hint).right_aligned());
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    app.sync_pane_size(inner.width, inner.height);
     let Some(pane) = &app.pane else { return };
     let screen = pane.screen();
 
     let buffer = frame.buffer_mut();
-    for row in 0..screen_area.height {
-        for col in 0..screen_area.width {
+    for row in 0..inner.height {
+        for col in 0..inner.width {
             let Some(cell) = screen.cell(row, col) else {
                 continue;
             };
             if cell.is_wide_continuation() {
                 continue;
             }
-            let target = Position::new(screen_area.x + col, screen_area.y + row);
-            let Some(target) = buffer.cell_mut(target) else {
+            let Some(target) = buffer.cell_mut(Position::new(inner.x + col, inner.y + row)) else {
                 continue;
             };
             let contents = cell.contents();
@@ -1324,33 +1348,10 @@ fn draw_terminal_pane(frame: &mut Frame, app: &mut App, area: Rect) {
 
     if !screen.hide_cursor() && pane.scrollback() == 0 {
         let (row, col) = screen.cursor_position();
-        if row < screen_area.height && col < screen_area.width {
-            frame.set_cursor_position(Position::new(screen_area.x + col, screen_area.y + row));
+        if row < inner.height && col < inner.width {
+            frame.set_cursor_position(Position::new(inner.x + col, inner.y + row));
         }
     }
-
-    let mut left = vec![
-        Span::styled(" TERM ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::raw(format!("  {}  ", fit(&pane.label, 40))),
-    ];
-    if let Some(exited) = &pane.exited {
-        left.push(Span::styled(
-            format!("{exited}  "),
-            Style::default().fg(Color::Red),
-        ));
-    }
-    if pane.scrollback() > 0 {
-        left.push(Span::styled(
-            format!("scrollback {}  ", pane.scrollback()),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-    let hint = "Ctrl-\\ detaches · wheel scrolls back";
-    let used: usize = left.iter().map(|s| s.content.chars().count()).sum();
-    let pad = (status.width as usize).saturating_sub(used + hint.chars().count() + 1);
-    left.push(Span::raw(" ".repeat(pad)));
-    left.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
-    frame.render_widget(Paragraph::new(Line::from(left)), status);
 }
 
 /// vt100 colors, with the terminal's own default for `Default`.
