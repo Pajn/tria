@@ -3677,6 +3677,8 @@ pub struct Launch {
     pub editor: String,
     /// The model remembered from the last choice, for the next new thread.
     pub model: Option<ModelSelection>,
+    /// Whether tria had to start the server it is about to talk to.
+    pub started_server: bool,
 }
 
 pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
@@ -3686,6 +3688,11 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     app.git_command = launch.git_command;
     app.editor = launch.editor;
     app.new_thread_model = launch.model;
+    if launch.started_server {
+        // Said again here because the line printed before the screen was taken over is
+        // gone, and starting a server that outlives tria is worth knowing about.
+        app.toast("started the T3 Code server", false);
+    }
 
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(

@@ -7,6 +7,7 @@ mod discovery;
 mod model;
 mod question;
 mod rpc;
+mod server;
 mod session;
 mod state;
 mod subagent;
@@ -17,7 +18,7 @@ mod ui;
 mod vim;
 mod wire;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -48,12 +49,17 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut cfg = config::Config::load()?;
-    let origin = match cli.url.or_else(|| cfg.url.clone()) {
-        Some(url) => url,
-        None => discovery::local_origin()?,
-    };
+    // What is already known: the flag, the stored origin, else the file a running local
+    // server writes. Missing entirely is not yet an error — no server having run is one
+    // of the ways there is nothing to talk to.
+    let known = cli
+        .url
+        .clone()
+        .or_else(|| cfg.url.clone())
+        .or_else(|| discovery::local_origin().ok());
     match cli.command {
         Some(Command::Pair { credential }) => {
+            let origin = known.context("no running local server found")?;
             let token = auth::exchange_pairing_credential(&origin, &credential).await?;
             cfg.url = Some(origin.clone());
             cfg.token = Some(token.access_token);
@@ -61,7 +67,10 @@ async fn main() -> Result<()> {
             println!("Paired with {origin}; scopes: {}", token.scope);
             Ok(())
         }
-        Some(Command::Probe) => probe(&origin, &cfg).await,
+        Some(Command::Probe) => {
+            let origin = known.context("no running local server found")?;
+            probe(&origin, &cfg).await
+        }
         None => {
             let token = cfg.token.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -69,7 +78,11 @@ async fn main() -> Result<()> {
                 )
             })?;
             init_logging()?;
+            // Only here: the chat is what a person opens expecting it to work, and the
+            // subcommands are for a server that is already up.
+            let (origin, started) = server::ensure(known, &cfg.server_command()).await?;
             let launch = app::Launch {
+                started_server: started,
                 git_command: cfg.git_command(),
                 editor: cfg.editor(),
                 model: cfg.model.clone(),
@@ -77,6 +90,7 @@ async fn main() -> Result<()> {
             app::run(origin, token, launch).await
         }
         Some(Command::Dump { thread_id, seconds }) => {
+            let origin = known.context("no running local server found")?;
             dump(&origin, &cfg, &thread_id, seconds).await
         }
     }

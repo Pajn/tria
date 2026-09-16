@@ -15,6 +15,10 @@ pub struct Config {
     /// Editor for `ge` and `gE`. Defaults to `$VISUAL`, then `$EDITOR`, then `nvim`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
+    /// Command that starts a local server when none is running. Defaults to `t3 serve`;
+    /// empty turns starting one off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_command: Option<String>,
     /// The last model picked, used for the next new thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<crate::model::ModelSelection>,
@@ -59,6 +63,14 @@ impl Config {
                     .filter(|e| !e.trim().is_empty())
             })
             .unwrap_or_else(|| "nvim".to_string())
+    }
+
+    /// The command that starts a server. An empty setting is kept as empty: it is how
+    /// starting one is turned off.
+    pub fn server_command(&self) -> String {
+        self.server_command
+            .clone()
+            .unwrap_or_else(|| crate::server::DEFAULT_COMMAND.to_string())
     }
 
     pub fn git_command(&self) -> String {

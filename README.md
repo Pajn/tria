@@ -7,8 +7,8 @@ web, or mobile app for those.
 
 ## Requirements
 
-- A running T3 Code server, either the desktop app or `npx t3@latest`, on the same machine or
-  reachable over the network.
+- A T3 Code server, either the desktop app or `npx t3@latest`, on the same machine or reachable
+  over the network. It need not already be running: see [Starting the server](#starting-the-server).
 - Rust 1.88 or newer to build.
 
 ## Setup
@@ -43,6 +43,36 @@ Then run:
 ```sh
 tria
 ```
+
+## Starting the server
+
+tria is a client, so it needs a server to talk to. If none is answering on this machine when
+you run `tria`, it starts one with `t3 serve` and waits for it to come up — the desktop app
+does not have to be open. It says what it is doing, then connects:
+
+```
+No T3 Code server running. Starting one with `t3 serve`.
+Server at http://127.0.0.1:3773. It keeps running after tria exits.
+```
+
+The server is left running on purpose. It owns provider sessions, background tasks, and
+terminals, all of which outlive a chat window, so quitting tria is not a reason to take them
+down. The next `tria` finds it and connects straight away. Stop it like any other process, or
+install it as a background service with `t3 service install` and it will always be up.
+
+Set `server_command` in the config file to start it some other way:
+
+```toml
+server_command = "npx t3@latest serve"
+```
+
+It runs through a shell, so a full command line works. Set it to `""` to never start a server;
+tria then reports that nothing is running and exits. Output from a start goes to
+`server-start.log` beside the config file, and a command that exits without serving is reported
+with the first lines of it.
+
+Only a server on this machine is ever started. Pointed at another host with `--url` or a stored
+remote origin, an unreachable server is reported, not replaced.
 
 ## Keys
 
