@@ -4,7 +4,8 @@
 //! The server owns the pty. This side only parses what it sends and writes what
 //! the user types, so there is no process handling here.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 /// How many lines of scrollback the parser keeps beyond the visible screen.
 const SCROLLBACK: usize = 5_000;
@@ -152,6 +153,15 @@ impl Pane {
     pub fn alternate_screen(&self) -> bool {
         self.parser.screen().alternate_screen()
     }
+
+    /// Whether the program running in the pane wants the mouse, and in which encoding.
+    pub fn mouse_protocol(&self) -> (MouseProtocolMode, MouseProtocolEncoding) {
+        let screen = self.parser.screen();
+        (
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+        )
+    }
 }
 
 /// Encode a key the way a terminal emulator would, for `terminal.write`.
@@ -248,6 +258,78 @@ pub fn encode_key(key: &KeyEvent, app_cursor: bool) -> Option<String> {
     Some(base)
 }
 
+/// Encode a mouse event for the program in the pane, at cell `col`/`row` within it.
+///
+/// Returns `None` when the program has not asked for the mouse, or has not asked for
+/// this kind of event, in which case the wheel is free to drive our own scrollback.
+pub fn encode_mouse(
+    event: &MouseEvent,
+    col: u16,
+    row: u16,
+    mode: MouseProtocolMode,
+    encoding: MouseProtocolEncoding,
+) -> Option<String> {
+    if mode == MouseProtocolMode::None {
+        return None;
+    }
+    let button = |button: &MouseButton| match button {
+        MouseButton::Left => 0u8,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    // Wheel events are buttons 64 and up; motion adds 32 to whichever button is held.
+    let (mut code, release) = match event.kind {
+        MouseEventKind::Down(ref b) => (button(b), false),
+        MouseEventKind::Up(ref b) if mode != MouseProtocolMode::Press => (button(b), true),
+        MouseEventKind::Drag(ref b)
+            if matches!(
+                mode,
+                MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
+            ) =>
+        {
+            (button(b) + 32, false)
+        }
+        MouseEventKind::Moved if mode == MouseProtocolMode::AnyMotion => (3 + 32, false),
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+        _ => return None,
+    };
+    if event.modifiers.contains(KeyModifiers::SHIFT) {
+        code += 4;
+    }
+    if event.modifiers.contains(KeyModifiers::ALT) {
+        code += 8;
+    }
+    if event.modifiers.contains(KeyModifiers::CONTROL) {
+        code += 16;
+    }
+
+    match encoding {
+        MouseProtocolEncoding::Sgr => Some(format!(
+            "\x1b[<{code};{};{}{}",
+            col + 1,
+            row + 1,
+            if release { 'm' } else { 'M' }
+        )),
+        // The original encoding sends one byte per field, offset by 32, and reports
+        // every release as button 3. It cannot address past column 223.
+        _ => {
+            if col >= 223 || row >= 223 {
+                return None;
+            }
+            let code = if release { 3 + (code & !3) } else { code };
+            Some(format!(
+                "\x1b[M{}{}{}",
+                (32 + code) as char,
+                (33 + col as u8) as char,
+                (33 + row as u8) as char
+            ))
+        }
+    }
+}
+
 fn tilde(code: u32, modifier: u8) -> String {
     if modifier > 1 {
         format!("\x1b[{code};{modifier}~")
@@ -323,6 +405,83 @@ mod tests {
         );
         // Plain output asks nothing.
         assert!(pane.feed("hello").is_empty());
+    }
+
+    fn mouse(kind: MouseEventKind, modifiers: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn the_mouse_is_left_alone_until_a_program_asks_for_it() {
+        let event = mouse(MouseEventKind::ScrollUp, KeyModifiers::NONE);
+        assert_eq!(
+            encode_mouse(
+                &event,
+                3,
+                4,
+                MouseProtocolMode::None,
+                MouseProtocolEncoding::Sgr
+            ),
+            None
+        );
+        assert_eq!(
+            encode_mouse(
+                &event,
+                3,
+                4,
+                MouseProtocolMode::Press,
+                MouseProtocolEncoding::Sgr
+            )
+            .as_deref(),
+            Some("\x1b[<64;4;5M")
+        );
+    }
+
+    #[test]
+    fn presses_releases_and_drags_follow_the_mode() {
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), KeyModifiers::NONE);
+        let drag = mouse(MouseEventKind::Drag(MouseButton::Left), KeyModifiers::NONE);
+        let sgr = MouseProtocolEncoding::Sgr;
+        // X10 mode reports presses only.
+        assert!(encode_mouse(&up, 0, 0, MouseProtocolMode::Press, sgr).is_none());
+        assert!(encode_mouse(&drag, 0, 0, MouseProtocolMode::PressRelease, sgr).is_none());
+        assert_eq!(
+            encode_mouse(&up, 0, 0, MouseProtocolMode::PressRelease, sgr).as_deref(),
+            Some("\x1b[<0;1;1m")
+        );
+        assert_eq!(
+            encode_mouse(&drag, 1, 1, MouseProtocolMode::ButtonMotion, sgr).as_deref(),
+            Some("\x1b[<32;2;2M")
+        );
+        // The original encoding offsets every field by 32, releases as button 3.
+        assert_eq!(
+            encode_mouse(
+                &down,
+                0,
+                0,
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Default
+            )
+            .as_deref(),
+            Some("\x1b[M\x20\x21\x21")
+        );
+        assert_eq!(
+            encode_mouse(
+                &up,
+                0,
+                0,
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Default
+            )
+            .as_deref(),
+            Some("\x1b[M\x23\x21\x21")
+        );
     }
 
     #[test]

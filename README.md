@@ -152,10 +152,13 @@ id, and whether a command is running right now. `x` closes the selected one, `r`
 it in the same directory, and `c` opens a new one in the thread's working directory.
 
 `Enter` attaches: the shell opens as a popup over the chat and every key goes to it, `Ctrl-c`
-included. `Ctrl-\` detaches and leaves the shell running. The mouse wheel moves through the scrollback,
-and typing returns to the live screen. Resizing the window resizes the pty. The pane is a real
-terminal emulator, so full-screen programs work: this is the other way to reach lazygit, and
-unlike `gl` it stays inside tria and survives detaching.
+included. `Ctrl-\` detaches and leaves the shell running, and exiting the shell closes the
+popup. A program that asks for the mouse gets it, so clicking and scrolling work inside lazygit
+and anything else full screen; otherwise the wheel moves through the pane's own scrollback, as
+does `Shift` with the wheel while a program is using the mouse. Typing returns to the live
+screen, and resizing the window resizes the pty. The pane is a real terminal emulator, so
+full-screen programs work: this is the other way to reach lazygit, and unlike `gl` it stays
+inside tria and survives detaching.
 
 The server owns the pty, so a shell you start here also appears in the desktop app's terminal
 tabs, keeps running after you detach or quit, and picks up where it left off when you attach

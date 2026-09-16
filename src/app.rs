@@ -237,6 +237,8 @@ pub struct App {
     pub pane: Option<crate::term::Pane>,
     /// A command to type into the pane once its shell reports for duty, for `gl`.
     pending_pane_command: Option<String>,
+    /// Where the pane's screen is drawn, for turning mouse positions into cells.
+    pub pane_area: Rect,
     /// Command for `gl` and `:git`, from the config file.
     pub git_command: String,
     /// Editor for `ge` and `gE`.
@@ -298,6 +300,7 @@ impl App {
             terminal_selected: 0,
             pane: None,
             pending_pane_command: None,
+            pane_area: Rect::default(),
             drafts: HashMap::new(),
             git_command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
             editor: "nvim".to_string(),
@@ -1147,6 +1150,32 @@ impl App {
             return;
         };
         self.write_to_pane(data);
+    }
+
+    /// The mouse in the pane: to the program when it has asked for it, otherwise the
+    /// wheel moves our own scrollback. Shift takes the wheel back from the program,
+    /// which is what terminals do.
+    fn on_pane_mouse(&mut self, mouse: MouseEvent) {
+        let area = self.pane_area;
+        let Some(pane) = self.pane.as_mut() else {
+            return;
+        };
+        let at = Position::new(mouse.column, mouse.row);
+        if !area.contains(at) {
+            return;
+        }
+        let (col, row) = (mouse.column - area.x, mouse.row - area.y);
+        let (mode, encoding) = pane.mouse_protocol();
+        let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+        if !shift && let Some(data) = crate::term::encode_mouse(&mouse, col, row, mode, encoding) {
+            self.write_to_pane(data);
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => pane.scroll(MOUSE_SCROLL_LINES as isize),
+            MouseEventKind::ScrollDown => pane.scroll(-(MOUSE_SCROLL_LINES as isize)),
+            _ => {}
+        }
     }
 
     /// Send bytes to the attached terminal.
@@ -2533,15 +2562,8 @@ impl App {
         if matches!(self.mode, Mode::Picker | Mode::Help) {
             return;
         }
-        // The attached terminal scrolls its own scrollback and ignores the rest.
         if self.mode == Mode::TerminalPane {
-            if let Some(pane) = self.pane.as_mut() {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => pane.scroll(MOUSE_SCROLL_LINES as isize),
-                    MouseEventKind::ScrollDown => pane.scroll(-(MOUSE_SCROLL_LINES as isize)),
-                    _ => {}
-                }
-            }
+            self.on_pane_mouse(mouse);
             return;
         }
         let at = Position::new(mouse.column, mouse.row);

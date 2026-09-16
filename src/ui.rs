@@ -1306,6 +1306,7 @@ fn draw_terminal_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
+    app.pane_area = inner;
     app.sync_pane_size(inner.width, inner.height);
     let Some(pane) = &app.pane else { return };
     // Until the command has taken over the shell, show a notice rather than the prompt
