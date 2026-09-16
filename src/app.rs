@@ -163,6 +163,8 @@ pub struct NewThreadDraft {
     pub model_selection: ModelSelection,
     pub runtime_mode: String,
     pub interaction_mode: String,
+    /// Start the thread in a fresh worktree rather than the project's own checkout.
+    pub worktree: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +255,11 @@ pub struct App {
     was_running: bool,
     /// When the checkout was last re-read.
     vcs_refreshed: Instant,
+    /// The model to start the next new thread with, remembered from the last choice.
+    new_thread_model: Option<ModelSelection>,
+    /// Project directory and base branch for a new thread's worktree, resolved as the
+    /// message is sent.
+    draft_worktree: Option<(String, String)>,
     /// Command for `gl` and `:git`, from the config file.
     pub git_command: String,
     /// Editor for `ge` and `gE`.
@@ -320,6 +327,8 @@ impl App {
             vcs_cwd: None,
             was_running: false,
             vcs_refreshed: Instant::now(),
+            new_thread_model: None,
+            draft_worktree: None,
             drafts: HashMap::new(),
             git_command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
             editor: "nvim".to_string(),
@@ -524,17 +533,26 @@ impl App {
 
     fn start_new_thread(&mut self, project_id: &str) {
         let project = self.shell.projects.get(project_id);
-        let model_selection = project
-            .and_then(|p| p.default_model_selection.clone())
+        // The last model picked wins: it is the most recent statement of intent.
+        let model_selection = self
+            .new_thread_model
+            .clone()
+            .or_else(|| project.and_then(|p| p.default_model_selection.clone()))
             .or_else(|| self.config.settings.default_model_selection.clone())
             .or_else(|| self.first_usable_model());
         let Some(model_selection) = model_selection else {
             self.toast("no usable provider or model configured on the server", true);
             return;
         };
+        // The project's setting wins, then the server's; the server's own default is
+        // the current checkout.
+        let env_mode = project
+            .and_then(|p| p.default_thread_env_mode.clone())
+            .or_else(|| self.config.settings.default_thread_env_mode.clone());
         self.swap_composer_draft(NEW_THREAD_DRAFT_KEY);
         self.draft = Some(NewThreadDraft {
             project_id: project_id.to_string(),
+            worktree: env_mode.as_deref() == Some("worktree"),
             model_selection,
             runtime_mode: self
                 .config
@@ -547,6 +565,7 @@ impl App {
         self.current_thread_id = None;
         self.thread = None;
         self.handle.close_thread();
+        self.sync_vcs_watch();
         self.scroll = Scroll::Follow;
         self.mode = Mode::Insert;
         self.focus = Focus::Composer;
@@ -594,7 +613,12 @@ impl App {
         // Read the slot before sending: starting a new thread moves the view to it, and the
         // parked text belongs to the slot the message was written in.
         let draft_key = self.draft_key();
+        if self.draft.is_some() && !self.resolve_draft_worktree() {
+            return;
+        }
         if let Some(draft) = self.draft.take() {
+            // Resolved above, while the draft was still in place.
+            let worktree = self.draft_worktree.take();
             let thread_id = commands::new_id();
             let title: String = text
                 .lines()
@@ -615,6 +639,10 @@ impl App {
                     model_selection: &draft.model_selection,
                     runtime_mode: &draft.runtime_mode,
                     interaction_mode: &draft.interaction_mode,
+                    worktree: worktree.as_ref().map(|(cwd, branch)| commands::Worktree {
+                        project_cwd: cwd,
+                        base_branch: branch,
+                    }),
                 }),
             );
             self.dispatch(command);
@@ -1185,10 +1213,59 @@ impl App {
         self.handle.refresh_vcs();
     }
 
+    /// Work out where a new thread's worktree would branch from, reporting why not when
+    /// it cannot. Returns false when the message should not be sent.
+    fn resolve_draft_worktree(&mut self) -> bool {
+        self.draft_worktree = None;
+        let Some(draft) = self.draft.as_ref() else {
+            return true;
+        };
+        if !draft.worktree {
+            return true;
+        }
+        let Some(project) = self.shell.projects.get(&draft.project_id) else {
+            self.toast("unknown project", true);
+            return false;
+        };
+        // The worktree branches off whatever the project's checkout has now, which is
+        // what the watch reports.
+        let base = self
+            .vcs
+            .as_ref()
+            .filter(|vcs| vcs.is_repo)
+            .and_then(|vcs| vcs.ref_name.clone());
+        let Some(base) = base else {
+            let message = if self.vcs.is_none() {
+                "still reading the project's checkout; send again in a moment"
+            } else {
+                "no branch to base a worktree on; gw starts in the checkout instead"
+            };
+            self.toast(message, true);
+            return false;
+        };
+        self.draft_worktree = Some((project.workspace_root.clone(), base));
+        true
+    }
+
+    /// `gw`: start the new thread in a fresh worktree, or in the project's checkout.
+    fn toggle_draft_worktree(&mut self) {
+        let Some(draft) = self.draft.as_mut() else {
+            self.toast("only a new thread can choose; press n first", true);
+            return;
+        };
+        draft.worktree = !draft.worktree;
+        let message = if draft.worktree {
+            "new thread starts in a fresh worktree"
+        } else {
+            "new thread starts in the project's checkout"
+        };
+        self.toast(message, false);
+    }
+
     /// Follow the open thread's checkout, so the header can show its branch. The thread
     /// list only carries a branch for threads the server made one for.
     fn sync_vcs_watch(&mut self) {
-        let cwd = self.thread_directory();
+        let cwd = self.watch_directory();
         if cwd == self.vcs_cwd {
             return;
         }
@@ -1511,6 +1588,19 @@ impl App {
     // ── tmux ───────────────────────────────────────────────────────────
 
     /// Directory the current thread works in: its worktree, else the project root.
+    /// The checkout the header describes: the open thread's, or the project a new
+    /// thread would start in.
+    fn watch_directory(&self) -> Option<String> {
+        if let Some(draft) = &self.draft {
+            return self
+                .shell
+                .projects
+                .get(&draft.project_id)
+                .map(|p| p.workspace_root.clone());
+        }
+        self.thread_directory()
+    }
+
     fn thread_directory(&self) -> Option<String> {
         let shell = self.thread.as_ref().map(|t| &t.detail.shell)?;
         shell.worktree_path.clone().or_else(|| {
@@ -1755,6 +1845,9 @@ impl App {
     }
 
     fn set_model(&mut self, selection: ModelSelection) {
+        // Whatever was picked last is what the next new thread starts with.
+        self.new_thread_model = Some(selection.clone());
+        crate::config::Config::remember_model(&selection);
         if let Some(draft) = self.draft.as_mut() {
             draft.model_selection = selection;
             self.mode = Mode::Insert;
@@ -1870,6 +1963,7 @@ impl App {
             "tasks" | "jobs" => self.open_tasks(),
             "terminals" | "shells" => self.open_terminals(),
             "shell" => self.open_shell(),
+            "worktree" | "wt" => self.toggle_draft_worktree(),
             "edit" => self.edit_composer(),
             "view" => self.view_conversation(),
             "settled" => self.show_settled = !self.show_settled,
@@ -2021,6 +2115,7 @@ impl App {
             }
             KeyCode::Char('l') if prefix == Some('g') => self.open_git(),
             KeyCode::Char('!') if prefix == Some('g') => self.open_shell(),
+            KeyCode::Char('w') if prefix == Some('g') => self.toggle_draft_worktree(),
             KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
             KeyCode::Char('S') if prefix == Some('g') => self.open_terminals(),
             KeyCode::Char('e') if prefix == Some('g') => self.view_at_cursor(),
@@ -2440,6 +2535,7 @@ impl App {
                 }
                 KeyCode::Char('l') if prefix == Some('g') => self.open_git(),
                 KeyCode::Char('!') if prefix == Some('g') => self.open_shell(),
+                KeyCode::Char('w') if prefix == Some('g') => self.toggle_draft_worktree(),
                 KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
                 KeyCode::Char('S') if prefix == Some('g') => self.open_terminals(),
                 KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
@@ -2495,6 +2591,7 @@ impl App {
             }
             KeyCode::Char('l') if prefix == Some('g') => return self.open_git(),
             KeyCode::Char('!') if prefix == Some('g') => return self.open_shell(),
+            KeyCode::Char('w') if prefix == Some('g') => return self.toggle_draft_worktree(),
             KeyCode::Char('T') if prefix == Some('g') => return self.open_tasks(),
             KeyCode::Char('S') if prefix == Some('g') => return self.open_terminals(),
             KeyCode::Char('e') if prefix == Some('g') => return self.edit_composer(),
@@ -3199,6 +3296,8 @@ pub enum SidebarRow {
 pub struct Launch {
     pub git_command: String,
     pub editor: String,
+    /// The model remembered from the last choice, for the next new thread.
+    pub model: Option<ModelSelection>,
 }
 
 pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
@@ -3207,6 +3306,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     let mut app = App::new(handle, events_tx.clone());
     app.git_command = launch.git_command;
     app.editor = launch.editor;
+    app.new_thread_model = launch.model;
 
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(

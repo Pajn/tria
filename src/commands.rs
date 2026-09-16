@@ -20,6 +20,15 @@ pub struct NewThread<'a> {
     pub model_selection: &'a ModelSelection,
     pub runtime_mode: &'a str,
     pub interaction_mode: &'a str,
+    /// Set to start the thread in a fresh worktree branched off `base_branch`; the
+    /// server creates it and points the thread at it.
+    pub worktree: Option<Worktree<'a>>,
+}
+
+/// Where a worktree for a new thread comes from.
+pub struct Worktree<'a> {
+    pub project_cwd: &'a str,
+    pub base_branch: &'a str,
 }
 
 /// Start a turn on an existing thread, or create the thread first when `bootstrap` is given.
@@ -60,6 +69,13 @@ pub fn turn_start(
                 "createdAt": created_at,
             }
         });
+        if let Some(worktree) = new_thread.worktree {
+            // The server names the branch itself and updates the thread to match.
+            command["bootstrap"]["prepareWorktree"] = json!({
+                "projectCwd": worktree.project_cwd,
+                "baseBranch": worktree.base_branch,
+            });
+        }
     }
     command
 }
@@ -180,4 +196,67 @@ pub fn interaction_mode_set(thread_id: &str, interaction_mode: &str) -> Value {
         "interactionMode": interaction_mode,
         "createdAt": now_iso(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selection() -> ModelSelection {
+        ModelSelection {
+            instance_id: "instance".into(),
+            model: "a-model".into(),
+            options: vec![],
+        }
+    }
+
+    #[test]
+    fn a_new_thread_can_ask_for_a_worktree() {
+        let selection = selection();
+        let command = turn_start(
+            "thread-1",
+            "hello",
+            &selection,
+            "full-access",
+            "default",
+            Some(NewThread {
+                project_id: "project-1",
+                title: "hello",
+                model_selection: &selection,
+                runtime_mode: "full-access",
+                interaction_mode: "default",
+                worktree: Some(Worktree {
+                    project_cwd: "/src/project",
+                    base_branch: "main",
+                }),
+            }),
+        );
+        let bootstrap = &command["bootstrap"];
+        assert_eq!(bootstrap["createThread"]["projectId"], "project-1");
+        // The thread starts without one; the server fills both in once it has the worktree.
+        assert!(bootstrap["createThread"]["worktreePath"].is_null());
+        assert_eq!(bootstrap["prepareWorktree"]["projectCwd"], "/src/project");
+        assert_eq!(bootstrap["prepareWorktree"]["baseBranch"], "main");
+    }
+
+    #[test]
+    fn a_new_thread_in_the_checkout_asks_for_no_worktree() {
+        let selection = selection();
+        let command = turn_start(
+            "thread-1",
+            "hello",
+            &selection,
+            "full-access",
+            "default",
+            Some(NewThread {
+                project_id: "project-1",
+                title: "hello",
+                model_selection: &selection,
+                runtime_mode: "full-access",
+                interaction_mode: "default",
+                worktree: None,
+            }),
+        );
+        assert!(command["bootstrap"]["prepareWorktree"].is_null());
+    }
 }

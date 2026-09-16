@@ -15,6 +15,30 @@ pub struct Config {
     /// Editor for `ge` and `gE`. Defaults to `$VISUAL`, then `$EDITOR`, then `nvim`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
+    /// The last model picked, used for the next new thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<crate::model::ModelSelection>,
+}
+
+impl Config {
+    /// Remember a model choice for the next new thread. Re-reads the file first so a
+    /// concurrent edit elsewhere is not overwritten, and failures are not worth a toast.
+    pub fn remember_model(selection: &crate::model::ModelSelection) {
+        let mut config = match Self::load() {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::warn!(%err, "reading config to remember the model");
+                return;
+            }
+        };
+        if config.model.as_ref() == Some(selection) {
+            return;
+        }
+        config.model = Some(selection.clone());
+        if let Err(err) = config.save() {
+            tracing::warn!(%err, "saving the remembered model");
+        }
+    }
 }
 
 pub const DEFAULT_GIT_COMMAND: &str = "lazygit";

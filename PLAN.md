@@ -210,6 +210,17 @@ Slash commands need no encoding: a provider command works when it is the first t
 text. File mentions can be plain `@path` text. Attachments and the `t3-context://` chip format
 are out of scope.
 
+### Starting a thread in a worktree
+
+`thread.turn.start` takes `bootstrap.prepareWorktree` beside `bootstrap.createThread`:
+`{ projectCwd, baseBranch, branch?, startFromOrigin? }`. The server creates the worktree off
+`baseBranch`, names the branch itself when `branch` is absent, and then dispatches a
+`thread.meta.update` setting the thread's `branch` and `worktreePath`. A `createThread` sends
+both as null and lets that happen.
+
+Where a new thread runs by default is `defaultThreadEnvMode`, `worktree` or `local`: on the
+project when set, otherwise the server setting, whose own default is `local`.
+
 ### Checkout state
 
 `subscribeVcsStatus` takes a `cwd` and streams `{ _tag: "snapshot", local, remote }` followed

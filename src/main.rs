@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
             let launch = app::Launch {
                 git_command: cfg.git_command(),
                 editor: cfg.editor(),
+                model: cfg.model.clone(),
             };
             app::run(origin, token, launch).await
         }

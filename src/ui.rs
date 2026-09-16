@@ -488,6 +488,24 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             format!("  in {}", app.shell.project_title(&draft.project_id)),
             Style::default().fg(Color::DarkGray),
         ));
+        let branch = app.vcs.as_ref().and_then(|vcs| vcs.ref_name.as_deref());
+        let (label, style) = if draft.worktree {
+            ("⌂ new worktree", Style::default().fg(Color::Cyan))
+        } else {
+            ("⌂ project checkout", Style::default().fg(Color::DarkGray))
+        };
+        spans.push(Span::styled(format!("  {label}"), style));
+        if let Some(branch) = branch {
+            spans.push(Span::styled(
+                if draft.worktree {
+                    format!(" off {branch}")
+                } else {
+                    format!(" on {branch}")
+                },
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        spans.push(Span::styled("  gw", Style::default().fg(Color::DarkGray)));
     } else if let Some(thread) = &app.thread {
         let shell = &thread.detail.shell;
         spans.push(Span::styled(
@@ -1637,6 +1655,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         Line::from("  s / S                   toggle sidebar / settled shelf"),
         Line::from("  gs                      settle the thread, or bring a settled one back"),
+        Line::from("  gw                      new thread: fresh worktree or the project checkout"),
         Line::from("  gl                      lazygit in the thread's terminal pane"),
         Line::from("  g!                      a shell in the pane"),
         Line::from("  gx                      open the thread's pull request in the browser"),

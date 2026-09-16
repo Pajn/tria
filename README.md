@@ -56,6 +56,7 @@ Press `?` inside the app for the full list.
 | `Tab` / `Shift-Tab` | cycle focus: composer, chat, thread list. `Esc` returns to the composer |
 | `s` `S` | toggle the sidebar / the settled shelf |
 | `n` | new thread (pick a project) |
+| `gw` | new thread: start it in a fresh worktree, or the project's checkout |
 | `m` | change model |
 | `i` `a` `I` `A` `o` `O` or `Enter` | write a message (Vim insert entry) |
 | `za` `zR` `zM` | toggle / expand all / collapse all tool groups; `za` on a tool row inside an open group expands that row |
@@ -107,7 +108,19 @@ command.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `archive`, `delete!`, `stop`,
-`older`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
+`older`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
+`worktree`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
+
+## New threads
+
+`n` picks a project and opens a draft; the message you write starts the thread. The header says
+where it will run: `⌂ project checkout on <branch>`, or `⌂ new worktree off <branch>`, which
+the server creates and names when the thread starts. `gw` or `:worktree` switches between them.
+The default comes from the project's own setting, then the server's, and the server's default
+is the current checkout.
+
+The model for a new thread is the last one you picked with `m`, remembered in the config file
+between runs. Without one it falls back to the project's default model, then the server's.
 
 ## Branch and pull request
 

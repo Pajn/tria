@@ -31,6 +31,10 @@ pub struct Project {
     pub workspace_root: String,
     #[serde(default)]
     pub default_model_selection: Option<ModelSelection>,
+    /// Where new threads for this project start: `worktree` or `local`. Unset means
+    /// the server-wide setting decides.
+    #[serde(default)]
+    pub default_thread_env_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -667,6 +671,10 @@ pub struct ServerSettings {
     pub default_model_selection: Option<ModelSelection>,
     #[serde(default)]
     pub default_runtime_mode: Option<String>,
+    /// Server-wide default for where new threads start; the server's own default is
+    /// the current checkout.
+    #[serde(default)]
+    pub default_thread_env_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
