@@ -15,6 +15,7 @@ use crate::{
     app::{App, Focus, Mode, PickerKind, Scroll, Section, SidebarRow, approval_options},
     model::ThreadStatus,
     session::Status,
+    subagent,
     timeline::{self, Block as ChatBlock, BlockKey},
 };
 
@@ -116,6 +117,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Picker => draw_picker(frame, app, area),
         Mode::Help => draw_help(frame, area),
         Mode::Tasks => draw_tasks(frame, app, area),
+        Mode::Agents => draw_agents(frame, app, area),
         Mode::Terminals => draw_terminals(frame, app, area),
         Mode::TerminalPane => draw_terminal_pane(frame, app, area),
         _ => {}
@@ -554,6 +556,37 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
+    // While a transcript is open the header names what is being read, since the chat
+    // below it is no longer the thread's own conversation.
+    if let Some(transcript) = &app.transcript {
+        spans.push(Span::styled("⤷ ", Style::default().fg(Color::Magenta)));
+        spans.push(Span::styled(
+            transcript.title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!("  {}", transcript.subtitle),
+            Style::default().fg(Color::DarkGray),
+        ));
+        if transcript.truncated {
+            spans.push(Span::styled(
+                "  cut at 1 MB",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        spans.push(Span::styled(
+            "  q back",
+            Style::default().fg(Color::DarkGray),
+        ));
+        let width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let pad = (area.width as usize).saturating_sub(width);
+        spans.push(Span::raw(" ".repeat(pad)));
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Indexed(236))),
+            area,
+        );
+        return;
+    }
     if let Some(draft) = &app.draft {
         spans.push(Span::styled(
             "New thread",
@@ -718,7 +751,14 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         height: area.height,
     };
     app.chat_area = inner;
-    let Some(thread) = &app.thread else {
+    // A subagent's transcript is read in place of the conversation, through the same
+    // renderer: it is a conversation too, only one held out of sight.
+    let open = app
+        .transcript
+        .as_ref()
+        .map(|transcript| &transcript.state)
+        .or(app.thread.as_ref());
+    let Some(thread) = open else {
         let text = if app.draft.is_some() {
             "Type your first message below and press Enter."
         } else if app.current_thread_id.is_some() {
@@ -1219,6 +1259,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             " HELP ",
             Style::default().bg(Color::Blue).fg(Color::Black).bold(),
         ),
+        (Mode::Agents, _) => (
+            " AGENTS ",
+            Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
+        ),
         (Mode::Question | Mode::QuestionCustom, _) => (
             " ANSWER ",
             Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
@@ -1305,6 +1349,17 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::styled(
                 format!("  ⚙ {tasks} bg"),
                 Style::default().fg(Color::Blue),
+            ));
+        }
+        let agents = thread
+            .subagents()
+            .into_iter()
+            .filter(|agent| agent.status.is_active())
+            .count();
+        if agents > 0 {
+            spans.push(Span::styled(
+                format!("  ⤷ {agents} agent{}", if agents == 1 { "" } else { "s" }),
+                Style::default().fg(Color::Magenta),
             ));
         }
     } else if let Some(draft) = &app.draft {
@@ -1599,6 +1654,160 @@ fn draw_terminals(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(text), inner);
 }
 
+/// The subagents the thread has run: what each one is, how it is going or how it went,
+/// and what it cost. Informational, like the task panel — a subagent is stopped by
+/// interrupting the turn that started it.
+fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
+    let agents = app.subagents();
+    let now = crate::commands::now_iso();
+    let width = 84.min(area.width);
+    let inner_width = width.saturating_sub(4) as usize;
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if agents.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no subagents in this thread",
+            dim,
+        )));
+    }
+    let selected_index = app.agent_selected.min(agents.len().saturating_sub(1));
+    for (index, agent) in agents.iter().enumerate() {
+        let selected = index == selected_index;
+        let (glyph, glyph_style) = match agent.status {
+            subagent::Status::Pending | subagent::Status::Running | subagent::Status::Waiting => {
+                (app.spinner_frame(), Style::default().fg(Color::Cyan))
+            }
+            subagent::Status::Idle => ("○", dim),
+            subagent::Status::Completed => ("✓", Style::default().fg(Color::Green)),
+            subagent::Status::Failed => ("✗", Style::default().fg(Color::Red)),
+            subagent::Status::Cancelled | subagent::Status::Interrupted => {
+                ("·", Style::default().fg(Color::Yellow))
+            }
+        };
+        // A running subagent is timed from its start; a settled one kept the time it took.
+        let elapsed = agent.started_at.as_deref().map(|started| {
+            elapsed_label(
+                started,
+                agent
+                    .completed_at
+                    .as_deref()
+                    .filter(|_| !agent.status.is_active())
+                    .unwrap_or(&now),
+            )
+        });
+        let elapsed = elapsed.unwrap_or_default();
+        let role = agent
+            .role
+            .as_deref()
+            .filter(|role| !role.eq_ignore_ascii_case(agent.title.trim()))
+            .map(|role| format!(" [{role}]"))
+            .unwrap_or_default();
+        let mut title_style = Style::default();
+        if selected {
+            title_style = title_style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { " ▸ " } else { "   " },
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(format!("{glyph} "), glyph_style),
+            Span::styled(
+                fit(
+                    &agent.title,
+                    inner_width.saturating_sub(elapsed.chars().count() + role.chars().count() + 8),
+                ),
+                title_style,
+            ),
+            Span::styled(role, dim),
+            Span::styled(format!("  {elapsed}"), dim),
+        ]));
+        let activity = agent
+            .activity()
+            .unwrap_or_else(|| agent.status.label().to_string());
+        lines.push(Line::from(Span::styled(
+            format!("      {}", fit(&activity, inner_width.saturating_sub(6))),
+            if agent.status == subagent::Status::Failed {
+                Style::default().fg(Color::Red)
+            } else {
+                dim
+            },
+        )));
+        let mut facts: Vec<String> = Vec::new();
+        if let Some(model) = agent.model_label() {
+            facts.push(model);
+        }
+        facts.push(match &agent.usage {
+            Some(usage) => format!("{} tok", tokens(usage.total_tokens)),
+            None => "— tok".to_string(),
+        });
+        if let Some(tools) = agent.usage.as_ref().and_then(|usage| usage.tool_uses) {
+            facts.push(format!("{tools} tools"));
+        }
+        if agent.activations > 1 {
+            facts.push(format!("run {}", agent.activations));
+        }
+        if agent.output_file.is_none() {
+            facts.push("no transcript".to_string());
+        }
+        if app.transcript_loading.as_deref() == Some(agent.id.as_str()) {
+            facts.push("reading…".to_string());
+        }
+        lines.push(Line::from(Span::styled(
+            format!(
+                "      {}",
+                fit(&facts.join(" · "), inner_width.saturating_sub(6))
+            ),
+            dim,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  j k select · Enter read the transcript · y yank the report · Esc",
+        dim,
+    )));
+    let text = Text::from(lines);
+    let height = (text.lines.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let live = agents
+        .iter()
+        .filter(|agent| agent.status.is_active())
+        .count();
+    let title = if live > 0 {
+        format!(" subagents ({} · {live} working) ", agents.len())
+    } else {
+        format!(" subagents ({}) ", agents.len())
+    };
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
+/// Token counts as the desktop writes them: `840`, `73.4k`, `1.2M`.
+fn tokens(total: u64) -> String {
+    match total {
+        0..=999 => total.to_string(),
+        1_000..=999_999 => {
+            let value = total as f64 / 1000.0;
+            if value >= 100.0 {
+                format!("{}k", value.round())
+            } else {
+                format!("{value:.1}k")
+            }
+        }
+        _ => format!("{:.1}M", total as f64 / 1_000_000.0),
+    }
+}
+
 /// The agent's unfinished background tasks. Informational: the protocol has no per-task
 /// stop, so the panel points at the turn-level interrupt instead.
 fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
@@ -1711,6 +1920,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  gl                      lazygit in the thread's terminal pane"),
         Line::from("  g!                      a shell in the pane; exiting it closes the popup"),
         Line::from("  gT                      background tasks still running in this thread"),
+        Line::from("  gA                      subagents this thread has run: Enter reads one's"),
+        Line::from("                          transcript, y yanks its report"),
         Line::from("  gS                      terminals for this thread: Enter attaches,"),
         Line::from("                          c opens a new one, x closes, r restarts"),
         Line::from("  in the pane             every key goes to the shell · Ctrl-\\ detaches"),
@@ -1753,7 +1964,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :pr  :tasks  :terminals  :tmux  :settle  :unsettle  :wake  :settled  :stop  :older  :answer  :dismiss  :sidebar  :q",
+            "  :pr  :tasks  :agents  :terminals  :tmux  :settle  :unsettle  :wake  :settled  :stop  :older  :answer  :dismiss  :sidebar  :q",
         ),
         Line::from(""),
         Line::from(Span::styled(

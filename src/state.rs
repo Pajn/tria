@@ -4,9 +4,12 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::model::{
-    Activity, Event, Id, Message, Project, ProposedPlan, Session, ShellItem, ThreadDetail,
-    ThreadDetailSnapshot, ThreadItem, ThreadShell,
+use crate::{
+    model::{
+        Activity, Event, Id, Message, Project, ProposedPlan, Session, ShellItem, ThreadDetail,
+        ThreadDetailSnapshot, ThreadItem, ThreadShell,
+    },
+    subagent::Subagent,
 };
 
 #[derive(Debug, Default)]
@@ -450,11 +453,33 @@ impl ThreadState {
                 .is_some_and(|s| s.status == "running" || s.status == "starting")
     }
 
-    /// Background tasks the agent started that have not reported an end. A task is done
-    /// once any of its activities carries a status or an `endedAt`; monitors and
-    /// backgrounded commands outlive their turn, so the turn is not used to settle them.
+    /// The subagents this thread has run, oldest first.
+    ///
+    /// They live in the same `task.*` activities as the background tasks and are told
+    /// apart by the `agentKind` the server stamps on each one.
+    pub fn subagents(&self) -> Vec<Subagent> {
+        crate::subagent::fold(&self.detail.activities, self.session_live())
+    }
+
+    /// Whether the provider session that would own a running subagent is still there. A
+    /// session that stopped, errored, or was interrupted took every process it started
+    /// with it, however the rows that would have settled them ended up lost.
+    fn session_live(&self) -> bool {
+        self.detail.shell.session.as_ref().is_some_and(|session| {
+            matches!(
+                session.status.as_str(),
+                "idle" | "starting" | "running" | "ready"
+            )
+        })
+    }
+
+    /// Background tasks the agent started that have not reported an end: monitors and
+    /// backgrounded commands, but not the subagents that share these activities. A task
+    /// is done once any of its activities carries a status or an `endedAt`; this work
+    /// outlives its turn, so the turn is not used to settle it.
     pub fn running_tasks(&self) -> Vec<RunningTask> {
         let mut open: Vec<RunningTask> = Vec::new();
+        let mut agents: Vec<&str> = Vec::new();
         for activity in &self.detail.activities {
             if !activity.kind.starts_with("task.") {
                 continue;
@@ -462,6 +487,14 @@ impl ThreadState {
             let Some(id) = activity.str("taskId") else {
                 continue;
             };
+            // Membership is settled by the first row for a task id: the rows that end a
+            // task often carry nothing but the id and a status.
+            if activity.str("agentKind") == Some("agent") && !agents.contains(&id) {
+                agents.push(id);
+            }
+            if agents.contains(&id) {
+                continue;
+            }
             let payload = &activity.payload;
             let ended = activity.kind == "task.completed"
                 || payload.get("status").is_some_and(|v| !v.is_null())

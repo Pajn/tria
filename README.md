@@ -65,6 +65,7 @@ Press `?` inside the app for the full list.
 | `gy` | copy the last assistant message (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
 | `gT` | list the agent's background tasks that are still running |
+| `gA` | list the subagents the thread has run; `Enter` reads one's transcript, `y` yanks its report |
 | `gS` | list the thread's terminals; attach to one, or close, restart, open a new one |
 | `gl` | open lazygit in a terminal popup for the thread |
 | `g!` | a shell in the popup, in the thread's directory |
@@ -109,7 +110,7 @@ command.
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `archive`, `delete!`, `stop`,
 `older`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
-`worktree`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `help`, `q`.
+`worktree`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`, `help`, `q`.
 
 ## New threads
 
@@ -178,7 +179,52 @@ itself.
 The agent runs monitors and background commands that outlive the turn that started them.
 `gT` or `:tasks` lists the ones with no reported end, with how long each has been running,
 and the status bar shows a count. There is no per-task stop in the protocol, so stopping
-means interrupting the turn with `Ctrl-c`.
+means interrupting the turn with `Ctrl-c`. Work the agent delegated to a subagent is not
+background work and is listed by `gA` instead.
+
+## Subagents
+
+The agent delegates work to subagents that run their own conversation out of sight of the
+thread. `gA` or `:agents` lists them: what each was asked for, the agent definition it runs
+as, how long it has been going or how long it took, what it is doing now or the first line
+of the report it came back with, and its model, tokens, and tool count. The status bar
+carries a count while any are working.
+
+They come from the same `task.*` activities as the background tasks, told apart by the
+`agentKind` the server stamps on each one as it ingests it. So `gT` lists monitors and
+backgrounded commands, `gA` lists subagents, and neither shows the other. Like a background
+task, a subagent has no stop of its own in the protocol: `Ctrl-c` interrupts the turn that
+started it.
+
+A subagent can run more than once under the same identity. The row then reads `run 2`, and
+shows the current run rather than the last one's outcome. If the provider session dies with
+subagents still working, they are reported as stopped rather than left spinning, since the
+processes that would have finished them died with it.
+
+`y` copies the report. `Enter` reads the whole transcript.
+
+## Subagent transcripts
+
+`Enter` on a row opens the subagent's own conversation in place of the thread's: the brief it
+was given, everything it said, and every tool call it made, in the same view with the same
+keys. Scrolling, folding, search, `ge`, `gE`, and yanking all work as they do in the chat,
+because it is the same renderer — the transcript's rows are translated into the messages and
+tool calls the server would have sent for the same work. `q` or `Esc` goes back to the list,
+and the conversation returns to where it was.
+
+The transcript is a file the provider wrote on the machine that ran the agent, fetched with
+`projects.readFile`, which takes an absolute path for exactly this. It therefore works against
+a remote server too. The server stops reading at a megabyte and the header says so when the
+tail is missing. A subagent that has not reported back yet has no transcript, and the row says
+that instead.
+
+Unlike the tool rows in the thread, these are not projected down to a summary on the way out:
+the file has the whole input and the whole output, so an expanded row shows the command it ran
+and what came back.
+
+The format is the provider's rather than the protocol's, so this reads what Claude's agent
+sessions record. A row that does not fit the shape is skipped rather than fatal, which is why
+the header counts what was read.
 
 ## Terminals
 
@@ -227,7 +273,8 @@ Expanding a tool row shows what the server sends: the command or tool input, the
 of the output or a line count, changed files, and the status. The server projects tool
 payloads to that summary before they go on the wire, so the full output is not available to
 any client through the orchestration API. Rows without anything beyond their summary have no
-fold marker.
+fold marker. A subagent's tool calls are the exception: those come from a file rather than the
+wire, and keep what they sent and what they got back.
 
 ## Thread list
 

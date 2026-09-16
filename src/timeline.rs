@@ -158,15 +158,16 @@ pub fn build(
                     &mut work_anchor,
                     &mut work_group_index,
                 );
+                let role = match message.role.as_str() {
+                    "user" => "you",
+                    other => other,
+                };
                 let text = match message.role.as_str() {
-                    "user" => render_user(&message.text),
+                    // A subagent transcript opens with the brief it was given, which is
+                    // the agent's instruction rather than anything the user typed.
+                    "user" | "prompt" => render_user(&message.text, role),
                     "system" => render_system(&message.text),
                     _ => render_assistant(&message.text, message.streaming),
-                };
-                let role = if message.role == "user" {
-                    "you"
-                } else {
-                    message.role.as_str()
                 };
                 blocks.push(Block {
                     key: BlockKey::Message(message.id.clone()),
@@ -229,6 +230,8 @@ fn is_visible_activity(activity: &Activity) -> bool {
             | "tool.completed"
             | "tool.denied"
             | "task.started"
+            | "task.progress"
+            | "task.updated"
             | "task.completed"
             | "approval.requested"
             | "approval.resolved"
@@ -241,7 +244,7 @@ fn is_visible_activity(activity: &Activity) -> bool {
 }
 
 fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
-    let entry = match activity.kind.as_str() {
+    let mut entry = match activity.kind.as_str() {
         "tool.started" | "tool.updated" | "tool.completed" | "tool.denied" => {
             let key = activity
                 .str("toolCallId")
@@ -268,26 +271,55 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
                 tone: activity.tone.clone(),
             }
         }
-        "task.started" | "task.completed" => {
+        "task.started" | "task.progress" | "task.updated" | "task.completed" => {
             let key = activity
                 .str("taskId")
                 .map(|id| format!("task:{id}"))
                 .unwrap_or_else(|| activity.id.clone());
-            let status = if activity.kind == "task.completed" {
-                activity.str("status").unwrap_or("completed").to_string()
-            } else {
-                "inProgress".to_string()
+            // The server stamps which of the two a task is as it ingests it: work the
+            // model delegated to a subagent, or a monitor or command left running in the
+            // background. They read differently, so they are not drawn the same.
+            let is_agent = activity.str("agentKind") == Some("agent");
+            let title = activity.str("title").unwrap_or("task");
+            // A refinement row without a status says nothing about how the task is
+            // going; an empty status leaves the one already on the row alone.
+            let status = activity
+                .str("status")
+                .unwrap_or(match activity.kind.as_str() {
+                    "task.completed" => "completed",
+                    "task.started" => "inProgress",
+                    _ => "",
+                });
+            // Where it has got to: the step the provider named, falling back to the role
+            // it runs as so a row is never bare.
+            let step = activity
+                .str("summary")
+                .or_else(|| activity.str("detail"))
+                .map(first_line)
+                .filter(|step| !step.is_empty() && *step != title);
+            let detail = match (activity.str("role").filter(|_| is_agent), step) {
+                (Some(role), Some(step)) => Some(format!("{role} · {step}")),
+                (Some(role), None) => Some(role.to_string()),
+                (None, step) => step.map(str::to_string),
             };
             WorkEntry {
                 key,
                 turn_id: activity.turn_id.clone(),
-                icon: "⤷",
-                title: format!("agent: {}", activity.str("title").unwrap_or("task")),
-                detail: activity.str("role").map(str::to_string),
+                icon: if is_agent { "⤷" } else { "⚙" },
+                title: if is_agent {
+                    format!("agent: {title}")
+                } else {
+                    format!("task: {title}")
+                },
+                detail,
                 input: None,
-                output: None,
+                // The report it came back with, as far as the server kept it.
+                output: (activity.kind == "task.completed")
+                    .then(|| activity.str("summary"))
+                    .flatten()
+                    .map(str::to_string),
                 files: Vec::new(),
-                status,
+                status: status.to_string(),
                 tone: "info".into(),
             }
         }
@@ -375,7 +407,9 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
     match pending.iter_mut().find(|e| e.key == entry.key) {
         Some(existing) => {
             // Later lifecycle events refine title and detail, but never blank them.
-            existing.status = entry.status;
+            if !entry.status.is_empty() {
+                existing.status = entry.status;
+            }
             if !entry.title.is_empty() {
                 existing.title = entry.title;
             }
@@ -393,7 +427,14 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             }
             existing.icon = entry.icon;
         }
-        None => pending.push(entry),
+        None => {
+            // The first row for a call decides how it reads, so it cannot leave the
+            // status open the way a later one can.
+            if entry.status.is_empty() {
+                entry.status = "inProgress".to_string();
+            }
+            pending.push(entry)
+        }
     }
 }
 
@@ -710,11 +751,11 @@ fn truncate(text: &str, max: usize) -> String {
     }
 }
 
-fn render_user(text: &str) -> Text<'static> {
+fn render_user(text: &str, label: &str) -> Text<'static> {
     let style = Style::default().fg(Color::Green);
     let mut lines = vec![Line::from(vec![
         Span::styled(USER_MARK, style),
-        Span::styled(" you", style.add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {label}"), style.add_modifier(Modifier::BOLD)),
     ])];
     for line in text.lines() {
         lines.push(Line::from(vec![
@@ -829,5 +870,97 @@ pub fn markdown(text: &str) -> Text<'static> {
             .collect(),
         style: rendered.style,
         alignment: rendered.alignment,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn activity(kind: &str, payload: serde_json::Value) -> Activity {
+        serde_json::from_value(json!({
+            "id": format!("{kind}-{}", payload["taskId"]),
+            "kind": kind,
+            "tone": "info",
+            "summary": "",
+            "payload": payload,
+            "createdAt": "1",
+        }))
+        .unwrap()
+    }
+
+    fn work(rows: &[Activity]) -> Vec<WorkEntry> {
+        let mut pending = Vec::new();
+        for row in rows {
+            merge_work(&mut pending, row);
+        }
+        pending
+    }
+
+    #[test]
+    fn a_subagent_and_a_background_task_read_differently() {
+        let rows = [
+            activity(
+                "task.started",
+                json!({"taskId": "a1", "agentKind": "agent", "title": "Review the diff",
+                       "role": "general-purpose", "detail": "Review the diff"}),
+            ),
+            activity(
+                "task.started",
+                json!({"taskId": "b1", "agentKind": "background", "title": "Watch the build"}),
+            ),
+        ];
+        let entries = work(&rows);
+        assert_eq!(entries[0].icon, "⤷");
+        assert_eq!(entries[0].title, "agent: Review the diff");
+        // The detail the row repeats from its own title is not worth a second line.
+        assert_eq!(entries[0].detail.as_deref(), Some("general-purpose"));
+        assert_eq!(entries[1].icon, "⚙");
+        assert_eq!(entries[1].title, "task: Watch the build");
+        assert_eq!(entries[1].detail, None);
+    }
+
+    #[test]
+    fn progress_refines_the_row_and_completion_carries_the_report() {
+        let rows = [
+            activity(
+                "task.started",
+                json!({"taskId": "a1", "agentKind": "agent", "title": "Review the diff",
+                       "role": "general-purpose"}),
+            ),
+            activity(
+                "task.progress",
+                json!({"taskId": "a1", "detail": "Running Read display utils"}),
+            ),
+            activity(
+                "task.completed",
+                json!({"taskId": "a1", "status": "completed", "summary": "Three findings"}),
+            ),
+        ];
+        let entries = work(&rows);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, "completed");
+        assert_eq!(entries[0].output.as_deref(), Some("Three findings"));
+        assert!(entries[0].has_more());
+    }
+
+    #[test]
+    fn a_row_without_a_status_leaves_the_one_it_has() {
+        let rows = [
+            activity(
+                "task.started",
+                json!({"taskId": "a1", "agentKind": "agent", "title": "Review the diff"}),
+            ),
+            activity(
+                "task.completed",
+                json!({"taskId": "a1", "status": "completed", "summary": "done"}),
+            ),
+            activity(
+                "task.updated",
+                json!({"taskId": "a1", "isBackgrounded": true}),
+            ),
+        ];
+        assert_eq!(work(&rows)[0].status, "completed");
     }
 }

@@ -64,6 +64,8 @@ pub enum Mode {
     Search,
     /// Listing the agent's background tasks that have not reported an end.
     Tasks,
+    /// Listing the subagents the thread has run, with their state and their reports.
+    Agents,
     /// Listing the thread's terminal sessions, with close and restart.
     Terminals,
     /// Attached to a terminal: keys go to the shell, `Ctrl-\` comes back.
@@ -183,6 +185,31 @@ pub enum AppEvent {
         result: Result<(), String>,
         ok: String,
     },
+    /// A subagent's transcript came back from the machine that ran it.
+    Transcript {
+        agent_id: String,
+        result: Result<TranscriptFile, String>,
+    },
+}
+
+/// A transcript as the server read it off disk.
+#[derive(Debug)]
+pub struct TranscriptFile {
+    pub contents: String,
+    /// The server stops reading at a megabyte; the tail of a long run is then missing.
+    pub truncated: bool,
+}
+
+/// A subagent's own conversation, open over the thread's.
+pub struct Transcript {
+    pub agent_id: String,
+    pub title: String,
+    pub subtitle: String,
+    /// The transcript rendered as a thread, so the chat draws it like any other.
+    pub state: ThreadState,
+    pub truncated: bool,
+    /// Where the conversation underneath was, to put it back on the way out.
+    restore: (Scroll, usize, Focus),
 }
 
 pub struct App {
@@ -239,6 +266,13 @@ pub struct App {
     pub terminals: Vec<crate::model::TerminalSummary>,
     /// Selection in the terminal panel.
     pub terminal_selected: usize,
+    /// Selection in the subagent roster.
+    pub agent_selected: usize,
+    /// The subagent transcript being read, in place of the thread's conversation.
+    pub transcript: Option<Transcript>,
+    /// The subagent whose transcript is on its way, so the row can say so and a second
+    /// keypress does not ask for it twice.
+    pub transcript_loading: Option<String>,
     /// The attached terminal, when one is open.
     pub pane: Option<crate::term::Pane>,
     /// A command to type into the pane once its shell reports for duty, for `gl`.
@@ -321,6 +355,9 @@ impl App {
             search_input: None,
             terminals: Vec::new(),
             terminal_selected: 0,
+            agent_selected: 0,
+            transcript: None,
+            transcript_loading: None,
             pane: None,
             pending_pane_command: None,
             pane_area: Rect::default(),
@@ -496,6 +533,9 @@ impl App {
             return;
         }
         self.swap_composer_draft(thread_id);
+        // A transcript belongs to the thread that ran the subagent; it does not follow.
+        self.transcript = None;
+        self.transcript_loading = None;
         self.current_thread_id = Some(thread_id.to_string());
         self.thread = None;
         self.draft = None;
@@ -613,6 +653,8 @@ impl App {
         if text.trim().is_empty() {
             return;
         }
+        // The message joins the conversation, so that is what to be looking at.
+        self.leave_transcript();
         // Read the slot before sending: starting a new thread moves the view to it, and the
         // parked text belongs to the slot the message was written in.
         let draft_key = self.draft_key();
@@ -882,7 +924,9 @@ impl App {
     }
 
     fn yank_last_assistant(&mut self) {
-        let Some(thread) = &self.thread else { return };
+        let Some(thread) = self.open_conversation() else {
+            return;
+        };
         let Some(message) = thread
             .detail
             .messages
@@ -1400,6 +1444,183 @@ impl App {
             return;
         }
         self.mode = Mode::Tasks;
+    }
+
+    // ── Subagents ──────────────────────────────────────────────────────
+
+    /// The conversation on screen: a subagent's transcript when one is open, otherwise
+    /// the thread's own. The renderer reads the same two fields directly, because taking
+    /// a reference to the whole of `self` here would borrow the fields it writes.
+    pub fn open_conversation(&self) -> Option<&ThreadState> {
+        self.transcript
+            .as_ref()
+            .map(|transcript| &transcript.state)
+            .or(self.thread.as_ref())
+    }
+
+    /// The subagents the open thread has run, newest work last.
+    pub fn subagents(&self) -> Vec<crate::subagent::Subagent> {
+        match &self.thread {
+            Some(thread) => thread.subagents(),
+            None => Vec::new(),
+        }
+    }
+
+    fn open_agents(&mut self) {
+        if self.thread.is_none() {
+            self.toast("no thread open", true);
+            return;
+        }
+        let agents = self.subagents();
+        if agents.is_empty() {
+            self.toast("no subagents in this thread", false);
+            return;
+        }
+        // Land on something worth watching: the transcript being read, else the first
+        // one still working, else the last to finish, which is the one the conversation
+        // has just been talking about.
+        let reading = self
+            .transcript
+            .as_ref()
+            .and_then(|transcript| agents.iter().position(|a| a.id == transcript.agent_id));
+        self.agent_selected = reading
+            .or_else(|| agents.iter().position(|agent| agent.status.is_active()))
+            .unwrap_or(agents.len() - 1);
+        self.mode = Mode::Agents;
+    }
+
+    fn on_agents_key(&mut self, key: KeyEvent) {
+        let agents = self.subagents();
+        let count = agents.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('A') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.agent_selected = (self.agent_selected + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.agent_selected = self.agent_selected.saturating_sub(1);
+            }
+            KeyCode::Char('g') => self.agent_selected = 0,
+            KeyCode::Char('G') => self.agent_selected = count.saturating_sub(1),
+            KeyCode::Enter | KeyCode::Char('l') => self.read_transcript(),
+            KeyCode::Char('y') => match agents.get(self.agent_selected) {
+                Some(agent) => match agent.result.as_deref().or(agent.error.as_deref()) {
+                    Some(report) => {
+                        copy_to_clipboard(report);
+                        self.toast("yanked the report", false);
+                    }
+                    None => self.toast("it has not reported back yet", false),
+                },
+                None => self.toast("no subagent selected", true),
+            },
+            _ => {}
+        }
+    }
+
+    /// Fetch the selected subagent's transcript from the machine that ran it. The path
+    /// is the provider's own, outside any workspace, which is what `projects.readFile`
+    /// takes an absolute path for.
+    fn read_transcript(&mut self) {
+        let agents = self.subagents();
+        let Some(agent) = agents.get(self.agent_selected) else {
+            self.toast("no subagent selected", true);
+            return;
+        };
+        let Some(path) = agent.output_file.clone() else {
+            self.toast("no transcript for this subagent yet", false);
+            return;
+        };
+        if self.transcript_loading.is_some() {
+            return;
+        }
+        let Some(cwd) = self.thread_directory() else {
+            self.toast("thread has no directory", true);
+            return;
+        };
+        self.transcript_loading = Some(agent.id.clone());
+        let agent_id = agent.id.clone();
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        let payload = json!({ "cwd": cwd, "relativePath": path });
+        tokio::spawn(async move {
+            let result = handle
+                .call("projects.readFile", payload)
+                .await
+                .map_err(|e| e.to_string())
+                .map(|value| TranscriptFile {
+                    contents: value
+                        .get("contents")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    truncated: value
+                        .get("truncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                });
+            let _ = events.send(AppEvent::Transcript { agent_id, result });
+        });
+    }
+
+    fn on_transcript(&mut self, agent_id: String, result: Result<TranscriptFile, String>) {
+        if self.transcript_loading.as_deref() != Some(agent_id.as_str()) {
+            return;
+        }
+        self.transcript_loading = None;
+        let file = match result {
+            Ok(file) => file,
+            Err(error) => return self.toast(format!("reading the transcript: {error}"), true),
+        };
+        let agents = self.subagents();
+        let Some(agent) = agents.iter().find(|agent| agent.id == agent_id) else {
+            return;
+        };
+        let (state, summary) =
+            match crate::transcript::parse(&file.contents, &agent.id, &agent.title) {
+                Ok(parsed) => parsed,
+                Err(error) => return self.toast(format!("{error}"), true),
+            };
+        let mut subtitle = format!(
+            "{} message{} · {} tool call{}",
+            summary.messages,
+            if summary.messages == 1 { "" } else { "s" },
+            summary.tools,
+            if summary.tools == 1 { "" } else { "s" },
+        );
+        if let Some(role) = &agent.role {
+            subtitle = format!("{role} · {subtitle}");
+        }
+        self.transcript = Some(Transcript {
+            agent_id,
+            title: agent.title.clone(),
+            subtitle,
+            state,
+            truncated: file.truncated,
+            restore: (self.scroll, self.chat_cursor, self.focus),
+        });
+        // The transcript is read, not written to, so the cursor goes where the reading
+        // is done and the conversation's own place is kept for the way back.
+        self.mode = Mode::Normal;
+        self.focus = Focus::Chat;
+        self.scroll = Scroll::Offset(0);
+        self.chat_cursor = 0;
+        self.chat_visual = None;
+        self.search = None;
+    }
+
+    /// Leave the transcript and put the conversation back where it was. Where to go next
+    /// is the caller's: `q` returns to the list the transcript was opened from, while
+    /// sending a message simply carries on.
+    fn leave_transcript(&mut self) {
+        let Some(transcript) = self.transcript.take() else {
+            return;
+        };
+        let (scroll, cursor, focus) = transcript.restore;
+        self.scroll = scroll;
+        self.chat_cursor = cursor;
+        self.focus = focus;
+        self.chat_visual = None;
+        self.search = None;
     }
 
     // ── Git popup ──────────────────────────────────────────────────────
@@ -1995,6 +2216,7 @@ impl App {
             "tmux" => self.switch_tmux_session(),
             "git" | "lazygit" => self.open_git(),
             "tasks" | "jobs" => self.open_tasks(),
+            "agents" | "subagents" => self.open_agents(),
             "terminals" | "shells" => self.open_terminals(),
             "shell" => self.open_shell(),
             "worktree" | "wt" => self.toggle_draft_worktree(),
@@ -2109,6 +2331,22 @@ impl App {
 
     fn on_chat_key(&mut self, key: KeyEvent, prefix: Option<char>) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // A transcript is read with the ordinary chat keys. `q` and `Esc` put it away
+        // and go back to the list it was opened from; anything that moves the focus
+        // elsewhere closes it too, so the keyboard and the screen never disagree about
+        // which conversation is in front.
+        if self.transcript.is_some() && prefix.is_none() {
+            let idle = self.chat_visual.is_none() && self.chat_count.is_none();
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc if idle => {
+                    self.leave_transcript();
+                    self.mode = Mode::Agents;
+                    return;
+                }
+                KeyCode::Tab | KeyCode::BackTab => self.leave_transcript(),
+                _ => {}
+            }
+        }
         let (height, total) = self.chat_viewport;
         let cursor = self.chat_cursor;
         match key.code {
@@ -2136,7 +2374,9 @@ impl App {
                 self.chat_count = None;
                 self.set_chat_cursor(0);
                 self.scroll = Scroll::Offset(0);
-                if self.thread.as_ref().is_some_and(|t| t.has_more) {
+                // A transcript is whole as it was read; there is nothing older to fetch,
+                // and the thread underneath is not what the top of the view belongs to.
+                if self.transcript.is_none() && self.thread.as_ref().is_some_and(|t| t.has_more) {
                     self.load_older();
                 }
             }
@@ -2151,6 +2391,7 @@ impl App {
             KeyCode::Char('!') if prefix == Some('g') => self.open_shell(),
             KeyCode::Char('w') if prefix == Some('g') => self.toggle_draft_worktree(),
             KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
+            KeyCode::Char('A') if prefix == Some('g') => self.open_agents(),
             KeyCode::Char('S') if prefix == Some('g') => self.open_terminals(),
             KeyCode::Char('e') if prefix == Some('g') => self.view_at_cursor(),
             KeyCode::Char('E') if prefix == Some('g') => self.view_conversation(),
@@ -2529,6 +2770,7 @@ impl App {
                     self.mode = Mode::Normal;
                 }
             }
+            Mode::Agents => self.on_agents_key(key),
             Mode::Terminals => self.on_terminals_key(key),
             // Handled above, before the global chords.
             Mode::TerminalPane => {}
@@ -2571,6 +2813,7 @@ impl App {
                 KeyCode::Char('!') if prefix == Some('g') => self.open_shell(),
                 KeyCode::Char('w') if prefix == Some('g') => self.toggle_draft_worktree(),
                 KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
+                KeyCode::Char('A') if prefix == Some('g') => self.open_agents(),
                 KeyCode::Char('S') if prefix == Some('g') => self.open_terminals(),
                 KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
                 KeyCode::Char('G') => {
@@ -2627,6 +2870,7 @@ impl App {
             KeyCode::Char('!') if prefix == Some('g') => return self.open_shell(),
             KeyCode::Char('w') if prefix == Some('g') => return self.toggle_draft_worktree(),
             KeyCode::Char('T') if prefix == Some('g') => return self.open_tasks(),
+            KeyCode::Char('A') if prefix == Some('g') => return self.open_agents(),
             KeyCode::Char('S') if prefix == Some('g') => return self.open_terminals(),
             KeyCode::Char('e') if prefix == Some('g') => return self.edit_composer(),
             KeyCode::Char('E') if prefix == Some('g') => return self.view_conversation(),
@@ -3468,6 +3712,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
                 Ok(()) => app.toast(ok, false),
                 Err(error) => app.toast(error, true),
             },
+            AppEvent::Transcript { agent_id, result } => app.on_transcript(agent_id, result),
         }
         if let Some(external) = app.pending_external.take() {
             if let Err(err) = run_external(&mut terminal, &external) {
