@@ -15,6 +15,10 @@ use crate::{
 };
 
 const THREAD_TURN_LIMIT: u32 = 40;
+/// How often a thread's stream is quietly asked for again before the trouble is worth
+/// reporting. A first failure is ordinary — a thread the server has only just been told
+/// to make, a socket that blinked — and asking again is all it takes.
+const STREAM_ATTEMPTS: u32 = 3;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 pub enum Request {
@@ -80,7 +84,9 @@ pub enum Update {
     TerminalStream(crate::model::TerminalStreamEvent),
     /// The watched checkout's state.
     Vcs(crate::model::VcsEvent),
-    /// The open thread's stream failed; the supervisor resubscribes on its own.
+    /// The open thread's stream stopped and asking for it again did not work either,
+    /// so nothing is listening to it now. Reopening the thread starts a new one, as does
+    /// the next reconnection.
     ThreadStreamError {
         error: String,
     },
@@ -177,6 +183,9 @@ struct OpenThread {
     /// Last sequence forwarded to the UI, for resume.
     last_sequence: Option<u64>,
     subscription: Option<Subscription>,
+    /// How many times in a row the stream has been asked for again without a single
+    /// item coming back. Reset by anything the thread says.
+    attempts: u32,
 }
 
 async fn run(
@@ -315,7 +324,7 @@ async fn run(
                                 continue;
                             }
                             let subscription = subscribe_thread(&client, &id, None, pagination).await.ok();
-                            open = Some(OpenThread { id, last_sequence: None, subscription });
+                            open = Some(OpenThread { id, last_sequence: None, subscription, attempts: 0 });
                         }
                         Request::CloseThread => open = None,
                         Request::Attach { thread_id, terminal_id, cwd, cols, rows } => {
@@ -468,13 +477,43 @@ async fn run(
                 item = thread_next => {
                     let Some(o) = open.as_mut() else { continue };
                     match item {
-                        Some(Ok(value)) => forward_thread_item(&updates, &o.id, value, &mut o.last_sequence),
-                        Some(Err(err)) => {
-                            let _ = updates.send(Update::ThreadStreamError { error: err.to_string() });
-                            o.subscription = subscribe_thread(&client, &o.id, o.last_sequence, pagination).await.ok();
+                        Some(Ok(value)) => {
+                            o.attempts = 0;
+                            forward_thread_item(&updates, &o.id, value, &mut o.last_sequence);
                         }
-                        None => {
-                            o.subscription = subscribe_thread(&client, &o.id, o.last_sequence, pagination).await.ok();
+                        // A stream that ends or fails is answered the same way, by asking
+                        // for it again from where it got to. One that comes back is a
+                        // moment of trouble nobody needs told about: it resumes mid-turn
+                        // without a mark on the screen. One that will not is reported and
+                        // left alone, rather than asked over and over in silence.
+                        item => {
+                            let failed = match item {
+                                Some(Err(err)) => err.to_string(),
+                                _ => "the thread's stream ended".to_string(),
+                            };
+                            o.attempts += 1;
+                            if o.attempts >= STREAM_ATTEMPTS {
+                                o.subscription = None;
+                                let _ = updates.send(Update::ThreadStreamError { error: failed });
+                            } else {
+                                // Only after the first, which is the one a thread being
+                                // made a moment ago answers on its own.
+                                if o.attempts > 1 {
+                                    tokio::time::sleep(Duration::from_millis(
+                                        200 * o.attempts as u64,
+                                    ))
+                                    .await;
+                                }
+                                match subscribe_thread(&client, &o.id, o.last_sequence, pagination).await {
+                                    Ok(again) => o.subscription = Some(again),
+                                    // Asking was refused outright, which the next ask is
+                                    // not going to change.
+                                    Err(err) => {
+                                        o.subscription = None;
+                                        let _ = updates.send(Update::ThreadStreamError { error: err.to_string() });
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -488,6 +527,9 @@ async fn run(
         }));
         if let Some(o) = open.as_mut() {
             o.subscription = None;
+            // A new connection is a fresh start: what the old one could not keep up says
+            // nothing about what this one will manage.
+            o.attempts = 0;
         }
         tokio::time::sleep(backoff(attempt)).await;
     }

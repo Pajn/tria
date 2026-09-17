@@ -181,6 +181,9 @@ pub enum AppEvent {
     Tick,
     Update(Box<Update>),
     Dispatched(Result<(), String>),
+    /// The server has made a thread a new message asked for, so there is now something
+    /// to subscribe to.
+    ThreadCreated(Id),
     /// A non-command RPC finished; `ok` is the toast for the success case.
     Called {
         result: Result<(), String>,
@@ -647,6 +650,14 @@ impl App {
     // ── Dispatch ───────────────────────────────────────────────────────
 
     fn dispatch(&self, command: Value) {
+        self.dispatch_opening(command, None);
+    }
+
+    /// Dispatch a command and, when it is a command that makes a thread, say so once the
+    /// server has applied it. A thread is the command's doing, so there is nothing to
+    /// subscribe to until the command has been through: asking first is asking for a
+    /// thread nobody has yet. A command that fails makes nothing, and says so instead.
+    fn dispatch_opening(&self, command: Value, creates: Option<Id>) {
         let handle = self.handle.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
@@ -655,8 +666,19 @@ impl App {
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string());
+            if let (Ok(()), Some(thread_id)) = (&result, creates) {
+                let _ = events.send(AppEvent::ThreadCreated(thread_id));
+            }
             let _ = events.send(AppEvent::Dispatched(result));
         });
+    }
+
+    /// Subscribe to a thread the server has just made, unless the view has moved on in
+    /// the meantime: a thread opened since the message was sent is the one wanted.
+    fn on_thread_created(&mut self, thread_id: Id) {
+        if self.current_thread_id.as_deref() == Some(thread_id.as_str()) {
+            self.handle.open_thread(&thread_id);
+        }
     }
 
     fn send_message(&mut self) {
@@ -701,10 +723,11 @@ impl App {
                     }),
                 }),
             );
-            self.dispatch(command);
+            // The view moves to the new thread now, and reads as loading until the
+            // server has made it and the subscription has something to say.
             self.current_thread_id = Some(thread_id.clone());
             self.thread = None;
-            self.handle.open_thread(&thread_id);
+            self.dispatch_opening(command, Some(thread_id));
         } else if let Some(thread) = &self.thread {
             let shell = &thread.detail.shell;
             let command = commands::turn_start(
@@ -3382,7 +3405,7 @@ impl App {
                 }
             }
             Update::ThreadStreamError { error } => {
-                self.toast(format!("stream error, resubscribing: {error}"), true)
+                self.toast(format!("lost this thread's updates: {error}"), true)
             }
             Update::Error(error) => self.toast(error, true),
         }
@@ -3813,6 +3836,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
                 }
             }
             AppEvent::Update(update) => app.on_update(*update),
+            AppEvent::ThreadCreated(thread_id) => app.on_thread_created(thread_id),
             AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
             AppEvent::Dispatched(Ok(())) => {}
             AppEvent::Called { result, ok } => match result {
