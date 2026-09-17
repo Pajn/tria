@@ -20,6 +20,7 @@ use crate::{
     commands,
     composer::Composer,
     model::{Id, ModelSelection, ServerConfig, ShellItem, ThreadDetailSnapshot, ThreadItem},
+    picture,
     question::QuestionDraft,
     session::{self, Handle, Status, Update},
     state::{ApprovalOption, PendingApproval, Shell, ThreadState},
@@ -3652,6 +3653,8 @@ fn run_external(terminal: &mut ratatui::DefaultTerminal, external: &ExternalComm
         crossterm::event::EnableBracketedPaste,
         crossterm::event::EnableMouseCapture
     );
+    // Whatever the terminal was holding for us went out with the other program's screen.
+    picture::forget();
     terminal.clear()?;
     match status {
         Ok(status) if status.success() => Ok(()),
@@ -3737,6 +3740,9 @@ pub struct Launch {
 }
 
 pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
+    // A thread's images are files on the server's disk, which are ours to read only when
+    // that disk is this one.
+    let local_files = crate::server::is_local(&origin);
     let (handle, mut updates) = session::spawn(origin, token);
     let (events_tx, mut events) = mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new(handle, events_tx.clone());
@@ -3750,6 +3756,9 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
+    // Before the event reader starts: the terminal answers what it can draw on stdin,
+    // and the reader would take the answer for typing.
+    picture::ask_terminal(local_files);
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableBracketedPaste,

@@ -10,10 +10,12 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap},
 };
+use ratatui_image::sliced::SignedPosition;
 
 use crate::{
     app::{App, Focus, Mode, PickerKind, Scroll, Section, SidebarRow, approval_options},
     model::ThreadStatus,
+    picture,
     session::Status,
     subagent,
     timeline::{self, Block as ChatBlock, BlockKey},
@@ -26,7 +28,7 @@ const COMPOSER_MAX_ROWS: u16 = 8;
 /// Cached rendered chat blocks with their wrapped heights.
 #[derive(Default)]
 pub struct ChatCache {
-    key: Option<(String, u64, u16, u64, bool, usize)>,
+    key: Option<(String, u64, u16, u16, u64, bool, usize)>,
     blocks: Vec<CachedBlock>,
     total: usize,
     /// Every content line as displayed, filled on demand for search.
@@ -40,6 +42,8 @@ pub struct CachedBlock {
     /// Toggle regions in wrapped content lines relative to the block start.
     rows: Vec<timeline::Region>,
     exports: Vec<(String, String)>,
+    /// Images in wrapped content lines relative to the block start.
+    images: Vec<timeline::Placed>,
 }
 
 thread_local! {
@@ -797,6 +801,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         thread.id().to_string(),
         thread.revision,
         inner.width,
+        inner.height,
         expanded_hash,
         app.expand_all,
         app.spinner % 8,
@@ -810,12 +815,19 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
                     || existing.2 != key.2
                     || existing.3 != key.3
                     || existing.4 != key.4
-                    || (thread.is_running() && existing.5 != key.5)
+                    || existing.5 != key.5
+                    || (thread.is_running() && existing.6 != key.6)
             }
             None => true,
         };
         if needs_rebuild {
-            let blocks = timeline::build(thread, &app.expanded, app.expand_all, inner.width);
+            let blocks = timeline::build(
+                thread,
+                &app.expanded,
+                app.expand_all,
+                inner.width,
+                inner.height,
+            );
             let mut total = 0usize;
             let blocks: Vec<CachedBlock> = blocks
                 .into_iter()
@@ -825,9 +837,10 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
                         .wrap(Wrap { trim: false })
                         .line_count(inner.width);
                     total += height;
-                    // Per-line wrapped heights turn text-line row ranges into content lines.
-                    let rows = if block.rows.is_empty() {
-                        Vec::new()
+                    // Per-line wrapped heights turn text-line row ranges into content
+                    // lines, and say where an image's reserved lines landed.
+                    let (rows, images) = if block.rows.is_empty() {
+                        (Vec::new(), Vec::new())
                     } else {
                         let mut starts = Vec::with_capacity(block.text.lines.len() + 1);
                         let mut acc = 0usize;
@@ -838,7 +851,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
                                 .line_count(inner.width);
                         }
                         starts.push(acc);
-                        block
+                        let rows = block
                             .rows
                             .iter()
                             .map(|region| timeline::Region {
@@ -846,13 +859,23 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
                                 end: starts[region.end.min(starts.len() - 1)],
                                 ..region.clone()
                             })
-                            .collect()
+                            .collect();
+                        let images = block
+                            .images
+                            .iter()
+                            .map(|placed| timeline::Placed {
+                                line: starts[placed.line.min(starts.len() - 1)],
+                                ..placed.clone()
+                            })
+                            .collect();
+                        (rows, images)
                     };
                     CachedBlock {
                         block,
                         height,
                         rows,
                         exports,
+                        images,
                     }
                 })
                 .collect();
@@ -888,6 +911,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             height: block_height,
             rows,
             exports,
+            images,
         } in &cache.blocks
         {
             let start = y;
@@ -934,6 +958,16 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
                     .scroll((skip as u16, 0)),
                 rect,
             );
+            // Over the blank lines the block left for them, and clipped to what of the
+            // block is on the screen: an image scrolls like the text it sits in.
+            for placed in images {
+                picture::draw(
+                    frame,
+                    &placed.key,
+                    rect,
+                    SignedPosition::from((placed.indent as i16, placed.line as i16 - skip as i16)),
+                );
+            }
             cursor += visible as u16;
         }
 

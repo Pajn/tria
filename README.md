@@ -318,6 +318,21 @@ any client through the orchestration API. Rows without anything beyond their sum
 fold marker. A subagent's tool calls are the exception: those come from a file rather than the
 wire, and keep what they sent and what they got back.
 
+An image the agent read is drawn rather than named: unfolding the row puts the picture under
+the line, as wide as the chat and at most half as tall, scrolling with the conversation like
+any other lines. The summary the server sends holds the path the tool read and not the
+picture, so the file is read from disk — which works when the server is on this machine, and
+is why an image row against a remote server has nothing to unfold. A subagent's transcript is
+the exception again: the provider's file carries its pictures inside it, and those draw
+wherever the server runs.
+
+How it is drawn is up to the terminal, which is asked once at startup: the kitty, iTerm2, or
+sixel graphics protocol where it speaks one, and half-blocks where it speaks none, which is
+coarse but is still the picture. PNG, JPEG, GIF, and WebP are read. A row says `[image]` in
+place of the picture when the file is something else, or when the terminal answered with no
+way to draw one, and says so with `nothing at that path now` when what the tool read was a
+temporary file that has since been cleaned up.
+
 ## Thread list
 
 The sidebar mirrors the desktop app's sections: pinned, active, snoozed, and settled. Settled

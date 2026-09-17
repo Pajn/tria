@@ -227,9 +227,11 @@ fn tool_activity(call_id: &str, block: &Value, at: &str) -> Value {
     })
 }
 
-/// Hang the result off the call it belongs to, where the expanded row looks for it.
+/// Hang the result off the call it belongs to, where the expanded row looks for it. The
+/// content is passed on as the provider wrote it — a string, or the blocks of a result —
+/// because that is the shape the server sends and the chat already reads, images and all.
 fn complete_tool(activity: &mut Value, block: &Value) {
-    let text = result_text(block.get("content"));
+    let content = block.get("content").cloned().unwrap_or_else(|| json!(""));
     let failed = block
         .get("is_error")
         .and_then(Value::as_bool)
@@ -240,31 +242,8 @@ fn complete_tool(activity: &mut Value, block: &Value) {
     }
     activity["payload"]["data"]["result"] = json!({
         "type": "tool_result",
-        "content": text,
+        "content": content,
     });
-}
-
-/// Tool results are a string, or the blocks of one. Anything that is not text — an
-/// image, say — is named rather than dropped, so the row does not read as empty.
-fn result_text(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .map(|block| match block.get("type").and_then(Value::as_str) {
-                Some("text") => block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                Some(other) => format!("[{other}]"),
-                None => String::new(),
-            })
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
 }
 
 fn string(input: &Value, keys: &[&str]) -> Option<String> {
@@ -422,9 +401,25 @@ mod tests {
         assert_eq!(tool.str("status"), Some("failed"));
         assert_eq!(tool.payload["data"]["files"][0]["path"], "/tmp/x.rs");
         assert_eq!(
-            tool.payload["data"]["result"]["content"],
+            tool.payload["data"]["result"]["content"][0]["text"],
             "read-only file system"
         );
+    }
+
+    /// An image the subagent looked at is carried through as it was written, so the row
+    /// can draw it rather than name it.
+    #[test]
+    fn an_image_a_subagent_read_is_kept_whole() {
+        let rows = r#"
+{"type":"assistant","uuid":"a1","timestamp":"1","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/tmp/shot.png"}}]}}
+{"type":"user","uuid":"u1","timestamp":"2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]}]}}
+"#;
+        let (state, _) = parse(rows, "a1", "Look at it").unwrap();
+        let tool = &state.detail.activities[0];
+        assert_eq!(tool.str("itemType"), Some("image_view"));
+        let block = &tool.payload["data"]["result"]["content"][0];
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["source"]["data"], "iVBORw0KGgo=");
     }
 
     #[test]

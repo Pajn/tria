@@ -4,15 +4,18 @@
 use std::collections::HashSet;
 
 use ratatui::{
+    layout::Size,
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
 };
 use serde_json::Value;
 
-use crate::{model::Activity, state::ThreadState};
+use crate::{model::Activity, picture, state::ThreadState};
 
 pub const USER_MARK: &str = "▌";
 const STREAM_CURSOR: &str = "▍";
+/// Where an image starts, lined up with the output of the row it belongs to.
+const IMAGE_INDENT: u16 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BlockKey {
@@ -32,10 +35,23 @@ pub struct Block {
     /// primary key (`msg:<id>`, the work group key, `plan:<id>`) and, for work groups, each
     /// tool row under its expand key.
     pub exports: Vec<(String, String)>,
+    /// Images an open row left room for, in text-line indices before wrapping. The lines
+    /// they sit on are blank; the renderer draws over them.
+    pub images: Vec<Placed>,
+}
+
+/// Where in a block an image goes. How large it is the drawing cache already knows.
+#[derive(Debug, Clone)]
+pub struct Placed {
+    /// Text-line index the image starts on, before wrapping.
+    pub line: usize,
+    pub indent: u16,
+    /// What the image is known by in the drawing cache.
+    pub key: String,
 }
 
 #[derive(Debug, Clone)]
-struct WorkEntry {
+struct WorkEntry<'a> {
     key: String,
     turn_id: Option<String>,
     icon: &'static str,
@@ -48,22 +64,34 @@ struct WorkEntry {
     input: Option<String>,
     output: Option<String>,
     files: Vec<String>,
+    /// Images the call came back with, borrowed from the activity that carried them:
+    /// the bytes run to hundreds of kilobytes and the timeline is rebuilt often, so they
+    /// are never copied for a row that may stay shut.
+    images: Vec<ToolImage<'a>>,
     status: String,
     tone: String,
 }
 
-impl WorkEntry {
+/// One image in a tool result: what to know it by, and where its bytes are.
+#[derive(Debug, Clone)]
+struct ToolImage<'a> {
+    key: String,
+    source: picture::Source<'a>,
+}
+
+impl WorkEntry<'_> {
     fn has_more(&self) -> bool {
         self.input
             .as_deref()
             .is_some_and(|i| Some(i) != self.detail.as_deref())
             || self.output.is_some()
             || !self.files.is_empty()
+            || !self.images.is_empty()
     }
 }
 
 /// Expand key of one tool row inside a work group.
-fn row_key(group: &str, entry: &WorkEntry) -> String {
+fn row_key(group: &str, entry: &WorkEntry<'_>) -> String {
     format!("{group}/{}", entry.key)
 }
 
@@ -82,11 +110,13 @@ fn item_time<'a>(item: &'a Item<'a>) -> &'a str {
 }
 
 /// Build the ordered blocks for a thread. `expanded` holds work-group keys shown in full.
+/// The height is the chat's own: it bounds how much of the window one image may take.
 pub fn build(
     thread: &ThreadState,
     expanded: &HashSet<String>,
     expand_all: bool,
     width: u16,
+    height: u16,
 ) -> Vec<Block> {
     let detail = &thread.detail;
     let mut items: Vec<Item<'_>> =
@@ -133,7 +163,7 @@ pub fn build(
                 entry.status = "completed".to_string();
             }
         }
-        let (text, rows) = render_work(pending, is_expanded, expanded, &key, width);
+        let (text, rows, images) = render_work(pending, is_expanded, expanded, &key, width, height);
         let mut exports = vec![(key.clone(), export_group(pending))];
         exports.extend(
             pending
@@ -145,6 +175,7 @@ pub fn build(
             text,
             rows,
             exports,
+            images,
         });
         pending.clear();
     };
@@ -177,6 +208,7 @@ pub fn build(
                         format!("msg:{}", message.id),
                         format!("## {role}\n\n{}\n", message.text.trim_end()),
                     )],
+                    images: Vec::new(),
                 });
             }
             Item::Activity(activity) => {
@@ -200,6 +232,7 @@ pub fn build(
                         format!("plan:{}", plan.id),
                         format!("## proposed plan\n\n{}\n", plan.plan_markdown.trim_end()),
                     )],
+                    images: Vec::new(),
                 });
             }
         }
@@ -217,6 +250,7 @@ pub fn build(
             text: render_working(thread),
             rows: Vec::new(),
             exports: Vec::new(),
+            images: Vec::new(),
         });
     }
     blocks
@@ -243,7 +277,7 @@ fn is_visible_activity(activity: &Activity) -> bool {
     ) || activity.kind.starts_with("provider.")
 }
 
-fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
+fn merge_work<'a>(pending: &mut Vec<WorkEntry<'a>>, activity: &'a Activity) {
     let mut entry = match activity.kind.as_str() {
         "tool.started" | "tool.updated" | "tool.completed" | "tool.denied" => {
             let key = activity
@@ -259,7 +293,6 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             };
             let (icon, title) = tool_presentation(item_type, activity);
             WorkEntry {
-                key,
                 turn_id: activity.turn_id.clone(),
                 icon,
                 title,
@@ -267,6 +300,8 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
                 input: tool_input(item_type, activity),
                 output: tool_output(activity),
                 files: tool_files(activity),
+                images: tool_images(&key, item_type, activity),
+                key,
                 status,
                 tone: activity.tone.clone(),
             }
@@ -319,6 +354,7 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
                     .flatten()
                     .map(str::to_string),
                 files: Vec::new(),
+                images: Vec::new(),
                 status: status.to_string(),
                 tone: "info".into(),
             }
@@ -335,6 +371,7 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             input: None,
             output: None,
             files: Vec::new(),
+            images: Vec::new(),
             status: "inProgress".into(),
             tone: "approval".into(),
         },
@@ -353,6 +390,7 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             input: None,
             output: None,
             files: Vec::new(),
+            images: Vec::new(),
             status: "completed".into(),
             tone: "approval".into(),
         },
@@ -365,6 +403,7 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             input: None,
             output: None,
             files: Vec::new(),
+            images: Vec::new(),
             status: "completed".into(),
             tone: "approval".into(),
         },
@@ -377,6 +416,7 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             input: None,
             output: None,
             files: Vec::new(),
+            images: Vec::new(),
             status: "completed".into(),
             tone: "info".into(),
         },
@@ -396,6 +436,7 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             input: None,
             output: None,
             files: Vec::new(),
+            images: Vec::new(),
             status: if activity.tone == "error" {
                 "failed".into()
             } else {
@@ -424,6 +465,9 @@ fn merge_work(pending: &mut Vec<WorkEntry>, activity: &Activity) {
             }
             if !entry.files.is_empty() {
                 existing.files = entry.files;
+            }
+            if !entry.images.is_empty() {
+                existing.images = entry.images;
             }
             existing.icon = entry.icon;
         }
@@ -528,9 +572,76 @@ fn tool_output(activity: &Activity) -> Option<String> {
     }
     data.get("result")
         .and_then(|r| r.get("content"))
+        .and_then(result_text)
+}
+
+/// The text of a result: a string for most tools, and the blocks of one for the rest.
+/// Images are drawn rather than described, so they are left out here; anything else that
+/// is not text is named, so a row never reads as empty when something came back.
+fn result_text(content: &Value) -> Option<String> {
+    let text = match content {
+        Value::String(text) => text.trim().to_string(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block.get("type").and_then(Value::as_str) {
+                Some("text") => block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(|text| text.trim().to_string()),
+                Some("image") => None,
+                Some(other) => Some(format!("[{other}]")),
+                None => None,
+            })
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// The images a call has to show. Each is known by the call it belongs to, so an image
+/// keeps its place in the drawing cache across the rebuilds of a running turn.
+///
+/// A transcript carries the picture itself, because it is the provider's file read whole.
+/// A thread's own rows carry the path and nothing else: the server summarises tool
+/// results on the way out and an image is not something a summary can hold. So the path
+/// is the image, when the disk it names is the one under us.
+fn tool_images<'a>(key: &str, item_type: &str, activity: &'a Activity) -> Vec<ToolImage<'a>> {
+    let data = &activity.payload["data"];
+    let carried: Vec<ToolImage<'a>> = data["result"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, block)| block.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|(index, block)| {
+            let source = block.get("source")?;
+            if source.get("type").and_then(Value::as_str) != Some("base64") {
+                return None;
+            }
+            Some(ToolImage {
+                key: format!("{key}/{index}"),
+                source: picture::Source::Data(source.get("data").and_then(Value::as_str)?),
+            })
+        })
+        .collect();
+    if !carried.is_empty() || item_type != "image_view" || !picture::reads_files() {
+        return carried;
+    }
+    let named = data
+        .get("imagePath")
+        .or_else(|| data.pointer("/input/file_path"))
+        .or_else(|| data.get("path"))
         .and_then(Value::as_str)
-        .filter(|c| !c.trim().is_empty())
-        .map(|c| c.trim().to_string())
+        .filter(|path| !path.is_empty());
+    named
+        .map(|path| ToolImage {
+            key: format!("{key}/file"),
+            source: picture::Source::File(path),
+        })
+        .into_iter()
+        .collect()
 }
 
 fn tool_files(activity: &Activity) -> Vec<String> {
@@ -551,7 +662,7 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("").trim()
 }
 
-fn status_style(entry: &WorkEntry) -> Style {
+fn status_style(entry: &WorkEntry<'_>) -> Style {
     match (entry.tone.as_str(), entry.status.as_str()) {
         ("error", _) | (_, "failed") => Style::default().fg(Color::Red),
         (_, "declined") => Style::default().fg(Color::Yellow),
@@ -576,7 +687,7 @@ type Rows = Vec<Region>;
 
 /// Plain text for one tool call: title, status, the input the server kept, the output
 /// summary, and changed files.
-fn export_entry(entry: &WorkEntry) -> String {
+fn export_entry(entry: &WorkEntry<'_>) -> String {
     let mut out = format!("{} {}", entry.icon, entry.title);
     if entry.status != "completed" {
         out.push_str(&format!(" ({})", entry.status));
@@ -596,6 +707,13 @@ fn export_entry(entry: &WorkEntry) -> String {
         out.push_str(output.trim_end());
         out.push('\n');
     }
+    if !entry.images.is_empty() {
+        out.push_str(&format!(
+            "\n→ {} image{}\n",
+            entry.images.len(),
+            if entry.images.len() == 1 { "" } else { "s" }
+        ));
+    }
     if !entry.files.is_empty() {
         out.push('\n');
         for file in &entry.files {
@@ -607,7 +725,7 @@ fn export_entry(entry: &WorkEntry) -> String {
     out
 }
 
-fn export_group(entries: &[WorkEntry]) -> String {
+fn export_group(entries: &[WorkEntry<'_>]) -> String {
     let mut out = format!(
         "## {} tool call{}\n",
         entries.len(),
@@ -621,12 +739,13 @@ fn export_group(entries: &[WorkEntry]) -> String {
 }
 
 fn render_work(
-    entries: &[WorkEntry],
+    entries: &[WorkEntry<'_>],
     expanded: bool,
     expanded_keys: &HashSet<String>,
     group_key: &str,
     width: u16,
-) -> (Text<'static>, Rows) {
+    height: u16,
+) -> (Text<'static>, Rows, Vec<Placed>) {
     let running = entries.iter().filter(|e| e.status == "inProgress").count();
     let failed = entries
         .iter()
@@ -634,6 +753,7 @@ fn render_work(
         .count();
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut rows: Rows = Vec::new();
+    let mut images: Vec<Placed> = Vec::new();
     let mut header = vec![
         Span::styled(
             if expanded { "▾ " } else { "▸ " },
@@ -680,7 +800,7 @@ fn render_work(
         foldable: true,
     });
     if !expanded {
-        return (Text::from(lines), rows);
+        return (Text::from(lines), rows, images);
     }
     let dim = Style::default().fg(Color::DarkGray);
     for entry in entries {
@@ -739,6 +859,30 @@ fn render_work(
                     Span::styled(file.clone(), Style::default().fg(Color::Gray)),
                 ]));
             }
+            for image in &entry.images {
+                match picture::place(&image.key, image.source, image_room(width, height)) {
+                    // Blank lines, which the renderer draws the image over once it knows
+                    // where on the screen they landed.
+                    Some(size) => {
+                        images.push(Placed {
+                            line: lines.len(),
+                            indent: IMAGE_INDENT,
+                            key: image.key.clone(),
+                        });
+                        lines.extend(std::iter::repeat_n(
+                            Line::from(" ".repeat(IMAGE_INDENT as usize)),
+                            size.height as usize,
+                        ));
+                    }
+                    // Nothing here can draw it. A file a tool read is often a temporary
+                    // one that has since been cleaned up, and that is worth saying: the
+                    // row above names the file, and this says what became of it.
+                    None => lines.push(Line::from(vec![
+                        Span::styled("      → ", dim),
+                        Span::styled(missing(image), Style::default().fg(Color::Gray)),
+                    ])),
+                }
+            }
             if entry.status != "completed" {
                 lines.push(Line::from(vec![
                     Span::raw("      "),
@@ -753,7 +897,26 @@ fn render_work(
             foldable: entry.has_more(),
         });
     }
-    (Text::from(lines), rows)
+    (Text::from(lines), rows, images)
+}
+
+/// What to say in place of an image that cannot be drawn.
+fn missing(image: &ToolImage<'_>) -> &'static str {
+    match image.source {
+        picture::Source::File(path) if std::fs::metadata(path).is_err() => {
+            "[image · nothing at that path now]"
+        }
+        _ => "[image]",
+    }
+}
+
+/// The room one image is given: what the row leaves of the width, and half the window,
+/// so what follows an open image is still in view.
+fn image_room(width: u16, height: u16) -> Size {
+    Size::new(
+        width.saturating_sub(IMAGE_INDENT + 2),
+        (height / 2).clamp(4, 24),
+    )
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -894,8 +1057,11 @@ pub fn markdown(text: &str) -> Text<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use base64::Engine;
+    use ratatui::widgets::{Paragraph, Wrap};
     use serde_json::json;
+
+    use super::*;
 
     fn activity(kind: &str, payload: serde_json::Value) -> Activity {
         serde_json::from_value(json!({
@@ -909,7 +1075,7 @@ mod tests {
         .unwrap()
     }
 
-    fn work(rows: &[Activity]) -> Vec<WorkEntry> {
+    fn work(rows: &[Activity]) -> Vec<WorkEntry<'_>> {
         let mut pending = Vec::new();
         for row in rows {
             merge_work(&mut pending, row);
@@ -917,12 +1083,142 @@ mod tests {
         pending
     }
 
+    fn image_call(data: &str) -> Activity {
+        serde_json::from_value(json!({
+            "id": "a-image",
+            "kind": "tool.completed",
+            "tone": "info",
+            "summary": "Image view",
+            "createdAt": "1",
+            "payload": {
+                "itemType": "image_view",
+                "toolCallId": "t1",
+                "status": "completed",
+                "title": "Image view",
+                "detail": "Read: /tmp/shot.png",
+                "data": {
+                    "toolName": "Read",
+                    "result": { "type": "tool_result", "content": [
+                        { "type": "text", "text": "the window" },
+                        { "type": "image", "source": {
+                            "type": "base64", "media_type": "image/png", "data": data } },
+                    ]},
+                },
+            },
+        }))
+        .unwrap()
+    }
+
+    /// An image read is a row worth opening, and what it opens onto is the picture: the
+    /// lines it reserves are blank, and one screen line each once wrapped.
+    #[test]
+    fn an_open_image_row_keeps_the_lines_its_picture_needs() {
+        picture::draw_in_halfblocks();
+        let data = picture::test_png(200, 100);
+        let rows = [image_call(&data)];
+        let entries = work(&rows);
+        assert!(entries[0].has_more(), "an image is something to unfold");
+        let open = HashSet::from(["work-1/t1".to_string()]);
+        let (text, regions, images) = render_work(&entries, true, &open, "work-1", 80, 24);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].key, "t1/1");
+        let size = picture::place(
+            &images[0].key,
+            picture::Source::Data(&data),
+            image_room(80, 24),
+        )
+        .unwrap();
+        let reserved = images[0].line..images[0].line + size.height as usize;
+        assert_eq!(regions[1].end, reserved.end, "the row owns them");
+        for index in reserved {
+            let line = &text.lines[index];
+            assert!(
+                line.spans.iter().all(|span| span.content.trim().is_empty()),
+                "line {index} is left blank for the image"
+            );
+            assert_eq!(
+                Paragraph::new(Text::from(line.clone()))
+                    .wrap(Wrap { trim: false })
+                    .line_count(80),
+                1,
+                "line {index} is one line on the screen"
+            );
+        }
+    }
+
+    /// What a thread's own image row carries: the path the tool read, and no picture.
+    /// That is the row the fix is for — it used to have nothing to unfold.
+    fn image_row_naming(path: &str) -> Activity {
+        serde_json::from_value(json!({
+            "id": "a-named",
+            "kind": "tool.completed",
+            "tone": "info",
+            "summary": "Image view",
+            "createdAt": "1",
+            "payload": {
+                "itemType": "image_view",
+                "toolCallId": "t2",
+                "status": "completed",
+                "title": "Image view",
+                "detail": path,
+                "data": { "imagePath": path, "toolName": "Read" },
+            },
+        }))
+        .unwrap()
+    }
+
+    /// The server sends a path where the picture would not fit, so the path is the
+    /// picture: the row unfolds onto the file it names.
+    #[test]
+    fn a_row_that_only_names_its_image_still_shows_it() {
+        picture::draw_in_halfblocks();
+        let path = std::env::temp_dir().join("tria-a-row-names.png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(picture::test_png(120, 60))
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let rows = [image_row_naming(path.to_str().unwrap())];
+        let entries = work(&rows);
+        assert!(entries[0].has_more(), "the file is something to unfold");
+        let open = HashSet::from(["work-1/t2".to_string()]);
+        let (_, _, images) = render_work(&entries, true, &open, "work-1", 80, 24);
+        assert_eq!(images.len(), 1);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The text of a result still reads as text when an image came with it, and the
+    /// picture is not described twice. A call is reported before it has a result, so the
+    /// image arrives on the row that completes it and has to survive the merge.
+    #[test]
+    fn what_came_back_beside_the_image_is_still_read() {
+        let started: Activity = serde_json::from_value(json!({
+            "id": "a-image",
+            "kind": "tool.started",
+            "tone": "info",
+            "summary": "Image view",
+            "createdAt": "0",
+            "payload": {
+                "itemType": "image_view",
+                "toolCallId": "t1",
+                "status": "inProgress",
+                "title": "Image view",
+                "data": { "imagePath": "/tmp/shot.png", "toolName": "Read" },
+            },
+        }))
+        .unwrap();
+        let rows = [started, image_call("not-an-image")];
+        let entries = work(&rows);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].output.as_deref(), Some("the window"));
+        assert_eq!(entries[0].images.len(), 1);
+    }
+
     /// Every row of an expanded group owns its lines, whether or not it has anything to
     /// unfold. Without that, a click on a row the server kept no payload for lands on the
     /// group instead and shuts the whole thing.
     #[test]
     fn a_row_with_nothing_to_unfold_still_owns_its_line() {
-        let entries = work(&[
+        let rows = [
             activity(
                 "task.started",
                 json!({"taskId": "a1", "agentKind": "agent", "title": "Review the diff"}),
@@ -932,9 +1228,10 @@ mod tests {
                 json!({"taskId": "a2", "agentKind": "agent", "title": "Check the tests",
                        "summary": "All green."}),
             ),
-        ]);
-        let (_, rows) = render_work(&entries, true, &HashSet::new(), "work-1", 80);
-        let keys: Vec<(&str, bool)> = rows
+        ];
+        let entries = work(&rows);
+        let (_, regions, _) = render_work(&entries, true, &HashSet::new(), "work-1", 80, 24);
+        let keys: Vec<(&str, bool)> = regions
             .iter()
             .map(|region| (region.key.as_str(), region.foldable))
             .collect();
@@ -947,9 +1244,9 @@ mod tests {
             ]
         );
         // Contiguous from the header down, so no line inside the group falls through to it.
-        assert_eq!(rows[0].first, 0);
-        assert_eq!(rows[1].first, rows[0].end);
-        assert_eq!(rows[2].first, rows[1].end);
+        assert_eq!(regions[0].first, 0);
+        assert_eq!(regions[1].first, regions[0].end);
+        assert_eq!(regions[2].first, regions[1].end);
     }
 
     #[test]
