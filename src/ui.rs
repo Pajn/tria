@@ -574,8 +574,19 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Yellow),
             ));
         }
+        // A run still going has written more since this was read, and nothing tells us.
+        if transcript.live {
+            spans.push(Span::styled(
+                "  still working",
+                Style::default().fg(Color::Cyan),
+            ));
+        }
         spans.push(Span::styled(
-            "  q back",
+            if transcript.live {
+                "  r re-reads · q back"
+            } else {
+                "  q back"
+            },
             Style::default().fg(Color::DarkGray),
         ));
         let width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -1767,7 +1778,7 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
         if agent.activations > 1 {
             facts.push(format!("run {}", agent.activations));
         }
-        if agent.output_file.is_none() {
+        if app.transcript_path(agent).is_none() {
             facts.push("no transcript".to_string());
         }
         if app.transcript_loading.as_deref() == Some(agent.id.as_str()) {
@@ -1941,7 +1952,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  g!                      a shell in the pane; exiting it closes the popup"),
         Line::from("  gT                      background tasks still running in this thread"),
         Line::from("  gA                      subagents this thread has run: Enter reads one's"),
-        Line::from("                          transcript, y yanks its report"),
+        Line::from("                          transcript (r re-reads a running one), y yanks its"),
+        Line::from("                          report"),
         Line::from("  gS                      terminals for this thread: Enter attaches,"),
         Line::from("                          c opens a new one, x closes, r restarts"),
         Line::from("  in the pane             every key goes to the shell · Ctrl-\\ detaches"),

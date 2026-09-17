@@ -95,7 +95,7 @@ Press `?` inside the app for the full list.
 | `gy` | copy the last assistant message (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
 | `gT` | list the agent's background tasks that are still running |
-| `gA` | list the subagents the thread has run; `Enter` reads one's transcript, `y` yanks its report |
+| `gA` | list the subagents the thread has run; `Enter` reads one's transcript (`r` re-reads a running one), `y` yanks its report |
 | `gS` | list the thread's terminals; attach to one, or close, restart, open a new one |
 | `gl` | open lazygit in a terminal popup for the thread |
 | `g!` | a shell in the popup, in the thread's directory |
@@ -251,8 +251,14 @@ and the conversation returns to where it was.
 The transcript is a file the provider wrote on the machine that ran the agent, fetched with
 `projects.readFile`, which takes an absolute path for exactly this. It therefore works against
 a remote server too. The server stops reading at a megabyte and the header says so when the
-tail is missing. A subagent that has not reported back yet has no transcript, and the row says
-that instead.
+tail is missing.
+
+A subagent that is still working can be read as far as it has got: the provider writes the
+file from the moment the agent starts, but it only reports the path once the task is over, so
+the path is taken from another task in the same thread — they are written side by side in one
+directory, each named after its task. The header says the run is still going, and `r` reads it
+again for whatever has been written since. In a thread where no task has finished yet there is
+nothing to take the directory from, and the row says it has no transcript.
 
 Unlike the tool rows in the thread, these are not projected down to a summary on the way out:
 the file has the whole input and the whole output, so an expanded row shows the command it ran

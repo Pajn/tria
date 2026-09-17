@@ -24,6 +24,15 @@ pub struct Summary {
     pub skipped: usize,
 }
 
+/// The file a task's output is written to, beside one whose path is known. The provider
+/// writes them all into a single directory named after the session, each named after its
+/// task, and it writes them as the task runs — but it only tells the server the path once
+/// the task is over, so this is how a run still going is read.
+pub fn sibling_path(known: &str, id: &str) -> Option<String> {
+    let (dir, _) = known.rsplit_once('/')?;
+    (!dir.is_empty()).then(|| format!("{dir}/{id}.output"))
+}
+
 /// Parse a transcript into a thread of its own. `id` and `title` name the subagent it
 /// belongs to; the thread is never sent to the server, so the rest of the shell is the
 /// little the renderer reads.
@@ -356,6 +365,15 @@ fn detail(name: &str, input: &Value, item_type: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_transcript_is_named_after_its_task_beside_its_siblings() {
+        assert_eq!(
+            sibling_path("/tmp/agent-runs/a-project/session/tasks/old.output", "new").as_deref(),
+            Some("/tmp/agent-runs/a-project/session/tasks/new.output")
+        );
+        assert_eq!(sibling_path("bare", "new"), None);
+    }
 
     const ROWS: &str = r#"
 {"type":"user","uuid":"u1","timestamp":"1","message":{"role":"user","content":"Find the wire protocol"}}

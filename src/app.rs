@@ -208,6 +208,9 @@ pub struct Transcript {
     /// The transcript rendered as a thread, so the chat draws it like any other.
     pub state: ThreadState,
     pub truncated: bool,
+    /// Whether the agent was still working when this was read, so what is shown is as
+    /// far as it had got rather than the whole run.
+    pub live: bool,
     /// Where the conversation underneath was, to put it back on the way out.
     restore: (Scroll, usize, Focus),
 }
@@ -1518,6 +1521,24 @@ impl App {
         }
     }
 
+    /// Where the provider is writing a subagent's transcript. It tells the server the
+    /// path only when the task finishes, so for one still working it is taken from a
+    /// task in the same thread that has: they are written side by side in one directory
+    /// and named after the task, and the file is there from the moment the agent starts.
+    pub fn transcript_path(&self, agent: &crate::subagent::Subagent) -> Option<String> {
+        if let Some(path) = &agent.output_file {
+            return Some(path.clone());
+        }
+        let thread = self.thread.as_ref()?;
+        let known = thread
+            .detail
+            .activities
+            .iter()
+            .rev()
+            .find_map(|activity| activity.str("outputFile"))?;
+        crate::transcript::sibling_path(known, &agent.id)
+    }
+
     /// Fetch the selected subagent's transcript from the machine that ran it. The path
     /// is the provider's own, outside any workspace, which is what `projects.readFile`
     /// takes an absolute path for.
@@ -1527,7 +1548,7 @@ impl App {
             self.toast("no subagent selected", true);
             return;
         };
-        let Some(path) = agent.output_file.clone() else {
+        let Some(path) = self.transcript_path(agent) else {
             self.toast("no transcript for this subagent yet", false);
             return;
         };
@@ -1591,22 +1612,53 @@ impl App {
         if let Some(role) = &agent.role {
             subtitle = format!("{role} · {subtitle}");
         }
+        // Re-reading a running agent replaces what is open, so the way back is the one
+        // taken on the way in, not wherever the reading had got to.
+        let reread = self
+            .transcript
+            .as_ref()
+            .is_some_and(|open| open.agent_id == agent_id);
+        let restore = match &self.transcript {
+            Some(open) if reread => open.restore,
+            _ => (self.scroll, self.chat_cursor, self.focus),
+        };
+        let live = !agent.status.is_terminal();
         self.transcript = Some(Transcript {
             agent_id,
             title: agent.title.clone(),
             subtitle,
             state,
             truncated: file.truncated,
-            restore: (self.scroll, self.chat_cursor, self.focus),
+            live,
+            restore,
         });
         // The transcript is read, not written to, so the cursor goes where the reading
-        // is done and the conversation's own place is kept for the way back.
+        // is done and the conversation's own place is kept for the way back. A re-read
+        // of a run still going lands at the end, which is the part that is new.
         self.mode = Mode::Normal;
         self.focus = Focus::Chat;
-        self.scroll = Scroll::Offset(0);
-        self.chat_cursor = 0;
+        if reread && live {
+            self.scroll = Scroll::Follow;
+        } else {
+            self.scroll = Scroll::Offset(0);
+            self.chat_cursor = 0;
+        }
         self.chat_visual = None;
         self.search = None;
+    }
+
+    /// Read the open transcript again: an agent still working has written more since.
+    fn reload_transcript(&mut self) {
+        let Some(open) = self.transcript.as_ref().map(|t| t.agent_id.clone()) else {
+            return;
+        };
+        let agents = self.subagents();
+        let Some(index) = agents.iter().position(|agent| agent.id == open) else {
+            self.toast("that subagent is no longer in this thread", true);
+            return;
+        };
+        self.agent_selected = index;
+        self.read_transcript();
     }
 
     /// Leave the transcript and put the conversation back where it was. Where to go next
@@ -2339,6 +2391,11 @@ impl App {
                     return;
                 }
                 KeyCode::Tab | KeyCode::BackTab => self.leave_transcript(),
+                // The file grows while the agent works, and nothing pushes it to us.
+                KeyCode::Char('r') if idle => {
+                    self.reload_transcript();
+                    return;
+                }
                 _ => {}
             }
         }
