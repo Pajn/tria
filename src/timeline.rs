@@ -25,9 +25,9 @@ pub enum BlockKey {
 pub struct Block {
     pub key: BlockKey,
     pub text: Text<'static>,
-    /// Toggleable regions as `(first line, end line exclusive, expand key)`, in text-line
-    /// indices before wrapping. Work groups list their header and each tool row.
-    pub rows: Vec<(usize, usize, String)>,
+    /// Toggleable regions, in text-line indices before wrapping. Work groups list their
+    /// header and every tool row, foldable or not.
+    pub rows: Vec<Region>,
     /// Plain-text renderings keyed for export to an editor: the block itself under its
     /// primary key (`msg:<id>`, the work group key, `plan:<id>`) and, for work groups, each
     /// tool row under its expand key.
@@ -561,7 +561,18 @@ fn status_style(entry: &WorkEntry) -> Style {
     }
 }
 
-type Rows = Vec<(usize, usize, String)>;
+/// A region of a block that a key folds: the text lines it covers, the key, and whether
+/// folding it shows anything. A tool row the server kept no input or output for is a
+/// region all the same — it owns its line, so a click on it is not a click on the group.
+#[derive(Debug, Clone)]
+pub struct Region {
+    pub first: usize,
+    pub end: usize,
+    pub key: String,
+    pub foldable: bool,
+}
+
+type Rows = Vec<Region>;
 
 /// Plain text for one tool call: title, status, the input the server kept, the output
 /// summary, and changed files.
@@ -662,7 +673,12 @@ fn render_work(
         ));
     }
     lines.push(Line::from(header));
-    rows.push((0, 1, group_key.to_string()));
+    rows.push(Region {
+        first: 0,
+        end: 1,
+        key: group_key.to_string(),
+        foldable: true,
+    });
     if !expanded {
         return (Text::from(lines), rows);
     }
@@ -730,9 +746,12 @@ fn render_work(
                 ]));
             }
         }
-        if entry.has_more() {
-            rows.push((first, lines.len(), key));
-        }
+        rows.push(Region {
+            first,
+            end: lines.len(),
+            key,
+            foldable: entry.has_more(),
+        });
     }
     (Text::from(lines), rows)
 }
@@ -896,6 +915,41 @@ mod tests {
             merge_work(&mut pending, row);
         }
         pending
+    }
+
+    /// Every row of an expanded group owns its lines, whether or not it has anything to
+    /// unfold. Without that, a click on a row the server kept no payload for lands on the
+    /// group instead and shuts the whole thing.
+    #[test]
+    fn a_row_with_nothing_to_unfold_still_owns_its_line() {
+        let entries = work(&[
+            activity(
+                "task.started",
+                json!({"taskId": "a1", "agentKind": "agent", "title": "Review the diff"}),
+            ),
+            activity(
+                "task.completed",
+                json!({"taskId": "a2", "agentKind": "agent", "title": "Check the tests",
+                       "summary": "All green."}),
+            ),
+        ]);
+        let (_, rows) = render_work(&entries, true, &HashSet::new(), "work-1", 80);
+        let keys: Vec<(&str, bool)> = rows
+            .iter()
+            .map(|region| (region.key.as_str(), region.foldable))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("work-1", true),
+                ("work-1/task:a1", false),
+                ("work-1/task:a2", true),
+            ]
+        );
+        // Contiguous from the header down, so no line inside the group falls through to it.
+        assert_eq!(rows[0].first, 0);
+        assert_eq!(rows[1].first, rows[0].end);
+        assert_eq!(rows[2].first, rows[1].end);
     }
 
     #[test]

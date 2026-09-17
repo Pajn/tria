@@ -315,7 +315,7 @@ pub struct App {
     pub selection: Option<Selection>,
     /// Text to push to the clipboard after the next frame is drawn.
     pub clipboard_pending: Option<String>,
-    pub work_ranges: Vec<(usize, usize, String)>,
+    pub work_ranges: Vec<crate::timeline::Region>,
     quit: bool,
 }
 
@@ -1809,18 +1809,12 @@ impl App {
     fn view_at_cursor(&mut self) {
         let line = self.chat_cursor;
         // A tool row is more specific than its group, which is more specific than a block.
-        let key = self
-            .work_ranges
-            .iter()
-            .filter(|(start, end, _)| *start <= line && line < *end)
-            .min_by_key(|(start, end, _)| end - start)
-            .map(|(_, _, key)| key.clone())
-            .or_else(|| {
-                self.block_ranges
-                    .iter()
-                    .find(|(start, end, _)| *start <= line && line < *end)
-                    .map(|(_, _, key)| key.clone())
-            });
+        let key = self.region_at(line).map(|(key, _)| key).or_else(|| {
+            self.block_ranges
+                .iter()
+                .find(|(start, end, _)| *start <= line && line < *end)
+                .map(|(_, _, key)| key.clone())
+        });
         let Some(key) = key else {
             self.toast("nothing under the cursor", true);
             return;
@@ -2431,18 +2425,8 @@ impl App {
                 self.set_chat_cursor(target);
             }
             KeyCode::Char('z') => self.pending_prefix = Some(('z', Instant::now())),
-            KeyCode::Char('a') if prefix == Some('z') => {
-                if let Some(key) = self.toggle_key_at(cursor) {
-                    self.toggle_expanded(key);
-                }
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                if let Some(key) = self.toggle_key_at(cursor) {
-                    self.toggle_expanded(key);
-                } else {
-                    self.toast("nothing to fold here", false);
-                }
-            }
+            KeyCode::Char('a') if prefix == Some('z') => self.fold_at(cursor, true),
+            KeyCode::Enter | KeyCode::Char(' ') => self.fold_at(cursor, false),
             KeyCode::Char('R') if prefix == Some('z') => self.expand_all = true,
             KeyCode::Char('M') if prefix == Some('z') => {
                 self.expand_all = false;
@@ -2692,14 +2676,26 @@ impl App {
         }
     }
 
-    /// The tightest toggle region covering a content line: a tool row inside an expanded
-    /// group wins over the group itself.
-    fn toggle_key_at(&self, line: usize) -> Option<String> {
+    /// The tightest toggle region covering a content line, with whether folding it shows
+    /// anything: a tool row inside an expanded group wins over the group itself, even
+    /// when the row has nothing to unfold — folding its group instead is not what the
+    /// click asked for.
+    fn region_at(&self, line: usize) -> Option<(String, bool)> {
         self.work_ranges
             .iter()
-            .filter(|(start, end, _)| *start <= line && line < *end)
-            .min_by_key(|(start, end, _)| end - start)
-            .map(|(_, _, key)| key.clone())
+            .filter(|region| region.first <= line && line < region.end)
+            .min_by_key(|region| region.end - region.first)
+            .map(|region| (region.key.clone(), region.foldable))
+    }
+
+    /// Fold what is under a content line, saying so when there is nothing to fold.
+    fn fold_at(&mut self, line: usize, quiet: bool) {
+        match self.region_at(line) {
+            Some((key, true)) => self.toggle_expanded(key),
+            Some((_, false)) => self.toast("the server kept nothing more for this row", false),
+            None if !quiet => self.toast("nothing to fold here", false),
+            None => {}
+        }
     }
 
     fn toggle_expanded(&mut self, key: String) {
@@ -2713,15 +2709,17 @@ impl App {
         let offset = self.chat_offset();
         let middle = offset + height / 2;
         let key = self
-            .toggle_key_at(middle)
+            .region_at(middle)
+            .filter(|(_, foldable)| *foldable)
+            .map(|(key, _)| key)
             .or_else(|| {
                 self.work_ranges
                     .iter()
                     .rev()
-                    .find(|(start, _, _)| *start < offset + height)
-                    .map(|(_, _, key)| key.clone())
+                    .find(|region| region.first < offset + height)
+                    .map(|region| region.key.clone())
             })
-            .or_else(|| self.work_ranges.last().map(|(_, _, key)| key.clone()));
+            .or_else(|| self.work_ranges.last().map(|region| region.key.clone()));
         if let Some(key) = key {
             self.toggle_expanded(key);
         }
@@ -3093,8 +3091,8 @@ impl App {
                             // A link takes the click; folding would be a surprise.
                             if let Some(url) = self.link_at(at) {
                                 self.open_url(&url);
-                            } else if let Some(key) = self.toggle_key_at(line) {
-                                self.toggle_expanded(key);
+                            } else {
+                                self.fold_at(line, true);
                             }
                         }
                     } else {

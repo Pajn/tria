@@ -38,7 +38,7 @@ pub struct CachedBlock {
     /// Rendered height after wrapping.
     height: usize,
     /// Toggle regions in wrapped content lines relative to the block start.
-    rows: Vec<(usize, usize, String)>,
+    rows: Vec<timeline::Region>,
     exports: Vec<(String, String)>,
 }
 
@@ -830,12 +830,10 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
                         block
                             .rows
                             .iter()
-                            .map(|(first, end, key)| {
-                                (
-                                    starts[*first],
-                                    starts[(*end).min(starts.len() - 1)],
-                                    key.clone(),
-                                )
+                            .map(|region| timeline::Region {
+                                first: starts[region.first],
+                                end: starts[region.end.min(starts.len() - 1)],
+                                ..region.clone()
                             })
                             .collect()
                     };
@@ -891,10 +889,18 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.block_ranges.push((start, end, key.clone()));
             }
             if let BlockKey::Work(key) = &block.key {
-                app.work_ranges.push((start, end, key.clone()));
-                for (row_start, row_end, row_key) in rows {
-                    app.work_ranges
-                        .push((start + row_start, start + row_end, row_key.clone()));
+                app.work_ranges.push(timeline::Region {
+                    first: start,
+                    end,
+                    key: key.clone(),
+                    foldable: true,
+                });
+                for region in rows {
+                    app.work_ranges.push(timeline::Region {
+                        first: start + region.first,
+                        end: start + region.end,
+                        ..region.clone()
+                    });
                 }
             }
             if end <= offset {
