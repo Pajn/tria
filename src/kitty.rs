@@ -198,6 +198,28 @@ enum Held {
     },
 }
 
+impl Held {
+    /// What the picture store knows this image by.
+    fn hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        match self {
+            Held::Encoded(bytes) => bytes.hash(&mut hasher),
+            Held::Pixels {
+                bytes,
+                width,
+                height,
+                alpha,
+            } => {
+                bytes.hash(&mut hasher);
+                (width, height, alpha).hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+}
+
 pub struct Graphics {
     /// What names this pane's images in the picture store, so two panes showing the same
     /// picture do not share an entry that one of them may replace.
@@ -212,9 +234,6 @@ pub struct Graphics {
     /// Counts feeds, so a pane that cannot say how far its text moved can at least drop
     /// what it drew before the text moved.
     feed: u64,
-    /// Numbers the images, so an id sent twice with different pictures is two entries in
-    /// the picture store rather than one.
-    serial: u64,
 }
 
 impl Graphics {
@@ -226,7 +245,6 @@ impl Graphics {
             kept: VecDeque::new(),
             placements: Vec::new(),
             feed: 0,
-            serial: 0,
         }
     }
 
@@ -476,8 +494,10 @@ impl Graphics {
 
     /// Keep an image for a later placement.
     fn keep(&mut self, control: &Control, source: Held) {
-        self.serial += 1;
-        let key = format!("{}/{}", self.prefix, self.serial);
+        // Named by what it is rather than by when it came, so a program showing the same
+        // picture again — stepping back through a list of files does it constantly —
+        // draws what has already been encoded instead of encoding it twice.
+        let key = format!("{}/{:016x}", self.prefix, source.hash());
         if control.id != 0 {
             self.kept.retain(|kept| kept.id != control.id);
         }
@@ -814,6 +834,22 @@ mod tests {
         // Three line feeds put the cursor on the picture's last row, and the column is
         // the one after its right edge, which is where the program writes next.
         assert_eq!(outcome.motion.as_deref(), Some("\n\n\n\x1b[14G"));
+    }
+
+    /// Stepping back and forth through a list of files sends the same picture over and
+    /// over, and encoding it again each time is what makes that feel slow.
+    #[test]
+    fn the_same_picture_sent_twice_is_the_same_picture() {
+        let mut graphics = graphics();
+        let data = png();
+        send(&mut graphics, &format!("\x1b_Ga=T,f=100,i=1;{data}\x1b\\"));
+        let first = graphics.placements()[0].key.clone();
+        send(&mut graphics, &format!("\x1b_Ga=T,f=100,i=1;{data}\x1b\\"));
+        assert_eq!(graphics.placements()[0].key, first);
+
+        let other = crate::picture::test_png(40, 20);
+        send(&mut graphics, &format!("\x1b_Ga=T,f=100,i=1;{other}\x1b\\"));
+        assert_ne!(graphics.placements()[0].key, first, "another picture");
     }
 
     #[test]
