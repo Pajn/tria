@@ -431,9 +431,11 @@ turn), `▤` has a plan ready, `✗` failed. The status bar spells the status ou
 thread. `:settle` and `:unsettle` move the current thread between the active list and the
 shelf; `:wake` ends a snooze.
 
-A thread that has finished a turn, or been written to, since you last had it open shows `●`
-in place of the quiet `·`; opening it clears the mark. The statuses above are left alone,
-since each already says more than "look at me". This is only for as long as tria is running:
+A thread that has finished a turn, been written to, or settled into monitoring since you last
+had it open shows `●` in place of the quiet `·`; opening it clears the mark. Monitoring keeps
+its `◔` and turns green instead, because a watcher sits there for hours and the glyph alone
+cannot say whether anything has happened in them. The other statuses are left alone, since
+each already says more than "look at me". This is only for as long as tria is running:
 what you have read is not written down, so a thread is never unread because of something that
 happened before tria started.
 

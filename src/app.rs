@@ -4602,15 +4602,20 @@ async fn favicon_bytes(handle: &session::Handle, origin: &str, cwd: &str) -> Opt
 }
 
 /// What a thread looks like from the list: which turn it is on, how that turn ended,
-/// and when it was last written to. Anything else the server touches is bookkeeping and
-/// is not a thread saying something.
+/// when it was last written to, and what its background work is up to. Anything else
+/// the server touches is bookkeeping and is not a thread saying something.
+///
+/// Background work counts because a thread can go quiet without the turn changing at
+/// all: the answer was written long ago and what is left is a watcher, which settling
+/// into monitoring is the whole of the news.
 fn mark_of(thread: &crate::model::ThreadShell) -> String {
     let turn = thread.latest_turn.as_ref();
     format!(
-        "{}/{}/{}",
+        "{}/{}/{}/{}",
         turn.map(|t| t.turn_id.as_str()).unwrap_or_default(),
         turn.map(|t| t.state.as_str()).unwrap_or_default(),
         thread.latest_user_message_at.as_deref().unwrap_or_default(),
+        thread.background_liveness.as_deref().unwrap_or_default(),
     )
 }
 
@@ -4865,6 +4870,25 @@ mod tests {
         .expect("a thread the server could have sent")
     }
 
+    /// A thread can go quiet without its turn changing at all: the answer was written
+    /// long ago and what is left is a watcher. Settling into monitoring is the news.
+    #[test]
+    fn background_work_settling_down_is_a_thread_speaking() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        upsert(&mut app, watching("a", "working"));
+        assert!(app.unseen.is_empty(), "a thread first heard of is not news");
+
+        // Still working, and the list already says so.
+        upsert(&mut app, watching("a", "working"));
+        assert!(app.unseen.is_empty());
+
+        // Dropping to a watcher is what there was to hear.
+        upsert(&mut app, watching("a", "monitoring"));
+        assert!(app.unseen.contains("a"));
+    }
+
     /// `g` and a key run whatever the config file put there, in the thread's own
     /// terminal — the binding tria ships with is only the first entry in that list.
     #[tokio::test]
@@ -4921,6 +4945,13 @@ mod tests {
                 "turnId": turn_id, "state": state, "requestedAt": "2026-01-01T00:00:00Z"
             })),
         })
+    }
+
+    /// The same, with background work still alive after the turn.
+    fn watching(id: &str, liveness: &str) -> serde_json::Value {
+        let mut thread = listed(id, Some(("t1", "completed")));
+        thread["backgroundLiveness"] = json!(liveness);
+        thread
     }
 
     fn upsert(app: &mut App, thread: serde_json::Value) {

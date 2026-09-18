@@ -571,6 +571,12 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     ThreadStatus::Working => (app.spinner_frame(), status_style(status)),
                     ThreadStatus::Approval | ThreadStatus::Question => ("!", status_style(status)),
                     ThreadStatus::Failed => ("✗", status_style(status)),
+                    // Monitoring is the one status that outlasts the news it brings:
+                    // the watcher sits there for hours, so it says in its own colour
+                    // whether anything has happened since anybody looked.
+                    ThreadStatus::Monitoring if app.unseen.contains(id) => {
+                        ("◔", Style::default().fg(Color::Green))
+                    }
                     ThreadStatus::Monitoring => ("◔", status_style(status)),
                     ThreadStatus::PlanReady => ("▤", status_style(status)),
                     // A thread that has spoken since anybody looked fills the dot in.
@@ -2535,6 +2541,35 @@ mod tests {
         assert!(chat(120, &mut app).contains("· a quiet thread"));
         app.unseen.insert("t1".into());
         assert!(chat(120, &mut app).contains("● a quiet thread"));
+    }
+
+    /// Monitoring outlasts the news it brings: the watcher sits there for hours, so the
+    /// glyph it keeps has to say whether anything has happened since anybody looked.
+    #[test]
+    fn a_watching_thread_says_so_in_its_own_colour() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.sidebar_visible = true;
+        let thread: crate::model::ThreadShell = serde_json::from_value(json!({
+            "id": "t1", "projectId": "p", "title": "a watching thread",
+            "modelSelection": {"instanceId": "i", "model": "m"},
+            "backgroundLiveness": "monitoring",
+        }))
+        .unwrap();
+        app.shell.threads.insert("t1".into(), thread);
+
+        // The glyph stays whatever happens; only its colour is the news.
+        let colour = |app: &mut App| {
+            let buffer = screen(120, app);
+            (0..buffer.area.width)
+                .find(|x| buffer[(*x, 2)].symbol() == "◔")
+                .map(|x| buffer[(x, 2)].fg)
+                .expect("the thread is drawn as watching")
+        };
+        assert_eq!(colour(&mut app), Color::Blue);
+        app.unseen.insert("t1".into());
+        assert_eq!(colour(&mut app), Color::Green);
     }
 
     /// Somebody coming back to a long thread: the context window was counted hours ago
