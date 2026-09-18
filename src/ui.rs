@@ -1362,10 +1362,18 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
         width: inner.width.saturating_sub(2),
         height: inner.height,
     };
-    let placeholder = if insert {
-        "type a message · Enter sends · Alt-Enter newline · Esc normal"
-    } else {
-        "i or a click to write · d c y w b f t motions edit"
+    // A thread being picked up after a long gap says what it is still carrying, in the
+    // one place somebody about to write to it is already looking.
+    let resume = app.resume_with_less().map(|used| {
+        format!(
+            "{} tokens from earlier · /compact resumes with less context",
+            tokens_label(used)
+        )
+    });
+    let placeholder = match resume.as_deref() {
+        Some(resume) => resume,
+        None if insert => "type a message · Enter sends · Alt-Enter newline · Esc normal",
+        None => "i or a click to write · d c y w b f t motions edit",
     };
     app.composer_area = text_area;
     let (lines, cursor) = app.composer.render(text_area, placeholder);
@@ -2190,6 +2198,20 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
+/// A token count the way the desktop writes one: `840`, `9.4k`, `101k`, `1.2m`.
+pub fn tokens_label(value: u64) -> String {
+    let thousands = value as f64 / 1_000.0;
+    if value < 1_000 {
+        value.to_string()
+    } else if value < 10_000 {
+        format!("{thousands:.1}k").replace(".0k", "k")
+    } else if value < 1_000_000 {
+        format!("{}k", thousands.round())
+    } else {
+        format!("{:.1}m", value as f64 / 1_000_000.0).replace(".0m", "m")
+    }
+}
+
 /// Rough "how long ago" for two RFC 3339 timestamps, for example `3m` or `2h04`.
 pub fn elapsed_label(since: &str, now: &str) -> String {
     let parse = |text: &str| {
@@ -2470,6 +2492,54 @@ mod tests {
         }))
         .unwrap();
         crate::state::ThreadState::from_snapshot(snapshot)
+    }
+
+    /// Somebody coming back to a long thread: the context window was counted hours ago
+    /// and there is a lot behind it.
+    fn thread_carrying(used: u64) -> crate::state::ThreadState {
+        let counted = time::OffsetDateTime::now_utc() - time::Duration::hours(4);
+        let counted = counted
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let snapshot: crate::model::ThreadDetailSnapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p1", "title": "Test",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "m"},
+                "runtimeMode": "full-access", "latestTurn": null,
+                "session": {"status": "idle"}, "messages": [],
+                "activities": [{
+                    "id": "a1", "kind": "context-window.updated", "tone": "info",
+                    "summary": "", "payload": {"usedTokens": used},
+                    "createdAt": counted
+                }]
+            }
+        }))
+        .unwrap();
+        crate::state::ThreadState::from_snapshot(snapshot)
+    }
+
+    /// The composer is where somebody about to write is already looking, so that is
+    /// where a thread says what it is still carrying.
+    #[test]
+    fn a_thread_picked_up_again_says_what_it_is_carrying() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.config = serde_json::from_value(json!({
+            "providers": [{
+                "instanceId": "claudeAgent", "driver": "claudeAgent",
+                "enabled": true, "installed": true, "status": "ready",
+                "slashCommands": [{"name": "compact"}]
+            }]
+        }))
+        .unwrap();
+        app.thread = Some(thread_carrying(101_000));
+        assert!(chat(80, &mut app).contains("101k tokens from earlier"));
+
+        // A provider with no way to compact has nothing to offer.
+        app.config.providers[0].slash_commands.clear();
+        assert!(!chat(80, &mut app).contains("tokens from earlier"));
     }
 
     fn screen(width: u16, app: &mut App) -> ratatui::buffer::Buffer {

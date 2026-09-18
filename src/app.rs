@@ -748,6 +748,23 @@ impl App {
         self.focus = Focus::Composer;
     }
 
+    /// How much context the open thread would leave behind by compacting before it
+    /// carries on, when that is worth saying. The provider has to have a `/compact` to
+    /// send, since that is what the offer amounts to.
+    pub fn resume_with_less(&self) -> Option<u64> {
+        let thread = self.thread.as_ref()?;
+        let used = thread.resume_with_less(&commands::now_iso())?;
+        let instance = &thread.detail.shell.model_selection.instance_id;
+        self.config
+            .providers
+            .iter()
+            .find(|provider| &provider.instance_id == instance)?
+            .slash_commands
+            .iter()
+            .any(|command| command.name == "compact")
+            .then_some(used)
+    }
+
     fn first_usable_model(&self) -> Option<ModelSelection> {
         self.config
             .providers

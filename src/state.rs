@@ -296,6 +296,14 @@ pub struct ThreadState {
     pub needs_snapshot: bool,
 }
 
+/// Context worth summarising. Below this there is not enough behind the thread for a
+/// summary to buy anything back.
+const RESUME_TOKENS: u64 = 100_000;
+
+/// And a thread touched more recently than this is one somebody is still in the middle
+/// of, rather than one they are coming back to.
+const RESUME_IDLE_MINUTES: i64 = 70;
+
 /// A message asking for the context to be compacted, which is `/compact` and nothing
 /// else — the same reading the server gives it, since a message with anything more in it
 /// is a message.
@@ -659,6 +667,44 @@ impl ThreadState {
             })
     }
 
+    /// What the thread has spent its context window on, as the provider last counted
+    /// it, and when the count was made.
+    fn context_window(&self) -> Option<(u64, &str)> {
+        self.detail.activities.iter().rev().find_map(|activity| {
+            if activity.kind != "context-window.updated" {
+                return None;
+            }
+            let used = activity.payload.get("usedTokens")?.as_u64()?;
+            Some((used, activity.created_at.as_str()))
+        })
+    }
+
+    /// How much context the thread is carrying, when picking it up again would be
+    /// better done with less of it: a long thread, left alone long enough that whoever
+    /// comes back to it is starting something rather than continuing it.
+    ///
+    /// `None` for a thread that is still being answered or is waiting on an answer,
+    /// where compacting is not what anybody wants next.
+    pub fn resume_with_less(&self, now: &str) -> Option<u64> {
+        if self.is_running() {
+            return None;
+        }
+        let (used, counted) = self.context_window()?;
+        if used < RESUME_TOKENS {
+            return None;
+        }
+        let parse = |text: &str| {
+            time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()
+        };
+        let (counted, now) = (parse(counted)?, parse(now)?);
+        if (now - counted).whole_minutes() < RESUME_IDLE_MINUTES {
+            return None;
+        }
+        // Read last: it is the dearest of these to work out, and the cheap tests have
+        // already ruled out every thread but the few this is for.
+        self.pending_user_input().is_none().then_some(used)
+    }
+
     pub fn active_plan(&self) -> Vec<PlanStep> {
         let Some(turn_id) = self.detail.shell.latest_turn.as_ref().map(|t| &t.turn_id) else {
             return Vec::new();
@@ -769,6 +815,56 @@ mod tests {
             !compacting("/compact please", "2026-01-01T00:00:00Z", "running", false)
                 .is_compacting()
         );
+    }
+
+    /// A thread that has counted its context window, in the shape the server sends one.
+    fn carrying(used: u64, counted: &str, running: bool) -> ThreadState {
+        let snapshot: ThreadDetailSnapshot = serde_json::from_value(json!({
+            "snapshotSequence": 10,
+            "thread": {
+                "id": "t1", "projectId": "p1", "title": "Test",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "m"},
+                "runtimeMode": "full-access",
+                "session": {"status": if running { "running" } else { "idle" }},
+                "latestTurn": null, "messages": [],
+                "activities": [{
+                    "id": "a1", "kind": "context-window.updated", "tone": "info",
+                    "summary": "", "payload": {"usedTokens": used, "maxTokens": 200_000},
+                    "createdAt": counted
+                }]
+            }
+        }))
+        .unwrap();
+        ThreadState::from_snapshot(snapshot)
+    }
+
+    /// Coming back to a long thread after a while, starting again with less behind it is
+    /// worth being told about — but only then, and only when there is nothing else the
+    /// thread is in the middle of.
+    #[test]
+    fn a_thread_come_back_to_after_a_long_gap_is_carrying_its_context() {
+        let now = "2026-01-01T12:00:00Z";
+        assert_eq!(
+            carrying(120_000, "2026-01-01T10:00:00Z", false).resume_with_less(now),
+            Some(120_000)
+        );
+        // A gap short enough that somebody is still in the middle of the thread.
+        assert_eq!(
+            carrying(120_000, "2026-01-01T11:30:00Z", false).resume_with_less(now),
+            None
+        );
+        // Not enough behind it for a summary to buy anything.
+        assert_eq!(
+            carrying(40_000, "2026-01-01T10:00:00Z", false).resume_with_less(now),
+            None
+        );
+        // And a thread that is answering is not one to compact.
+        assert_eq!(
+            carrying(120_000, "2026-01-01T10:00:00Z", true).resume_with_less(now),
+            None
+        );
+        // A thread that has never counted its context has nothing to say.
+        assert_eq!(thread().resume_with_less(now), None);
     }
 
     fn message_event(sequence: u64, text: &str, streaming: bool) -> Event {

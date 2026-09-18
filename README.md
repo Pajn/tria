@@ -362,6 +362,13 @@ terminal otherwise. `:edit` and `:view` are the command forms.
 Unsent composer text stays with its thread: switch away and back and the half-written
 message is still there. New-thread drafts have a slot of their own.
 
+A thread you come back to after a long gap says what it is still carrying, where the
+composer's usual hint goes: `101k tokens from earlier · /compact resumes with less
+context`. It appears for a thread whose last context count was at least 100k tokens and
+was made over an hour ago, whose provider has a `compact` command to send, and which is
+not running or waiting on an answer — the same rule the desktop app offers it by. Typing
+takes it off the screen, and ignoring it costs nothing.
+
 ## tmux
 
 When tria runs inside tmux, `gt` or `:tmux` switches the client to the session named after
