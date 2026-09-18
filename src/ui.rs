@@ -1256,7 +1256,7 @@ fn draw_question(
     }
 }
 
-fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
     let insert = app.mode == Mode::Insert;
     let border_style = if insert {
         Style::default().fg(Color::Green)
@@ -1295,8 +1295,9 @@ fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
     let placeholder = if insert {
         "type a message · Enter sends · Alt-Enter newline · Esc normal"
     } else {
-        "i to write · d c y w b f t motions edit"
+        "i or a click to write · d c y w b f t motions edit"
     };
+    app.composer_area = text_area;
     let (lines, cursor) = app.composer.render(text_area, placeholder);
     frame.render_widget(Paragraph::new(lines), text_area);
     if insert || (app.mode == Mode::Normal && app.focus == Focus::Composer) {

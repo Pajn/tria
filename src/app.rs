@@ -316,6 +316,8 @@ pub struct App {
     /// Screen regions from the last frame, for mouse hit testing.
     pub sidebar_inner: Option<Rect>,
     pub chat_area: Rect,
+    /// Where the composer's text is drawn, so a click can be turned into a cursor.
+    pub composer_area: Rect,
     /// Line cursor in the chat, as a content line index. Tracks the last line while the
     /// view follows new output.
     pub chat_cursor: usize,
@@ -431,6 +433,7 @@ impl App {
             sidebar_reveal: false,
             sidebar_inner: None,
             chat_area: Rect::default(),
+            composer_area: Rect::default(),
             chat_cursor: 0,
             chat_visual: None,
             chat_count: None,
@@ -3536,6 +3539,22 @@ impl App {
                     None => {}
                 }
             }
+            // Clicking in the composer is asking to write there, which means putting
+            // the cursor where the click landed and being in insert mode, since that is
+            // what a click in a text box does everywhere else.
+            MouseEventKind::Down(MouseButton::Left)
+                if self.composer_area.contains(at)
+                    && matches!(self.mode, Mode::Normal | Mode::Insert) =>
+            {
+                self.selection = None;
+                self.chat_visual = None;
+                self.focus = Focus::Composer;
+                if self.mode != Mode::Insert {
+                    self.composer.checkpoint();
+                    self.mode = Mode::Insert;
+                }
+                self.composer.click(self.composer_area, at.x, at.y);
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.focus == Focus::Sidebar {
                     self.focus = Focus::Composer;
@@ -4451,6 +4470,38 @@ mod tests {
             .collect();
         assert_eq!(offered, ["here"]);
         std::fs::remove_dir(&here).unwrap();
+    }
+
+    /// Clicking into the composer is how a text box is asked for: the cursor goes where
+    /// the click was and typing works, without a trip through normal mode first.
+    #[test]
+    fn clicking_the_composer_puts_the_cursor_there_and_writes() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.composer_area = Rect::new(2, 10, 20, 2);
+        app.composer.set_text("hello world");
+        app.focus = Focus::Chat;
+
+        let click = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(click(2 + 6, 10));
+
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!((app.composer.row, app.composer.col), (0, 6));
+        app.composer.insert_str("wide ");
+        assert_eq!(app.composer.text(), "hello wide world");
+
+        // Outside it, the composer is left alone.
+        app.mode = Mode::Normal;
+        app.on_mouse(click(2, 20));
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     /// Leaving a thread drops the status of the checkout it was in, because the next

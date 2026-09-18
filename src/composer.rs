@@ -288,25 +288,73 @@ impl Composer {
         (rows as u16).clamp(1, max)
     }
 
+    /// The lines as they are drawn: each one cut into rows of `width` characters, with
+    /// the line it came from and the part of it shown. Wrapping is by width alone, so a
+    /// row is a slice and a screen position maps straight back to a character.
+    fn wrapped(&self, width: usize) -> Vec<Row> {
+        let mut rows = Vec::new();
+        for (line, text) in self.lines.iter().enumerate() {
+            let chars = char_len(text);
+            for chunk in 0..chars.div_ceil(width).max(1) {
+                rows.push(Row {
+                    line,
+                    start: chunk * width,
+                    end: ((chunk + 1) * width).min(chars),
+                    last: (chunk + 1) * width >= chars,
+                });
+            }
+        }
+        rows
+    }
+
+    /// Which row the cursor is on, and how far along it.
+    fn cursor_row(&self, rows: &[Row]) -> (u16, u16) {
+        for (index, row) in rows.iter().enumerate() {
+            if row.line == self.row
+                && self.col >= row.start
+                && (self.col < row.end || (self.col == row.end && row.last))
+            {
+                return ((self.col - row.start) as u16, index as u16);
+            }
+        }
+        (0, 0)
+    }
+
+    /// How far the rows are scrolled to keep the cursor on screen.
+    fn scroll(&self, rows: &[Row], height: u16) -> u16 {
+        self.cursor_row(rows).1.saturating_sub(height.max(1) - 1)
+    }
+
+    /// Put the cursor where a click landed, given the area the composer was drawn in.
+    /// Past the end of a line is the end of it, and past the last line is the last one:
+    /// clicking into the empty part of the box means the nearest place to type.
+    pub fn click(&mut self, area: Rect, column: u16, row: u16) {
+        let width = area.width.max(1) as usize;
+        let rows = self.wrapped(width);
+        let scroll = self.scroll(&rows, area.height) as usize;
+        let wanted = scroll + row.saturating_sub(area.y) as usize;
+        let Some(row) = rows.get(wanted).or_else(|| rows.last()) else {
+            return;
+        };
+        self.row = row.line;
+        let along = column.saturating_sub(area.x) as usize;
+        self.col = (row.start + along).min(row.end);
+        // A half-typed operator has nothing to do with where the mouse went.
+        self.vim_cancel();
+    }
+
     /// Wrapped lines plus the cursor position relative to `area`, scrolled so the cursor is visible.
     pub fn render(&self, area: Rect, placeholder: &str) -> (Vec<Line<'static>>, (u16, u16)) {
         let width = area.width.max(1) as usize;
+        let cursor = self.cursor_row(&self.wrapped(width));
         let mut rows: Vec<Line<'static>> = Vec::new();
-        let mut cursor = (0u16, 0u16);
-        for (row_index, line) in self.lines.iter().enumerate() {
+        for line in &self.lines {
             let chars: Vec<char> = line.chars().collect();
             let chunks = chars.len().div_ceil(width).max(1);
             for chunk in 0..chunks {
                 let start = chunk * width;
                 let end = ((chunk + 1) * width).min(chars.len());
-                let text: String = chars[start..end].iter().collect();
-                if row_index == self.row
-                    && self.col >= start
-                    && (self.col < end || (self.col == end && chunk == chunks - 1))
-                {
-                    cursor = ((self.col - start) as u16, rows.len() as u16);
-                }
-                rows.push(Line::from(text));
+                rows.push(Line::from(chars[start..end].iter().collect::<String>()));
             }
         }
         if self.is_empty() && self.lines.len() == 1 {
@@ -332,6 +380,15 @@ impl Composer {
     }
 }
 
+/// One line as one row of the screen: which line, and the slice of it shown.
+struct Row {
+    line: usize,
+    start: usize,
+    end: usize,
+    /// The last row of its line, which is the one that can hold the cursor past the end.
+    last: bool,
+}
+
 fn char_len(s: &str) -> usize {
     s.chars().count()
 }
@@ -339,6 +396,61 @@ fn char_len(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A click is a character, and the two have to agree about wrapping and scrolling
+    /// or the cursor lands somewhere the text is not.
+    #[test]
+    fn a_click_lands_on_the_character_under_it() {
+        let area = Rect::new(4, 2, 10, 3);
+        let mut c = Composer::new();
+        c.set_text("0123456789abcde\nsecond");
+
+        // Second row of the first line: ten characters in, plus three along.
+        c.click(area, 4 + 3, 2 + 1);
+        assert_eq!((c.row, c.col), (0, 13));
+
+        // Past the end of a row that is the end of its line: the end of it.
+        c.click(area, 4 + 9, 2 + 2);
+        assert_eq!((c.row, c.col), (1, 6));
+
+        // Below everything: the last line, which is the nearest place to type.
+        c.click(area, 4, 2 + 2);
+        assert_eq!((c.row, c.col), (1, 0));
+
+        // The first character of all.
+        c.click(area, 4, 2);
+        assert_eq!((c.row, c.col), (0, 0));
+    }
+
+    /// A composer taller than its box is scrolled to keep the cursor in view, and a
+    /// click has to be read through the same scroll.
+    #[test]
+    fn a_click_reads_through_the_scroll() {
+        let area = Rect::new(0, 0, 10, 2);
+        let mut c = Composer::new();
+        c.set_text("one\ntwo\nthree\nfour");
+        // The cursor is at the end, so the last two lines are the ones drawn.
+        assert_eq!((c.row, c.col), (3, 4));
+        c.click(area, 1, 0);
+        assert_eq!(
+            (c.row, c.col),
+            (2, 1),
+            "the top row shown is the third line"
+        );
+    }
+
+    /// The mouse is not part of a half-typed operator.
+    #[test]
+    fn a_click_cancels_a_pending_operator() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        let mut c = Composer::new();
+        c.set_text("hello world");
+        c.vim_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(c.vim_pending());
+        c.click(Rect::new(0, 0, 20, 1), 2, 0);
+        assert!(!c.vim_pending());
+        assert_eq!(c.text(), "hello world");
+    }
 
     #[test]
     fn editing_round_trips() {

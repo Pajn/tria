@@ -106,7 +106,7 @@ Press `?` inside the app for the full list.
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
 | `Ctrl-c` | interrupt the running turn |
 | mouse wheel | scroll the conversation, or the thread list when the pointer is over it |
-| left click | in the thread list: open a thread, or fold and unfold a section; in the chat: open a link, or fold and unfold a tool group or row |
+| left click | in the thread list: open a thread, or fold and unfold a section; in the chat: open a link, or fold and unfold a tool group or row; in the composer: put the cursor there and write |
 | drag | select text in the conversation; releasing copies it (OSC 52) |
 
 With the chat focused, a line cursor moves through the conversation: `j` `k` with counts,
@@ -115,6 +115,10 @@ output), `Ctrl-d` `Ctrl-u` `Ctrl-f` `Ctrl-b` `Ctrl-e` `Ctrl-y` to scroll with th
 `za`, `Enter`, or `Space` folds the tool group or row under the cursor. `V` starts a linewise
 selection and `y` copies it; `yy` or `3y` copy from the cursor. Clicking a chat line focuses
 the chat and moves the cursor there.
+
+Clicking in the composer puts the cursor where you clicked and leaves you writing, without a
+trip through normal mode. Past the end of a line is the end of it, and below the last line is
+the last line, so a click anywhere in the box lands somewhere you can type.
 
 `/` and `?` search the conversation forward or backward. The cursor previews the first match
 while you type, `Enter` accepts, `Esc` goes back to where you were. `n` and `N` step to the
