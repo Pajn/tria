@@ -2503,7 +2503,6 @@ impl App {
                 })
                 .collect(),
             PickerKind::Project => {
-                self.ask_favicons();
                 let mut projects: Vec<_> = self.shell.projects.values().collect();
                 projects.sort_by(|a, b| a.title.cmp(&b.title));
                 projects
@@ -3963,6 +3962,9 @@ impl App {
                     tracing::info!("nothing open, falling back to the first thread");
                     self.open_thread(&first);
                 }
+                // The sidebar draws a thread with its project's icon, so they are asked
+                // for as the projects arrive rather than when a list of them is opened.
+                self.ask_favicons();
             }
             Update::Thread { thread_id, item } => {
                 if self.current_thread_id.as_deref() != Some(thread_id.as_str()) {

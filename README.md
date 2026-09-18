@@ -189,13 +189,16 @@ settled section says how many there are.
 The model for a new thread is the last one you picked with `m`, remembered in the config file
 between runs. Without one it falls back to the project's default model, then the server's.
 
-The project list `n` opens draws each project with the icon its checkout is known by, where
-the terminal can draw pictures at all. The looking is the server's: the icon the project
-names, then the one its `t3.json` names in `iconPath`, then the usual places a favicon lives,
-then whatever the project's `index.html` links to. The bytes come over HTTP, so a server on
-another machine works the same as one here. A repository that keeps its icon somewhere of its
-own — a monorepo, say — is worth naming in `t3.json`, which the whole team then shares. SVG
-icons are not drawn.
+Projects are drawn with the icon their checkout is known by, where the terminal can draw
+pictures at all: in the list `n` opens, beside the name, and in the sidebar in place of it —
+two columns instead of fourteen, with the rest going to the thread's title. A project the
+server found no icon for keeps its name, so nothing is lost by having none.
+
+The looking is the server's: the icon the project names, then the one its `t3.json` names in
+`iconPath`, then the usual places a favicon lives, then whatever the project's `index.html`
+links to. The bytes come over HTTP, so a server on another machine works the same as one
+here. A repository that keeps its icon somewhere of its own — a monorepo, say — is worth
+naming in `t3.json`, which the whole team then shares. SVG icons are not drawn.
 
 ## Branch and pull request
 

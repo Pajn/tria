@@ -572,8 +572,16 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     ThreadStatus::Done | ThreadStatus::Idle => ("·", dim),
                 };
                 let is_current = app.current_thread_id.as_ref() == Some(id);
-                // The glyph carries the status; the right column always names the project.
-                let mut right = app.shell.project_title(&t.project_id).to_string();
+                // The glyph carries the status; the right column says which project the
+                // thread belongs to. A project the server found an icon for is drawn as
+                // the icon, which says the same thing in two columns instead of fourteen
+                // and leaves the rest to the title.
+                let icon = app.favicon(&t.project_id).is_some();
+                let mut right = if icon {
+                    "  ".to_string()
+                } else {
+                    app.shell.project_title(&t.project_id).to_string()
+                };
                 // A worktree of its own, still on the disk. Marked only where the thread
                 // is done with it, since that is when it is leavings rather than a
                 // workplace.
@@ -648,6 +656,34 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut state = ListState::default().with_offset(app.sidebar_offset);
     let list = List::new(items);
     frame.render_stateful_widget(list, inner, &mut state);
+
+    // The icons go on after the list, in the two columns each row kept at its right end.
+    for (offset, row) in rows.iter().skip(app.sidebar_offset).enumerate() {
+        if offset >= height {
+            break;
+        }
+        let SidebarRow::Thread { id, .. } = row else {
+            continue;
+        };
+        let Some(bytes) = app
+            .shell
+            .threads
+            .get(id)
+            .and_then(|t| app.favicon(&t.project_id))
+        else {
+            continue;
+        };
+        let key = format!("favicon:{}", app.shell.threads[id].project_id);
+        let area = Rect {
+            x: inner.x + inner.width.saturating_sub(2),
+            y: inner.y + offset as u16,
+            width: 2,
+            height: 1,
+        };
+        if picture::place(&key, picture::Source::Bytes(bytes), area.as_size()).is_some() {
+            picture::draw(frame, &key, area, SignedPosition::from((0, 0)));
+        }
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -2606,6 +2642,64 @@ mod tests {
             label_at("/src/shelfie", "shelfie"),
             label_at("/src/tria", "tria")
         );
+    }
+
+    /// In the sidebar the icon stands in for the project's name, which is the whole
+    /// point of it: two columns where there were fourteen, and the title takes the rest.
+    #[test]
+    fn a_threads_project_is_drawn_as_its_icon_rather_than_its_name() {
+        picture::draw_in_halfblocks();
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.shell.projects.insert(
+            "p1".into(),
+            serde_json::from_value(json!({
+                "id": "p1", "title": "a-long-project", "workspaceRoot": "/src/p1",
+                "defaultModelSelection": null
+            }))
+            .unwrap(),
+        );
+        app.shell.threads.insert(
+            "t1".into(),
+            serde_json::from_value(json!({
+                "id": "t1", "projectId": "p1", "title": "kettle on a long slow boil",
+                "modelSelection": { "instanceId": "i", "model": "m", "options": [] }
+            }))
+            .unwrap(),
+        );
+        app.shell.synchronized = true;
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let without = terminal.backend().buffer().clone();
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(picture::test_png(64, 64))
+            .unwrap();
+        app.give_favicon("p1", bytes);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let with = terminal.backend().buffer().clone();
+
+        let text = |buffer: &ratatui::buffer::Buffer, y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let row = |buffer: &ratatui::buffer::Buffer| {
+            (0..buffer.area.height)
+                .find(|y| text(buffer, *y).contains("kettle"))
+                .expect("the thread should be listed")
+        };
+        assert!(text(&without, row(&without)).contains("a-long-project"));
+        let line = text(&with, row(&with));
+        assert!(!line.contains("a-long-project"), "{line:?}");
+        // Half blocks are colour rather than glyphs, and the icon sits at the right edge
+        // of the sidebar where the name was.
+        let painted: Vec<u16> = (0..with.area.width)
+            .filter(|x| with[(*x, row(&with))].bg != Color::Reset)
+            .collect();
+        assert_eq!(painted, vec![SIDEBAR_WIDTH - 3, SIDEBAR_WIDTH - 2]);
     }
 
     /// A screen with no room at all still draws something rather than panicking.
