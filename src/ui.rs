@@ -573,6 +573,12 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     ThreadStatus::Failed => ("✗", status_style(status)),
                     ThreadStatus::Monitoring => ("◔", status_style(status)),
                     ThreadStatus::PlanReady => ("▤", status_style(status)),
+                    // A thread that has spoken since anybody looked fills the dot in.
+                    // The statuses above it are already asking to be looked at, and say
+                    // so more precisely than this could.
+                    ThreadStatus::Done | ThreadStatus::Idle if app.unseen.contains(id) => {
+                        ("●", Style::default().fg(Color::Cyan))
+                    }
                     ThreadStatus::Done | ThreadStatus::Idle => ("·", dim),
                 };
                 let is_current = app.current_thread_id.as_ref() == Some(id);
@@ -2492,6 +2498,30 @@ mod tests {
         }))
         .unwrap();
         crate::state::ThreadState::from_snapshot(snapshot)
+    }
+
+    /// The list is where somebody looks to find out what happened while they were
+    /// somewhere else, so that is where a thread says it has spoken.
+    #[test]
+    fn a_thread_that_has_spoken_is_marked_in_the_list() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.sidebar_visible = true;
+        let thread: crate::model::ThreadShell = serde_json::from_value(json!({
+            "id": "t1", "projectId": "p", "title": "a quiet thread",
+            "modelSelection": {"instanceId": "i", "model": "m"},
+            "latestTurn": {
+                "turnId": "turn", "state": "completed",
+                "requestedAt": "2026-01-01T00:00:00Z"
+            },
+        }))
+        .unwrap();
+        app.shell.threads.insert("t1".into(), thread);
+
+        assert!(chat(120, &mut app).contains("· a quiet thread"));
+        app.unseen.insert("t1".into());
+        assert!(chat(120, &mut app).contains("● a quiet thread"));
     }
 
     /// Somebody coming back to a long thread: the context window was counted hours ago

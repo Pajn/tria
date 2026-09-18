@@ -296,6 +296,13 @@ pub struct App {
     pub handle: Handle,
     events: mpsc::UnboundedSender<AppEvent>,
     pub shell: Shell,
+    /// Threads that have said something since anybody last had them open. This run
+    /// only: which threads you have read is not worth keeping on the disk, and a tria
+    /// that has just started has nothing to tell you about yet.
+    pub unseen: HashSet<Id>,
+    /// What each thread looked like when it was last taken in, for telling a thread
+    /// that has moved on from one the server merely mentioned again.
+    marks: HashMap<Id, String>,
     pub config: ServerConfig,
     pub status: Status,
     pub thread: Option<ThreadState>,
@@ -429,6 +436,8 @@ impl App {
             handle,
             events,
             shell: Shell::default(),
+            unseen: HashSet::new(),
+            marks: HashMap::new(),
             config: ServerConfig::default(),
             status: Status::Connecting,
             thread: None,
@@ -667,6 +676,7 @@ impl App {
         self.transcript = None;
         self.transcript_loading = None;
         self.current_thread_id = Some(thread_id.to_string());
+        self.unseen.remove(thread_id);
         self.thread = None;
         self.draft = None;
         self.question = None;
@@ -763,6 +773,28 @@ impl App {
             .iter()
             .any(|command| command.name == "compact")
             .then_some(used)
+    }
+
+    /// Take a thread in as the list now has it, and say whether it has spoken since it
+    /// was last looked at.
+    ///
+    /// Only what the list itself shows is compared: the turn the thread is on, how that
+    /// turn ended, and when anybody last wrote to it. A thread that has only just been
+    /// heard of is not news, or every thread would be unseen the moment tria connects.
+    fn note_thread(&mut self, thread: &crate::model::ThreadShell) {
+        let mark = mark_of(thread);
+        let moved_on = self
+            .marks
+            .insert(thread.id.clone(), mark.clone())
+            .is_some_and(|known| known != mark);
+        // The open thread is being read as it arrives, and a thread still working says
+        // so with its own glyph — what it has to show is not there yet.
+        if moved_on
+            && self.current_thread_id.as_deref() != Some(thread.id.as_str())
+            && thread.status() != crate::model::ThreadStatus::Working
+        {
+            self.unseen.insert(thread.id.clone());
+        }
     }
 
     fn first_usable_model(&self) -> Option<ModelSelection> {
@@ -4049,6 +4081,20 @@ impl App {
                 {
                     open.sync_shell(thread);
                 }
+                match &item {
+                    // The first list is what is already there, so none of it is news.
+                    ShellItem::Snapshot { snapshot } => {
+                        for thread in &snapshot.threads {
+                            self.marks.insert(thread.id.clone(), mark_of(thread));
+                        }
+                    }
+                    ShellItem::ThreadUpserted { thread, .. } => self.note_thread(thread),
+                    ShellItem::ThreadRemoved { thread_id, .. } => {
+                        self.marks.remove(thread_id);
+                        self.unseen.remove(thread_id);
+                    }
+                    _ => {}
+                }
                 let removed = matches!(&item, ShellItem::ThreadRemoved { thread_id, .. } if Some(thread_id) == self.current_thread_id.as_ref());
                 self.shell.apply(item);
                 if removed {
@@ -4522,6 +4568,19 @@ async fn favicon_bytes(handle: &session::Handle, origin: &str, cwd: &str) -> Opt
     Some(response.bytes().await.ok()?.to_vec())
 }
 
+/// What a thread looks like from the list: which turn it is on, how that turn ended,
+/// and when it was last written to. Anything else the server touches is bookkeeping and
+/// is not a thread saying something.
+fn mark_of(thread: &crate::model::ThreadShell) -> String {
+    let turn = thread.latest_turn.as_ref();
+    format!(
+        "{}/{}/{}",
+        turn.map(|t| t.turn_id.as_str()).unwrap_or_default(),
+        turn.map(|t| t.state.as_str()).unwrap_or_default(),
+        thread.latest_user_message_at.as_deref().unwrap_or_default(),
+    )
+}
+
 /// Do what an event asks of the app. Drawing is the caller's, so that a burst of them
 /// costs one screen rather than one each.
 fn apply(app: &mut App, event: AppEvent) {
@@ -4768,6 +4827,75 @@ mod tests {
             "settledAt": "2026-01-01T00:00:00Z",
         }))
         .expect("a thread the server could have sent")
+    }
+
+    /// A thread as the list has it, on a given turn in a given state.
+    fn listed(id: &str, turn: Option<(&str, &str)>) -> serde_json::Value {
+        json!({
+            "id": id,
+            "projectId": "p",
+            "title": id,
+            "modelSelection": { "instanceId": "i", "model": "m", "options": [] },
+            "latestTurn": turn.map(|(turn_id, state)| json!({
+                "turnId": turn_id, "state": state, "requestedAt": "2026-01-01T00:00:00Z"
+            })),
+        })
+    }
+
+    fn upsert(app: &mut App, thread: serde_json::Value) {
+        app.on_update(crate::session::Update::Shell(
+            crate::model::ShellItem::ThreadUpserted {
+                sequence: 1,
+                thread: serde_json::from_value(thread).expect("a thread the server could send"),
+            },
+        ));
+    }
+
+    /// Which threads have spoken while you were looking elsewhere is only worth knowing
+    /// about the ones that spoke while you were there to miss it.
+    #[test]
+    fn a_thread_that_speaks_while_you_are_elsewhere_is_marked() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.on_update(crate::session::Update::Shell(
+            crate::model::ShellItem::Snapshot {
+                snapshot: serde_json::from_value(json!({
+                    "snapshotSequence": 1,
+                    "threads": [listed("a", Some(("t1", "completed"))), listed("b", None)],
+                }))
+                .unwrap(),
+            },
+        ));
+        // The list as it stands when tria connects is not news.
+        assert!(app.unseen.is_empty());
+        app.current_thread_id = Some("a".into());
+
+        // A turn finishing in a thread nobody is looking at is.
+        upsert(&mut app, listed("b", Some(("t2", "completed"))));
+        assert!(app.unseen.contains("b"));
+
+        // The open thread is being read as it arrives.
+        upsert(&mut app, listed("a", Some(("t3", "completed"))));
+        assert!(!app.unseen.contains("a"));
+
+        // Opening it is having seen it.
+        app.open_thread("b");
+        assert!(app.unseen.is_empty());
+
+        // A thread that has only started working has nothing to show yet: the list
+        // already says it is working.
+        upsert(&mut app, listed("c", None));
+        upsert(&mut app, listed("c", Some(("t4", "running"))));
+        assert!(!app.unseen.contains("c"));
+        // And says so when it stops.
+        upsert(&mut app, listed("c", Some(("t4", "completed"))));
+        assert!(app.unseen.contains("c"));
+
+        // The server mentioning a thread that has not moved is not a thread speaking.
+        app.unseen.clear();
+        upsert(&mut app, listed("c", Some(("t4", "completed"))));
+        assert!(app.unseen.is_empty());
     }
 
     /// A worktree is offered when a thread has one of its own and it is still there. A

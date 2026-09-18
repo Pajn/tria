@@ -414,6 +414,12 @@ turn), `▤` has a plan ready, `✗` failed. The status bar spells the status ou
 thread. `:settle` and `:unsettle` move the current thread between the active list and the
 shelf; `:wake` ends a snooze.
 
+A thread that has finished a turn, or been written to, since you last had it open shows `●`
+in place of the quiet `·`; opening it clears the mark. The statuses above are left alone,
+since each already says more than "look at me". This is only for as long as tria is running:
+what you have read is not written down, so a thread is never unread because of something that
+happened before tria started.
+
 ## Other subcommands
 
 - `tria probe` connects, prints the server config keys and the thread list, and exits.
