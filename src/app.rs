@@ -101,7 +101,7 @@ pub struct SearchInput {
 pub enum Focus {
     /// Keys edit the composer with Vim motions; the chat scrolls with Ctrl keys.
     Composer,
-    /// A line cursor moves through the conversation.
+    /// A cursor moves through the conversation, a line and a character at a time.
     Chat,
     Sidebar,
 }
@@ -318,8 +318,8 @@ pub struct App {
     pub chat_area: Rect,
     /// Where the composer's text is drawn, so a click can be turned into a cursor.
     pub composer_area: Rect,
-    /// Line cursor in the chat, as a content line index. Tracks the last line while the
-    /// view follows new output.
+    /// Line the chat cursor is on, as a content line index. Tracks the last line while
+    /// the view follows new output.
     pub chat_cursor: usize,
     /// Character the chat cursor is on, held where it was so a shorter line in passing
     /// does not lose the column.

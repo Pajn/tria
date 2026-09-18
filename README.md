@@ -111,11 +111,12 @@ Press `?` inside the app for the full list.
 | left click | in the thread list: open a thread, or fold and unfold a section; in the chat: open a link, or fold and unfold a tool group or row; in the composer: put the cursor there and write |
 | drag | select text in the conversation; releasing copies it (OSC 52) |
 
-With the chat focused, a line cursor moves through the conversation: `j` `k` with counts,
+With the chat focused, a cursor moves through the conversation: `j` `k` with counts,
 `{` `}` to the previous or next message, `gg` and `G` (which also resumes following new
 output), `Ctrl-d` `Ctrl-u` `Ctrl-f` `Ctrl-b` `Ctrl-e` `Ctrl-y` to scroll with the cursor.
-`za`, `Enter`, or `Space` folds the tool group or row under the cursor. The cursor also sits
-on a character: `h` `l` `0` `$` `w` `b` move along the line, and `j` `k` keep the column.
+`za`, `Enter`, or `Space` folds the tool group or row under the cursor. The cursor is a
+block on one character: `h` `l` `0` `$` `w` `b` move along the line, and `j` `k` keep the
+column.
 `v` starts a selection by character and `V` by line; `y` copies it, and `yy` or `3y` copy
 from the cursor without one. Clicking a chat line focuses the chat and puts the cursor on
 the character clicked.

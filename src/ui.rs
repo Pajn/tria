@@ -156,18 +156,15 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
             }
         }
     };
-    let charwise = app.chat_visual.is_some_and(|a| !a.whole_lines);
-    // The line the cursor is on is marked whole, unless a character-wise selection is
-    // being made, where a bar the width of the chat would only be in the way.
-    if !charwise {
-        paint(
-            buffer,
-            cursor,
-            chat.x,
-            chat.x + chat.width,
-            Style::default().add_modifier(Modifier::REVERSED),
-        );
-    }
+    // The line being read is tinted rather than filled, so the conversation keeps the
+    // colours it is written in and the cursor is still easy to find on a wide screen.
+    paint(
+        buffer,
+        cursor,
+        chat.x,
+        chat.x + chat.width,
+        Style::default().bg(Color::Indexed(236)),
+    );
     if let Some(anchor) = app.chat_visual {
         let style = Style::default().bg(Color::Blue).fg(Color::White);
         let head = (anchor.line, anchor.column.min(chat_len(anchor.line)));
@@ -197,7 +194,9 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
             paint(buffer, line, chat.x + from, chat.x + to, style);
         }
     }
-    // The cursor itself is whichever way round the cell it sits on is not.
+    // The cursor is a block on the character under it, as the composer's is, drawn as
+    // whichever way round that cell is not so it shows on the tinted line and inside a
+    // selection alike.
     if let Some(y) = row(cursor) {
         let x = chat.x + chat_column(cursor, column);
         if x < chat.x + chat.width
@@ -2148,7 +2147,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  /                       fuzzy thread picker"),
         Line::from(""),
         Line::from("  chat (focused):"),
-        Line::from("  j k  { }  gg G  Ctrl-d/u/f/b/e/y   line cursor / by message / scroll"),
+        Line::from("  j k  { }  gg G  Ctrl-d/u/f/b/e/y   move the cursor / by message / scroll"),
         Line::from("  h l  0 $  w b           move along the line, character by character"),
         Line::from(
             "  za or Enter             fold or unfold the tool group or row under the cursor",
@@ -2473,6 +2472,43 @@ mod tests {
                 .contains(Modifier::REVERSED)
         );
         assert_eq!(chat_span((line, 4), (line, 7)), Some("two".into()));
+    }
+
+    /// The line being read is tinted and the cursor is the one character on it, so the
+    /// conversation keeps the colours it is written in.
+    #[test]
+    fn the_cursor_marks_a_character_on_a_tinted_line() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_saying("one two three four five six seven eight"));
+        chat(30, &mut app);
+
+        let line = app.message_starts.first().copied().unwrap() + 1;
+        app.focus = crate::app::Focus::Chat;
+        app.scroll = crate::app::Scroll::Offset(0);
+        app.chat_cursor = line;
+        app.chat_column = 4;
+        let buffer = screen(30, &mut app);
+
+        let y = app.chat_area.y + (line - app.chat_offset()) as u16;
+        let marked: Vec<u16> = (0..buffer.area.width)
+            .filter(|x| {
+                buffer[(*x, y)]
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::REVERSED)
+            })
+            .collect();
+        assert_eq!(marked, vec![app.chat_area.x + chat_column(line, 4)]);
+
+        // The line carries the tint from edge to edge, and no other line does.
+        let tint = |y: u16| {
+            (app.chat_area.x..app.chat_area.x + app.chat_area.width)
+                .all(|x| buffer[(x, y)].style().bg == Some(Color::Indexed(236)))
+        };
+        assert!(tint(y));
+        assert!(!tint(y - 1));
     }
 
     /// A screen with no room at all still draws something rather than panicking.
