@@ -400,7 +400,13 @@ impl App {
     }
 
     pub fn toast(&mut self, message: impl Into<String>, is_error: bool) {
-        self.toast = Some((message.into(), Instant::now(), is_error));
+        let message = message.into();
+        // A toast is gone in seconds and the next one takes its place, so the one thing
+        // said about a failure is also the first thing lost. Trouble is kept.
+        if is_error {
+            tracing::info!(%message, "toast");
+        }
+        self.toast = Some((message, Instant::now(), is_error));
     }
 
     pub fn spinner_frame(&self) -> &'static str {
@@ -565,6 +571,9 @@ impl App {
         }
         self.scroll = Scroll::Follow;
         self.expanded.clear();
+        // The view moving is the one thing a report of trouble always mentions and the
+        // one thing the screen keeps no record of.
+        tracing::info!(thread = %thread_id, "opening thread");
         // The watch goes with the status: where the thread being opened turns out to
         // sit in the directory the last one did, nothing else would ask for a status
         // to replace the one just dropped, and a quiet checkout sends none by itself.
@@ -735,6 +744,12 @@ impl App {
             );
             // The view moves to the new thread now, and reads as loading until the
             // server has made it and the subscription has something to say.
+            tracing::info!(
+                thread = %thread_id,
+                project = %draft.project_id,
+                worktree = worktree.is_some(),
+                "creating a thread"
+            );
             self.current_thread_id = Some(thread_id.clone());
             self.thread = None;
             self.dispatch_opening(command, Some(thread_id));
@@ -3405,6 +3420,7 @@ impl App {
                 let removed = matches!(&item, ShellItem::ThreadRemoved { thread_id, .. } if Some(thread_id) == self.current_thread_id.as_ref());
                 self.shell.apply(item);
                 if removed {
+                    tracing::info!("the open thread was removed by the server");
                     self.thread = None;
                     self.current_thread_id = None;
                     self.toast("thread was removed", false);
@@ -3414,6 +3430,7 @@ impl App {
                     && self.shell.synchronized
                     && let Some(first) = self.visible_threads().first().cloned()
                 {
+                    tracing::info!("nothing open, falling back to the first thread");
                     self.open_thread(&first);
                 }
             }
