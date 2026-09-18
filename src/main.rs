@@ -4,6 +4,7 @@ mod commands;
 mod composer;
 mod config;
 mod discovery;
+mod kitty;
 mod model;
 mod picture;
 mod question;

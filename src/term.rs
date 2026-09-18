@@ -84,6 +84,13 @@ pub struct Pane {
     pub starting: Option<String>,
     parser: vt100::Parser<Answers>,
     size: (u16, u16),
+    graphics: crate::kitty::Graphics,
+    /// How many lines have scrolled off the top, which is what a placed image is
+    /// anchored against.
+    history: usize,
+    /// Whether a full-screen program has the screen, tracked because its grid keeps no
+    /// history of its own and images cannot be anchored across the swap.
+    alternate: bool,
 }
 
 impl Pane {
@@ -96,12 +103,15 @@ impl Pane {
     ) -> Self {
         Self {
             thread_id,
-            terminal_id,
-            label,
             exited: None,
             starting: None,
+            graphics: crate::kitty::Graphics::new(&terminal_id),
+            terminal_id,
+            label,
             parser: vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK, Answers::default()),
             size: (cols, rows),
+            history: 0,
+            alternate: false,
         }
     }
 
@@ -114,10 +124,77 @@ impl Pane {
     }
 
     /// Parse output, and hand back whatever the program asked the terminal to answer.
+    ///
+    /// Graphics commands never reach the parser: it has no hook for one, so they are
+    /// taken out of the stream first and answered here.
     #[must_use]
     pub fn feed(&mut self, data: &str) -> Vec<String> {
-        self.parser.process(data.as_bytes());
-        std::mem::take(&mut self.parser.callbacks_mut().replies)
+        use crate::kitty::Piece;
+
+        let mut replies = Vec::new();
+        for piece in self.graphics.split(data) {
+            match piece {
+                Piece::Text(text) => {
+                    self.parser.process(text.as_bytes());
+                    self.follow();
+                }
+                Piece::Erase => self.graphics.clear(),
+                Piece::Command(command) => {
+                    let (row, column) = self.parser.screen().cursor_position();
+                    let spot = crate::kitty::Spot {
+                        line: self.history as i64 + i64::from(row),
+                        column,
+                    };
+                    let outcome = self.graphics.take(command, spot, self.size);
+                    if let Some(reply) = outcome.reply {
+                        replies.push(reply);
+                    }
+                    // Displaying an image leaves the cursor past it, which at the foot of
+                    // the screen is a scroll like any other.
+                    if let Some(motion) = outcome.motion {
+                        self.parser.process(motion.as_bytes());
+                        self.follow();
+                    }
+                }
+            }
+        }
+        // An image is anchored to a line of the history. Where there is no history to
+        // anchor to — a full-screen program's grid keeps none, and a pane's own runs out
+        // eventually — a picture lives until the next thing the program prints.
+        if self.alternate != self.parser.screen().alternate_screen() {
+            self.alternate = !self.alternate;
+            self.graphics.clear();
+        }
+        if !self.alternate && self.history >= SCROLLBACK {
+            self.graphics.keep_only_the_newest();
+        }
+        replies.extend(std::mem::take(&mut self.parser.callbacks_mut().replies));
+        replies
+    }
+
+    /// Note how far the text has scrolled, so the images over it move with it.
+    fn follow(&mut self) {
+        if self.parser.screen().alternate_screen() {
+            return;
+        }
+        let screen = self.parser.screen_mut();
+        // The parser will say how long its history is, if asked the only way it can be:
+        // scrolling further back than there is and seeing where that landed.
+        let looking = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        self.history = screen.scrollback();
+        screen.set_scrollback(looking);
+    }
+
+    /// The images the program in the pane has placed, and how far the text under them
+    /// has scrolled.
+    pub fn placements(&self) -> &[crate::kitty::Placement] {
+        self.graphics.placements()
+    }
+
+    /// The line of the pane's history showing at the top of the screen.
+    pub fn top_line(&self) -> i64 {
+        self.history as i64 - self.scrollback() as i64
     }
 
     /// Replace the screen with a replayed scrollback, as after attach or restart.
@@ -125,6 +202,9 @@ impl Pane {
         let (cols, rows) = self.size;
         self.parser = vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK, Answers::default());
         self.exited = None;
+        self.graphics.clear();
+        self.history = 0;
+        self.alternate = false;
         let _ = self.feed(history);
     }
 
@@ -135,6 +215,9 @@ impl Pane {
         }
         self.size = (cols, rows);
         self.parser.screen_mut().set_size(rows, cols);
+        // The text the images were drawn over has moved around them.
+        self.graphics.clear();
+        self.follow();
         true
     }
 
@@ -481,6 +564,61 @@ mod tests {
             )
             .as_deref(),
             Some("\x1b[M\x23\x21\x21")
+        );
+    }
+
+    fn showing(width: u16, height: u16) -> String {
+        format!(
+            "\x1b_Ga=T,f=100,c={width},r={height},C=1;{}\x1b\\",
+            crate::picture::test_png(40, 40)
+        )
+    }
+
+    /// An image is drawn over cells that scroll, and it has to go with them.
+    #[test]
+    fn a_picture_follows_the_text_it_was_drawn_over() {
+        crate::picture::draw_in_halfblocks();
+        let mut pane = Pane::new("t".into(), "term-1".into(), "Terminal".into(), 20, 6);
+        // Fill the screen, so that anything more scrolls it.
+        let _ = pane.feed("one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+        let _ = pane.feed(&format!("\r\n{}", showing(4, 2)));
+        let [placement] = pane.placements() else {
+            panic!("the picture is on the screen");
+        };
+        let line = placement.line;
+        assert_eq!(line - pane.top_line(), 5, "on the row the cursor was on");
+
+        let _ = pane.feed("\r\nseven\r\neight");
+        let [placement] = pane.placements() else {
+            panic!("the picture is still on the screen");
+        };
+        assert_eq!(
+            placement.line, line,
+            "the picture is on the line it was put on"
+        );
+        assert_eq!(
+            placement.line - pane.top_line(),
+            3,
+            "which has moved up the screen"
+        );
+    }
+
+    #[test]
+    fn a_picture_goes_with_the_screen_it_was_drawn_over() {
+        crate::picture::draw_in_halfblocks();
+        let mut pane = Pane::new("t".into(), "term-1".into(), "Terminal".into(), 20, 6);
+        let _ = pane.feed(&showing(4, 2));
+        assert_eq!(pane.placements().len(), 1);
+        let _ = pane.feed("\x1b[2J");
+        assert!(pane.placements().is_empty(), "the screen was wiped");
+
+        // And a full-screen program takes the screen away entirely.
+        let _ = pane.feed(&showing(4, 2));
+        assert_eq!(pane.placements().len(), 1);
+        let _ = pane.feed("\x1b[?1049h");
+        assert!(
+            pane.placements().is_empty(),
+            "something else has the screen"
         );
     }
 

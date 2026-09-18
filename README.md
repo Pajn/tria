@@ -338,6 +338,17 @@ The server owns the pty, so a shell you start here also appears in the desktop a
 tabs, keeps running after you detach or quit, and picks up where it left off when you attach
 again.
 
+A program in the pane can draw a picture: tria answers the kitty graphics protocol, so `chafa`,
+`timg`, `viu` and anything else that asks the terminal whether pictures work is told that they
+do, and what it sends is drawn over the pane. An image is placed where the cursor is and rides
+the text as that scrolls, and it goes when the screen it was drawn over does — a `clear`, a
+full-screen program taking over, or a resize. This needs a terminal underneath that draws
+pictures too; where there is none, the pane draws in half-blocks like the chat does. A program
+that decides by `$TERM` alone rather than asking will not try, because the pty is a plain
+`xterm-256color` and saying otherwise would name a terminfo entry that may not be installed.
+Animation and the unicode placeholder scheme are not answered, and a program asking for them is
+told so rather than left waiting.
+
 ## Editor
 
 `ge` with the composer focused writes the draft to a private temp file, opens it in your

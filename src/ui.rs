@@ -1757,6 +1757,21 @@ fn draw_terminal_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
+    // Pictures the program sent sit over the cells, and ride the text as it scrolls.
+    let top = pane.top_line();
+    for placement in pane.placements() {
+        let row = placement.line - top;
+        if row >= i64::from(inner.height) || row + i64::from(placement.size.height) <= 0 {
+            continue;
+        }
+        crate::picture::draw(
+            frame,
+            &placement.key,
+            inner,
+            SignedPosition::from((placement.column as i16, row as i16)),
+        );
+    }
+
     if !screen.hide_cursor() && pane.scrollback() == 0 {
         let (row, col) = screen.cursor_position();
         if row < inner.height && col < inner.width {
@@ -2381,6 +2396,42 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The whole way through: a program in the pane sends a picture, and it lands on the
+    /// screen rather than in the text.
+    #[test]
+    fn a_picture_a_program_sent_is_drawn_over_the_pane() {
+        crate::picture::draw_in_halfblocks();
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        // The size the popup gives the pane inside a screen of forty by twelve.
+        let mut pane = crate::term::Pane::new("t".into(), "term-1".into(), "shell".into(), 32, 8);
+        let _ = pane.feed(&format!(
+            "$ show\r\n\x1b_Ga=T,f=100,c=6,r=3;{}\x1b\\",
+            crate::picture::test_png(60, 60)
+        ));
+        app.pane = Some(pane);
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal
+            .draw(|frame| draw_terminal_pane(frame, &mut app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        // Half-blocks are colour rather than glyphs, so a cell of the picture is one that
+        // has been painted.
+        let painted = |x: u16, y: u16| buffer[(x, y)].bg != Color::Reset;
+        // The pane is inset by the popup's border, and the picture starts on the line
+        // under the command that printed it.
+        assert!(painted(4, 3), "the picture starts where the cursor was");
+        assert!(!painted(4, 2), "and not on the line above it");
+        assert!(painted(9, 5), "down to its far corner");
+        assert!(!painted(10, 3), "and no wider than it was given");
+        // Nothing of the sequence was printed as text.
+        let row: String = (0..40).map(|x| buffer[(x, 2)].symbol()).collect();
+        assert!(row.contains("$ show"), "{row}");
+        assert!(!row.contains("a=T"), "{row}");
     }
 
     /// More worktrees than there are rows for is the case worth drawing: the cursor has

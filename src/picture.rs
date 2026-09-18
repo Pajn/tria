@@ -65,6 +65,14 @@ pub enum Source<'a> {
     File(&'a str),
     /// The bytes themselves, for an image that was fetched rather than read.
     Bytes(&'a [u8]),
+    /// Pixels as a program handed them over, with no container around them to say how
+    /// big they are or how many channels they have.
+    Pixels {
+        bytes: &'a [u8],
+        width: u32,
+        height: u32,
+        alpha: bool,
+    },
 }
 
 /// A file this large is not a screenshot and is not worth the memory of finding out.
@@ -135,7 +143,8 @@ pub fn place(key: &str, source: Source<'_>, offered: Size) -> Option<Size> {
             store.ready.push_front(ready);
             return Some(size);
         }
-        let picker = store.picker.as_ref()?;
+        // Nothing can be drawn at all until the terminal has said how.
+        store.picker.as_ref()?;
         let bytes = match source {
             Source::Data(data) => base64::engine::general_purpose::STANDARD
                 .decode(data)
@@ -148,28 +157,49 @@ pub fn place(key: &str, source: Source<'_>, offered: Size) -> Option<Size> {
             }
             Source::File(_) => return None,
             Source::Bytes(bytes) => bytes.to_vec(),
+            Source::Pixels {
+                bytes,
+                width,
+                height,
+                alpha,
+            } => {
+                let image = if alpha {
+                    image::RgbaImage::from_raw(width, height, bytes.to_vec())
+                        .map(image::DynamicImage::ImageRgba8)
+                } else {
+                    image::RgbImage::from_raw(width, height, bytes.to_vec())
+                        .map(image::DynamicImage::ImageRgb8)
+                };
+                return fit(&mut store, key, offered, image?);
+            }
         };
         let image = image::load_from_memory(&bytes).ok()?;
-        // Fit shrinks but never enlarges, so an image smaller than the room it is given
-        // is drawn at its own size rather than blown up.
-        let natural = Resize::natural_size(&image, picker.font_size());
-        let within = Size::new(
-            natural.width.min(offered.width),
-            natural.height.min(offered.height),
-        );
-        let protocol =
-            SlicedProtocol::new_with_resize(picker, image, within, Resize::Fit(None)).ok()?;
-        let size = protocol.size();
-        store.ready.retain(|ready| ready.key != key);
-        store.ready.push_front(Ready {
-            key: key.to_string(),
-            offered,
-            size,
-            protocol,
-        });
-        store.ready.truncate(KEPT);
-        Some(size)
+        fit(&mut store, key, offered, image)
     })
+}
+
+/// Encode a decoded image at the size the room allows, and keep it ready to draw.
+fn fit(store: &mut Store, key: &str, offered: Size, image: image::DynamicImage) -> Option<Size> {
+    let picker = store.picker.as_ref()?;
+    // Fit shrinks but never enlarges, so an image smaller than the room it is given
+    // is drawn at its own size rather than blown up.
+    let natural = Resize::natural_size(&image, picker.font_size());
+    let within = Size::new(
+        natural.width.min(offered.width),
+        natural.height.min(offered.height),
+    );
+    let protocol =
+        SlicedProtocol::new_with_resize(picker, image, within, Resize::Fit(None)).ok()?;
+    let size = protocol.size();
+    store.ready.retain(|ready| ready.key != key);
+    store.ready.push_front(Ready {
+        key: key.to_string(),
+        offered,
+        size,
+        protocol,
+    });
+    store.ready.truncate(KEPT);
+    Some(size)
 }
 
 /// Draw a placed image at `position` within `area`, clipped to it. The position may sit
