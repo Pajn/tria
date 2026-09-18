@@ -1012,7 +1012,13 @@ fn render_working(thread: &ThreadState) -> Text<'static> {
             .plan_progress
             .as_ref()
             .map(|p| p.step.clone())
-            .unwrap_or_else(|| "working".to_string());
+            .unwrap_or_else(|| {
+                if thread.is_compacting() {
+                    "compacting the context".to_string()
+                } else {
+                    "working".to_string()
+                }
+            });
         lines.push(Line::from(Span::styled(format!("… {label}"), style)));
     } else {
         for step in steps {

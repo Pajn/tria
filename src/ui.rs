@@ -1480,8 +1480,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::styled("  plan", Style::default().fg(Color::Blue)));
         }
         if thread.is_running() {
+            // Compacting is a turn like any other on the wire, and says nothing while it
+            // runs; a thread that looks like it is answering and is not is worth naming.
+            let doing = if thread.is_compacting() {
+                "compacting"
+            } else {
+                "running"
+            };
             spans.push(Span::styled(
-                format!("  {} running", app.spinner_frame()),
+                format!("  {} {doing}", app.spinner_frame()),
                 Style::default().fg(Color::Cyan),
             ));
         } else if let Some(session) = &shell.session {

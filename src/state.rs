@@ -296,6 +296,13 @@ pub struct ThreadState {
     pub needs_snapshot: bool,
 }
 
+/// A message asking for the context to be compacted, which is `/compact` and nothing
+/// else — the same reading the server gives it, since a message with anything more in it
+/// is a message.
+fn is_compact_command(message: &crate::model::Message) -> bool {
+    message.role == "user" && message.text.trim().eq_ignore_ascii_case("/compact")
+}
+
 impl ThreadState {
     pub fn from_snapshot(snapshot: ThreadDetailSnapshot) -> Self {
         let (has_more, before_cursor) = match &snapshot.page {
@@ -619,6 +626,39 @@ impl ThreadState {
     }
 
     /// Latest plan steps for the active turn, if any.
+    /// Whether the running turn is the context being compacted rather than an answer
+    /// being written.
+    ///
+    /// Nothing on the wire says so. `/compact` is sent as an ordinary message and the
+    /// turn it starts looks like any other, so what marks one is the message itself: the
+    /// last `/compact` anybody sent, once it is the message the running turn was asked
+    /// for. What ends it is the `context-compaction` activity that names the request, or
+    /// the turn ending, which takes the whole line with it.
+    pub fn is_compacting(&self) -> bool {
+        let Some(asked) = self
+            .detail
+            .messages
+            .iter()
+            .rev()
+            .find(|m| is_compact_command(m))
+        else {
+            return false;
+        };
+        let started = match self.detail.shell.latest_turn.as_ref() {
+            // Sent after the last turn was asked for, or the turn it asked for itself.
+            Some(turn) => {
+                asked.created_at > turn.requested_at
+                    || (turn.state == "running" && asked.created_at == turn.requested_at)
+            }
+            None => true,
+        };
+        started
+            && !self.detail.activities.iter().any(|activity| {
+                activity.kind == "context-compaction"
+                    && activity.str("requestId") == Some(&asked.id)
+            })
+    }
+
     pub fn active_plan(&self) -> Vec<PlanStep> {
         let Some(turn_id) = self.detail.shell.latest_turn.as_ref().map(|t| &t.turn_id) else {
             return Vec::new();
@@ -678,6 +718,57 @@ mod tests {
         }))
         .unwrap();
         ThreadState::from_snapshot(snapshot)
+    }
+
+    /// A thread whose last message asked for the context to be compacted, in the shape
+    /// the server sends one.
+    fn compacting(text: &str, requested_at: &str, state: &str, settled: bool) -> ThreadState {
+        let snapshot: ThreadDetailSnapshot = serde_json::from_value(json!({
+            "snapshotSequence": 10,
+            "thread": {
+                "id": "t1", "projectId": "p1", "title": "Test",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "m"},
+                "runtimeMode": "full-access", "session": {"status": "running"},
+                "latestTurn": {
+                    "turnId": "turn", "state": state, "requestedAt": requested_at
+                },
+                "messages": [{
+                    "id": "m1", "role": "user", "text": text,
+                    "createdAt": "2026-01-01T00:00:01Z"
+                }],
+                "activities": if settled {
+                    json!([{
+                        "id": "a1", "kind": "context-compaction", "tone": "info",
+                        "summary": "", "payload": {"requestId": "m1"},
+                        "createdAt": "2026-01-01T00:00:02Z"
+                    }])
+                } else {
+                    json!([])
+                }
+            }
+        }))
+        .unwrap();
+        ThreadState::from_snapshot(snapshot)
+    }
+
+    /// `/compact` is sent as a message and the turn it starts looks like any other, so a
+    /// thread that is compacting has to be read from the message and the activity that
+    /// answers it — otherwise it is drawn as though an answer were being written.
+    #[test]
+    fn a_thread_compacting_its_context_is_not_a_thread_answering() {
+        // Asked for after the last turn started: the turn to come is the compaction.
+        assert!(compacting("/compact", "2026-01-01T00:00:00Z", "completed", false).is_compacting());
+        // Or the turn it asked for itself, while it runs.
+        assert!(compacting("/compact", "2026-01-01T00:00:01Z", "running", false).is_compacting());
+        // Once the compaction has been recorded the thread is answering again.
+        assert!(!compacting("/compact", "2026-01-01T00:00:00Z", "completed", true).is_compacting());
+        // A turn asked for after the message is somebody carrying on.
+        assert!(!compacting("/compact", "2026-01-01T00:00:09Z", "running", false).is_compacting());
+        // And a message with anything else in it is a message.
+        assert!(
+            !compacting("/compact please", "2026-01-01T00:00:00Z", "running", false)
+                .is_compacting()
+        );
     }
 
     fn message_event(sequence: u64, text: &str, streaming: bool) -> Event {
