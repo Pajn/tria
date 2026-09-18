@@ -31,14 +31,8 @@ use crate::{
 const TERMINAL_COLS: u16 = 120;
 const TERMINAL_ROWS: u16 = 30;
 
-/// The terminal `gl` reuses, one per thread, so the git command keeps its place.
-const GIT_TERMINAL_ID: &str = "tria-git";
-
 /// The terminal `g!` reuses, one per thread.
 const SHELL_TERMINAL_ID: &str = "tria-shell";
-/// The terminals the popups run in: one per thread, scratch by nature, and the two that
-/// are worth keeping a shell warm in.
-const POPUP_TERMINALS: [&str; 2] = [GIT_TERMINAL_ID, SHELL_TERMINAL_ID];
 
 /// Draft key for a thread that does not exist yet.
 const NEW_THREAD_DRAFT_KEY: &str = "\0new-thread";
@@ -412,8 +406,8 @@ pub struct App {
     draft_worktree: Option<(String, String)>,
     /// Links on screen, rebuilt each draw, so a click knows what it landed on.
     pub links: Vec<Link>,
-    /// Command for `gl` and `:git`, from the config file.
-    pub git_command: String,
+    /// Programs bound to `g` and a key, from the config file.
+    pub programs: Vec<crate::config::Program>,
     /// Editor for `ge` and `gE`.
     pub editor: String,
     /// A program to run in the terminal in tria's place; the event loop picks it up.
@@ -500,7 +494,10 @@ impl App {
             draft_worktree: None,
             links: Vec::new(),
             drafts: HashMap::new(),
-            git_command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
+            programs: vec![crate::config::Program {
+                key: 'l',
+                command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
+            }],
             editor: "nvim".to_string(),
             pending_external: None,
             popup: None,
@@ -1452,7 +1449,7 @@ impl App {
                 self.toast(format!("{label} exited"), false);
                 // Sessions tria opened are scratch; leave the desktop app's own alone.
                 if terminal_id.starts_with("tria-") {
-                    let warm = POPUP_TERMINALS.contains(&terminal_id.as_str());
+                    let warm = self.popup_terminals().contains(&terminal_id);
                     self.end_terminal(thread_id, terminal_id, warm);
                 }
             }
@@ -1673,16 +1670,16 @@ impl App {
     /// and one per thread visited is a pile of shells nobody asked for. One with
     /// something running in it is not idle and not ours to end.
     fn release_popup_terminals(&self, thread_id: &str) {
-        for terminal_id in POPUP_TERMINALS {
+        for terminal_id in self.popup_terminals() {
             // By thread as well as by name: every thread has a `tria-git` of its own.
             let idle = self.terminals.iter().any(|t| {
                 t.thread_id == thread_id
-                    && t.terminal_id == terminal_id
+                    && t.terminal_id == *terminal_id
                     && t.is_live()
                     && !t.has_running_subprocess
             });
             if idle {
-                self.end_terminal(thread_id.to_string(), terminal_id.to_string(), false);
+                self.end_terminal(thread_id.to_string(), terminal_id, false);
             }
         }
     }
@@ -2186,7 +2183,12 @@ impl App {
     /// the command exits.
     /// `gl` and `:git`: run the git command in the thread's own terminal, in the pane.
     /// Reuses one terminal per thread, so leaving and coming back finds it where it was.
-    fn open_git(&mut self) {
+    fn open_program(&mut self, key: char) {
+        let Some(program) = self.programs.iter().find(|p| p.key == key).cloned() else {
+            // Only `:git` reaches this: the key itself is not a key until it is bound.
+            self.toast(format!("nothing is bound to g{key}"), true);
+            return;
+        };
         let Some(dir) = self.thread_directory() else {
             self.toast("no thread open", true);
             return;
@@ -2195,14 +2197,28 @@ impl App {
             self.toast("no thread open", true);
             return;
         };
-        let command = self.git_command.clone();
-        // `exec` replaces the shell, so quitting the command ends the session and the
-        // popup closes with it. It also means `git_command` should be interactive.
+        let command = program.command.clone();
+        // `exec` replaces the shell, so quitting the program ends the session and the
+        // popup closes with it. It also means a program bound here should be one that
+        // holds the terminal until you leave it.
         self.pending_pane_command = Some(format!("exec {command}\r"));
-        self.open_pane(thread_id, GIT_TERMINAL_ID.to_string(), command.clone(), dir);
+        self.open_pane(thread_id, program.terminal_id(), command.clone(), dir);
         if let Some(pane) = self.pane.as_mut() {
             pane.starting = Some(command);
         }
+    }
+
+    /// Whether `g` and this key run a program.
+    fn bound(&self, key: char) -> bool {
+        self.programs.iter().any(|program| program.key == key)
+    }
+
+    /// The terminals the popups run in: one per thread and binding, scratch by nature,
+    /// and the ones worth keeping a shell warm in.
+    fn popup_terminals(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.programs.iter().map(|p| p.terminal_id()).collect();
+        ids.push(SHELL_TERMINAL_ID.to_string());
+        ids
     }
 
     /// `g!` and `:shell`: a plain shell for the thread, in the pane. Exiting it closes
@@ -2855,7 +2871,8 @@ impl App {
             "sidebar" => self.sidebar_visible = !self.sidebar_visible,
             "pr" | "pull" => self.open_pull_request(true),
             "tmux" => self.switch_tmux_session(),
-            "git" | "lazygit" => self.open_git(),
+            // `:git` is what the `l` binding has always been called, whatever is on it.
+            "git" | "lazygit" => self.open_program('l'),
             "tasks" | "jobs" => self.open_tasks(),
             "agents" | "subagents" => self.open_agents(),
             "terminals" | "shells" => self.open_terminals(),
@@ -2889,7 +2906,16 @@ impl App {
                     self.toast("no pending question", false);
                 }
             }
-            _ => self.toast(format!("unknown command :{name}"), true),
+            // A program bound to a key answers to its own name as well.
+            _ => match self
+                .programs
+                .iter()
+                .find(|p| p.name() == name)
+                .map(|p| p.key)
+            {
+                Some(key) => self.open_program(key),
+                None => self.toast(format!("unknown command :{name}"), true),
+            },
         }
     }
 
@@ -3114,7 +3140,7 @@ impl App {
                 let id = self.current_thread_id.clone();
                 self.toggle_settled(id);
             }
-            KeyCode::Char('l') if prefix == Some('g') => self.open_git(),
+            KeyCode::Char(key) if prefix == Some('g') && self.bound(key) => self.open_program(key),
             KeyCode::Char('!') if prefix == Some('g') => self.open_shell(),
             KeyCode::Char('w') if prefix == Some('g') => self.toggle_draft_worktree(),
             KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
@@ -3595,7 +3621,9 @@ impl App {
                     let id = self.sidebar_selected_thread();
                     self.toggle_settled(id);
                 }
-                KeyCode::Char('l') if prefix == Some('g') => self.open_git(),
+                KeyCode::Char(key) if prefix == Some('g') && self.bound(key) => {
+                    self.open_program(key)
+                }
                 KeyCode::Char('!') if prefix == Some('g') => self.open_shell(),
                 KeyCode::Char('w') if prefix == Some('g') => self.toggle_draft_worktree(),
                 KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
@@ -3653,7 +3681,9 @@ impl App {
                 self.toggle_settled(id);
                 return;
             }
-            KeyCode::Char('l') if prefix == Some('g') => return self.open_git(),
+            KeyCode::Char(key) if prefix == Some('g') && self.bound(key) => {
+                return self.open_program(key);
+            }
             KeyCode::Char('!') if prefix == Some('g') => return self.open_shell(),
             KeyCode::Char('w') if prefix == Some('g') => return self.toggle_draft_worktree(),
             KeyCode::Char('T') if prefix == Some('g') => return self.open_tasks(),
@@ -4541,7 +4571,10 @@ pub enum SidebarRow {
 
 /// External programs tria hands the terminal to, from the config file.
 pub struct Launch {
-    pub git_command: String,
+    pub programs: Vec<crate::config::Program>,
+    /// Bindings the config asked for that tria could not give, to be said out loud once
+    /// the screen exists to say them on.
+    pub refused: Vec<String>,
     pub editor: String,
     /// The model remembered from the last choice, for the next new thread.
     pub model: Option<ModelSelection>,
@@ -4637,7 +4670,10 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     let mut app = App::new(handle, events_tx.clone());
     app.local_disk = local_files;
     app.origin = origin;
-    app.git_command = launch.git_command;
+    app.programs = launch.programs;
+    if !launch.refused.is_empty() {
+        app.toast(format!("config: {}", launch.refused.join(", ")), true);
+    }
     app.editor = launch.editor;
     app.new_thread_model = launch.model;
     if launch.started_server {
@@ -4827,6 +4863,51 @@ mod tests {
             "settledAt": "2026-01-01T00:00:00Z",
         }))
         .expect("a thread the server could have sent")
+    }
+
+    /// `g` and a key run whatever the config file put there, in the thread's own
+    /// terminal — the binding tria ships with is only the first entry in that list.
+    #[tokio::test]
+    async fn a_program_the_config_bound_runs_on_its_key() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        project(&mut app);
+        app.programs = vec![crate::config::Program {
+            key: 'b',
+            command: "yazi".into(),
+        }];
+        app.current_thread_id = Some("t1".into());
+        app.thread = Some(crate::state::ThreadState::from_snapshot(
+            serde_json::from_value(json!({
+                "snapshotSequence": 1,
+                "thread": {
+                    "id": "t1", "projectId": "p", "title": "Test",
+                    "modelSelection": {"instanceId": "i", "model": "m"},
+                    "messages": [], "activities": []
+                }
+            }))
+            .unwrap(),
+        ));
+
+        let press = |app: &mut App, c: char| {
+            app.on_key(crossterm::event::KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            ))
+        };
+        press(&mut app, 'g');
+        press(&mut app, 'b');
+        assert_eq!(app.pending_pane_command.as_deref(), Some("exec yazi\r"));
+        let pane = app.pane.as_ref().expect("the popup is open");
+        assert_eq!(pane.terminal_id, "tria-gb");
+        assert_eq!(pane.label, "yazi");
+
+        // A key the config did not bind is still not a key.
+        app.pending_pane_command = None;
+        press(&mut app, 'g');
+        press(&mut app, 'q');
+        assert_eq!(app.pending_pane_command, None);
     }
 
     /// A thread as the list has it, on a given turn in a given state.

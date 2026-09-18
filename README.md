@@ -98,7 +98,7 @@ Press `?` inside the app for the full list.
 | `gA` | list the subagents the thread has run; `Enter` reads one's transcript (`r` re-reads a running one), `y` yanks its report |
 | `gS` | list the thread's terminals; attach to one, or close, restart, open a new one |
 | `gW` | list the worktrees threads are holding; remove the ones that are done with |
-| `gl` | open lazygit in a terminal popup for the thread |
+| `gl` | open lazygit in a terminal popup for the thread; `[programs]` in the config file binds more keys |
 | `g!` | a shell in the popup, in the thread's directory |
 | `ge` | composer focused: edit the draft in your editor, read back on exit. Chat focused: view the message, plan, tool row, or tool group under the cursor |
 | `gE` | view the whole conversation in your editor |
@@ -226,22 +226,39 @@ every twenty seconds otherwise. The pull request on the thread's branch wins; ot
 `gx` opens it in the browser through the platform's URL opener. `:pr` does the same, and
 offers a picker when several pull requests are linked.
 
-## Git
+## Programs
 
-`gl` or `:git` runs `lazygit` in a terminal of the thread's own, as a popup inside tria: the
-chat stays on screen around it and tria keeps running. The command replaces the shell rather
-than running inside it, so the popup goes straight to lazygit and closes again when you quit
-it. Set `git_command` in the config file to run something else, for example `tig` or `gitui`;
-it should be interactive, since a command that prints and exits takes the popup with it.
+`g` and one more key run a program in a terminal of the thread's own, as a popup inside tria:
+the chat stays on screen around it and tria keeps running. The program replaces the shell
+rather than running inside it, so the popup goes straight to it and closes again when you
+quit. `gl` is `lazygit` until you say otherwise, and what is on the other keys is the config
+file's to decide:
 
-While lazygit is up, `Ctrl-\` leaves it running and `gl` comes back to it exactly as it was.
+```toml
+[programs]
+b = "yazi"
+l = "gitui"
+d = "lazydocker"
+```
+
+The key is the one pressed after `g`, and the value is the command, which should be
+interactive: one that prints and exits takes the popup with it. A key set to `""` takes its
+binding away, including `l`. Each binding also answers to the program's own name on the
+command line, so `:yazi` is `gb`; `:git` stays the name for whatever is on `l`, as does the
+older `git_command` setting, which `programs.l` overrides. The keys tria answers itself —
+`g` `a` `e` `s` `t` `w` `x` `y` `A` `E` `S` `T` `W` `!` — are refused, and tria says which
+when it starts rather than binding a key that would never arrive.
+
+While a program is up, `Ctrl-\` leaves it running and its key comes back to it exactly as it
+was. Each binding has a terminal of its own, so a file manager and a git client left open in
+one thread do not take turns in the same shell.
 
 The terminal belongs to the server, so this works the same whether the server is on this
-machine or another one, and lazygit runs where the repository is.
+machine or another one, and the program runs where the repository is.
 
 Startup goes through your login shell, which is the whole of what a popup costs, and a thread
 pays it once: closing the popup closes the terminal and opens another in its place, so the
-shell is already at a prompt when you next ask for lazygit. Leaving a thread lets go of the
+shell is already at a prompt when you next ask for one. Leaving a thread lets go of the
 one it was keeping. The pane also answers the capability queries a full-screen program sends
 on startup, so nothing waits on a timeout.
 

@@ -2237,6 +2237,19 @@ pub fn elapsed_label(since: &str, now: &str) -> String {
 }
 
 fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
+    // What `g` runs is the config file's to say, so the help reads it rather than
+    // naming the one program tria happens to ship with.
+    let programs = if app.programs.is_empty() {
+        "  g and a key             run a program, once the config file binds one".to_string()
+    } else {
+        let keys: Vec<String> = app.programs.iter().map(|p| format!("g{}", p.key)).collect();
+        let names: Vec<&str> = app.programs.iter().map(|p| p.name()).collect();
+        format!(
+            "  {:<24}{} in the thread's terminal pane",
+            keys.join(" "),
+            names.join(", ")
+        )
+    };
     let text = Text::from(vec![
         Line::from(Span::styled("Normal", Style::default().bold())),
         Line::from("  Tab / Shift-Tab         cycle focus: composer → chat → threads · Esc back"),
@@ -2261,7 +2274,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
             "  ga                      answer the agent's question (digits, Space, c custom, Enter)",
         ),
         Line::from("  gy                      yank last assistant message (OSC 52)"),
-        Line::from("  gl                      lazygit in the thread's terminal pane"),
+        Line::from(programs.clone()),
         Line::from("  g!                      a shell in the pane; exiting it closes the popup"),
         Line::from("  gT                      background tasks still running in this thread"),
         Line::from("  gA                      subagents this thread has run: Enter reads one's"),
@@ -2289,7 +2302,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  s / S                   toggle sidebar / settled shelf"),
         Line::from("  gs                      settle the thread, or bring a settled one back"),
         Line::from("  gw                      new thread: fresh worktree or the project checkout"),
-        Line::from("  gl                      lazygit in the thread's terminal pane"),
+        Line::from(programs),
         Line::from("  g!                      a shell in the pane"),
         Line::from(
             "  gx                      open the link under the cursor, else the pull request",
