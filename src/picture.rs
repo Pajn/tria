@@ -29,10 +29,12 @@ use ratatui_image::{
 };
 
 /// How many images are kept ready to draw. Each holds the encoded form the terminal was
-/// given, which is large, so this is not a cache of everything a thread ever showed — it
-/// is enough that the rows anyone has open stay ready. An image that falls out of it is
-/// encoded again the next time the timeline is built, which costs a few milliseconds.
-const KEPT: usize = 16;
+/// given, which for a picture in the chat is large, so this is not a cache of everything
+/// a thread ever showed — it is enough that the rows anyone has open stay ready, and that
+/// a list of projects drawn with their icons does not push them all out. An image that
+/// falls out of it is encoded again the next time it is drawn, which costs a few
+/// milliseconds.
+const KEPT: usize = 48;
 
 struct Ready {
     key: String,
@@ -61,6 +63,8 @@ pub enum Source<'a> {
     Data(&'a str),
     /// A path on the machine that ran the tool.
     File(&'a str),
+    /// The bytes themselves, for an image that was fetched rather than read.
+    Bytes(&'a [u8]),
 }
 
 /// A file this large is not a screenshot and is not worth the memory of finding out.
@@ -143,6 +147,7 @@ pub fn place(key: &str, source: Source<'_>, offered: Size) -> Option<Size> {
                 std::fs::read(path).ok()?
             }
             Source::File(_) => return None,
+            Source::Bytes(bytes) => bytes.to_vec(),
         };
         let image = image::load_from_memory(&bytes).ok()?;
         // Fit shrinks but never enlarges, so an image smaller than the room it is given

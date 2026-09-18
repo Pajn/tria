@@ -1583,12 +1583,15 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     ));
 
     let items = picker.filtered();
-    let label_width = (list_area.width as usize).saturating_sub(4);
+    // A project is drawn with the icon its checkout is known by, in room left for it.
+    let icons = picker.kind == PickerKind::Project;
+    let gutter = if icons { "   " } else { "" };
+    let label_width = (list_area.width as usize).saturating_sub(4 + gutter.len());
     let list_items: Vec<ListItem> = items
         .iter()
         .map(|item| {
             let label_len = item.label.chars().count().min(label_width * 2 / 3);
-            let label = fit(&item.label, label_len.max(1));
+            let label = format!("{gutter}{}", fit(&item.label, label_len.max(1)));
             let remaining = label_width.saturating_sub(label.chars().count() + 2);
             ListItem::new(Line::from(vec![
                 Span::raw(label),
@@ -1611,6 +1614,31 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         )
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, list_area, &mut state);
+
+    if icons {
+        // Drawn after the list, over the room the labels left, so an icon lands on the
+        // row it belongs to rather than under it.
+        for (row, item) in items
+            .iter()
+            .skip(state.offset())
+            .take(list_area.height as usize)
+            .enumerate()
+        {
+            let Some(bytes) = app.favicon(&item.key) else {
+                continue;
+            };
+            let key = format!("favicon:{}", item.key);
+            let area = Rect {
+                x: list_area.x + 2,
+                y: list_area.y + row as u16,
+                width: 2,
+                height: 1,
+            };
+            if picture::place(&key, picture::Source::Bytes(bytes), area.as_size()).is_some() {
+                picture::draw(frame, &key, area, SignedPosition::from((0, 0)));
+            }
+        }
+    }
 }
 
 /// The attached terminal, drawn from the parsed screen as a popup over the chat.
@@ -2291,6 +2319,7 @@ fn hash_set(set: &HashSet<String>) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
     use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
 
@@ -2509,6 +2538,74 @@ mod tests {
         };
         assert!(tint(y));
         assert!(!tint(y - 1));
+    }
+
+    /// A project the server found an icon for is drawn with it, in room the label left;
+    /// one with none is not shifted out of line by the others having icons.
+    #[test]
+    fn a_project_is_listed_with_the_icon_its_checkout_is_known_by() {
+        picture::draw_in_halfblocks();
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.mode = Mode::Picker;
+        app.picker = Some(crate::app::Picker {
+            kind: PickerKind::Project,
+            query: String::new(),
+            selected: 1,
+            items: vec![
+                crate::app::PickerItem {
+                    label: "shelfie".into(),
+                    detail: "/src/shelfie".into(),
+                    key: "p1".into(),
+                },
+                crate::app::PickerItem {
+                    label: "tria".into(),
+                    detail: "/src/tria".into(),
+                    key: "p2".into(),
+                },
+            ],
+        });
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(picture::test_png(64, 64))
+            .unwrap();
+        app.give_favicon("p1", bytes);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let row = |name: &str| {
+            (0..buffer.area.height)
+                .find(|y| text(*y).contains(name))
+                .unwrap_or_else(|| panic!("{name} should be listed"))
+        };
+        // Half blocks are what a terminal with no image protocol gets, and they are
+        // colour rather than glyphs: a cell of the picture is one with a background.
+        let painted = |y: u16| {
+            (0..buffer.area.width)
+                .filter(|x| buffer[(*x, y)].bg != Color::Reset)
+                .count()
+        };
+        assert_eq!(
+            painted(row("/src/shelfie")),
+            2,
+            "{:?}",
+            text(row("/src/shelfie"))
+        );
+        // The one without an icon keeps the room anyway, so the labels line up.
+        let label_at = |detail: &str, name: &str| {
+            let line = text(row(detail));
+            line.find(name).map(|byte| line[..byte].chars().count())
+        };
+        assert_eq!(
+            label_at("/src/shelfie", "shelfie"),
+            label_at("/src/tria", "tria")
+        );
     }
 
     /// A screen with no room at all still draws something rather than panicking.

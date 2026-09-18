@@ -245,6 +245,11 @@ pub enum AppEvent {
         result: Result<(), String>,
         ok: String,
     },
+    /// A project's icon, or the news that it has none.
+    Favicon {
+        project: Id,
+        bytes: Option<Vec<u8>>,
+    },
     /// A subagent's transcript came back from the machine that ran it.
     Transcript {
         agent_id: String,
@@ -318,6 +323,11 @@ pub struct App {
     pub chat_area: Rect,
     /// Where the composer's text is drawn, so a click can be turned into a cursor.
     pub composer_area: Rect,
+    /// Where the server is, for the files it serves over HTTP rather than the socket.
+    pub origin: String,
+    /// The icon each project is known by, once asked for. `None` where the server found
+    /// the project none.
+    favicons: HashMap<Id, Option<Vec<u8>>>,
     /// Line the chat cursor is on, as a content line index. Tracks the last line while
     /// the view follows new output.
     pub chat_cursor: usize,
@@ -437,6 +447,8 @@ impl App {
             sidebar_inner: None,
             chat_area: Rect::default(),
             composer_area: Rect::default(),
+            origin: String::new(),
+            favicons: HashMap::new(),
             chat_cursor: 0,
             chat_column: 0,
             chat_visual: None,
@@ -2425,6 +2437,51 @@ impl App {
 
     // ── Pickers ────────────────────────────────────────────────────────
 
+    /// Fetch the icon of every project that has not been asked about yet.
+    ///
+    /// The looking is the server's: the path the project names, then the one its `t3.json`
+    /// names, then the usual places a favicon lives, then whatever the project's
+    /// `index.html` links to. It answers with a URL good for a few minutes, signed, and
+    /// the bytes come over HTTP — so a server on another machine works like this one,
+    /// which reading the path ourselves would not.
+    fn ask_favicons(&mut self) {
+        let wanted: Vec<(Id, String)> = self
+            .shell
+            .projects
+            .values()
+            .filter(|p| !self.favicons.contains_key(&p.id))
+            .map(|p| (p.id.clone(), p.workspace_root.clone()))
+            .collect();
+        for (project, cwd) in wanted {
+            // Marked before the answer so a picker opened twice asks once.
+            self.favicons.insert(project.clone(), None);
+            let handle = self.handle.clone();
+            let events = self.events.clone();
+            let origin = self.origin.clone();
+            tokio::spawn(async move {
+                let bytes = favicon_bytes(&handle, &origin, &cwd).await;
+                let _ = events.send(AppEvent::Favicon { project, bytes });
+            });
+        }
+    }
+
+    fn on_favicon(&mut self, project: Id, bytes: Option<Vec<u8>>) {
+        if bytes.is_some() {
+            self.favicons.insert(project, bytes);
+        }
+    }
+
+    /// The icon a project is known by, for whoever is drawing its name.
+    pub fn favicon(&self, project: &str) -> Option<&[u8]> {
+        self.favicons.get(project)?.as_deref()
+    }
+
+    /// Hand a project an icon, for a test that draws one.
+    #[cfg(test)]
+    pub fn give_favicon(&mut self, project: &str, bytes: Vec<u8>) {
+        self.favicons.insert(project.to_string(), Some(bytes));
+    }
+
     fn open_picker(&mut self, kind: PickerKind) {
         let items: Vec<PickerItem> = match kind {
             PickerKind::Thread => self
@@ -2446,6 +2503,7 @@ impl App {
                 })
                 .collect(),
             PickerKind::Project => {
+                self.ask_favicons();
                 let mut projects: Vec<_> = self.shell.projects.values().collect();
                 projects.sort_by(|a, b| a.title.cmp(&b.title));
                 projects
@@ -4340,14 +4398,34 @@ pub struct Launch {
     pub started_server: bool,
 }
 
+/// Ask where a project's icon is and fetch it. `sourcePath` is the server saying it found
+/// one; without it the URL leads to nothing and there is no icon to draw.
+async fn favicon_bytes(handle: &session::Handle, origin: &str, cwd: &str) -> Option<Vec<u8>> {
+    let answer = handle
+        .call(
+            "assets.createUrl",
+            json!({ "resource": { "_tag": "project-favicon", "cwd": cwd } }),
+        )
+        .await
+        .ok()?;
+    answer.get("sourcePath")?;
+    let url = answer.get("relativeUrl")?.as_str()?;
+    let response = reqwest::get(format!("{origin}{url}")).await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    Some(response.bytes().await.ok()?.to_vec())
+}
+
 pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     // A thread's images are files on the server's disk, which are ours to read only when
     // that disk is this one.
     let local_files = crate::server::is_local(&origin);
-    let (handle, mut updates) = session::spawn(origin, token);
+    let (handle, mut updates) = session::spawn(origin.clone(), token);
     let (events_tx, mut events) = mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new(handle, events_tx.clone());
     app.local_disk = local_files;
+    app.origin = origin;
     app.git_command = launch.git_command;
     app.editor = launch.editor;
     app.new_thread_model = launch.model;
@@ -4427,6 +4505,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
                 Err(error) => app.toast(error, true),
             },
             AppEvent::Transcript { agent_id, result } => app.on_transcript(agent_id, result),
+            AppEvent::Favicon { project, bytes } => app.on_favicon(project, bytes),
         }
         if let Some(external) = app.pending_external.take() {
             if let Err(err) = run_external(&mut terminal, &external) {
