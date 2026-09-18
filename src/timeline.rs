@@ -1315,3 +1315,291 @@ mod tests {
         assert_eq!(work(&rows)[0].status, "completed");
     }
 }
+// ── Wrapping ───────────────────────────────────────────────────────────
+
+/// One drawn line of a block, and where in the block's text it came from.
+#[derive(Debug, Clone)]
+pub struct Row {
+    /// The line of the block's text this row is part of.
+    pub line: usize,
+    /// The row's text as a byte range of its line, decoration not counted.
+    pub start: usize,
+    pub end: usize,
+}
+
+/// A block's text broken into the lines it is drawn as.
+#[derive(Debug, Clone, Default)]
+pub struct Wrapped {
+    /// The rows as drawn, decoration and all.
+    pub lines: Vec<Line<'static>>,
+    pub rows: Vec<Row>,
+    /// Each line of the block's text as it was written, without its decoration, so a
+    /// selection can give back what was said rather than what was shown.
+    pub texts: Vec<String>,
+    /// The first row of each line of the text, with the total at the end, for turning a
+    /// range of text lines into a range of rows.
+    pub starts: Vec<usize>,
+}
+
+/// Break a block's text into the rows it fits `width` as.
+///
+/// The wrapping is ours rather than the paragraph widget's for two reasons. A line that
+/// carries a mark — a message of yours, a plan — loses it on every row but the first
+/// when something else does the breaking, because the mark is only the line's first
+/// span. And selecting part of a line means knowing where the breaks fell and which
+/// columns are decoration.
+///
+/// So the mark and indent a line opens with are repeated on each of its rows, and the
+/// text is wrapped to what is left. Words are kept whole where they fit; one that never
+/// fits is broken at the edge.
+pub fn wrap(text: &Text<'static>, width: u16) -> Wrapped {
+    let width = width.max(1) as usize;
+    let mut out = Wrapped::default();
+    for (index, line) in text.lines.iter().enumerate() {
+        out.starts.push(out.lines.len());
+        let chars = chars_of(line);
+        let (prefix, body) = chars.split_at(hanging(&chars));
+        let room = width.saturating_sub(display_width(prefix)).max(1);
+        // Byte offset of every character of the body, so a row can say where it starts.
+        let mut offsets = Vec::with_capacity(body.len() + 1);
+        let mut at = 0;
+        for (ch, _) in body {
+            offsets.push(at);
+            at += ch.len_utf8();
+        }
+        offsets.push(at);
+        for (n, (from, to)) in break_line(body, room).into_iter().enumerate() {
+            let mut row: Vec<(char, Style)> = if n == 0 {
+                prefix.to_vec()
+            } else {
+                // The mark again, so a message broken over rows still reads as one; the
+                // rest of the decoration only holds the text where it was.
+                prefix
+                    .iter()
+                    .map(|(ch, style)| (if *ch == USER_MARK_CHAR { *ch } else { ' ' }, *style))
+                    .collect()
+            };
+            row.extend_from_slice(&body[from..to]);
+            out.rows.push(Row {
+                line: index,
+                start: offsets[from],
+                end: offsets[to],
+            });
+            out.lines.push(line_of(&row));
+        }
+        out.texts.push(body.iter().map(|(ch, _)| *ch).collect());
+    }
+    out.starts.push(out.lines.len());
+    out
+}
+
+impl Wrapped {
+    /// What a row says, without the decoration it opens with.
+    pub fn text(&self, row: usize) -> &str {
+        match self.rows.get(row) {
+            Some(row) => &self.texts[row.line][row.start..row.end],
+            None => "",
+        }
+    }
+
+    /// Where a character of a row sits in its line, as a byte offset.
+    pub fn byte(&self, row: usize, index: usize) -> usize {
+        let Some(at) = self.rows.get(row) else {
+            return 0;
+        };
+        self.text(row)
+            .char_indices()
+            .nth(index)
+            .map_or(at.end, |(byte, _)| at.start + byte)
+    }
+}
+
+const USER_MARK_CHAR: char = '▌';
+
+fn chars_of(line: &Line<'static>) -> Vec<(char, Style)> {
+    let mut out = Vec::new();
+    for span in &line.spans {
+        let style = line.style.patch(span.style);
+        out.extend(span.content.chars().map(|ch| (ch, style)));
+    }
+    out
+}
+
+fn line_of(chars: &[(char, Style)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (ch, style) in chars {
+        match spans.last_mut() {
+            Some(last) if last.style == *style => last.content.to_mut().push(*ch),
+            _ => spans.push(Span::styled(ch.to_string(), *style)),
+        }
+    }
+    Line::from(spans)
+}
+
+fn char_width(ch: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+fn display_width(chars: &[(char, Style)]) -> usize {
+    chars.iter().map(|(ch, _)| char_width(*ch)).sum()
+}
+
+/// How much of the start of a line is decoration rather than what it says: the indent,
+/// and the mark a message or a plan is drawn with. A line of nothing but whitespace has
+/// none — it is a blank line, not an indent standing on its own.
+fn hanging(chars: &[(char, Style)]) -> usize {
+    let mut hang = 0;
+    while let Some((ch, _)) = chars.get(hang) {
+        if *ch == USER_MARK_CHAR || ch.is_whitespace() {
+            hang += 1;
+        } else {
+            break;
+        }
+    }
+    if hang == chars.len() { 0 } else { hang }
+}
+
+/// Greedy word wrapping over a line's body, as character ranges of it: whole words while
+/// they fit, the break swallowing the whitespace it falls on, and a word too long for a
+/// row of its own broken where the row ends.
+fn break_line(chars: &[(char, Style)], room: usize) -> Vec<(usize, usize)> {
+    if chars.is_empty() {
+        return vec![(0, 0)];
+    }
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    let mut index = 0;
+    // Where the row could end, and where the text after that break picks up.
+    let mut cut: Option<(usize, usize)> = None;
+    while index < chars.len() {
+        let (ch, _) = chars[index];
+        let width = char_width(ch);
+        if ch.is_whitespace() && used > 0 {
+            // A run of spaces is a break that costs nothing.
+            let mut end = index;
+            while matches!(chars.get(end), Some((ch, _)) if ch.is_whitespace()) {
+                end += 1;
+            }
+            cut = Some((index, end));
+        }
+        if used + width > room && used > 0 {
+            match cut.filter(|(at, _)| *at > start) {
+                Some((at, next)) => {
+                    rows.push((start, at));
+                    start = next;
+                    index = next;
+                }
+                // One long word, broken where the row runs out.
+                None => {
+                    rows.push((start, index));
+                    start = index;
+                }
+            }
+            used = 0;
+            cut = None;
+            continue;
+        }
+        used += width;
+        index += 1;
+    }
+    rows.push((start, chars.len()));
+    rows
+}
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    fn drawn(wrapped: &Wrapped) -> Vec<String> {
+        wrapped
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_message_too_wide_for_the_window_keeps_its_mark_all_the_way_down() {
+        let text = render_user("one two three four five six", "you");
+        let wrapped = wrap(&text, 12);
+        assert_eq!(
+            drawn(&wrapped),
+            vec![
+                "\u{258c} you",
+                "\u{258c} one two",
+                "\u{258c} three four",
+                "\u{258c} five six",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_mark_a_row_carries_is_not_part_of_what_it_says() {
+        let text = render_user("one two three", "you");
+        let wrapped = wrap(&text, 12);
+        assert_eq!(wrapped.text(1), "one two");
+        assert_eq!(wrapped.text(2), "three");
+        // Every row of the message comes from the one line it was written as.
+        assert_eq!(wrapped.rows[1].line, wrapped.rows[2].line);
+    }
+
+    #[test]
+    fn a_word_wider_than_the_window_is_broken_where_it_runs_out() {
+        let text = Text::from("aaaaaaaaaa bb");
+        let wrapped = wrap(&text, 4);
+        assert_eq!(drawn(&wrapped), vec!["aaaa", "aaaa", "aa", "bb"]);
+    }
+
+    #[test]
+    fn an_indented_line_stays_under_itself() {
+        let text = Text::from("    alpha beta gamma");
+        let wrapped = wrap(&text, 12);
+        assert_eq!(drawn(&wrapped), vec!["    alpha", "    beta", "    gamma"]);
+        assert_eq!(wrapped.text(1), "beta");
+    }
+
+    #[test]
+    fn a_blank_line_is_a_row_of_its_own() {
+        let text = Text::from(vec![Line::from("a"), Line::default(), Line::from("b")]);
+        let wrapped = wrap(&text, 8);
+        assert_eq!(drawn(&wrapped), vec!["a", "", "b"]);
+        assert_eq!(wrapped.starts, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_wide_character_takes_the_room_it_draws_in() {
+        let text = Text::from("\u{4f60}\u{597d} ab");
+        let wrapped = wrap(&text, 4);
+        assert_eq!(drawn(&wrapped), vec!["\u{4f60}\u{597d}", "ab"]);
+    }
+
+    #[test]
+    fn a_line_keeps_the_colours_it_was_written_in() {
+        let text = render_user("one two three", "you");
+        let wrapped = wrap(&text, 12);
+        let row = &wrapped.lines[1];
+        assert_eq!(row.spans[0].content.as_ref(), USER_MARK);
+        assert_eq!(row.spans[0].style.fg, Some(Color::Green));
+        assert_eq!(row.spans[1].style.fg, None);
+    }
+
+    #[test]
+    fn what_a_row_says_is_a_piece_of_the_line_it_came_from() {
+        let text = render_user("one two three four", "you");
+        let wrapped = wrap(&text, 12);
+        let line = wrapped.rows[1].line;
+        let from = wrapped.byte(1, 0);
+        let to = wrapped.rows[2].end;
+        // Taken together the rows give the message back, spaces and all.
+        assert_eq!(&wrapped.texts[line][from..to], "one two three four");
+    }
+
+    #[test]
+    fn a_line_that_fits_is_left_alone() {
+        let text = Text::from(vec![Line::from("short"), Line::from("also short")]);
+        let wrapped = wrap(&text, 40);
+        assert_eq!(drawn(&wrapped), vec!["short", "also short"]);
+        assert_eq!(wrapped.starts, vec![0, 1, 2]);
+    }
+}

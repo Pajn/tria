@@ -3209,6 +3209,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "tui-markdown",
+ "unicode-width",
  "url",
  "uuid",
  "vt100",

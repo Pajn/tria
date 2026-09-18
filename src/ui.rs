@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use ratatui_image::sliced::SignedPosition;
 
@@ -37,13 +37,19 @@ pub struct ChatCache {
 
 pub struct CachedBlock {
     block: ChatBlock,
-    /// Rendered height after wrapping.
-    height: usize,
+    /// The block's text broken into the rows it is drawn as.
+    wrapped: timeline::Wrapped,
     /// Toggle regions in wrapped content lines relative to the block start.
     rows: Vec<timeline::Region>,
     exports: Vec<(String, String)>,
     /// Images in wrapped content lines relative to the block start.
     images: Vec<timeline::Placed>,
+}
+
+impl CachedBlock {
+    fn height(&self) -> usize {
+        self.wrapped.lines.len()
+    }
 }
 
 thread_local! {
@@ -190,30 +196,18 @@ pub fn chat_export_all() -> String {
     })
 }
 
-/// Every content line of the chat as displayed, rendered off screen once per rebuild.
+/// Every content line of the chat as displayed, marks and indents and all, kept from one
+/// rebuild to the next for search to read.
 pub fn chat_lines() -> Vec<String> {
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if cache.lines.is_none() {
-            let Some(width) = cache.key.as_ref().map(|k| k.2) else {
-                return Vec::new();
-            };
             let mut lines = Vec::with_capacity(cache.total);
             for cached in &cache.blocks {
-                let area = Rect::new(0, 0, width, cached.height.min(u16::MAX as usize) as u16);
-                let mut buffer = ratatui::buffer::Buffer::empty(area);
-                Paragraph::new(cached.block.text.clone())
-                    .wrap(Wrap { trim: false })
-                    .render(area, &mut buffer);
-                for row in 0..area.height {
-                    let mut text = String::new();
-                    for x in 0..width {
-                        if let Some(cell) = buffer.cell(Position::new(x, row)) {
-                            text.push_str(cell.symbol());
-                        }
-                    }
-                    lines.push(text.trim_end().to_string());
-                }
+                lines.extend(cached.wrapped.lines.iter().map(|line| {
+                    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    text.trim_end().to_string()
+                }));
             }
             cache.lines = Some(lines);
         }
@@ -332,43 +326,62 @@ fn apply_search_highlights(frame: &mut Frame, app: &App, chat: Rect) {
     }
 }
 
-/// Text of the chat's content lines `start..=end`, as displayed after wrapping. Renders the
-/// covering blocks off screen so lines outside the viewport are available too.
-pub fn chat_text(start: usize, end: usize) -> Option<String> {
+/// The chat text from one point to another, each a content line and a character on it,
+/// the end exclusive. What comes back is what was written rather than what was drawn: the
+/// marks and indents the chat decorates its lines with are left out, and a line broken
+/// over several rows comes back as the one line it was, spaces and all.
+pub fn chat_span(start: (usize, usize), end: (usize, usize)) -> Option<String> {
     CACHE.with(|cache| {
         let cache = cache.borrow();
-        let width = cache.key.as_ref()?.2;
-        let mut out: Vec<String> = Vec::new();
+        // The pieces to take, each a byte range of one line of one block. Rows of the
+        // same line join into one piece, which puts back the space a break swallowed.
+        let mut pieces: Vec<(usize, usize, usize, usize)> = Vec::new();
         let mut y = 0usize;
-        for cached in &cache.blocks {
+        for (index, cached) in cache.blocks.iter().enumerate() {
             let block_start = y;
-            let block_end = y + cached.height;
-            y = block_end;
-            if block_end <= start || block_start > end {
+            y += cached.height();
+            if y <= start.0 || block_start > end.0 {
                 continue;
             }
-            let area = Rect::new(0, 0, width, cached.height.min(u16::MAX as usize) as u16);
-            let mut buffer = ratatui::buffer::Buffer::empty(area);
-            Paragraph::new(cached.block.text.clone())
-                .wrap(Wrap { trim: false })
-                .render(area, &mut buffer);
-            for line in start.max(block_start)..=end.min(block_end - 1) {
-                let row = (line - block_start) as u16;
-                let mut text = String::new();
-                for x in 0..width {
-                    if let Some(cell) = buffer.cell(Position::new(x, row)) {
-                        text.push_str(cell.symbol());
-                    }
+            for (row, at) in cached.wrapped.rows.iter().enumerate() {
+                let line = block_start + row;
+                if line < start.0 || line > end.0 {
+                    continue;
                 }
-                out.push(text.trim_end().to_string());
+                let from = if line == start.0 {
+                    cached.wrapped.byte(row, start.1)
+                } else {
+                    at.start
+                };
+                let to = if line == end.0 {
+                    cached.wrapped.byte(row, end.1)
+                } else {
+                    at.end
+                };
+                match pieces.last_mut() {
+                    Some(last) if (last.0, last.1) == (index, at.line) => last.3 = to.max(last.3),
+                    _ => pieces.push((index, at.line, from, to)),
+                }
             }
         }
-        if out.is_empty() {
-            None
-        } else {
-            Some(out.join("\n"))
+        if pieces.is_empty() {
+            return None;
         }
+        Some(
+            pieces
+                .iter()
+                .map(|&(block, line, from, to)| {
+                    &cache.blocks[block].wrapped.texts[line][from..to.max(from)]
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     })
+}
+
+/// Text of the chat's content lines `start..=end`, whole lines at a time.
+pub fn chat_text(start: usize, end: usize) -> Option<String> {
+    chat_span((start, 0), (end, usize::MAX))
 }
 
 /// Highlight the mouse selection over the drawn chat cells and, when a drag has just ended,
@@ -848,24 +861,14 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
                 .into_iter()
                 .map(|mut block| {
                     let exports = std::mem::take(&mut block.exports);
-                    let height = Paragraph::new(block.text.clone())
-                        .wrap(Wrap { trim: false })
-                        .line_count(inner.width);
-                    total += height;
-                    // Per-line wrapped heights turn text-line row ranges into content
-                    // lines, and say where an image's reserved lines landed.
+                    let wrapped = timeline::wrap(&block.text, inner.width);
+                    total += wrapped.lines.len();
+                    // Where each line of the text starts turns text-line row ranges into
+                    // content lines, and says where an image's reserved lines landed.
                     let (rows, images) = if block.rows.is_empty() {
                         (Vec::new(), Vec::new())
                     } else {
-                        let mut starts = Vec::with_capacity(block.text.lines.len() + 1);
-                        let mut acc = 0usize;
-                        for line in &block.text.lines {
-                            starts.push(acc);
-                            acc += Paragraph::new(Text::from(line.clone()))
-                                .wrap(Wrap { trim: false })
-                                .line_count(inner.width);
-                        }
-                        starts.push(acc);
+                        let starts = &wrapped.starts;
                         let rows = block
                             .rows
                             .iter()
@@ -887,7 +890,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
                     };
                     CachedBlock {
                         block,
-                        height,
+                        wrapped,
                         rows,
                         exports,
                         images,
@@ -921,16 +924,16 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         let mut y = 0usize;
         let mut cursor = inner.y;
         let bottom = inner.y + inner.height;
-        for CachedBlock {
-            block,
-            height: block_height,
-            rows,
-            exports,
-            images,
-        } in &cache.blocks
-        {
+        for cached in &cache.blocks {
+            let CachedBlock {
+                block,
+                wrapped,
+                rows,
+                exports,
+                images,
+            } = cached;
             let start = y;
-            let end = y + block_height;
+            let end = y + cached.height();
             y = end;
             if matches!(block.key, BlockKey::Message(_)) {
                 app.message_starts.push(start);
@@ -960,17 +963,16 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
                 break;
             }
             let skip = offset.saturating_sub(start);
-            let visible = (block_height - skip).min((bottom - cursor) as usize);
+            let visible = (cached.height() - skip).min((bottom - cursor) as usize);
             let rect = Rect {
                 x: inner.x,
                 y: cursor,
                 width: inner.width,
                 height: visible as u16,
             };
+            // Already broken to the width, so the widget is only placing the rows.
             frame.render_widget(
-                Paragraph::new(block.text.clone())
-                    .wrap(Wrap { trim: false })
-                    .scroll((skip as u16, 0)),
+                Paragraph::new(Text::from(wrapped.lines[skip..skip + visible].to_vec())),
                 rect,
             );
             // Over the blank lines the block left for them, and clipped to what of the
@@ -2221,6 +2223,7 @@ fn hash_set(set: &HashSet<String>) -> u64 {
 #[cfg(test)]
 mod tests {
     use ratatui::{Terminal, backend::TestBackend};
+    use serde_json::json;
 
     use super::*;
     use crate::app::ThreadWorktree;
@@ -2277,6 +2280,83 @@ mod tests {
         let screen = drawn(100, 24, &app);
         assert!(screen.contains("thread number 0"), "{screen}");
         assert!(screen.contains("below"), "{screen}");
+    }
+
+    fn thread_saying(text: &str) -> crate::state::ThreadState {
+        let snapshot: crate::model::ThreadDetailSnapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p1", "title": "Test",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "m"},
+                "runtimeMode": "full-access", "latestTurn": null, "session": null,
+                "messages": [{"id": "m1", "role": "user", "text": text}],
+                "activities": []
+            }
+        }))
+        .unwrap();
+        crate::state::ThreadState::from_snapshot(snapshot)
+    }
+
+    fn chat(width: u16, app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A message wider than the chat is drawn over several rows, and each of them has to
+    /// carry the mark: without it the rows after the first read as somebody else talking.
+    #[test]
+    fn every_row_of_a_message_carries_its_mark() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_saying("one two three four five six seven eight"));
+
+        let screen = chat(30, &mut app);
+        let said: Vec<&str> = screen
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.contains("one") || line.contains("eight"))
+            .collect();
+        assert!(said.len() > 1, "the message should have wrapped: {screen}");
+        assert!(
+            said.iter().all(|line| line.starts_with("\u{258c} ")),
+            "{screen}"
+        );
+    }
+
+    /// What is taken out of the chat is what was written into it, not what was drawn: no
+    /// marks, and a message broken over rows comes back as the one line it was.
+    #[test]
+    fn what_is_yanked_is_the_message_and_not_its_decoration() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let said = "one two three four five six seven eight";
+        app.thread = Some(thread_saying(said));
+        chat(30, &mut app);
+
+        let start = app.message_starts.first().copied().unwrap();
+        // The label is the block's first row; the message itself starts under it and
+        // runs over the two rows it was broken into.
+        let text = chat_span((start + 1, 0), (start + 2, usize::MAX)).unwrap();
+        assert_eq!(text, said);
+        // And a piece of a row is only that piece.
+        assert_eq!(
+            chat_span((start + 1, 4), (start + 1, 7)),
+            Some("two".into())
+        );
     }
 
     /// A screen with no room at all still draws something rather than panicking.

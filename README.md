@@ -116,6 +116,10 @@ output), `Ctrl-d` `Ctrl-u` `Ctrl-f` `Ctrl-b` `Ctrl-e` `Ctrl-y` to scroll with th
 selection and `y` copies it; `yy` or `3y` copy from the cursor. Clicking a chat line focuses
 the chat and moves the cursor there.
 
+What a copy gives you is what was written rather than what was drawn: the marks and indents
+the chat decorates its lines with are left out, and a message broken over several rows comes
+back as the one line it was written as.
+
 Clicking in the composer puts the cursor where you clicked and leaves you writing, without a
 trip through normal mode. Past the end of a line is the end of it, and below the last line is
 the last line, so a click anywhere in the box lands somewhere you can type.
