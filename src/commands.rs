@@ -25,10 +25,25 @@ pub struct NewThread<'a> {
     pub worktree: Option<Worktree<'a>>,
 }
 
-/// Where a worktree for a new thread comes from.
+/// Where a worktree for a new thread comes from, and what it is called.
 pub struct Worktree<'a> {
     pub project_cwd: &'a str,
     pub base_branch: &'a str,
+    /// The branch to make for it. Naming one is what asks for a branch at all: without
+    /// it the server checks the base branch out into the worktree instead, which git
+    /// refuses the moment that branch is checked out anywhere else — and the project's
+    /// own checkout, which is where the base branch was read from, is exactly that.
+    pub branch: &'a str,
+    /// Fetch and start from `origin/<base branch>` rather than the local one.
+    pub start_from_origin: bool,
+}
+
+/// The branch a thread's worktree gets. The server names the worktree's directory after
+/// it, so it is the thread rather than the message: a name made of whatever was typed
+/// is a ref made of whatever was typed, and a message is not a ref.
+pub fn worktree_branch(thread_id: &str) -> String {
+    let short: String = thread_id.chars().take(8).collect();
+    format!("tria/{short}")
 }
 
 /// Start a turn on an existing thread, or create the thread first when `bootstrap` is given.
@@ -74,6 +89,8 @@ pub fn turn_start(
             command["bootstrap"]["prepareWorktree"] = json!({
                 "projectCwd": worktree.project_cwd,
                 "baseBranch": worktree.base_branch,
+                "branch": worktree.branch,
+                "startFromOrigin": worktree.start_from_origin,
             });
         }
     }
@@ -228,6 +245,8 @@ mod tests {
                 worktree: Some(Worktree {
                     project_cwd: "/src/project",
                     base_branch: "main",
+                    branch: "tria/12345678",
+                    start_from_origin: true,
                 }),
             }),
         );
@@ -237,6 +256,20 @@ mod tests {
         assert!(bootstrap["createThread"]["worktreePath"].is_null());
         assert_eq!(bootstrap["prepareWorktree"]["projectCwd"], "/src/project");
         assert_eq!(bootstrap["prepareWorktree"]["baseBranch"], "main");
+        // Without a branch of its own the server checks the base branch out instead,
+        // which fails while the project's checkout has it.
+        assert_eq!(bootstrap["prepareWorktree"]["branch"], "tria/12345678");
+        assert_eq!(bootstrap["prepareWorktree"]["startFromOrigin"], true);
+    }
+
+    #[test]
+    fn a_worktree_branch_is_named_after_its_thread() {
+        assert_eq!(
+            worktree_branch("1f3f5b4d-9421-4c40-81d4-fa96b4179d7e"),
+            "tria/1f3f5b4d"
+        );
+        // Whatever it is given, the result is a name git will take.
+        assert_eq!(worktree_branch(""), "tria/");
     }
 
     #[test]

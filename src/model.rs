@@ -675,6 +675,10 @@ pub struct ServerSettings {
     /// the current checkout.
     #[serde(default)]
     pub default_thread_env_mode: Option<String>,
+    /// Whether a new worktree starts from the remote's copy of the base branch rather
+    /// than the local one.
+    #[serde(default)]
+    pub new_worktrees_start_from_origin: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

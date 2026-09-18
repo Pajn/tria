@@ -773,6 +773,7 @@ impl App {
             // Resolved above, while the draft was still in place.
             let worktree = self.draft_worktree.take();
             let thread_id = commands::new_id();
+            let worktree_branch = commands::worktree_branch(&thread_id);
             let title: String = text
                 .lines()
                 .next()
@@ -792,9 +793,11 @@ impl App {
                     model_selection: &draft.model_selection,
                     runtime_mode: &draft.runtime_mode,
                     interaction_mode: &draft.interaction_mode,
-                    worktree: worktree.as_ref().map(|(cwd, branch)| commands::Worktree {
+                    worktree: worktree.as_ref().map(|(cwd, base)| commands::Worktree {
                         project_cwd: cwd,
-                        base_branch: branch,
+                        base_branch: base,
+                        branch: &worktree_branch,
+                        start_from_origin: self.config.settings.new_worktrees_start_from_origin,
                     }),
                 }),
             );
@@ -803,7 +806,7 @@ impl App {
             tracing::info!(
                 thread = %thread_id,
                 project = %draft.project_id,
-                worktree = worktree.is_some(),
+                worktree = ?worktree,
                 "creating a thread"
             );
             self.current_thread_id = Some(thread_id.clone());

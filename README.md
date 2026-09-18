@@ -152,9 +152,14 @@ Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [l
 
 `n` picks a project and opens a draft; the message you write starts the thread. The header says
 where it will run: `⌂ project checkout on <branch>`, or `⌂ new worktree off <branch>`, which
-the server creates and names when the thread starts. `gw` or `:worktree` switches between them.
-The default comes from the project's own setting, then the server's, and the server's default
-is the current checkout.
+the server creates when the thread starts. `gw` or `:worktree` switches between them. The
+default comes from the project's own setting, then the server's, and the server's default is
+the current checkout.
+
+A worktree branches off whatever the project's checkout has at the time, or off the remote's
+copy of it where the server is set to start new worktrees from origin. Its branch is named
+after the thread rather than the message, since the server names the worktree's directory
+after the branch and a message is not a branch name.
 
 The model for a new thread is the last one you picked with `m`, remembered in the config file
 between runs. Without one it falls back to the project's default model, then the server's.
