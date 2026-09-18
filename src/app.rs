@@ -46,6 +46,11 @@ const NEW_THREAD_DRAFT_KEY: &str = "\0new-thread";
 /// Rows moved per mouse wheel notch.
 const MOUSE_SCROLL_LINES: usize = 3;
 const TICK: Duration = Duration::from_millis(120);
+
+/// How many events waiting at once are applied before the screen is drawn. Enough that a
+/// picture arriving in the terminal pane is one screen rather than a hundred, and few
+/// enough that a stream which never stops still gets drawn.
+const BATCH: usize = 512;
 const TOAST_TTL: Duration = Duration::from_secs(6);
 const PREFIX_TTL: Duration = Duration::from_millis(1200);
 
@@ -4500,6 +4505,53 @@ async fn favicon_bytes(handle: &session::Handle, origin: &str, cwd: &str) -> Opt
     Some(response.bytes().await.ok()?.to_vec())
 }
 
+/// Do what an event asks of the app. Drawing is the caller's, so that a burst of them
+/// costs one screen rather than one each.
+fn apply(app: &mut App, event: AppEvent) {
+    match event {
+        AppEvent::Terminal(Event::Key(key)) => app.on_key(key),
+        AppEvent::Terminal(Event::Mouse(mouse)) => app.on_mouse(mouse),
+        AppEvent::Terminal(Event::Paste(text)) => {
+            if app.mode == Mode::Insert {
+                app.composer.insert_str(&text);
+            } else if app.mode == Mode::Picker {
+                if let Some(p) = app.picker.as_mut() {
+                    p.query.push_str(text.trim());
+                }
+            } else if app.mode == Mode::Command {
+                app.command_line.push_str(text.trim());
+            }
+        }
+        AppEvent::Terminal(_) => {}
+        AppEvent::Tick => {
+            app.spinner = app.spinner.wrapping_add(1);
+            app.poll_popup();
+            app.refresh_vcs_periodically();
+            app.refresh_worktrees_periodically();
+            if app
+                .toast
+                .as_ref()
+                .is_some_and(|(_, at, _)| at.elapsed() > TOAST_TTL)
+            {
+                app.toast = None;
+            }
+        }
+        AppEvent::Update(update) => app.on_update(*update),
+        AppEvent::ThreadCreated(thread_id) => app.on_thread_created(thread_id),
+        AppEvent::CreateRefused { thread_id, error } => app.on_create_refused(thread_id, error),
+        AppEvent::WorktreeChecked { path, changes } => app.on_worktree_checked(path, changes),
+        AppEvent::WorktreeRemoved { path, result } => app.on_worktree_removed(path, result),
+        AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
+        AppEvent::Dispatched(Ok(())) => {}
+        AppEvent::Called { result, ok } => match result {
+            Ok(()) => app.toast(ok, false),
+            Err(error) => app.toast(error, true),
+        },
+        AppEvent::Transcript { agent_id, result } => app.on_transcript(agent_id, result),
+        AppEvent::Favicon { project, bytes } => app.on_favicon(project, bytes),
+    }
+}
+
 pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     // A thread's images are files on the server's disk, which are ours to read only when
     // that disk is this one.
@@ -4548,47 +4600,20 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
             Some(ev) = events.recv() => ev,
             _ = tick.tick() => AppEvent::Tick,
         };
-        match event {
-            AppEvent::Terminal(Event::Key(key)) => app.on_key(key),
-            AppEvent::Terminal(Event::Mouse(mouse)) => app.on_mouse(mouse),
-            AppEvent::Terminal(Event::Paste(text)) => {
-                if app.mode == Mode::Insert {
-                    app.composer.insert_str(&text);
-                } else if app.mode == Mode::Picker {
-                    if let Some(p) = app.picker.as_mut() {
-                        p.query.push_str(text.trim());
-                    }
-                } else if app.mode == Mode::Command {
-                    app.command_line.push_str(text.trim());
-                }
+        apply(&mut app, event);
+        // Whatever else is already waiting is applied before the screen is drawn again.
+        // One picture reaching the pane arrives as a hundred messages, and a screen
+        // drawn between two of them is a screen nobody sees.
+        for _ in 0..BATCH {
+            let waiting = updates
+                .try_recv()
+                .ok()
+                .map(|update| AppEvent::Update(Box::new(update)))
+                .or_else(|| events.try_recv().ok());
+            match waiting {
+                Some(event) => apply(&mut app, event),
+                None => break,
             }
-            AppEvent::Terminal(_) => {}
-            AppEvent::Tick => {
-                app.spinner = app.spinner.wrapping_add(1);
-                app.poll_popup();
-                app.refresh_vcs_periodically();
-                app.refresh_worktrees_periodically();
-                if app
-                    .toast
-                    .as_ref()
-                    .is_some_and(|(_, at, _)| at.elapsed() > TOAST_TTL)
-                {
-                    app.toast = None;
-                }
-            }
-            AppEvent::Update(update) => app.on_update(*update),
-            AppEvent::ThreadCreated(thread_id) => app.on_thread_created(thread_id),
-            AppEvent::CreateRefused { thread_id, error } => app.on_create_refused(thread_id, error),
-            AppEvent::WorktreeChecked { path, changes } => app.on_worktree_checked(path, changes),
-            AppEvent::WorktreeRemoved { path, result } => app.on_worktree_removed(path, result),
-            AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
-            AppEvent::Dispatched(Ok(())) => {}
-            AppEvent::Called { result, ok } => match result {
-                Ok(()) => app.toast(ok, false),
-                Err(error) => app.toast(error, true),
-            },
-            AppEvent::Transcript { agent_id, result } => app.on_transcript(agent_id, result),
-            AppEvent::Favicon { project, bytes } => app.on_favicon(project, bytes),
         }
         if let Some(external) = app.pending_external.take() {
             if let Err(err) = run_external(&mut terminal, &external) {
