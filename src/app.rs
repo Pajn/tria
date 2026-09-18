@@ -36,6 +36,9 @@ const GIT_TERMINAL_ID: &str = "tria-git";
 
 /// The terminal `g!` reuses, one per thread.
 const SHELL_TERMINAL_ID: &str = "tria-shell";
+/// The terminals the popups run in: one per thread, scratch by nature, and the two that
+/// are worth keeping a shell warm in.
+const POPUP_TERMINALS: [&str; 2] = [GIT_TERMINAL_ID, SHELL_TERMINAL_ID];
 
 /// Draft key for a thread that does not exist yet.
 const NEW_THREAD_DRAFT_KEY: &str = "\0new-thread";
@@ -547,6 +550,9 @@ impl App {
             return;
         }
         self.swap_composer_draft(thread_id);
+        if let Some(leaving) = self.current_thread_id.clone() {
+            self.release_popup_terminals(&leaving);
+        }
         // A transcript belongs to the thread that ran the subagent; it does not follow.
         self.transcript = None;
         self.transcript_loading = None;
@@ -1230,11 +1236,8 @@ impl App {
                 self.toast(format!("{label} exited"), false);
                 // Sessions tria opened are scratch; leave the desktop app's own alone.
                 if terminal_id.starts_with("tria-") {
-                    self.call(
-                        "terminal.close",
-                        json!({"threadId": thread_id, "terminalId": terminal_id}),
-                        String::new(),
-                    );
+                    let warm = POPUP_TERMINALS.contains(&terminal_id.as_str());
+                    self.end_terminal(thread_id, terminal_id, warm);
                 }
             }
             Event::Closed => {
@@ -1411,6 +1414,61 @@ impl App {
         tokio::spawn(async move {
             let _ = handle.call("terminal.write", payload).await;
         });
+    }
+
+    /// Close a session tria opened, and for a popup leave a fresh shell waiting in its
+    /// place. Opening a popup costs a shell's whole startup — profiles, prompt, whatever
+    /// the directory arranges — and none of that is a wait when it is paid with the popup
+    /// shut. The two calls share a task because the order is the point: the other way
+    /// round the close takes the shell that was just warmed.
+    fn end_terminal(&self, thread_id: String, terminal_id: String, warm: bool) {
+        let warm = warm.then(|| self.thread_directory()).flatten();
+        let (cols, rows) = self.pane_size();
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            let _ = handle
+                .call(
+                    "terminal.close",
+                    json!({ "threadId": thread_id, "terminalId": terminal_id }),
+                )
+                .await;
+            let Some(cwd) = warm else { return };
+            // Nothing waits on this. A popup opened before the shell is up starts one
+            // itself, which is what every opening used to do.
+            if let Err(err) = handle
+                .call(
+                    "terminal.open",
+                    json!({
+                        "threadId": thread_id,
+                        "terminalId": terminal_id,
+                        "cwd": cwd,
+                        "cols": cols,
+                        "rows": rows,
+                    }),
+                )
+                .await
+            {
+                tracing::info!(%err, "could not leave a shell waiting");
+            }
+        });
+    }
+
+    /// Let go of the popup shells kept warm for a thread being left. They are scratch,
+    /// and one per thread visited is a pile of shells nobody asked for. One with
+    /// something running in it is not idle and not ours to end.
+    fn release_popup_terminals(&self, thread_id: &str) {
+        for terminal_id in POPUP_TERMINALS {
+            // By thread as well as by name: every thread has a `tria-git` of its own.
+            let idle = self.terminals.iter().any(|t| {
+                t.thread_id == thread_id
+                    && t.terminal_id == terminal_id
+                    && t.is_live()
+                    && !t.has_running_subprocess
+            });
+            if idle {
+                self.end_terminal(thread_id.to_string(), terminal_id.to_string(), false);
+            }
+        }
     }
 
     /// Whether that terminal has a command running, as the metadata stream last said.
