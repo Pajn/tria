@@ -135,39 +135,82 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Highlight the chat line cursor and the linewise visual range when the chat has focus.
+/// Highlight the chat cursor and the visual selection when the chat has focus.
 fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
     if app.focus != Focus::Chat || app.thread.is_none() || chat.height == 0 {
         return;
     }
     let offset = app.chat_offset();
+    let (cursor, column) = app.chat_spot();
+    let row = |line: usize| {
+        (line >= offset)
+            .then(|| chat.y + (line - offset) as u16)
+            .filter(|y| *y < chat.y + chat.height)
+    };
     let buffer = frame.buffer_mut();
-    let paint = |buffer: &mut ratatui::buffer::Buffer, line: usize, style: Style| {
-        if line < offset || line >= offset + chat.height as usize {
-            return;
-        }
-        let y = chat.y + (line - offset) as u16;
-        for x in chat.x..chat.x + chat.width {
+    let paint = |buffer: &mut ratatui::buffer::Buffer, line, from: u16, to: u16, style| {
+        let Some(y) = row(line) else { return };
+        for x in from.max(chat.x)..to.min(chat.x + chat.width) {
             if let Some(cell) = buffer.cell_mut(Position::new(x, y)) {
                 cell.set_style(style);
             }
         }
     };
+    let charwise = app.chat_visual.is_some_and(|a| !a.whole_lines);
+    // The line the cursor is on is marked whole, unless a character-wise selection is
+    // being made, where a bar the width of the chat would only be in the way.
+    if !charwise {
+        paint(
+            buffer,
+            cursor,
+            chat.x,
+            chat.x + chat.width,
+            Style::default().add_modifier(Modifier::REVERSED),
+        );
+    }
     if let Some(anchor) = app.chat_visual {
-        let (start, end) = (anchor.min(app.chat_cursor), anchor.max(app.chat_cursor));
-        for line in start..=end {
-            paint(
-                buffer,
-                line,
-                Style::default().bg(Color::Blue).fg(Color::White),
-            );
+        let style = Style::default().bg(Color::Blue).fg(Color::White);
+        let head = (anchor.line, anchor.column.min(chat_len(anchor.line)));
+        let spot = (cursor, column);
+        let (first, last) = if head <= spot {
+            (head, spot)
+        } else {
+            (spot, head)
+        };
+        for line in first.0..=last.0 {
+            let (from, to) = if anchor.whole_lines {
+                (0, chat.width)
+            } else {
+                let from = if line == first.0 {
+                    chat_column(line, first.1)
+                } else {
+                    0
+                };
+                let to = if line == last.0 {
+                    chat_column(line, last.1 + 1)
+                } else {
+                    chat_column(line, chat_len(line))
+                };
+                // An empty line still shows that it is in the selection.
+                (from, to.max(from + 1))
+            };
+            paint(buffer, line, chat.x + from, chat.x + to, style);
         }
     }
-    paint(
-        buffer,
-        app.chat_cursor,
-        Style::default().add_modifier(Modifier::REVERSED),
-    );
+    // The cursor itself is whichever way round the cell it sits on is not.
+    if let Some(y) = row(cursor) {
+        let x = chat.x + chat_column(cursor, column);
+        if x < chat.x + chat.width
+            && let Some(cell) = buffer.cell_mut(Position::new(x, y))
+        {
+            let style = if cell.style().add_modifier.contains(Modifier::REVERSED) {
+                Style::default().remove_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().add_modifier(Modifier::REVERSED)
+            };
+            cell.set_style(style);
+        }
+    }
 }
 
 /// Plain text of a block or tool row by export key.
@@ -379,21 +422,57 @@ pub fn chat_span(start: (usize, usize), end: (usize, usize)) -> Option<String> {
     })
 }
 
-/// Text of the chat's content lines `start..=end`, whole lines at a time.
-pub fn chat_text(start: usize, end: usize) -> Option<String> {
-    chat_span((start, 0), (end, usize::MAX))
+/// The block a content line belongs to, and which of its rows the line is.
+fn locate(cache: &ChatCache, line: usize) -> Option<(&CachedBlock, usize)> {
+    let mut y = 0usize;
+    for cached in &cache.blocks {
+        if line < y + cached.height() {
+            return Some((cached, line - y));
+        }
+        y += cached.height();
+    }
+    None
 }
 
-/// Highlight the mouse selection over the drawn chat cells and, when a drag has just ended,
-/// collect the selected text so the event loop can copy it.
-fn apply_selection(frame: &mut Frame, app: &mut App, chat: Rect) {
+/// The character of a content line drawn at a column of the chat, for a click or a drag.
+pub fn chat_index(line: usize, column: u16) -> usize {
+    CACHE.with(|cache| {
+        let cache = cache.borrow();
+        locate(&cache, line).map_or(0, |(block, row)| block.wrapped.index(row, column))
+    })
+}
+
+/// Where a character of a content line is drawn, as a column of the chat.
+pub fn chat_column(line: usize, index: usize) -> u16 {
+    CACHE.with(|cache| {
+        let cache = cache.borrow();
+        locate(&cache, line).map_or(0, |(block, row)| block.wrapped.column(row, index))
+    })
+}
+
+/// What a content line says, without the decoration it is drawn with.
+pub fn chat_row(line: usize) -> String {
+    CACHE.with(|cache| {
+        let cache = cache.borrow();
+        locate(&cache, line).map_or(String::new(), |(block, row)| block.wrapped.text(row).into())
+    })
+}
+
+/// How many characters a content line can be addressed by, its decoration not counted.
+pub fn chat_len(line: usize) -> usize {
+    CACHE.with(|cache| {
+        let cache = cache.borrow();
+        locate(&cache, line).map_or(0, |(block, row)| block.wrapped.len(row))
+    })
+}
+
+/// Highlight the drag over the chat cells it covers.
+fn apply_selection(frame: &mut Frame, app: &App, chat: Rect) {
     let Some(selection) = app.selection else {
         return;
     };
     let (start, end) = selection.ordered();
-    let want_text = app.clipboard_pending.is_some();
     let buffer = frame.buffer_mut();
-    let mut text = String::new();
     for y in start.y..=end.y {
         if y < chat.y || y >= chat.y + chat.height {
             continue;
@@ -404,25 +483,11 @@ fn apply_selection(frame: &mut Frame, app: &mut App, chat: Rect) {
         } else {
             chat.x + chat.width.saturating_sub(1)
         };
-        let mut row = String::new();
         for x in from.max(chat.x)..=to.min(chat.x + chat.width.saturating_sub(1)) {
             if let Some(cell) = buffer.cell_mut(Position::new(x, y)) {
-                if want_text {
-                    // Continuation cells of wide characters carry an empty symbol.
-                    row.push_str(cell.symbol());
-                }
                 cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
             }
         }
-        if want_text {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(row.trim_end());
-        }
-    }
-    if want_text {
-        app.clipboard_pending = Some(text);
     }
 }
 
@@ -1354,6 +1419,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             " THREADS ",
             Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
         ),
+        (_, Focus::Chat) if app.chat_visual.is_some_and(|a| a.whole_lines) => (
+            " VISUAL LINE ",
+            Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
+        ),
         (_, Focus::Chat) if app.chat_visual.is_some() => (
             " VISUAL ",
             Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
@@ -2080,10 +2149,11 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(""),
         Line::from("  chat (focused):"),
         Line::from("  j k  { }  gg G  Ctrl-d/u/f/b/e/y   line cursor / by message / scroll"),
+        Line::from("  h l  0 $  w b           move along the line, character by character"),
         Line::from(
             "  za or Enter             fold or unfold the tool group or row under the cursor",
         ),
-        Line::from("  V then y  ·  yy  ·  Ny  yank lines to the clipboard"),
+        Line::from("  v / V then y  ·  yy  ·  Ny   yank characters or lines to the clipboard"),
         Line::from("  / ?  n N               search forward / backward, next / previous match"),
         Line::from(""),
         Line::from("  n                       new thread (pick project)"),
@@ -2297,10 +2367,14 @@ mod tests {
         crate::state::ThreadState::from_snapshot(snapshot)
     }
 
-    fn chat(width: u16, app: &mut App) -> String {
+    fn screen(width: u16, app: &mut App) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        terminal.backend().buffer().clone()
+    }
+
+    fn chat(width: u16, app: &mut App) -> String {
+        let buffer = screen(width, app);
         let area = buffer.area;
         (0..area.height)
             .map(|y| {
@@ -2357,6 +2431,48 @@ mod tests {
             chat_span((start + 1, 4), (start + 1, 7)),
             Some("two".into())
         );
+    }
+
+    /// A character-wise selection covers the characters between its ends and nothing
+    /// else — not the rest of the row, and not the mark the row is drawn with.
+    #[test]
+    fn a_selection_covers_the_characters_between_its_ends() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_saying("one two three four five six seven eight"));
+        chat(30, &mut app);
+
+        // "two" on the first row of the message.
+        let line = app.message_starts.first().copied().unwrap() + 1;
+        app.focus = crate::app::Focus::Chat;
+        // Following new output keeps the cursor on the last line; this is a reader
+        // looking at something further up.
+        app.scroll = crate::app::Scroll::Offset(0);
+        app.chat_cursor = line;
+        app.chat_column = 6;
+        app.chat_visual = Some(crate::app::ChatAnchor {
+            line,
+            column: 4,
+            whole_lines: false,
+        });
+        let buffer = screen(30, &mut app);
+
+        let y = app.chat_area.y + (line - app.chat_offset()) as u16;
+        let marked: String = (0..buffer.area.width)
+            .filter(|x| buffer[(*x, y)].style().bg == Some(Color::Blue))
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        assert_eq!(marked, "two");
+        // And the cursor, at the far end of it, is turned the other way round again.
+        let x = app.chat_area.x + chat_column(line, 6);
+        assert!(
+            buffer[(x, y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(chat_span((line, 4), (line, 7)), Some("two".into()));
     }
 
     /// A screen with no room at all still draws something rather than panicking.

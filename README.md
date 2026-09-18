@@ -104,6 +104,8 @@ Press `?` inside the app for the full list.
 | `gE` | view the whole conversation in your editor |
 | `gx` | open the link on the cursor's line, else the thread's pull request |
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
+| `h` `l` `0` `$` `w` `b` | chat focused: move along the line under the cursor |
+| `v` `V` | chat focused: start a selection by character or by line; `y` copies it |
 | `Ctrl-c` | interrupt the running turn |
 | mouse wheel | scroll the conversation, or the thread list when the pointer is over it |
 | left click | in the thread list: open a thread, or fold and unfold a section; in the chat: open a link, or fold and unfold a tool group or row; in the composer: put the cursor there and write |
@@ -112,9 +114,11 @@ Press `?` inside the app for the full list.
 With the chat focused, a line cursor moves through the conversation: `j` `k` with counts,
 `{` `}` to the previous or next message, `gg` and `G` (which also resumes following new
 output), `Ctrl-d` `Ctrl-u` `Ctrl-f` `Ctrl-b` `Ctrl-e` `Ctrl-y` to scroll with the cursor.
-`za`, `Enter`, or `Space` folds the tool group or row under the cursor. `V` starts a linewise
-selection and `y` copies it; `yy` or `3y` copy from the cursor. Clicking a chat line focuses
-the chat and moves the cursor there.
+`za`, `Enter`, or `Space` folds the tool group or row under the cursor. The cursor also sits
+on a character: `h` `l` `0` `$` `w` `b` move along the line, and `j` `k` keep the column.
+`v` starts a selection by character and `V` by line; `y` copies it, and `yy` or `3y` copy
+from the cursor without one. Clicking a chat line focuses the chat and puts the cursor on
+the character clicked.
 
 What a copy gives you is what was written rather than what was drawn: the marks and indents
 the chat decorates its lines with are left out, and a message broken over several rows comes

@@ -321,8 +321,11 @@ pub struct App {
     /// Line cursor in the chat, as a content line index. Tracks the last line while the
     /// view follows new output.
     pub chat_cursor: usize,
-    /// Anchor line of a linewise visual selection in the chat.
-    pub chat_visual: Option<usize>,
+    /// Character the chat cursor is on, held where it was so a shorter line in passing
+    /// does not lose the column.
+    pub chat_column: usize,
+    /// Where a visual selection in the chat began.
+    pub chat_visual: Option<ChatAnchor>,
     /// Count typed before a chat motion.
     chat_count: Option<usize>,
     /// First content line of every message block, for `{` and `}`.
@@ -435,6 +438,7 @@ impl App {
             chat_area: Rect::default(),
             composer_area: Rect::default(),
             chat_cursor: 0,
+            chat_column: 0,
             chat_visual: None,
             chat_count: None,
             message_starts: Vec::new(),
@@ -2759,6 +2763,69 @@ impl App {
         }
     }
 
+    /// The chat cursor as a line and the character it is on. The column is held where it
+    /// was put, so passing a short line does not pull the cursor left for good.
+    pub fn chat_spot(&self) -> (usize, usize) {
+        let line = self.chat_cursor;
+        (
+            line,
+            self.chat_column.min(ui::chat_len(line).saturating_sub(1)),
+        )
+    }
+
+    /// `w` and `b` over the characters of the chat, carrying on into the line above or
+    /// below when the one under the cursor runs out.
+    fn chat_word(&mut self, forward: bool) {
+        let n = self.take_chat_count();
+        let (_, total) = self.chat_viewport;
+        for _ in 0..n {
+            let (mut line, mut column) = self.chat_spot();
+            let mut chars: Vec<char> = ui::chat_row(line).chars().collect();
+            if forward {
+                let from = word_class(chars.get(column).copied());
+                while column < chars.len() && word_class(Some(chars[column])) == from {
+                    column += 1;
+                }
+                loop {
+                    while chars.get(column).is_some_and(|c| c.is_whitespace()) {
+                        column += 1;
+                    }
+                    if column < chars.len() || line + 1 >= total {
+                        break;
+                    }
+                    line += 1;
+                    column = 0;
+                    chars = ui::chat_row(line).chars().collect();
+                    // A blank line is a stop of its own, as it is in Vim.
+                    if chars.is_empty() {
+                        break;
+                    }
+                }
+            } else {
+                loop {
+                    while column > 0 && chars[column - 1].is_whitespace() {
+                        column -= 1;
+                    }
+                    if column > 0 || line == 0 {
+                        break;
+                    }
+                    line -= 1;
+                    chars = ui::chat_row(line).chars().collect();
+                    column = chars.len();
+                    if chars.is_empty() {
+                        break;
+                    }
+                }
+                let to = word_class(chars.get(column.wrapping_sub(1)).copied());
+                while column > 0 && word_class(Some(chars[column - 1])) == to {
+                    column -= 1;
+                }
+            }
+            self.set_chat_cursor(line);
+            self.chat_column = column.min(chars.len().saturating_sub(1));
+        }
+    }
+
     /// Place the cursor and scroll just enough to keep it in view with a margin. Landing on
     /// the last line resumes following new output.
     fn set_chat_cursor(&mut self, line: usize) {
@@ -2828,6 +2895,9 @@ impl App {
         }
         let (height, total) = self.chat_viewport;
         let cursor = self.chat_cursor;
+        // A key that moves the cursor within a line is only itself: `gl` opens git and
+        // Ctrl-b pages up.
+        let plain = prefix.is_none() && !ctrl;
         match key.code {
             KeyCode::Char(c @ '0'..='9') if c != '0' || self.chat_count.is_some() => {
                 let current = self.chat_count.unwrap_or(0);
@@ -2841,6 +2911,20 @@ impl App {
                 let n = self.take_chat_count();
                 self.set_chat_cursor(cursor.saturating_sub(n));
             }
+            KeyCode::Char('h') | KeyCode::Left if plain => {
+                let n = self.take_chat_count();
+                self.chat_column = self.chat_spot().1.saturating_sub(n);
+            }
+            KeyCode::Char('l') | KeyCode::Right if plain => {
+                let n = self.take_chat_count();
+                let last = ui::chat_len(cursor).saturating_sub(1);
+                self.chat_column = (self.chat_spot().1 + n).min(last);
+            }
+            KeyCode::Char('0') if plain => self.chat_column = 0,
+            // Held past the end, so the cursor stays there down a ragged block.
+            KeyCode::Char('$') if plain => self.chat_column = usize::MAX,
+            KeyCode::Char('w') if plain => self.chat_word(true),
+            KeyCode::Char('b') if plain => self.chat_word(false),
             KeyCode::Char('d') if ctrl => self.chat_scroll_by(height as isize / 2),
             KeyCode::Char('u') if ctrl => self.chat_scroll_by(-(height as isize / 2)),
             KeyCode::Char('f') if ctrl => self.chat_scroll_by(height as isize),
@@ -2917,30 +3001,61 @@ impl App {
                 self.expand_all = false;
                 self.expanded.clear();
             }
-            KeyCode::Char('V') | KeyCode::Char('v') => {
+            // `v` takes the text a character at a time, `V` whole lines; either one
+            // pressed again lets the selection go, and each takes over from the other.
+            KeyCode::Char(key @ ('v' | 'V')) => {
+                let whole_lines = key == 'V';
                 self.chat_visual = match self.chat_visual {
-                    Some(_) => None,
-                    None => Some(cursor),
+                    Some(anchor) if anchor.whole_lines == whole_lines => None,
+                    Some(anchor) => Some(ChatAnchor {
+                        whole_lines,
+                        ..anchor
+                    }),
+                    None => Some(ChatAnchor {
+                        line: cursor,
+                        column: self.chat_spot().1,
+                        whole_lines,
+                    }),
                 };
             }
             KeyCode::Char('y') => {
+                let spot = self.chat_spot();
                 let (start, end) = match self.chat_visual.take() {
-                    Some(anchor) => (anchor.min(cursor), anchor.max(cursor)),
+                    // A character-wise selection reaches through the character the
+                    // cursor is on, which is where the block cursor is drawn.
+                    Some(anchor) if !anchor.whole_lines => {
+                        let head = (anchor.line, anchor.column.min(ui::chat_len(anchor.line)));
+                        let (first, last) = if head <= spot {
+                            (head, spot)
+                        } else {
+                            (spot, head)
+                        };
+                        (first, (last.0, last.1 + 1))
+                    }
+                    Some(anchor) => (
+                        (anchor.line.min(cursor), 0),
+                        (anchor.line.max(cursor), usize::MAX),
+                    ),
                     None => {
                         // `yy`: the current line, or `Ny` for several.
                         let n = self.take_chat_count();
-                        (cursor, (cursor + n - 1).min(total.saturating_sub(1)))
+                        (
+                            (cursor, 0),
+                            ((cursor + n - 1).min(total.saturating_sub(1)), usize::MAX),
+                        )
                     }
                 };
-                match ui::chat_text(start, end) {
+                match ui::chat_span(start, end) {
                     Some(text) if !text.trim().is_empty() => {
+                        let lines = text.lines().count();
                         copy_to_clipboard(&text);
-                        let lines = end - start + 1;
                         self.toast(
-                            if lines == 1 {
-                                "yanked line".to_string()
-                            } else {
-                                format!("yanked {lines} lines")
+                            match lines {
+                                1 if start.0 == end.0 && end.1 != usize::MAX => {
+                                    "yanked selection".to_string()
+                                }
+                                1 => "yanked line".to_string(),
+                                lines => format!("yanked {lines} lines"),
                             },
                             false,
                         );
@@ -3591,6 +3706,7 @@ impl App {
                                 self.focus = Focus::Chat;
                                 self.chat_visual = None;
                                 self.set_chat_cursor(line);
+                                self.chat_column = ui::chat_index(line, at.x - self.chat_area.x);
                             }
                             // A link takes the click; folding would be a surprise.
                             if let Some(url) = self.link_at(at) {
@@ -3600,13 +3716,23 @@ impl App {
                             }
                         }
                     } else {
-                        // The renderer fills `clipboard_pending` from the drawn cells.
-                        self.clipboard_pending = Some(String::new());
+                        let (from, to) = sel.ordered();
+                        self.clipboard_pending = self.chat_under(from, to);
                     }
                 }
             }
             _ => {}
         }
+    }
+
+    /// What a drag over the chat covers, the marks and indents it was drawn with left out.
+    fn chat_under(&self, from: Position, to: Position) -> Option<String> {
+        let offset = self.chat_offset();
+        let spot = |at: Position, past: usize| {
+            let line = offset + at.y.saturating_sub(self.chat_area.y) as usize;
+            (line, ui::chat_index(line, at.x - self.chat_area.x) + past)
+        };
+        ui::chat_span(spot(from, 0), spot(to, 1))
     }
 
     /// Called by the event loop once the frame that resolved a selection has been drawn.
@@ -3984,7 +4110,16 @@ fn count(text: &str, byte: u8) -> usize {
     text.bytes().filter(|b| *b == byte).count()
 }
 
-/// down and `head` follows the pointer; either may come first in reading order.
+/// Where a visual selection in the chat began, and whether it takes whole lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChatAnchor {
+    pub line: usize,
+    pub column: usize,
+    pub whole_lines: bool,
+}
+
+/// A drag over the chat, in screen cells: `anchor` is where the button went down and
+/// `head` follows the pointer; either may come first in reading order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     pub anchor: Position,
@@ -4000,6 +4135,17 @@ impl Selection {
         } else {
             (self.head, self.anchor)
         }
+    }
+}
+
+/// What kind of run a character belongs to, so a word motion stops where Vim's does:
+/// blank, word, or punctuation.
+fn word_class(ch: Option<char>) -> u8 {
+    match ch {
+        None => 0,
+        Some(ch) if ch.is_whitespace() => 0,
+        Some(ch) if ch.is_alphanumeric() || ch == '_' => 1,
+        Some(_) => 2,
     }
 }
 

@@ -1322,6 +1322,9 @@ mod tests {
 pub struct Row {
     /// The line of the block's text this row is part of.
     pub line: usize,
+    /// Columns of decoration the row opens with — a mark, an indent. The text starts
+    /// after them, which is what a selection has to know.
+    pub indent: u16,
     /// The row's text as a byte range of its line, decoration not counted.
     pub start: usize,
     pub end: usize,
@@ -1379,9 +1382,11 @@ pub fn wrap(text: &Text<'static>, width: u16) -> Wrapped {
                     .map(|(ch, style)| (if *ch == USER_MARK_CHAR { *ch } else { ' ' }, *style))
                     .collect()
             };
+            let indent = display_width(&row) as u16;
             row.extend_from_slice(&body[from..to]);
             out.rows.push(Row {
                 line: index,
+                indent,
                 start: offsets[from],
                 end: offsets[to],
             });
@@ -1400,6 +1405,37 @@ impl Wrapped {
             Some(row) => &self.texts[row.line][row.start..row.end],
             None => "",
         }
+    }
+
+    /// How many characters a row can be addressed by.
+    pub fn len(&self, row: usize) -> usize {
+        self.text(row).chars().count()
+    }
+
+    /// The column a character of a row is drawn at, counted from the block's left edge.
+    /// One past the last character answers the column after it.
+    pub fn column(&self, row: usize, index: usize) -> u16 {
+        let indent = self.rows.get(row).map_or(0, |row| row.indent);
+        indent
+            + self
+                .text(row)
+                .chars()
+                .take(index)
+                .map(char_width)
+                .sum::<usize>() as u16
+    }
+
+    /// The character of a row drawn at a column, for a click or a drag. A column before
+    /// the text answers its first character, one past its end the character after it.
+    pub fn index(&self, row: usize, column: u16) -> usize {
+        let mut at = self.rows.get(row).map_or(0, |row| row.indent);
+        for (index, ch) in self.text(row).chars().enumerate() {
+            at += char_width(ch).max(1) as u16;
+            if column < at {
+                return index;
+            }
+        }
+        self.len(row)
     }
 
     /// Where a character of a row sits in its line, as a byte offset.
@@ -1538,6 +1574,7 @@ mod wrap_tests {
     fn the_mark_a_row_carries_is_not_part_of_what_it_says() {
         let text = render_user("one two three", "you");
         let wrapped = wrap(&text, 12);
+        assert_eq!(wrapped.rows[1].indent, 2);
         assert_eq!(wrapped.text(1), "one two");
         assert_eq!(wrapped.text(2), "three");
         // Every row of the message comes from the one line it was written as.
@@ -1556,6 +1593,7 @@ mod wrap_tests {
         let text = Text::from("    alpha beta gamma");
         let wrapped = wrap(&text, 12);
         assert_eq!(drawn(&wrapped), vec!["    alpha", "    beta", "    gamma"]);
+        assert_eq!(wrapped.rows[1].indent, 4);
         assert_eq!(wrapped.text(1), "beta");
     }
 
@@ -1585,12 +1623,35 @@ mod wrap_tests {
     }
 
     #[test]
+    fn a_column_and_the_character_drawn_there_find_each_other() {
+        let text = render_user("one two three", "you");
+        let wrapped = wrap(&text, 12);
+        // The row reads "\u{258c} one two": the text starts two columns in.
+        assert_eq!(wrapped.column(1, 0), 2);
+        assert_eq!(wrapped.column(1, 4), 6);
+        assert_eq!(wrapped.index(1, 6), 4);
+        // A column in the mark is the first character, one past the end the last.
+        assert_eq!(wrapped.index(1, 0), 0);
+        assert_eq!(wrapped.index(1, 40), wrapped.len(1));
+    }
+
+    #[test]
+    fn a_wide_character_is_one_character_over_two_columns() {
+        let text = Text::from("\u{4f60}\u{597d}ab");
+        let wrapped = wrap(&text, 20);
+        assert_eq!(wrapped.column(0, 2), 4);
+        assert_eq!(wrapped.index(0, 1), 0);
+        assert_eq!(wrapped.index(0, 2), 1);
+        assert_eq!(wrapped.byte(0, 2), 6);
+    }
+
+    #[test]
     fn what_a_row_says_is_a_piece_of_the_line_it_came_from() {
         let text = render_user("one two three four", "you");
         let wrapped = wrap(&text, 12);
         let line = wrapped.rows[1].line;
         let from = wrapped.byte(1, 0);
-        let to = wrapped.rows[2].end;
+        let to = wrapped.byte(2, wrapped.len(2));
         // Taken together the rows give the message back, spaces and all.
         assert_eq!(&wrapped.texts[line][from..to], "one two three four");
     }
