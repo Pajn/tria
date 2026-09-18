@@ -49,6 +49,10 @@ const TICK: Duration = Duration::from_millis(120);
 const TOAST_TTL: Duration = Duration::from_secs(6);
 const PREFIX_TTL: Duration = Duration::from_millis(1200);
 
+/// How often to look for worktrees that have gone from the disk. They only go when
+/// something removes one, which is rare and is usually this.
+const WORKTREE_REFRESH: Duration = Duration::from_secs(60);
+
 /// How often to re-read the open thread's checkout. The server does not report edits
 /// made outside it, so the working tree counts would otherwise sit still.
 const VCS_REFRESH: Duration = Duration::from_secs(20);
@@ -68,6 +72,8 @@ pub enum Mode {
     Search,
     /// Listing the agent's background tasks that have not reported an end.
     Tasks,
+    /// Listing the worktrees the server made for threads, to be rid of them.
+    Worktrees,
     /// Listing the subagents the thread has run, with their state and their reports.
     Agents,
     /// Listing the thread's terminal sessions, with close and restart.
@@ -171,6 +177,29 @@ struct PendingCreate {
     text: String,
 }
 
+/// The last two parts of a path, which is what tells one worktree from another.
+fn short_path(path: &str) -> String {
+    let parts: Vec<&str> = path.rsplit('/').take(2).collect();
+    parts.into_iter().rev().collect::<Vec<_>>().join("/")
+}
+
+/// A worktree the server made for a thread. Its own checkout, its own branch, and once
+/// the thread is done with it, a directory nobody will open again.
+pub struct ThreadWorktree {
+    pub thread_id: Id,
+    pub title: String,
+    pub project: String,
+    /// The repository the worktree belongs to, which is what git is asked from.
+    pub project_cwd: String,
+    pub path: String,
+    pub branch: Option<String>,
+    pub settled: bool,
+    pub running: bool,
+    /// What the checkout has that is not committed, once the server has said. `None`
+    /// until then, and for a worktree it could not read.
+    pub changes: Option<bool>,
+}
+
 /// A thread being composed that does not exist on the server yet.
 #[derive(Debug, Clone)]
 pub struct NewThreadDraft {
@@ -196,6 +225,16 @@ pub enum AppEvent {
     /// The server has made a thread a new message asked for, so there is now something
     /// to subscribe to.
     ThreadCreated(Id),
+    /// What a worktree has uncommitted, once the server has looked.
+    WorktreeChecked {
+        path: String,
+        changes: bool,
+    },
+    /// A worktree was removed, or was not.
+    WorktreeRemoved {
+        path: String,
+        result: Result<(), String>,
+    },
     /// The server would not make the thread a new message asked for.
     CreateRefused {
         thread_id: Id,
@@ -316,6 +355,18 @@ pub struct App {
     vcs_cwd: Option<String>,
     /// Set between asking for a thread and hearing whether it was made.
     pending_create: Option<PendingCreate>,
+    /// The worktree list as it was when it was opened, so it does not move under the
+    /// cursor while it is being read.
+    pub worktrees: Vec<ThreadWorktree>,
+    pub worktree_selected: usize,
+    /// The worktrees that are still on the disk, so the sidebar can mark the threads
+    /// holding one without asking the disk about every row it draws.
+    live_worktrees: HashSet<String>,
+    /// `None` until the first look, so the sidebar is marked as soon as there is a
+    /// thread list to mark rather than a minute later.
+    worktrees_checked: Option<Instant>,
+    /// Whether the server's disk is this one.
+    pub local_disk: bool,
     /// Whether the open thread was running at the last update, to notice it finishing.
     was_running: bool,
     /// When the checkout was last re-read.
@@ -398,6 +449,11 @@ impl App {
             vcs_remote: None,
             vcs_cwd: None,
             pending_create: None,
+            worktrees: Vec::new(),
+            worktree_selected: 0,
+            live_worktrees: HashSet::new(),
+            worktrees_checked: None,
+            local_disk: false,
             was_running: false,
             vcs_refreshed: Instant::now(),
             new_thread_model: None,
@@ -1593,6 +1649,211 @@ impl App {
         });
     }
 
+    // ── Worktrees ──────────────────────────────────────────────────────
+
+    /// Every worktree the server made for a thread and that is still on the disk. A
+    /// thread that runs in the project's own checkout has none, so having one is what
+    /// makes it ours to offer; a worktree that is some project's root is not, since a
+    /// project is a place to work rather than the leavings of a thread.
+    ///
+    /// Threads keep the path of a worktree long after it has gone, and most of them have
+    /// gone — so where the disk is ours to ask, it is asked. Where it is not, the
+    /// server's word is all there is.
+    fn collect_worktrees(&self) -> Vec<ThreadWorktree> {
+        let roots: Vec<&str> = self
+            .shell
+            .projects
+            .values()
+            .map(|p| p.workspace_root.as_str())
+            .collect();
+        let mut out: Vec<ThreadWorktree> = self
+            .shell
+            .threads
+            .values()
+            .filter_map(|thread| {
+                let path = thread.worktree_path.clone()?;
+                if roots.contains(&path.as_str()) {
+                    return None;
+                }
+                if self.local_disk && !std::path::Path::new(&path).is_dir() {
+                    return None;
+                }
+                let project = self.shell.projects.get(&thread.project_id)?;
+                Some(ThreadWorktree {
+                    thread_id: thread.id.clone(),
+                    title: thread.title.clone(),
+                    project: project.title.clone(),
+                    project_cwd: project.workspace_root.clone(),
+                    path,
+                    branch: thread.branch.clone(),
+                    settled: thread.is_settled(),
+                    running: thread.is_running(),
+                    changes: None,
+                })
+            })
+            .collect();
+        // The ones there is nothing left to wait for first, since they are the point.
+        out.sort_by(|a, b| {
+            (!a.settled, &a.project, &a.title).cmp(&(!b.settled, &b.project, &b.title))
+        });
+        out
+    }
+
+    /// Which of the worktrees the server says exist are still there. Threads keep the
+    /// path of a worktree that has been removed, so the answer is the disk's — where the
+    /// disk is ours to ask. Where it is not, the server's word is all there is.
+    fn refresh_live_worktrees(&mut self) {
+        self.worktrees_checked = Some(Instant::now());
+        self.live_worktrees = self
+            .collect_worktrees()
+            .into_iter()
+            .map(|worktree| worktree.path)
+            .collect();
+    }
+
+    fn refresh_worktrees_periodically(&mut self) {
+        if !self.shell.synchronized {
+            return;
+        }
+        match self.worktrees_checked {
+            Some(at) if at.elapsed() < WORKTREE_REFRESH => {}
+            _ => self.refresh_live_worktrees(),
+        }
+    }
+
+    /// Whether a thread is holding a worktree that is still on the disk.
+    pub fn holds_worktree(&self, thread: &crate::model::ThreadShell) -> bool {
+        thread
+            .worktree_path
+            .as_deref()
+            .is_some_and(|path| self.live_worktrees.contains(path))
+    }
+
+    /// Settled threads still holding one, which is the pile worth clearing.
+    pub fn settled_worktrees(&self) -> usize {
+        self.shell
+            .threads
+            .values()
+            .filter(|thread| thread.is_settled() && self.holds_worktree(thread))
+            .count()
+    }
+
+    fn open_worktrees(&mut self) {
+        self.worktrees = self.collect_worktrees();
+        self.worktree_selected = 0;
+        if self.worktrees.is_empty() {
+            self.toast("no thread has a worktree of its own", false);
+            return;
+        }
+        self.mode = Mode::Worktrees;
+        // What each one has uncommitted, asked for all at once: the answer decides
+        // whether it can go, and a list of this size is a handful of calls.
+        for worktree in &self.worktrees {
+            let handle = self.handle.clone();
+            let events = self.events.clone();
+            let path = worktree.path.clone();
+            tokio::spawn(async move {
+                let result = handle
+                    .call("vcs.refreshStatus", json!({ "cwd": path.clone() }))
+                    .await;
+                if let Ok(status) = result {
+                    let changes = status
+                        .get("hasWorkingTreeChanges")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let _ = events.send(AppEvent::WorktreeChecked { path, changes });
+                }
+            });
+        }
+    }
+
+    fn on_worktrees_key(&mut self, key: KeyEvent) {
+        let count = self.worktrees.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.worktree_selected = (self.worktree_selected + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.worktree_selected = self.worktree_selected.saturating_sub(1);
+            }
+            KeyCode::Char('g') => self.worktree_selected = 0,
+            KeyCode::Char('G') => self.worktree_selected = count.saturating_sub(1),
+            KeyCode::Char('x') | KeyCode::Char('d') => self.remove_worktree(false),
+            KeyCode::Char('X') | KeyCode::Char('D') => self.remove_worktree(true),
+            KeyCode::Enter | KeyCode::Char('l') => {
+                if let Some(worktree) = self.worktrees.get(self.worktree_selected) {
+                    let thread_id = worktree.thread_id.clone();
+                    self.mode = Mode::Normal;
+                    self.open_thread(&thread_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Hand a worktree back. Without `force` git refuses one with anything uncommitted
+    /// in it, which is the check worth having and is git's to make: it counts what is
+    /// not tracked as well, which a status does not.
+    fn remove_worktree(&mut self, force: bool) {
+        let Some(worktree) = self.worktrees.get(self.worktree_selected) else {
+            return;
+        };
+        if worktree.running {
+            self.toast("that thread is still running", true);
+            return;
+        }
+        // A shell sitting in it would be left in a directory that is not there.
+        if self
+            .terminals
+            .iter()
+            .any(|t| t.is_live() && t.cwd == worktree.path)
+        {
+            self.toast("a terminal is open in it", true);
+            return;
+        }
+        let path = worktree.path.clone();
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        let payload = json!({ "cwd": worktree.project_cwd, "path": path, "force": force });
+        self.toast(format!("removing {}", short_path(&path)), false);
+        tokio::spawn(async move {
+            let result = handle
+                .call("vcs.removeWorktree", payload)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            let _ = events.send(AppEvent::WorktreeRemoved { path, result });
+        });
+    }
+
+    fn on_worktree_checked(&mut self, path: String, changes: bool) {
+        if let Some(worktree) = self.worktrees.iter_mut().find(|w| w.path == path) {
+            worktree.changes = Some(changes);
+        }
+    }
+
+    fn on_worktree_removed(&mut self, path: String, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.worktrees.retain(|w| w.path != path);
+                self.live_worktrees.remove(&path);
+                self.worktree_selected = self
+                    .worktree_selected
+                    .min(self.worktrees.len().saturating_sub(1));
+                self.toast(format!("removed {}", short_path(&path)), false);
+                if self.worktrees.is_empty() && self.mode == Mode::Worktrees {
+                    self.mode = Mode::Normal;
+                }
+            }
+            // Git's own refusal, which is a whole paragraph of advice about --force.
+            Err(error) if error.contains("modified or untracked") => {
+                self.toast("it has uncommitted work in it · X removes it anyway", true)
+            }
+            Err(error) => self.toast(error, true),
+        }
+    }
+
     // ── Background tasks ───────────────────────────────────────────────
 
     /// Tasks the agent started that have not reported an end: monitors and backgrounded
@@ -2427,6 +2688,7 @@ impl App {
             "tasks" | "jobs" => self.open_tasks(),
             "agents" | "subagents" => self.open_agents(),
             "terminals" | "shells" => self.open_terminals(),
+            "worktrees" => self.open_worktrees(),
             "shell" => self.open_shell(),
             "worktree" | "wt" => self.toggle_draft_worktree(),
             "edit" => self.edit_composer(),
@@ -2607,6 +2869,7 @@ impl App {
             KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
             KeyCode::Char('A') if prefix == Some('g') => self.open_agents(),
             KeyCode::Char('S') if prefix == Some('g') => self.open_terminals(),
+            KeyCode::Char('W') if prefix == Some('g') => self.open_worktrees(),
             KeyCode::Char('e') if prefix == Some('g') => self.view_at_cursor(),
             KeyCode::Char('E') if prefix == Some('g') => self.view_conversation(),
             KeyCode::Char('a') if prefix == Some('g') => {
@@ -2990,6 +3253,7 @@ impl App {
             }
             Mode::Agents => self.on_agents_key(key),
             Mode::Terminals => self.on_terminals_key(key),
+            Mode::Worktrees => self.on_worktrees_key(key),
             // Handled above, before the global chords.
             Mode::TerminalPane => {}
             Mode::Picker => self.on_picker_key(key),
@@ -3055,6 +3319,7 @@ impl App {
                 KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
                 KeyCode::Char('A') if prefix == Some('g') => self.open_agents(),
                 KeyCode::Char('S') if prefix == Some('g') => self.open_terminals(),
+                KeyCode::Char('W') if prefix == Some('g') => self.open_worktrees(),
                 KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
                 KeyCode::Char('G') => {
                     self.sidebar_selected = self.sidebar_rows().len().saturating_sub(1);
@@ -3112,6 +3377,7 @@ impl App {
             KeyCode::Char('T') if prefix == Some('g') => return self.open_tasks(),
             KeyCode::Char('A') if prefix == Some('g') => return self.open_agents(),
             KeyCode::Char('S') if prefix == Some('g') => return self.open_terminals(),
+            KeyCode::Char('W') if prefix == Some('g') => return self.open_worktrees(),
             KeyCode::Char('e') if prefix == Some('g') => return self.edit_composer(),
             KeyCode::Char('E') if prefix == Some('g') => return self.view_conversation(),
             KeyCode::Char('a') if prefix == Some('g') => {
@@ -3916,6 +4182,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     let (handle, mut updates) = session::spawn(origin, token);
     let (events_tx, mut events) = mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new(handle, events_tx.clone());
+    app.local_disk = local_files;
     app.git_command = launch.git_command;
     app.editor = launch.editor;
     app.new_thread_model = launch.model;
@@ -3974,6 +4241,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
                 app.spinner = app.spinner.wrapping_add(1);
                 app.poll_popup();
                 app.refresh_vcs_periodically();
+                app.refresh_worktrees_periodically();
                 if app
                     .toast
                     .as_ref()
@@ -3985,6 +4253,8 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
             AppEvent::Update(update) => app.on_update(*update),
             AppEvent::ThreadCreated(thread_id) => app.on_thread_created(thread_id),
             AppEvent::CreateRefused { thread_id, error } => app.on_create_refused(thread_id, error),
+            AppEvent::WorktreeChecked { path, changes } => app.on_worktree_checked(path, changes),
+            AppEvent::WorktreeRemoved { path, result } => app.on_worktree_removed(path, result),
             AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
             AppEvent::Dispatched(Ok(())) => {}
             AppEvent::Called { result, ok } => match result {
@@ -4116,6 +4386,71 @@ mod tests {
             app.toast.map(|t| t.0),
             Some("git worktree add failed".to_string())
         );
+    }
+
+    fn shell_thread(id: &str, project: &str, worktree: Option<&str>) -> crate::model::ThreadShell {
+        serde_json::from_value(json!({
+            "id": id,
+            "projectId": project,
+            "title": id,
+            "modelSelection": { "instanceId": "i", "model": "m", "options": [] },
+            "worktreePath": worktree,
+            "settledAt": "2026-01-01T00:00:00Z",
+        }))
+        .expect("a thread the server could have sent")
+    }
+
+    /// A worktree is offered when a thread has one of its own and it is still there. A
+    /// project rooted in a worktree is not: it is a place to work, and taking it away
+    /// would take the project with it.
+    #[test]
+    fn only_the_worktrees_a_thread_is_holding_are_offered() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.local_disk = false;
+        project(&mut app);
+        app.shell.projects.insert(
+            "rooted".into(),
+            Project {
+                id: "rooted".into(),
+                title: "rooted".into(),
+                // A project whose root is itself a worktree of another repository.
+                workspace_root: "/worktrees/rooted".into(),
+                default_model_selection: None,
+                default_thread_env_mode: None,
+            },
+        );
+        for thread in [
+            shell_thread("has-one", "p", Some("/worktrees/p/one")),
+            shell_thread("in-the-checkout", "p", None),
+            shell_thread("is-a-project", "rooted", Some("/worktrees/rooted")),
+        ] {
+            app.shell.threads.insert(thread.id.clone(), thread);
+        }
+
+        let offered: Vec<String> = app
+            .collect_worktrees()
+            .into_iter()
+            .map(|worktree| worktree.thread_id)
+            .collect();
+        assert_eq!(offered, ["has-one"]);
+
+        // Where the disk is ours, one that has already gone is not offered either —
+        // which is most of them, since a thread keeps the path long after the worktree.
+        let here = std::env::temp_dir().join("tria-a-worktree-that-is-here");
+        std::fs::create_dir_all(&here).unwrap();
+        app.local_disk = true;
+        app.shell
+            .threads
+            .insert("here".into(), shell_thread("here", "p", here.to_str()));
+        let offered: Vec<String> = app
+            .collect_worktrees()
+            .into_iter()
+            .map(|worktree| worktree.thread_id)
+            .collect();
+        assert_eq!(offered, ["here"]);
+        std::fs::remove_dir(&here).unwrap();
     }
 
     /// Leaving a thread drops the status of the checkout it was in, because the next

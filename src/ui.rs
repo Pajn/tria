@@ -123,6 +123,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Tasks => draw_tasks(frame, app, area),
         Mode::Agents => draw_agents(frame, app, area),
         Mode::Terminals => draw_terminals(frame, app, area),
+        Mode::Worktrees => draw_worktrees(frame, app, area),
         Mode::TerminalPane => draw_terminal_pane(frame, app, area),
         _ => {}
     }
@@ -462,7 +463,15 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     }
                     _ => "  ",
                 };
-                let label = format!("{arrow}{} ({count})", section.label());
+                // The settled pile is where worktrees collect, so it says how many are
+                // still there: the count is the whole reminder that they need clearing.
+                let label = match section {
+                    Section::Settled => match app.settled_worktrees() {
+                        0 => format!("{arrow}{} ({count})", section.label()),
+                        held => format!("{arrow}{} ({count} · {held} ⌂)", section.label()),
+                    },
+                    _ => format!("{arrow}{} ({count})", section.label()),
+                };
                 let hint = match section {
                     Section::Settled if *collapsed => "  S",
                     _ => "",
@@ -487,9 +496,15 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 };
                 let is_current = app.current_thread_id.as_ref() == Some(id);
                 // The glyph carries the status; the right column always names the project.
-                let right = app.shell.project_title(&t.project_id).to_string();
+                let mut right = app.shell.project_title(&t.project_id).to_string();
+                // A worktree of its own, still on the disk. Marked only where the thread
+                // is done with it, since that is when it is leavings rather than a
+                // workplace.
+                if *parked && app.holds_worktree(t) {
+                    right = format!("⌂ {right}");
+                }
                 let right_style = dim;
-                let right_width = right.chars().count().min(12);
+                let right_width = right.chars().count().min(14);
                 let title_width = width.saturating_sub(right_width + 4);
                 let title = fit(&t.title, title_width);
                 let mut title_style = if *parked { dim } else { Style::default() };
@@ -1641,6 +1656,101 @@ fn vt_color(color: vt100::Color, fallback: Color) -> Color {
 
 /// The thread's terminal sessions, with close and restart. These are real shells on the
 /// server, shared with the desktop app.
+fn draw_worktrees(frame: &mut Frame, app: &App, area: Rect) {
+    let worktrees = &app.worktrees;
+    let width = 88.min(area.width);
+    let inner_width = width.saturating_sub(4) as usize;
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Three lines each, and there can be a great many: show the ones around the cursor
+    // rather than a list that runs off the bottom of the screen.
+    let selection = app.worktree_selected.min(worktrees.len().saturating_sub(1));
+    let room = (area.height.saturating_sub(6) / 3).max(1) as usize;
+    let first = selection
+        .saturating_sub(room.saturating_sub(1))
+        .min(worktrees.len().saturating_sub(room.min(worktrees.len())));
+    if first > 0 {
+        lines.push(Line::from(Span::styled(format!("   ⋯ {first} above"), dim)));
+    }
+    for (index, worktree) in worktrees.iter().enumerate().skip(first).take(room) {
+        let selected = index == selection;
+        // What it is waiting for, which is what says whether it can go.
+        let (glyph, glyph_style) = if worktree.running {
+            (app.spinner_frame(), Style::default().fg(Color::Cyan))
+        } else if worktree.settled {
+            ("✓", Style::default().fg(Color::Green))
+        } else {
+            ("●", Style::default().fg(Color::Yellow))
+        };
+        let mut title_style = Style::default();
+        if selected {
+            title_style = title_style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { " ▸ " } else { "   " },
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(format!("{glyph} "), glyph_style),
+            Span::styled(
+                fit(&worktree.title, inner_width.saturating_sub(6)),
+                title_style,
+            ),
+        ]));
+        let mut detail = vec![
+            Span::styled(format!("      {}", worktree.project), dim),
+            Span::styled(
+                format!("  {}", worktree.branch.as_deref().unwrap_or("no branch")),
+                Style::default().fg(Color::Blue),
+            ),
+        ];
+        match worktree.changes {
+            None => detail.push(Span::styled("  reading…", dim)),
+            Some(true) => detail.push(Span::styled(
+                "  uncommitted work",
+                Style::default().fg(Color::Yellow),
+            )),
+            Some(false) => detail.push(Span::styled("  clean", dim)),
+        }
+        lines.push(Line::from(detail));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "      {}",
+                fit(&worktree.path, inner_width.saturating_sub(6))
+            ),
+            dim,
+        )));
+    }
+    let below = worktrees.len().saturating_sub(first + room);
+    if below > 0 {
+        lines.push(Line::from(Span::styled(format!("   ⋯ {below} below"), dim)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  j k select · Enter open the thread · x remove · X remove anyway · Esc",
+        dim,
+    )));
+    let text = Text::from(lines);
+    let height = (text.lines.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let settled = worktrees.iter().filter(|w| w.settled).count();
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(
+            " worktrees ({}, {settled} settled) ",
+            worktrees.len()
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
 fn draw_terminals(frame: &mut Frame, app: &App, area: Rect) {
     let terminals = app.thread_terminals();
     let width = 80.min(area.width);
@@ -1991,6 +2101,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  gS                      terminals for this thread: Enter attaches,"),
         Line::from("                          c opens a new one, x closes, r restarts"),
         Line::from("  in the pane             every key goes to the shell · Ctrl-\\ detaches"),
+        Line::from("  gW                      worktrees threads are holding: Enter opens the"),
+        Line::from("                          thread, x removes one, X removes it anyway"),
         Line::from(
             "  ge                      composer: edit the draft · chat: view the block under the cursor",
         ),
@@ -2103,4 +2215,78 @@ fn hash_set(set: &HashSet<String>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     keys.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use super::*;
+    use crate::app::ThreadWorktree;
+
+    fn worktree(index: usize) -> ThreadWorktree {
+        ThreadWorktree {
+            thread_id: format!("id-{index}"),
+            title: format!("thread number {index}"),
+            project: "a-project".into(),
+            project_cwd: "/src/a-project".into(),
+            path: format!("/worktrees/a-project/w-{index}"),
+            branch: Some(format!("tria/{index}")),
+            settled: true,
+            running: false,
+            changes: Some(false),
+        }
+    }
+
+    fn drawn(width: u16, height: u16, app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_worktrees(frame, app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// More worktrees than there are rows for is the case worth drawing: the cursor has
+    /// to stay on the screen, and what is not on it has to be said rather than dropped.
+    #[test]
+    fn a_worktree_list_longer_than_the_screen_follows_the_cursor() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.worktrees = (0..20).map(worktree).collect();
+        app.worktree_selected = 19;
+
+        let screen = drawn(100, 24, &app);
+        assert!(screen.contains("thread number 19"), "{screen}");
+        assert!(!screen.contains("thread number 0 "), "{screen}");
+        assert!(screen.contains("above"), "{screen}");
+        assert!(screen.contains("worktrees (20, 20 settled)"), "{screen}");
+
+        // From the top, the other end is the one summarised.
+        app.worktree_selected = 0;
+        let screen = drawn(100, 24, &app);
+        assert!(screen.contains("thread number 0"), "{screen}");
+        assert!(screen.contains("below"), "{screen}");
+    }
+
+    /// A screen with no room at all still draws something rather than panicking.
+    #[test]
+    fn a_worktree_list_in_no_room_draws_anyway() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.worktrees = vec![worktree(1)];
+        drawn(24, 4, &app);
+        app.worktrees.clear();
+        drawn(24, 4, &app);
+    }
 }

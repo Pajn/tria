@@ -97,6 +97,7 @@ Press `?` inside the app for the full list.
 | `gT` | list the agent's background tasks that are still running |
 | `gA` | list the subagents the thread has run; `Enter` reads one's transcript (`r` re-reads a running one), `y` yanks its report |
 | `gS` | list the thread's terminals; attach to one, or close, restart, open a new one |
+| `gW` | list the worktrees threads are holding; remove the ones that are done with |
 | `gl` | open lazygit in a terminal popup for the thread |
 | `g!` | a shell in the popup, in the thread's directory |
 | `ge` | composer focused: edit the draft in your editor, read back on exit. Chat focused: view the message, plan, tool row, or tool group under the cursor |
@@ -160,6 +161,17 @@ A worktree branches off whatever the project's checkout has at the time, or off 
 copy of it where the server is set to start new worktrees from origin. Its branch is named
 after the thread rather than the message, since the server names the worktree's directory
 after the branch and a message is not a branch name.
+
+Worktrees outlive the threads that used them, so `gW` or `:worktrees` lists the ones threads
+are still holding: the thread, its project and branch, and whether the checkout has anything
+uncommitted in it. `x` removes the selected one and `X` removes it anyway — git refuses a
+worktree with modified or untracked files in it, which is the check worth having, and `X` is
+how you say you meant it. A worktree the server made for a thread is the only kind offered:
+one that a project is rooted in is a place to work rather than something left over.
+
+Removing a worktree leaves its branch, so nothing committed is lost by clearing them out.
+Threads that are done with a worktree still on the disk are marked `⌂` in the sidebar, and the
+settled section says how many there are.
 
 The model for a new thread is the last one you picked with `m`, remembered in the config file
 between runs. Without one it falls back to the project's default model, then the server's.
