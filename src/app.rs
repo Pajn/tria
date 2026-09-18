@@ -162,6 +162,15 @@ fn fuzzy_score(query: &str, label: &str, detail: &str) -> Option<i64> {
     Some(score)
 }
 
+/// A thread asked for and not yet made. Kept whole so a refusal can put back what was
+/// typed: the message is otherwise gone, and the view is left on a thread that will
+/// never exist.
+struct PendingCreate {
+    thread_id: Id,
+    draft: NewThreadDraft,
+    text: String,
+}
+
 /// A thread being composed that does not exist on the server yet.
 #[derive(Debug, Clone)]
 pub struct NewThreadDraft {
@@ -187,6 +196,11 @@ pub enum AppEvent {
     /// The server has made a thread a new message asked for, so there is now something
     /// to subscribe to.
     ThreadCreated(Id),
+    /// The server would not make the thread a new message asked for.
+    CreateRefused {
+        thread_id: Id,
+        error: String,
+    },
     /// A non-command RPC finished; `ok` is the toast for the success case.
     Called {
         result: Result<(), String>,
@@ -300,6 +314,8 @@ pub struct App {
     pub vcs_remote: Option<crate::model::VcsRemote>,
     /// The directory the watch is on, so it only resubscribes when the thread moves.
     vcs_cwd: Option<String>,
+    /// Set between asking for a thread and hearing whether it was made.
+    pending_create: Option<PendingCreate>,
     /// Whether the open thread was running at the last update, to notice it finishing.
     was_running: bool,
     /// When the checkout was last re-read.
@@ -381,6 +397,7 @@ impl App {
             vcs: None,
             vcs_remote: None,
             vcs_cwd: None,
+            pending_create: None,
             was_running: false,
             vcs_refreshed: Instant::now(),
             new_thread_model: None,
@@ -685,8 +702,18 @@ impl App {
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string());
-            if let (Ok(()), Some(thread_id)) = (&result, creates) {
-                let _ = events.send(AppEvent::ThreadCreated(thread_id));
+            match (&result, creates) {
+                (Ok(()), Some(thread_id)) => {
+                    let _ = events.send(AppEvent::ThreadCreated(thread_id));
+                }
+                (Err(error), Some(thread_id)) => {
+                    let _ = events.send(AppEvent::CreateRefused {
+                        thread_id,
+                        error: error.clone(),
+                    });
+                    return;
+                }
+                _ => {}
             }
             let _ = events.send(AppEvent::Dispatched(result));
         });
@@ -695,9 +722,38 @@ impl App {
     /// Subscribe to a thread the server has just made, unless the view has moved on in
     /// the meantime: a thread opened since the message was sent is the one wanted.
     fn on_thread_created(&mut self, thread_id: Id) {
+        self.pending_create.take();
         if self.current_thread_id.as_deref() == Some(thread_id.as_str()) {
             self.handle.open_thread(&thread_id);
         }
+    }
+
+    /// The server would not make the thread. The view is on one that does not exist and
+    /// the message has left the composer, so both go back: what was typed is the work,
+    /// and it is the only copy. Staying on the draft also keeps the view still, rather
+    /// than falling through to whichever thread happens to be first in the list.
+    fn on_create_refused(&mut self, thread_id: Id, error: String) {
+        let pending = self
+            .pending_create
+            .take()
+            .filter(|pending| pending.thread_id == thread_id);
+        let Some(pending) = pending else {
+            self.toast(error, true);
+            return;
+        };
+        // Unless the view has moved on by itself, in which case it is where it is meant
+        // to be and the message is still in the composer's history.
+        if self.current_thread_id.as_deref() == Some(thread_id.as_str()) {
+            self.current_thread_id = None;
+            self.thread = None;
+            self.draft = Some(pending.draft);
+            self.composer.set_text(&pending.text);
+            self.handle.close_thread();
+            self.sync_vcs_watch();
+            self.mode = Mode::Insert;
+            self.focus = Focus::Composer;
+        }
+        self.toast(error, true);
     }
 
     fn send_message(&mut self) {
@@ -752,6 +808,11 @@ impl App {
             );
             self.current_thread_id = Some(thread_id.clone());
             self.thread = None;
+            self.pending_create = Some(PendingCreate {
+                thread_id: thread_id.clone(),
+                draft,
+                text: text.clone(),
+            });
             self.dispatch_opening(command, Some(thread_id));
         } else if let Some(thread) = &self.thread {
             let shell = &thread.detail.shell;
@@ -3923,6 +3984,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
             }
             AppEvent::Update(update) => app.on_update(*update),
             AppEvent::ThreadCreated(thread_id) => app.on_thread_created(thread_id),
+            AppEvent::CreateRefused { thread_id, error } => app.on_create_refused(thread_id, error),
             AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
             AppEvent::Dispatched(Ok(())) => {}
             AppEvent::Called { result, ok } => match result {
@@ -3968,6 +4030,21 @@ mod tests {
         }
     }
 
+    fn project(app: &mut App) -> Id {
+        app.shell.projects.insert(
+            "p".into(),
+            Project {
+                id: "p".into(),
+                title: "p".into(),
+                workspace_root: "/src/p".into(),
+                default_model_selection: None,
+                default_thread_env_mode: None,
+            },
+        );
+        app.new_thread_model = Some(selection());
+        "p".into()
+    }
+
     fn status(ref_name: &str) -> crate::model::VcsLocal {
         VcsLocal {
             is_repo: true,
@@ -4006,6 +4083,38 @@ mod tests {
         assert_eq!(
             app.vcs.as_ref().and_then(|vcs| vcs.ref_name.as_deref()),
             Some("main")
+        );
+    }
+
+    /// A refused create used to leave the view on a thread that was never made and the
+    /// message nowhere at all.
+    #[tokio::test]
+    async fn a_thread_the_server_refuses_gives_the_message_back() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let project_id = project(&mut app);
+        app.start_new_thread(&project_id);
+        app.composer.set_text("the message");
+        app.send_message();
+
+        let thread_id = app
+            .current_thread_id
+            .clone()
+            .expect("a thread was asked for");
+        assert!(app.draft.is_none() && app.composer.text().is_empty());
+
+        app.on_create_refused(thread_id, "git worktree add failed".into());
+
+        assert!(
+            app.current_thread_id.is_none(),
+            "still on a thread that is not there"
+        );
+        assert_eq!(app.draft.map(|d| d.project_id), Some(project_id));
+        assert_eq!(app.composer.text(), "the message");
+        assert_eq!(
+            app.toast.map(|t| t.0),
+            Some("git worktree add failed".to_string())
         );
     }
 
