@@ -128,10 +128,17 @@ pub struct Picker {
     pub query: String,
     pub selected: usize,
     pub items: Vec<PickerItem>,
+    /// The project being renamed, while one is: the query line is its new title.
+    pub renaming: Option<Id>,
 }
 
 impl Picker {
     pub fn filtered(&self) -> Vec<&PickerItem> {
+        // While a name is being typed the list is not being searched, and a list that
+        // reshuffled under the row being renamed would be reshuffling for nothing.
+        if self.renaming.is_some() {
+            return self.items.iter().collect();
+        }
         let query = self.query.to_lowercase();
         let mut scored: Vec<(i64, &PickerItem)> = self
             .items
@@ -2573,8 +2580,34 @@ impl App {
             query: String::new(),
             selected: 0,
             items,
+            renaming: None,
         });
         self.mode = Mode::Picker;
+    }
+
+    /// Give a project a new name. The name is the server's, so this is the name the
+    /// project has everywhere — the sidebar here, the desktop app, the next client.
+    fn rename_project(&mut self, project: &str, title: &str) {
+        if title.is_empty() {
+            self.toast("a project needs a name", true);
+            return;
+        }
+        if !self.shell.projects.contains_key(project) {
+            self.toast("that project is no longer here", true);
+            return;
+        }
+        self.dispatch(commands::project_rename(project, title));
+        self.toast(format!("renamed the project to {title}"), false);
+    }
+
+    /// The project a rename with no project named is about: the open thread's, or the
+    /// one a draft is being written for.
+    fn current_project(&self) -> Option<Id> {
+        if let Some(draft) = &self.draft {
+            return Some(draft.project_id.clone());
+        }
+        let thread = self.thread.as_ref()?;
+        Some(thread.detail.shell.project_id.clone())
     }
 
     fn current_model_selection(&self) -> Option<&ModelSelection> {
@@ -2603,6 +2636,11 @@ impl App {
         let Some(picker) = self.picker.take() else {
             return;
         };
+        if let Some(project) = picker.renaming {
+            self.mode = Mode::Normal;
+            self.rename_project(&project, picker.query.trim());
+            return;
+        }
         let Some(item) = picker.filtered().get(picker.selected).map(|i| (*i).clone()) else {
             self.mode = Mode::Normal;
             return;
@@ -2727,6 +2765,15 @@ impl App {
                     d.runtime_mode = arg.into();
                 }
             }
+            "project" => match arg.split_once(char::is_whitespace) {
+                Some(("rename", title)) if !title.trim().is_empty() => {
+                    match self.current_project() {
+                        Some(project) => self.rename_project(&project, title.trim()),
+                        None => self.toast("no project open", true),
+                    }
+                }
+                _ => self.toast("usage: :project rename <name>", true),
+            },
             "rename" | "title" => match thread_id.as_deref() {
                 Some(id) if arg.is_empty() => self.dispatch(commands::meta_regenerate_title(id)),
                 Some(id) => self.dispatch(commands::meta_update_title(id, arg)),
@@ -3882,6 +3929,10 @@ impl App {
         };
         let count = picker.filtered().len();
         match key.code {
+            KeyCode::Esc if picker.renaming.is_some() => {
+                picker.renaming = None;
+                picker.query.clear();
+            }
             KeyCode::Esc => {
                 self.picker = None;
                 self.mode = if self.draft.is_some() {
@@ -3891,6 +3942,24 @@ impl App {
                 };
             }
             KeyCode::Enter => self.picker_select(),
+            // Ctrl-r rather than r: the letters go to the search, which is what the
+            // list is driven by. The name being changed takes the search's place, so
+            // there is nowhere else the typing could go.
+            KeyCode::Char('r')
+                if ctrl && picker.kind == PickerKind::Project && picker.renaming.is_none() =>
+            {
+                let chosen = picker
+                    .filtered()
+                    .get(picker.selected)
+                    .map(|item| (item.key.clone(), item.label.clone()));
+                match chosen {
+                    Some((project, title)) => {
+                        picker.renaming = Some(project);
+                        picker.query = title;
+                    }
+                    None => self.toast("no project under the cursor", true),
+                }
+            }
             KeyCode::Down | KeyCode::Tab => {
                 picker.selected = (picker.selected + 1).min(count.saturating_sub(1))
             }
@@ -3905,15 +3974,21 @@ impl App {
             KeyCode::Char('k') if ctrl => picker.selected = picker.selected.saturating_sub(1),
             KeyCode::Backspace => {
                 picker.query.pop();
-                picker.selected = 0;
+                if picker.renaming.is_none() {
+                    picker.selected = 0;
+                }
             }
             KeyCode::Char('u') if ctrl => {
                 picker.query.clear();
-                picker.selected = 0;
+                if picker.renaming.is_none() {
+                    picker.selected = 0;
+                }
             }
             KeyCode::Char(c) if !ctrl => {
                 picker.query.push(c);
-                picker.selected = 0;
+                if picker.renaming.is_none() {
+                    picker.selected = 0;
+                }
             }
             _ => {}
         }
@@ -4779,6 +4854,64 @@ mod tests {
             |request| matches!(request, crate::session::Request::WatchVcs { cwd } if cwd.as_deref() == Some("/src/p")),
         );
         assert!(asked, "the draft's checkout was never asked for");
+    }
+
+    /// Renaming from the list of projects: the letters go into the name rather than the
+    /// search that is usually under them, and what the server is asked is the new title.
+    #[tokio::test]
+    async fn a_project_is_renamed_by_typing_over_its_name() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        project(&mut app);
+        app.open_picker(PickerKind::Project);
+
+        let press = |app: &mut App, code, ctrl| {
+            app.on_picker_key(KeyEvent::new(
+                code,
+                if ctrl {
+                    KeyModifiers::CONTROL
+                } else {
+                    KeyModifiers::NONE
+                },
+            ))
+        };
+        press(&mut app, KeyCode::Char('r'), true);
+        // The name it already has is there to be edited, and the list stays put.
+        let picker = app.picker.as_ref().expect("the list is still open");
+        assert_eq!(picker.query, "p");
+        assert_eq!(picker.renaming.as_deref(), Some("p"));
+        press(&mut app, KeyCode::Backspace, false);
+        for letter in "shelf".chars() {
+            press(&mut app, KeyCode::Char(letter), false);
+        }
+        assert_eq!(app.picker.as_ref().unwrap().filtered().len(), 1);
+        press(&mut app, KeyCode::Enter, false);
+        tokio::task::yield_now().await;
+
+        let renamed = std::iter::from_fn(|| requests.try_recv().ok()).any(|request| {
+            matches!(request, crate::session::Request::Dispatch { command, .. }
+                if command["type"] == "project.meta.update"
+                    && command["projectId"] == "p"
+                    && command["title"] == "shelf")
+        });
+        assert!(renamed, "the server was never asked to rename it");
+    }
+
+    /// Escaping a rename leaves the project's name alone and the list where it was.
+    #[test]
+    fn a_rename_let_go_of_changes_nothing() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        project(&mut app);
+        app.open_picker(PickerKind::Project);
+        app.on_picker_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.on_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let picker = app.picker.as_ref().expect("the list is still open");
+        assert!(picker.renaming.is_none());
+        assert!(picker.query.is_empty());
+        assert_eq!(app.shell.projects["p"].title, "p");
     }
 
     use super::tmux_session_name;

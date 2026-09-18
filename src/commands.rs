@@ -151,6 +151,17 @@ pub fn meta_update_title(thread_id: &str, title: &str) -> Value {
     })
 }
 
+/// Rename a project. The title is the server's own, so every client that draws the
+/// project — this one, the desktop app — is renaming it for all of them.
+pub fn project_rename(project_id: &str, title: &str) -> Value {
+    json!({
+        "type": "project.meta.update",
+        "commandId": new_id(),
+        "projectId": project_id,
+        "title": title,
+    })
+}
+
 pub fn meta_regenerate_title(thread_id: &str) -> Value {
     json!({
         "type": "thread.meta.update",

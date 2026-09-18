@@ -1561,9 +1561,10 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     };
     frame.render_widget(Clear, popup);
     let title = match picker.kind {
+        _ if picker.renaming.is_some() => " rename project · Enter renames · Esc keeps it ",
         PickerKind::Thread => " threads ",
         PickerKind::Model => " models ",
-        PickerKind::Project => " new thread in project ",
+        PickerKind::Project => " new thread in project · ^R renames ",
         PickerKind::Effort => " effort ",
         PickerKind::PullRequest => " pull requests ",
     };
@@ -2201,7 +2202,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  v / V then y  ·  yy  ·  Ny   yank characters or lines to the clipboard"),
         Line::from("  / ?  n N               search forward / backward, next / previous match"),
         Line::from(""),
-        Line::from("  n                       new thread (pick project)"),
+        Line::from("  n                       new thread (pick project; ^R renames one)"),
         Line::from("  m                       change model"),
         Line::from("  i / Enter               write a message"),
         Line::from("  za  zR  zM              toggle / expand all / collapse all tool groups"),
@@ -2583,6 +2584,7 @@ mod tests {
                     key: "p2".into(),
                 },
             ],
+            renaming: None,
         });
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(picture::test_png(64, 64))
@@ -2653,6 +2655,7 @@ mod tests {
                 detail: "/src/shelfie".into(),
                 key: "p1".into(),
             }],
+            renaming: None,
         });
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(picture::test_png(64, 64))

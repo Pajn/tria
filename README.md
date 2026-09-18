@@ -85,7 +85,7 @@ Press `?` inside the app for the full list.
 | `/` | fuzzy thread picker |
 | `Tab` / `Shift-Tab` | cycle focus: composer, chat, thread list. `Esc` returns to the composer |
 | `s` `S` | toggle the sidebar / the settled shelf |
-| `n` | new thread (pick a project) |
+| `n` | new thread (pick a project; `^R` renames the one under the cursor) |
 | `gw` | new thread: start it in a fresh worktree, or the project's checkout |
 | `m` | change model |
 | `i` `a` `I` `A` `o` `O` or `Enter` | write a message (Vim insert entry) |
@@ -158,7 +158,8 @@ a long answer scrolls inside its row rather than wrapping, `Enter` confirms it, 
 goes back to the options without keeping it.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
-`mode plan|default`, `perm <runtime mode>`, `rename [title]`, `archive`, `delete!`, `stop`,
+`mode plan|default`, `perm <runtime mode>`, `rename [title]`, `project rename <name>`,
+`archive`, `delete!`, `stop`,
 `older`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
 `worktree`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`, `help`, `q`.
 
@@ -188,6 +189,12 @@ settled section says how many there are.
 
 The model for a new thread is the last one you picked with `m`, remembered in the config file
 between runs. Without one it falls back to the project's default model, then the server's.
+
+`^R` in that list renames the project under the cursor: the name it has takes the search's
+place, ready to be typed over, `Enter` renames it and `Esc` keeps the old one. `:project
+rename <name>` does the same for the project the open thread belongs to. The name is the
+server's, so it is the name everywhere — this sidebar, the desktop app, the next client to
+connect. It is `^R` rather than `r` because the letters in that list go to the search.
 
 The project list `n` opens draws each project with what it is known by: the emoji it was
 given, or failing that the icon its checkout carries, where the terminal can draw pictures at
