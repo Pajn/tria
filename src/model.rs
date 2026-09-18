@@ -31,12 +31,37 @@ pub struct Project {
     pub id: Id,
     pub title: String,
     pub workspace_root: String,
+    /// What somebody chose to draw the project as.
+    #[serde(default)]
+    pub project_icon: Option<ProjectIcon>,
     #[serde(default)]
     pub default_model_selection: Option<ModelSelection>,
     /// Where new threads for this project start: `worktree` or `local`. Unset means
     /// the server-wide setting decides.
     #[serde(default)]
     pub default_thread_env_mode: Option<String>,
+}
+
+/// The icon a project was given. The other kind is a name from a drawing set, which is
+/// a picture a terminal has no way to draw, so it is taken as no icon at all.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ProjectIcon {
+    Emoji {
+        emoji: String,
+    },
+    #[serde(other)]
+    Drawn,
+}
+
+impl Project {
+    /// The emoji the project is drawn with, where that is what it was given.
+    pub fn emoji(&self) -> Option<&str> {
+        match &self.project_icon {
+            Some(ProjectIcon::Emoji { emoji }) => Some(emoji),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -853,6 +878,7 @@ mod settings_tests {
             id: id.into(),
             title: id.into(),
             workspace_root: format!("/src/{id}"),
+            project_icon: None,
             default_model_selection: None,
             default_thread_env_mode: env_mode.map(str::to_string),
         }

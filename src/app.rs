@@ -2476,6 +2476,12 @@ impl App {
         self.favicons.get(project)?.as_deref()
     }
 
+    /// The emoji a project was given, which stands in front of it wherever it is named.
+    /// Chosen by hand, so it wins over the icon the server went looking for.
+    pub fn project_emoji(&self, project: &str) -> Option<&str> {
+        self.shell.projects.get(project)?.emoji()
+    }
+
     /// Hand a project an icon, for a test that draws one.
     #[cfg(test)]
     pub fn give_favicon(&mut self, project: &str, bytes: Vec<u8>) {
@@ -4553,6 +4559,7 @@ mod tests {
                 id: "p".into(),
                 title: "p".into(),
                 workspace_root: "/src/p".into(),
+                project_icon: None,
                 default_model_selection: None,
                 default_thread_env_mode: None,
             },
@@ -4663,6 +4670,7 @@ mod tests {
                 title: "rooted".into(),
                 // A project whose root is itself a worktree of another repository.
                 workspace_root: "/worktrees/rooted".into(),
+                project_icon: None,
                 default_model_selection: None,
                 default_thread_env_mode: None,
             },
@@ -4748,6 +4756,7 @@ mod tests {
                 id: "p".into(),
                 title: "p".into(),
                 workspace_root: "/src/p".into(),
+                project_icon: None,
                 default_model_selection: None,
                 default_thread_env_mode: Some("worktree".into()),
             },

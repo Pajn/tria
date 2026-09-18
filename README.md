@@ -189,10 +189,9 @@ settled section says how many there are.
 The model for a new thread is the last one you picked with `m`, remembered in the config file
 between runs. Without one it falls back to the project's default model, then the server's.
 
-Projects are drawn with the icon their checkout is known by, where the terminal can draw
-pictures at all: in the list `n` opens, beside the name, and in the sidebar in place of it —
-two columns instead of fourteen, with the rest going to the thread's title. A project the
-server found no icon for keeps its name, so nothing is lost by having none.
+The project list `n` opens draws each project with what it is known by: the emoji it was
+given, or failing that the icon its checkout carries, where the terminal can draw pictures at
+all. An icon from a drawing set is neither, and the project is drawn with its name alone.
 
 The looking is the server's: the icon the project names, then the one its `t3.json` names in
 `iconPath`, then the usual places a favicon lives, then whatever the project's `index.html`

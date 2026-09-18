@@ -11,6 +11,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use ratatui_image::sliced::SignedPosition;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{App, Focus, Mode, PickerKind, Scroll, Section, SidebarRow, approval_options},
@@ -23,6 +24,9 @@ use crate::{
 
 const SIDEBAR_WIDTH: u16 = 34;
 const MIN_WIDTH_FOR_SIDEBAR: u16 = 90;
+/// Columns kept in front of a project's name for what it is drawn with. Two for the
+/// picture or the emoji, one to stand it off the name.
+const MARK: usize = 3;
 const COMPOSER_MAX_ROWS: u16 = 8;
 
 /// Cached rendered chat blocks with their wrapped heights.
@@ -572,16 +576,8 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     ThreadStatus::Done | ThreadStatus::Idle => ("·", dim),
                 };
                 let is_current = app.current_thread_id.as_ref() == Some(id);
-                // The glyph carries the status; the right column says which project the
-                // thread belongs to. A project the server found an icon for is drawn as
-                // the icon, which says the same thing in two columns instead of fourteen
-                // and leaves the rest to the title.
-                let icon = app.favicon(&t.project_id).is_some();
-                let mut right = if icon {
-                    "  ".to_string()
-                } else {
-                    app.shell.project_title(&t.project_id).to_string()
-                };
+                // The glyph carries the status; the right column always names the project.
+                let mut right = app.shell.project_title(&t.project_id).to_string();
                 // A worktree of its own, still on the disk. Marked only where the thread
                 // is done with it, since that is when it is leavings rather than a
                 // workplace.
@@ -656,34 +652,6 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut state = ListState::default().with_offset(app.sidebar_offset);
     let list = List::new(items);
     frame.render_stateful_widget(list, inner, &mut state);
-
-    // The icons go on after the list, in the two columns each row kept at its right end.
-    for (offset, row) in rows.iter().skip(app.sidebar_offset).enumerate() {
-        if offset >= height {
-            break;
-        }
-        let SidebarRow::Thread { id, .. } = row else {
-            continue;
-        };
-        let Some(bytes) = app
-            .shell
-            .threads
-            .get(id)
-            .and_then(|t| app.favicon(&t.project_id))
-        else {
-            continue;
-        };
-        let key = format!("favicon:{}", app.shell.threads[id].project_id);
-        let area = Rect {
-            x: inner.x + inner.width.saturating_sub(2),
-            y: inner.y + offset as u16,
-            width: 2,
-            height: 1,
-        };
-        if picture::place(&key, picture::Source::Bytes(bytes), area.as_size()).is_some() {
-            picture::draw(frame, &key, area, SignedPosition::from((0, 0)));
-        }
-    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -1619,15 +1587,25 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     ));
 
     let items = picker.filtered();
-    // A project is drawn with the icon its checkout is known by, in room left for it.
+    // A project is drawn with what it is known by, in room kept at the front of the row:
+    // the emoji it was given, or failing that the icon its checkout carries.
     let icons = picker.kind == PickerKind::Project;
-    let gutter = if icons { "   " } else { "" };
-    let label_width = (list_area.width as usize).saturating_sub(4 + gutter.len());
+    let gutter = if icons { MARK } else { 0 };
+    let label_width = (list_area.width as usize).saturating_sub(4 + gutter);
     let list_items: Vec<ListItem> = items
         .iter()
         .map(|item| {
             let label_len = item.label.chars().count().min(label_width * 2 / 3);
-            let label = format!("{gutter}{}", fit(&item.label, label_len.max(1)));
+            let mark = match icons.then(|| app.project_emoji(&item.key)).flatten() {
+                // Emoji are drawn at whatever width the terminal gives them, so the room
+                // is filled out to keep the names in a line.
+                Some(emoji) => {
+                    let used = UnicodeWidthStr::width(emoji).min(MARK);
+                    format!("{emoji}{}", " ".repeat(MARK - used))
+                }
+                None => " ".repeat(gutter),
+            };
+            let label = format!("{mark}{}", fit(&item.label, label_len.max(1)));
             let remaining = label_width.saturating_sub(label.chars().count() + 2);
             ListItem::new(Line::from(vec![
                 Span::raw(label),
@@ -1660,6 +1638,10 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
             .take(list_area.height as usize)
             .enumerate()
         {
+            // The emoji was drawn with the label; a picture goes on over the row.
+            if app.project_emoji(&item.key).is_some() {
+                continue;
+            }
             let Some(bytes) = app.favicon(&item.key) else {
                 continue;
             };
@@ -2644,10 +2626,10 @@ mod tests {
         );
     }
 
-    /// In the sidebar the icon stands in for the project's name, which is the whole
-    /// point of it: two columns where there were fourteen, and the title takes the rest.
+    /// A project given an emoji is drawn with it, and that is what it is drawn with:
+    /// somebody chose it, so it stands in front of the icon the server went looking for.
     #[test]
-    fn a_threads_project_is_drawn_as_its_icon_rather_than_its_name() {
+    fn a_project_given_an_emoji_is_drawn_with_it() {
         picture::draw_in_halfblocks();
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = tokio::sync::mpsc::unbounded_channel();
@@ -2655,51 +2637,48 @@ mod tests {
         app.shell.projects.insert(
             "p1".into(),
             serde_json::from_value(json!({
-                "id": "p1", "title": "a-long-project", "workspaceRoot": "/src/p1",
-                "defaultModelSelection": null
+                "id": "p1", "title": "shelfie", "workspaceRoot": "/src/shelfie",
+                "defaultModelSelection": null,
+                "projectIcon": { "kind": "emoji", "emoji": "\u{1f4da}" }
             }))
             .unwrap(),
         );
-        app.shell.threads.insert(
-            "t1".into(),
-            serde_json::from_value(json!({
-                "id": "t1", "projectId": "p1", "title": "kettle on a long slow boil",
-                "modelSelection": { "instanceId": "i", "model": "m", "options": [] }
-            }))
-            .unwrap(),
-        );
-        app.shell.synchronized = true;
-
-        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let without = terminal.backend().buffer().clone();
-
+        app.mode = Mode::Picker;
+        app.picker = Some(crate::app::Picker {
+            kind: PickerKind::Project,
+            query: String::new(),
+            selected: 0,
+            items: vec![crate::app::PickerItem {
+                label: "shelfie".into(),
+                detail: "/src/shelfie".into(),
+                key: "p1".into(),
+            }],
+        });
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(picture::test_png(64, 64))
             .unwrap();
         app.give_favicon("p1", bytes);
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let with = terminal.backend().buffer().clone();
 
-        let text = |buffer: &ratatui::buffer::Buffer, y: u16| {
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = |y: u16| {
             (0..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
         };
-        let row = |buffer: &ratatui::buffer::Buffer| {
-            (0..buffer.area.height)
-                .find(|y| text(buffer, *y).contains("kettle"))
-                .expect("the thread should be listed")
-        };
-        assert!(text(&without, row(&without)).contains("a-long-project"));
-        let line = text(&with, row(&with));
-        assert!(!line.contains("a-long-project"), "{line:?}");
-        // Half blocks are colour rather than glyphs, and the icon sits at the right edge
-        // of the sidebar where the name was.
-        let painted: Vec<u16> = (0..with.area.width)
-            .filter(|x| with[(*x, row(&with))].bg != Color::Reset)
-            .collect();
-        assert_eq!(painted, vec![SIDEBAR_WIDTH - 3, SIDEBAR_WIDTH - 2]);
+        let row = (0..buffer.area.height)
+            .find(|y| text(*y).contains("shelfie"))
+            .expect("the project should be listed");
+        let line = text(row);
+        assert!(line.contains("\u{1f4da}"), "{line:?}");
+        // And the picture was left off, since the row already says what the project is:
+        // nothing on it is coloured but the bar under the selected row.
+        assert!(
+            (0..buffer.area.width)
+                .all(|x| matches!(buffer[(x, row)].bg, Color::Reset | Color::DarkGray)),
+            "{line:?}"
+        );
     }
 
     /// A screen with no room at all still draws something rather than panicking.
