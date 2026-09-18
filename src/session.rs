@@ -100,6 +100,14 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// A handle with nothing behind it but the queue of requests it was given, for
+    /// tests that care about what the UI asked the server for.
+    #[cfg(test)]
+    pub fn detached() -> (Self, mpsc::UnboundedReceiver<Request>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Handle { tx }, rx)
+    }
+
     pub fn open_thread(&self, thread_id: &str) {
         let _ = self.tx.send(Request::OpenThread(thread_id.to_string()));
     }
@@ -272,10 +280,7 @@ async fn run(
         let mut attached: Option<Subscription> = None;
         let mut vcs: Option<Subscription> = None;
         if let Some(cwd) = watched_cwd.clone() {
-            vcs = client
-                .subscribe("subscribeVcsStatus", json!({ "cwd": cwd.clone() }))
-                .await
-                .ok();
+            vcs = subscribe_vcs(&client, &cwd).await;
             refresh_vcs(&client, cwd);
         }
         if let Some(open) = open.as_mut() {
@@ -348,16 +353,8 @@ async fn run(
                         Request::WatchVcs { cwd } => {
                             watched_cwd = cwd.clone();
                             vcs = match cwd {
-                                // Not every thread directory is a checkout; the stream
-                                // says so itself and a failure is not worth reporting.
                                 Some(cwd) => {
-                                    let sub = client
-                                        .subscribe(
-                                            "subscribeVcsStatus",
-                                            json!({ "cwd": cwd.clone() }),
-                                        )
-                                        .await
-                                        .ok();
+                                    let sub = subscribe_vcs(&client, &cwd).await;
                                     refresh_vcs(&client, cwd);
                                     sub
                                 }
@@ -577,6 +574,22 @@ async fn subscribe_shell(client: &RpcClient, after: Option<u64>) -> Result<Subsc
 /// Re-read a checkout in the background. The server caches its git status and can be
 /// behind the disk; the refreshed result is broadcast to the watch, so the reply here
 /// is of no interest.
+/// Watch a checkout. Not every directory is one, and the stream says so itself, so a
+/// refusal is the UI showing no branch rather than anything to report — but a header
+/// that stays empty is a question, and this is where the answer is.
+async fn subscribe_vcs(client: &RpcClient, cwd: &str) -> Option<Subscription> {
+    match client
+        .subscribe("subscribeVcsStatus", json!({ "cwd": cwd }))
+        .await
+    {
+        Ok(sub) => Some(sub),
+        Err(err) => {
+            tracing::info!(%err, %cwd, "not watching this checkout");
+            None
+        }
+    }
+}
+
 fn refresh_vcs(client: &RpcClient, cwd: String) {
     let client = client.clone();
     tokio::spawn(async move {

@@ -565,8 +565,12 @@ impl App {
         }
         self.scroll = Scroll::Follow;
         self.expanded.clear();
+        // The watch goes with the status: where the thread being opened turns out to
+        // sit in the directory the last one did, nothing else would ask for a status
+        // to replace the one just dropped, and a quiet checkout sends none by itself.
         self.vcs = None;
         self.vcs_remote = None;
+        self.vcs_cwd = None;
         self.handle.open_thread(thread_id);
         if let Some(thread) = self.shell.threads.get(thread_id) {
             if thread.is_settled() {
@@ -3927,6 +3931,60 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::model::{Project, VcsLocal, VcsWorkingTree};
+
+    fn selection() -> ModelSelection {
+        ModelSelection {
+            instance_id: "instance".into(),
+            model: "a-model".into(),
+            options: vec![],
+        }
+    }
+
+    /// Leaving a thread drops the status of the checkout it was in, because the next
+    /// thread's directory is not known until its snapshot arrives. The watch has to go
+    /// with it: where the next thread — or a new one being drafted — sits in the same
+    /// directory, a watch that is still on it sends nothing, a quiet checkout offers
+    /// nothing unasked, and a draft that needs a branch to base a worktree on would be
+    /// refused for as long as the repository stayed quiet.
+    #[test]
+    fn leaving_a_thread_asks_again_for_a_checkout_it_was_already_watching() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.shell.projects.insert(
+            "p".into(),
+            Project {
+                id: "p".into(),
+                title: "p".into(),
+                workspace_root: "/src/p".into(),
+                default_model_selection: None,
+                default_thread_env_mode: Some("worktree".into()),
+            },
+        );
+        app.new_thread_model = Some(selection());
+        // Watching the project's own checkout, with its branch in hand.
+        app.vcs_cwd = Some("/src/p".into());
+        app.vcs = Some(VcsLocal {
+            is_repo: true,
+            ref_name: Some("main".into()),
+            is_default_ref: true,
+            has_working_tree_changes: false,
+            working_tree: VcsWorkingTree::default(),
+        });
+
+        app.open_thread("t1");
+        app.start_new_thread("p");
+
+        let asked = std::iter::from_fn(|| requests.try_recv().ok()).any(
+            |request| matches!(request, crate::session::Request::WatchVcs { cwd } if cwd.as_deref() == Some("/src/p")),
+        );
+        assert!(asked, "the draft's checkout was never asked for");
+    }
+
     use super::tmux_session_name;
 
     #[test]
