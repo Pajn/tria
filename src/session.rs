@@ -83,7 +83,13 @@ pub enum Update {
     /// Output from the attached terminal.
     TerminalStream(crate::model::TerminalStreamEvent),
     /// The watched checkout's state.
-    Vcs(crate::model::VcsEvent),
+    /// A checkout's status, with the directory it describes. The watch is asked for
+    /// through a queue, so a status of the directory just left can still be on its way
+    /// when the UI has moved on, and only the name tells them apart.
+    Vcs {
+        cwd: String,
+        event: crate::model::VcsEvent,
+    },
     /// The open thread's stream stopped and asking for it again did not work either,
     /// so nothing is listening to it now. Reopening the thread starts a new one, as does
     /// the next reconnection.
@@ -278,9 +284,12 @@ async fn run(
         };
         // Attachments belong to one socket; a reconnect drops it and the UI re-attaches.
         let mut attached: Option<Subscription> = None;
-        let mut vcs: Option<Subscription> = None;
+        // The directory travels with its subscription, so what it reports is named.
+        let mut vcs: Option<(String, Subscription)> = None;
         if let Some(cwd) = watched_cwd.clone() {
-            vcs = subscribe_vcs(&client, &cwd).await;
+            vcs = subscribe_vcs(&client, &cwd)
+                .await
+                .map(|sub| (cwd.clone(), sub));
             refresh_vcs(&client, cwd);
         }
         if let Some(open) = open.as_mut() {
@@ -315,7 +324,7 @@ async fn run(
             };
             let vcs_next = async {
                 match vcs.as_mut() {
-                    Some(sub) => sub.next().await,
+                    Some((_, sub)) => sub.next().await,
                     None => std::future::pending().await,
                 }
             };
@@ -355,8 +364,8 @@ async fn run(
                             vcs = match cwd {
                                 Some(cwd) => {
                                     let sub = subscribe_vcs(&client, &cwd).await;
-                                    refresh_vcs(&client, cwd);
-                                    sub
+                                    refresh_vcs(&client, cwd.clone());
+                                    sub.map(|sub| (cwd, sub))
                                 }
                                 None => None,
                             };
@@ -432,9 +441,10 @@ async fn run(
                     }
                 }
                 item = vcs_next => {
+                    let cwd = vcs.as_ref().map(|(cwd, _)| cwd.clone()).unwrap_or_default();
                     match item {
                         Some(Ok(value)) => match serde_json::from_value::<crate::model::VcsEvent>(value) {
-                            Ok(event) => { let _ = updates.send(Update::Vcs(event)); }
+                            Ok(event) => { let _ = updates.send(Update::Vcs { cwd, event }); }
                             Err(err) => tracing::warn!(?err, "undecodable vcs event"),
                         },
                         Some(Err(err)) => {

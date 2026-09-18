@@ -3471,8 +3471,15 @@ impl App {
             }
             Update::Terminals(event) => self.apply_terminal_event(event),
             Update::TerminalStream(event) => self.apply_terminal_stream(event),
-            Update::Vcs(event) => {
+            Update::Vcs { cwd, event } => {
                 use crate::model::VcsEvent;
+                // A status for a directory that is no longer the one being watched is
+                // the previous thread's checkout answering for this one's. It arrives
+                // because the watch is asked for through a queue the status is already
+                // in, and taking it would put the wrong branch under a new worktree.
+                if self.vcs_cwd.as_deref() != Some(cwd.as_str()) {
+                    return;
+                }
                 match event {
                     VcsEvent::Snapshot { local, remote } => {
                         self.vcs = Some(local);
@@ -3959,6 +3966,47 @@ mod tests {
             model: "a-model".into(),
             options: vec![],
         }
+    }
+
+    fn status(ref_name: &str) -> crate::model::VcsLocal {
+        VcsLocal {
+            is_repo: true,
+            ref_name: Some(ref_name.into()),
+            is_default_ref: true,
+            has_working_tree_changes: false,
+            working_tree: VcsWorkingTree::default(),
+        }
+    }
+
+    /// The watch is asked for through a queue, so the status of the directory just left
+    /// can arrive after the view has moved to another. Taken, it would answer for a
+    /// checkout it does not describe — and a new worktree would be branched off the
+    /// previous thread's branch, which the server may not be able to find at all.
+    #[test]
+    fn a_status_for_a_directory_no_longer_watched_is_not_taken() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.vcs_cwd = Some("/src/p".into());
+
+        app.on_update(crate::session::Update::Vcs {
+            cwd: "/src/p/../worktree".into(),
+            event: crate::model::VcsEvent::LocalUpdated {
+                local: status("a-worktree-branch"),
+            },
+        });
+        assert!(app.vcs.is_none(), "a status from elsewhere was taken");
+
+        app.on_update(crate::session::Update::Vcs {
+            cwd: "/src/p".into(),
+            event: crate::model::VcsEvent::LocalUpdated {
+                local: status("main"),
+            },
+        });
+        assert_eq!(
+            app.vcs.as_ref().and_then(|vcs| vcs.ref_name.as_deref()),
+            Some("main")
+        );
     }
 
     /// Leaving a thread drops the status of the checkout it was in, because the next

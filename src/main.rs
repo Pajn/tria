@@ -219,7 +219,7 @@ async fn dump(origin: &str, cfg: &config::Config, thread_id: &str, seconds: u64)
             }
             session::Update::Terminals(_)
             | session::Update::TerminalStream(_)
-            | session::Update::Vcs(_) => {}
+            | session::Update::Vcs { .. } => {}
             session::Update::Error(error) => println!("error: {error}"),
         }
     }
