@@ -630,8 +630,7 @@ impl App {
         let model_selection = self
             .new_thread_model
             .clone()
-            .or_else(|| project.and_then(|p| p.default_model_selection.clone()))
-            .or_else(|| self.config.settings.default_model_selection.clone())
+            .or_else(|| self.config.settings.model_selection(project))
             .or_else(|| self.first_usable_model());
         let Some(model_selection) = model_selection else {
             self.toast("no usable provider or model configured on the server", true);
@@ -639,9 +638,7 @@ impl App {
         };
         // The project's setting wins, then the server's; the server's own default is
         // the current checkout.
-        let env_mode = project
-            .and_then(|p| p.default_thread_env_mode.clone())
-            .or_else(|| self.config.settings.default_thread_env_mode.clone());
+        let env_mode = self.config.settings.thread_env_mode(project);
         self.swap_composer_draft(NEW_THREAD_DRAFT_KEY);
         self.draft = Some(NewThreadDraft {
             project_id: project_id.to_string(),

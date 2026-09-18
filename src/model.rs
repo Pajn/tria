@@ -3,6 +3,8 @@
 //! default, and open string unions stay `String`.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -679,6 +681,45 @@ pub struct ServerSettings {
     /// than the local one.
     #[serde(default)]
     pub new_worktrees_start_from_origin: bool,
+    /// What a project asks for in place of the settings above, by project id. This is
+    /// the server's own merged view of the per-project settings, so it answers for the
+    /// fields on a project as well as for anything set against the project since.
+    #[serde(default)]
+    pub project_settings_overrides: HashMap<Id, ProjectSettings>,
+}
+
+/// One project's answer to the settings that can be set per project.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSettings {
+    #[serde(default)]
+    pub default_model_selection: Option<ModelSelection>,
+    #[serde(default)]
+    pub default_thread_env_mode: Option<String>,
+}
+
+impl ServerSettings {
+    fn for_project(&self, project: Option<&Project>) -> Option<&ProjectSettings> {
+        self.project_settings_overrides.get(&project?.id)
+    }
+
+    /// The model a new thread in this project starts with. A project's own field is
+    /// taken too: the server folds it into the overrides itself, and where it has not,
+    /// it is still what the project says.
+    pub fn model_selection(&self, project: Option<&Project>) -> Option<ModelSelection> {
+        self.for_project(project)
+            .and_then(|settings| settings.default_model_selection.clone())
+            .or_else(|| project.and_then(|p| p.default_model_selection.clone()))
+            .or_else(|| self.default_model_selection.clone())
+    }
+
+    /// Where a new thread in this project starts: `worktree` or `local`.
+    pub fn thread_env_mode(&self, project: Option<&Project>) -> Option<String> {
+        self.for_project(project)
+            .and_then(|settings| settings.default_thread_env_mode.clone())
+            .or_else(|| project.and_then(|p| p.default_thread_env_mode.clone()))
+            .or_else(|| self.default_thread_env_mode.clone())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -800,5 +841,68 @@ mod tests {
         let detail: ThreadDetail = serde_json::from_str(json).unwrap();
         assert_eq!(detail.shell.title, "T");
         assert!(!detail.shell.has_pending_approvals);
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    fn project(id: &str, env_mode: Option<&str>) -> Project {
+        Project {
+            id: id.into(),
+            title: id.into(),
+            workspace_root: format!("/src/{id}"),
+            default_model_selection: None,
+            default_thread_env_mode: env_mode.map(str::to_string),
+        }
+    }
+
+    fn settings(overrides: &[(&str, &str)]) -> ServerSettings {
+        ServerSettings {
+            default_thread_env_mode: Some("local".into()),
+            project_settings_overrides: overrides
+                .iter()
+                .map(|(id, mode)| {
+                    (
+                        (*id).to_string(),
+                        ProjectSettings {
+                            default_model_selection: None,
+                            default_thread_env_mode: Some((*mode).to_string()),
+                        },
+                    )
+                })
+                .collect(),
+            ..ServerSettings::default()
+        }
+    }
+
+    /// What a project asks for is kept apart from the project itself, so reading only
+    /// the project is reading a field that is usually empty — and every new thread
+    /// starts in the checkout of a project that asked for a worktree.
+    #[test]
+    fn a_project_setting_is_taken_from_where_the_server_keeps_it() {
+        let settings = settings(&[("one", "worktree")]);
+        assert_eq!(
+            settings
+                .thread_env_mode(Some(&project("one", None)))
+                .as_deref(),
+            Some("worktree")
+        );
+        // Nothing set for it: the server-wide answer.
+        assert_eq!(
+            settings
+                .thread_env_mode(Some(&project("two", None)))
+                .as_deref(),
+            Some("local")
+        );
+        // Set on the project itself, which the server has not folded in yet.
+        assert_eq!(
+            settings
+                .thread_env_mode(Some(&project("two", Some("worktree"))))
+                .as_deref(),
+            Some("worktree")
+        );
+        assert_eq!(settings.thread_env_mode(None).as_deref(), Some("local"));
     }
 }
