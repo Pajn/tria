@@ -2,11 +2,13 @@
 //! subscription for the currently open thread. Reconnects with backoff and
 //! resumes both streams from their last applied sequence.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::{
     auth,
@@ -43,11 +45,14 @@ pub enum Request {
     },
     /// Drop the terminal attachment, which stops the server sending its output.
     Detach,
-    /// Watch the checkout at `cwd`, or stop watching when it is `None`.
+    /// Follow these checkouts and no others. A whole set rather than one directory:
+    /// the sidebar says where every thread's work stands, and threads sit in as many
+    /// checkouts as they have worktrees between them.
     WatchVcs {
-        cwd: Option<String>,
+        cwds: Vec<String>,
     },
-    /// Re-read the watched checkout, for when something outside the server changed it.
+    /// Re-read the followed checkouts, for when something outside the server changed
+    /// one of them.
     RefreshVcs,
     /// Throw away the connection and make another. What `:reconnect` sends: the way
     /// out of a connection that has settled into refusing, and a way to start again
@@ -86,10 +91,10 @@ pub enum Update {
     Terminals(crate::model::TerminalEvent),
     /// Output from the attached terminal.
     TerminalStream(crate::model::TerminalStreamEvent),
-    /// The watched checkout's state.
-    /// A checkout's status, with the directory it describes. The watch is asked for
-    /// through a queue, so a status of the directory just left can still be on its way
-    /// when the UI has moved on, and only the name tells them apart.
+    /// A checkout's status, with the directory it describes. Several are followed at
+    /// once and the watches are asked for through a queue, so a status can outlive the
+    /// watch that asked for it, and only the directory tells one checkout's from
+    /// another's.
     Vcs {
         cwd: String,
         event: crate::model::VcsEvent,
@@ -175,13 +180,14 @@ impl Handle {
         let _ = self.tx.send(Request::Detach);
     }
 
-    /// Follow the branch of a checkout. One at a time: this is for the open thread.
-    pub fn watch_vcs(&self, cwd: Option<String>) {
-        let _ = self.tx.send(Request::WatchVcs { cwd });
+    /// Follow these checkouts and no others. Directories that drop out of the set are
+    /// let go, and ones new to it are subscribed to.
+    pub fn watch_vcs(&self, cwds: Vec<String>) {
+        let _ = self.tx.send(Request::WatchVcs { cwds });
     }
 
-    /// Ask the server to re-read the watched checkout. Its own cache can be behind
-    /// what is on disk, and the result reaches the watch as an update.
+    /// Ask the server to re-read the followed checkouts. Its own cache can be behind
+    /// what is on disk, and the results reach the watches as updates.
     pub fn refresh_vcs(&self) {
         let _ = self.tx.send(Request::RefreshVcs);
     }
@@ -222,7 +228,10 @@ async fn run(
     let mut shell_sequence: Option<u64> = None;
     let mut open: Option<OpenThread> = None;
     // Kept across reconnects so the watch resumes with the socket.
-    let mut watched_cwd: Option<String> = None;
+    let mut watched_cwds: Vec<String> = Vec::new();
+    // A task per followed checkout, forwarding its statuses. Keyed by the directory,
+    // which is the only thing that tells one checkout's news from another's.
+    let mut following: HashMap<String, JoinHandle<()>> = HashMap::new();
     let mut attempt: u32 = 0;
     let mut pagination = false;
 
@@ -303,14 +312,12 @@ async fn run(
         };
         // Attachments belong to one socket; a reconnect drops it and the UI re-attaches.
         let mut attached: Option<Subscription> = None;
-        // The directory travels with its subscription, so what it reports is named.
-        let mut vcs: Option<(String, Subscription)> = None;
-        if let Some(cwd) = watched_cwd.clone() {
-            vcs = subscribe_vcs(&client, &cwd)
-                .await
-                .map(|sub| (cwd.clone(), sub));
-            refresh_vcs(&client, cwd);
+        // Subscriptions belong to the socket that made them, so the watches are dropped
+        // and asked for again on the new one.
+        for (_, task) in following.drain() {
+            task.abort();
         }
+        follow_checkouts(&client, &updates, &mut following, &watched_cwds);
         if let Some(open) = open.as_mut() {
             // A new socket with no stream on it is the same silence as a stream that
             // stopped, and is worth the same word: the conversation stops moving either
@@ -351,12 +358,6 @@ async fn run(
                     None => std::future::pending().await,
                 }
             };
-            let vcs_next = async {
-                match vcs.as_mut() {
-                    Some((_, sub)) => sub.next().await,
-                    None => std::future::pending().await,
-                }
-            };
             tokio::select! {
                 _ = &mut closed => break,
                 request = requests.recv() => {
@@ -392,20 +393,13 @@ async fn run(
                             }
                         }
                         Request::Detach => attached = None,
-                        Request::WatchVcs { cwd } => {
-                            watched_cwd = cwd.clone();
-                            vcs = match cwd {
-                                Some(cwd) => {
-                                    let sub = subscribe_vcs(&client, &cwd).await;
-                                    refresh_vcs(&client, cwd.clone());
-                                    sub.map(|sub| (cwd, sub))
-                                }
-                                None => None,
-                            };
+                        Request::WatchVcs { cwds } => {
+                            watched_cwds = cwds;
+                            follow_checkouts(&client, &updates, &mut following, &watched_cwds);
                         }
                         Request::RefreshVcs => {
-                            if let Some(cwd) = watched_cwd.clone() {
-                                refresh_vcs(&client, cwd);
+                            for cwd in &watched_cwds {
+                                refresh_vcs(&client, cwd.clone());
                             }
                         }
                         Request::LoadOlder { before_cursor } => {
@@ -471,20 +465,6 @@ async fn run(
                                 Err(_) => break,
                             }
                         }
-                    }
-                }
-                item = vcs_next => {
-                    let cwd = vcs.as_ref().map(|(cwd, _)| cwd.clone()).unwrap_or_default();
-                    match item {
-                        Some(Ok(value)) => match serde_json::from_value::<crate::model::VcsEvent>(value) {
-                            Ok(event) => { let _ = updates.send(Update::Vcs { cwd, event }); }
-                            Err(err) => tracing::warn!(?err, "undecodable vcs event"),
-                        },
-                        Some(Err(err)) => {
-                            tracing::info!(%err, "vcs status stream ended");
-                            vcs = None;
-                        }
-                        None => vcs = None,
                     }
                 }
                 item = attached_next => {
@@ -663,6 +643,65 @@ async fn subscribe_shell(client: &RpcClient, after: Option<u64>) -> Result<Subsc
 /// Re-read a checkout in the background. The server caches its git status and can be
 /// behind the disk; the refreshed result is broadcast to the watch, so the reply here
 /// is of no interest.
+/// Follow exactly `cwds`: let go of the checkouts that have left the set, and take up
+/// the ones new to it. A task each rather than one arm of the select, because the set
+/// changes as threads come and go and a task can simply be dropped.
+fn follow_checkouts(
+    client: &RpcClient,
+    updates: &mpsc::UnboundedSender<Update>,
+    following: &mut HashMap<String, JoinHandle<()>>,
+    cwds: &[String],
+) {
+    following.retain(|cwd, task| {
+        let keep = cwds.contains(cwd);
+        if !keep {
+            task.abort();
+        }
+        keep
+    });
+    for cwd in cwds {
+        if following.contains_key(cwd) {
+            continue;
+        }
+        let client = client.clone();
+        let updates = updates.clone();
+        let cwd = cwd.clone();
+        let task = tokio::spawn({
+            let cwd = cwd.clone();
+            async move {
+                let Some(mut sub) = subscribe_vcs(&client, &cwd).await else {
+                    return;
+                };
+                // The server answers a subscription from its own cache, which can be behind
+                // the disk, so the first real reading is asked for.
+                refresh_vcs(&client, cwd.clone());
+                while let Some(item) = sub.next().await {
+                    let value = match item {
+                        Ok(value) => value,
+                        Err(err) => {
+                            tracing::info!(%err, %cwd, "vcs status stream ended");
+                            return;
+                        }
+                    };
+                    match serde_json::from_value::<crate::model::VcsEvent>(value) {
+                        Ok(event) => {
+                            let update = Update::Vcs {
+                                cwd: cwd.clone(),
+                                event,
+                            };
+                            if updates.send(update).is_err() {
+                                return;
+                            }
+                        }
+                        Err(err) => tracing::warn!(?err, "undecodable vcs event"),
+                    }
+                }
+            }
+        });
+        following.insert(cwd, task);
+    }
+}
+
 /// Watch a checkout. Not every directory is one, and the stream says so itself, so a
 /// refusal is the UI showing no branch rather than anything to report — but a header
 /// that stays empty is a question, and this is where the answer is.

@@ -16,7 +16,7 @@ use ratatui_image::sliced::SignedPosition;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{App, Focus, Mode, PickerKind, Scroll, Section, SidebarRow, approval_options},
+    app::{App, Checkout, Focus, Mode, PickerKind, Scroll, Section, SidebarRow, approval_options},
     config::SidebarLayout,
     model::ThreadStatus,
     picture,
@@ -586,18 +586,12 @@ fn apply_selection(frame: &mut Frame, app: &App, chat: Rect) {
     }
 }
 
-/// How the checkout tria is watching stands: a dot for work that is not committed
-/// yet, the lines that work adds and takes away, and how far the branch has drifted
-/// from its upstream.
-///
-/// Only the open thread has one, because the checkout being watched is the open
-/// thread's. Saying nothing about the other rows is better than putting one thread's
-/// numbers under another thread's branch.
-fn git_marks(app: &App) -> Vec<Span<'static>> {
+/// How a checkout stands: a dot for work that is not committed yet, the lines that
+/// work adds and takes away, and how far the branch has drifted from its upstream.
+fn git_marks(checkout: &Checkout) -> Vec<Span<'static>> {
     let mut marks = Vec::new();
-    if let Some(vcs) = &app.vcs
-        && vcs.has_working_tree_changes
-    {
+    let vcs = &checkout.local;
+    if vcs.has_working_tree_changes {
         let tree = &vcs.working_tree;
         let counts = match tree.insertions + tree.deletions {
             0 => String::new(),
@@ -608,7 +602,7 @@ fn git_marks(app: &App) -> Vec<Span<'static>> {
             Style::default().fg(Color::Yellow),
         ));
     }
-    if let Some(remote) = &app.vcs_remote {
+    if let Some(remote) = &checkout.remote {
         if remote.ahead_count > 0 {
             marks.push(Span::styled(
                 format!("  ↑{}", remote.ahead_count),
@@ -748,28 +742,21 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     // text stops short of it whether or not this project has one.
                     let title_width = width.saturating_sub(ICON_COLUMN + 4);
                     let title = fit(&t.title, title_width);
-                    // Threads that were not given a worktree work in the project's own
-                    // checkout, so the one tria watches is several threads' at once and
-                    // what it knows is true of each of them.
-                    let watched = app.shares_watched_checkout(t);
+                    let checkout = app.checkout_of(t);
                     // What the thread is working in: its own branch, the branch of the
-                    // checkout it shares with the watched one, and failing both the
-                    // project it belongs to, which is always known.
-                    let mut under = t.branch.clone().or_else(|| {
-                        watched
-                            .then(|| app.vcs.as_ref().and_then(|vcs| vcs.ref_name.clone()))
-                            .flatten()
-                    });
+                    // checkout it works in, and failing both the project it belongs to,
+                    // which is always known.
+                    let mut under = t
+                        .branch
+                        .clone()
+                        .or_else(|| checkout.and_then(|c| c.local.ref_name.clone()));
                     if under.is_none() {
                         under = Some(app.shell.project_title(&t.project_id).to_string());
                     }
                     // Where the checkout stands goes on the right of the branch it is
                     // the state of. It needs room of its own, and the branch is what
                     // the line is for, so it is left off rather than squeezed in.
-                    let mut marks = match watched {
-                        true => git_marks(app),
-                        false => Vec::new(),
-                    };
+                    let mut marks = checkout.map(git_marks).unwrap_or_default();
                     let mut taken: usize = marks.iter().map(|s| s.content.chars().count()).sum();
                     if title_width.saturating_sub(taken) < LEAST_BRANCH {
                         marks.clear();
@@ -995,7 +982,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             format!("  in {}", app.shell.project_title(&draft.project_id)),
             Style::default().fg(Color::DarkGray),
         ));
-        let branch = app.vcs.as_ref().and_then(|vcs| vcs.ref_name.as_deref());
+        let branch = app.vcs().and_then(|vcs| vcs.ref_name.as_deref());
         let (label, style) = if draft.worktree {
             ("⌂ new worktree", Style::default().fg(Color::Cyan))
         } else {
@@ -1028,14 +1015,16 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         let branch = shell
             .branch
             .clone()
-            .or_else(|| app.vcs.as_ref().and_then(|vcs| vcs.ref_name.clone()));
+            .or_else(|| app.vcs().and_then(|vcs| vcs.ref_name.clone()));
         if let Some(branch) = branch {
             spans.push(Span::styled(
                 format!("   {branch}"),
                 Style::default().fg(Color::DarkGray),
             ));
         }
-        spans.extend(git_marks(app));
+        if let Some(checkout) = app.checkout() {
+            spans.extend(git_marks(checkout));
+        }
         // Only worth naming when the thread has a checkout of its own.
         if let Some(worktree) = shell.worktree_path.as_deref().and_then(worktree_name) {
             spans.push(Span::styled(
@@ -3949,18 +3938,19 @@ mod tests {
         assert_eq!(nx, stop + 2);
     }
 
-    /// Every row working in the watched checkout says where it stands, on the right of
-    /// the branch the state belongs to. Rows on a checkout of their own say nothing:
-    /// the numbers would be a lie under somebody else's branch.
+    /// Every row says where its own checkout stands, on the right of the branch the
+    /// state belongs to. Rows sharing a checkout say the same thing about it, a row on
+    /// a worktree of its own says what is true of that one, and a clean checkout says
+    /// nothing at all.
     #[test]
-    fn the_rows_on_the_watched_checkout_say_where_it_stands() {
+    fn every_row_says_where_its_own_checkout_stands() {
         picture::draw_in_halfblocks();
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         app.sidebar_layout = SidebarLayout::TwoLine;
         with_threads(&mut app);
-        // A second thread in the project's checkout, which is the one being watched.
+        // A second thread in the project's checkout, which two rows then share.
         app.shell.apply(crate::model::ShellItem::ThreadUpserted {
             sequence: 2,
             thread: serde_json::from_value(json!({
@@ -3973,47 +3963,68 @@ mod tests {
         });
         app.current_thread_id = Some("t1".into());
         app.vcs_cwd = Some("/src/tria".into());
-        app.vcs = Some(
-            serde_json::from_value(json!({
-                "isRepo": true,
-                "refName": "main",
-                "hasWorkingTreeChanges": true,
-                "workingTree": {"insertions": 252, "deletions": 316}
-            }))
-            .unwrap(),
+        let checkout = |local: serde_json::Value, remote: Option<serde_json::Value>| Checkout {
+            local: serde_json::from_value(local).unwrap(),
+            remote: remote.map(|r| serde_json::from_value(r).unwrap()),
+        };
+        app.checkouts.insert(
+            "/src/tria".into(),
+            checkout(
+                json!({"isRepo": true, "refName": "main", "hasWorkingTreeChanges": true,
+                       "workingTree": {"insertions": 252, "deletions": 316}}),
+                Some(json!({"aheadCount": 1})),
+            ),
         );
-        app.vcs_remote = Some(serde_json::from_value(json!({"aheadCount": 1})).unwrap());
+        app.checkouts.insert(
+            "/worktrees/t3code-afa6757e".into(),
+            checkout(
+                json!({"isRepo": true, "refName": "t3code/mobile-update-publish",
+                       "hasWorkingTreeChanges": true,
+                       "workingTree": {"insertions": 4, "deletions": 1}}),
+                Some(json!({"behindCount": 2})),
+            ),
+        );
+        app.checkouts.insert(
+            "/src/shelfie".into(),
+            checkout(json!({"isRepo": true, "refName": "trunk"}), None),
+        );
 
         let lines: Vec<String> = sidebar_text(&mut app).lines().map(str::to_string).collect();
-        let row = |needle: &str| {
-            lines
+        let under = |needle: &str| {
+            let at = lines
                 .iter()
                 .position(|line| line.contains(needle))
-                .unwrap_or_else(|| panic!("{needle} should be listed"))
+                .unwrap_or_else(|| panic!("{needle} should be listed"));
+            lines[at + 1].clone()
         };
-        let marks = "● +252 −316  ↑1";
-        for title in ["Can we add a way to sto", "Teach the picker"] {
-            let line = &lines[row(title) + 1];
+        // Hard against the column the branch stops short of for the project's icon,
+        // rather than trailing the branch wherever that happens to end.
+        let text_end = 3 + (SIDEBAR_WIDTH as usize - 1 - ICON_COLUMN - 4);
+        let aligned = |line: &str, marks: &str| {
             let at = line
                 .find(marks)
                 .unwrap_or_else(|| panic!("the checkout's state is on the row · {line}"));
-            // Hard against the column the branch stops short of for the project's icon,
-            // rather than trailing the branch wherever that happens to end.
-            let text_end = 3 + (SIDEBAR_WIDTH as usize - 1 - ICON_COLUMN - 4);
             assert_eq!(
                 line[..at].chars().count() + marks.chars().count(),
                 text_end,
                 "{line}"
             );
+        };
+
+        // Two threads in the project's own checkout, so both say the same of it.
+        for title in ["Can we add a way to sto", "Teach the picker"] {
+            let line = under(title);
+            aligned(&line, "● +252 −316  ↑1");
             assert!(line.contains("main"), "the branch is still named · {line}");
         }
-
-        // Its own worktree, so the watched checkout says nothing about it.
-        let elsewhere = &lines[row("Nx cache invalidation") + 1];
-        assert!(!elsewhere.contains('●'), "{elsewhere}");
-        // Another project altogether.
-        let other = &lines[row("What do I need to do") + 1];
-        assert!(!other.contains('●'), "{other}");
+        // A worktree of its own, with its own state.
+        let worktree = under("Nx cache invalidation");
+        aligned(&worktree, "● +4 −1  ↓2");
+        assert!(worktree.contains("t3code/"), "{worktree}");
+        // Nothing uncommitted and nowhere to push, so there is nothing to say.
+        let clean = under("What do I need to do");
+        assert!(!clean.contains('●'), "{clean}");
+        assert!(clean.contains("trunk"), "{clean}");
     }
 
     /// The branch is what the second line is for. Where there is no room for both, the
@@ -4028,16 +4039,20 @@ mod tests {
         with_threads(&mut app);
         app.current_thread_id = Some("t2".into());
         app.vcs_cwd = Some("/worktrees/t3code-afa6757e".into());
-        app.vcs = Some(
-            serde_json::from_value(json!({
-                "isRepo": true,
-                "hasWorkingTreeChanges": true,
-                "workingTree": {"insertions": 999_999, "deletions": 999_999}
-            }))
-            .unwrap(),
+        app.checkouts.insert(
+            "/worktrees/t3code-afa6757e".into(),
+            Checkout {
+                local: serde_json::from_value(json!({
+                    "isRepo": true,
+                    "hasWorkingTreeChanges": true,
+                    "workingTree": {"insertions": 999_999, "deletions": 999_999}
+                }))
+                .unwrap(),
+                remote: Some(
+                    serde_json::from_value(json!({"aheadCount": 99, "behindCount": 99})).unwrap(),
+                ),
+            },
         );
-        app.vcs_remote =
-            Some(serde_json::from_value(json!({"aheadCount": 99, "behindCount": 99})).unwrap());
 
         let lines: Vec<String> = sidebar_text(&mut app).lines().map(str::to_string).collect();
         let at = lines

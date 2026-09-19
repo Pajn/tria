@@ -61,8 +61,8 @@ const WORKTREE_REFRESH: Duration = Duration::from_secs(60);
 /// frozen for the rest of the session is the one answer that is always wrong.
 const STREAM_RETRY: Duration = Duration::from_secs(10);
 
-/// How often to re-read the open thread's checkout. The server does not report edits
-/// made outside it, so the working tree counts would otherwise sit still.
+/// How often to re-read the followed checkouts. The server does not report edits made
+/// outside it, so the working tree counts would otherwise sit still.
 const VCS_REFRESH: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -522,11 +522,14 @@ pub struct App {
     pending_pane_command: Option<String>,
     /// Where the pane's screen is drawn, for turning mouse positions into cells.
     pub pane_area: Rect,
-    /// The open thread's checkout, for the branch the thread list does not carry.
-    pub vcs: Option<crate::model::VcsLocal>,
-    /// How that checkout stands against its upstream.
-    pub vcs_remote: Option<crate::model::VcsRemote>,
-    /// The directory the watch is on, so it only resubscribes when the thread moves.
+    /// What each followed checkout is holding, by directory. A checkout is not one
+    /// thread's — every thread without a worktree of its own works in the project's —
+    /// so the state is kept under the directory it describes and read from there.
+    pub checkouts: HashMap<String, Checkout>,
+    /// The directories being followed, so a set that has not changed is not asked for
+    /// again.
+    watched_cwds: Vec<String>,
+    /// The open thread's checkout, which is the one the header speaks for.
     pub(crate) vcs_cwd: Option<String>,
     /// Set between asking for a thread and hearing whether it was made.
     pending_create: Option<PendingCreate>,
@@ -663,8 +666,8 @@ impl App {
             pane: None,
             pending_pane_command: None,
             pane_area: Rect::default(),
-            vcs: None,
-            vcs_remote: None,
+            checkouts: HashMap::new(),
+            watched_cwds: Vec::new(),
             vcs_cwd: None,
             pending_create: None,
             lost_stream: None,
@@ -939,11 +942,8 @@ impl App {
         // The view moving is the one thing a report of trouble always mentions and the
         // one thing the screen keeps no record of.
         tracing::info!(thread = %thread_id, "opening thread");
-        // The watch goes with the status: where the thread being opened turns out to
-        // sit in the directory the last one did, nothing else would ask for a status
-        // to replace the one just dropped, and a quiet checkout sends none by itself.
-        self.vcs = None;
-        self.vcs_remote = None;
+        // Which checkout the header speaks for is only known once the thread arrives
+        // and says where it works.
         self.vcs_cwd = None;
         self.handle.open_thread(thread_id);
         if let Some(thread) = self.shell.threads.get(thread_id) {
@@ -2036,12 +2036,11 @@ impl App {
         // The worktree branches off whatever the project's checkout has now, which is
         // what the watch reports.
         let base = self
-            .vcs
-            .as_ref()
+            .vcs()
             .filter(|vcs| vcs.is_repo)
             .and_then(|vcs| vcs.ref_name.clone());
         let Some(base) = base else {
-            let message = if self.vcs.is_none() {
+            let message = if self.vcs().is_none() {
                 "still reading the project's checkout; send again in a moment"
             } else {
                 "no branch to base a worktree on; gw starts in the checkout instead"
@@ -2089,17 +2088,32 @@ impl App {
         self.toast(message, false);
     }
 
-    /// Follow the open thread's checkout, so the header can show its branch. The thread
-    /// list only carries a branch for threads the server made one for.
+    /// Follow every checkout there is a thread on show in, so each row can say where
+    /// its own work stands and not just the open thread's. The thread list only carries
+    /// a branch for threads the server made one for, so this is where the rest of them
+    /// get theirs.
+    ///
+    /// The parked sections are left out: they are collapsed most of the time, and a
+    /// settled thread's worktree is usually gone.
     fn sync_vcs_watch(&mut self) {
-        let cwd = self.watch_directory();
-        if cwd == self.vcs_cwd {
+        self.vcs_cwd = self.watch_directory();
+        let sections = self.shell.sections(&commands::now_iso());
+        let mut cwds: Vec<String> = self.vcs_cwd.clone().into_iter().collect();
+        for thread in sections.pinned.iter().chain(&sections.active) {
+            if let Some(cwd) = self.directory_of(thread)
+                && !cwds.contains(&cwd)
+            {
+                cwds.push(cwd);
+            }
+        }
+        if cwds == self.watched_cwds {
             return;
         }
-        self.vcs = None;
-        self.vcs_remote = None;
-        self.vcs_cwd = cwd.clone();
-        self.handle.watch_vcs(cwd);
+        // Nothing is dropped from the map with the watch: a checkout that has gone
+        // quiet still holds what was last known of it, and a thread coming back to it
+        // reads that rather than an empty line until the first status arrives.
+        self.watched_cwds = cwds.clone();
+        self.handle.watch_vcs(cwds);
     }
 
     /// The mouse in the pane: to the program when it has asked for it, otherwise the
@@ -3187,11 +3201,19 @@ impl App {
         })
     }
 
-    /// Whether a thread works in the checkout tria is watching. One is watched at a
-    /// time and it is the open thread's, but a checkout is not a thread's to itself:
-    /// what is known of this one is true of every thread that works in it.
-    pub fn shares_watched_checkout(&self, thread: &crate::model::ThreadShell) -> bool {
-        self.vcs_cwd.is_some() && self.directory_of(thread) == self.vcs_cwd
+    /// What is known of the checkout a thread works in, if anything is yet.
+    pub fn checkout_of(&self, thread: &crate::model::ThreadShell) -> Option<&Checkout> {
+        self.checkouts.get(&self.directory_of(thread)?)
+    }
+
+    /// The open thread's checkout, which is what the header speaks for.
+    pub fn vcs(&self) -> Option<&crate::model::VcsLocal> {
+        self.checkout().map(|c| &c.local)
+    }
+
+    /// What is known of it, which is nothing until the first status arrives.
+    pub fn checkout(&self) -> Option<&Checkout> {
+        self.checkouts.get(self.vcs_cwd.as_deref()?)
     }
 
     /// `gD` and `:reveal`: show the thread's directory in whatever this machine browses
@@ -5289,6 +5311,8 @@ impl App {
                 // The sidebar draws a thread with its project's icon, so they are asked
                 // for as the projects arrive rather than when a list of them is opened.
                 self.ask_favicons();
+                // Threads arriving and leaving change which checkouts are on show.
+                self.sync_vcs_watch();
             }
             Update::Thread { thread_id, item } => {
                 if self.current_thread_id.as_deref() != Some(thread_id.as_str()) {
@@ -5331,20 +5355,18 @@ impl App {
             Update::TerminalStream(event) => self.apply_terminal_stream(event),
             Update::Vcs { cwd, event } => {
                 use crate::model::VcsEvent;
-                // A status for a directory that is no longer the one being watched is
-                // the previous thread's checkout answering for this one's. It arrives
-                // because the watch is asked for through a queue the status is already
-                // in, and taking it would put the wrong branch under a new worktree.
-                if self.vcs_cwd.as_deref() != Some(cwd.as_str()) {
-                    return;
-                }
+                // Filed under the directory it describes. Several checkouts are
+                // followed at once and a status can still be on its way when the watch
+                // that asked for it has been let go, so what a status is about is the
+                // one thing that must not be guessed from what is open.
+                let checkout = self.checkouts.entry(cwd).or_default();
                 match event {
                     VcsEvent::Snapshot { local, remote } => {
-                        self.vcs = Some(local);
-                        self.vcs_remote = remote;
+                        checkout.local = local;
+                        checkout.remote = remote;
                     }
-                    VcsEvent::LocalUpdated { local } => self.vcs = Some(local),
-                    VcsEvent::RemoteUpdated { remote } => self.vcs_remote = remote,
+                    VcsEvent::LocalUpdated { local } => checkout.local = local,
+                    VcsEvent::RemoteUpdated { remote } => checkout.remote = remote,
                     VcsEvent::Unknown => {}
                 }
             }
@@ -5747,6 +5769,14 @@ impl Section {
     }
 }
 
+/// What is known of one checkout: its branch and what is uncommitted, and how it
+/// stands against its upstream once the server has looked.
+#[derive(Debug, Clone, Default)]
+pub struct Checkout {
+    pub local: crate::model::VcsLocal,
+    pub remote: Option<crate::model::VcsRemote>,
+}
+
 #[derive(Debug, Clone)]
 pub enum SidebarRow {
     Header {
@@ -6039,24 +6069,27 @@ mod tests {
         }
     }
 
-    /// The watch is asked for through a queue, so the status of the directory just left
-    /// can arrive after the view has moved to another. Taken, it would answer for a
-    /// checkout it does not describe — and a new worktree would be branched off the
-    /// previous thread's branch, which the server may not be able to find at all.
+    /// Several checkouts are followed at once, so each status is filed under the
+    /// directory it describes and read back from there. Letting one answer for another
+    /// would branch a new worktree off the wrong branch, off one the server may not be
+    /// able to find at all.
     #[test]
-    fn a_status_for_a_directory_no_longer_watched_is_not_taken() {
+    fn a_status_answers_only_for_its_own_directory() {
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         app.vcs_cwd = Some("/src/p".into());
 
         app.on_update(crate::session::Update::Vcs {
-            cwd: "/src/p/../worktree".into(),
+            cwd: "/worktrees/p-1".into(),
             event: crate::model::VcsEvent::LocalUpdated {
                 local: status("a-worktree-branch"),
             },
         });
-        assert!(app.vcs.is_none(), "a status from elsewhere was taken");
+        assert!(
+            app.vcs().is_none(),
+            "another checkout answered for the open thread's"
+        );
 
         app.on_update(crate::session::Update::Vcs {
             cwd: "/src/p".into(),
@@ -6065,8 +6098,13 @@ mod tests {
             },
         });
         assert_eq!(
-            app.vcs.as_ref().and_then(|vcs| vcs.ref_name.as_deref()),
+            app.vcs().and_then(|vcs| vcs.ref_name.as_deref()),
             Some("main")
+        );
+        // And the worktree's is still there, under its own name.
+        assert_eq!(
+            app.checkouts["/worktrees/p-1"].local.ref_name.as_deref(),
+            Some("a-worktree-branch")
         );
     }
 
@@ -7791,19 +7829,19 @@ mod tests {
         app.new_thread_model = Some(selection());
         // Watching the project's own checkout, with its branch in hand.
         app.vcs_cwd = Some("/src/p".into());
-        app.vcs = Some(VcsLocal {
-            is_repo: true,
-            ref_name: Some("main".into()),
-            is_default_ref: true,
-            has_working_tree_changes: false,
-            working_tree: VcsWorkingTree::default(),
-        });
+        app.checkouts.insert(
+            "/src/p".into(),
+            Checkout {
+                local: status("main"),
+                remote: None,
+            },
+        );
 
         app.open_thread("t1");
         app.start_new_thread("p");
 
         let asked = std::iter::from_fn(|| requests.try_recv().ok()).any(
-            |request| matches!(request, crate::session::Request::WatchVcs { cwd } if cwd.as_deref() == Some("/src/p")),
+            |request| matches!(request, crate::session::Request::WatchVcs { cwds } if cwds.iter().any(|cwd| cwd == "/src/p")),
         );
         assert!(asked, "the draft's checkout was never asked for");
     }
