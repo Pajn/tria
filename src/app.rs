@@ -2636,6 +2636,22 @@ impl App {
         })
     }
 
+    /// `gD` and `:reveal`: show the thread's directory in whatever this machine browses
+    /// files with — the Finder, the file manager, the explorer. The path is the server's,
+    /// so it means nothing when the server is on another machine: there it is either not
+    /// a directory here or, worse, a different one.
+    fn reveal_directory(&mut self) {
+        let Some(dir) = self.thread_directory() else {
+            self.toast("no thread open", true);
+            return;
+        };
+        if !self.local_disk {
+            self.toast("the thread's directory is on the server's machine", true);
+            return;
+        }
+        self.open_url(&dir);
+    }
+
     /// `gt` and `:tmux`: switch the tmux client to the session named after the thread's
     /// directory, creating it there first when it does not exist.
     fn switch_tmux_session(&mut self) {
@@ -3138,6 +3154,7 @@ impl App {
             "sidebar" => self.sidebar_visible = !self.sidebar_visible,
             "pr" | "pull" => self.open_pull_request(true),
             "tmux" => self.switch_tmux_session(),
+            "reveal" | "dir" => self.reveal_directory(),
             // `:git` is what the `l` binding has always been called, whatever is on it.
             "git" | "lazygit" => self.open_program('l'),
             "usage" | "limits" => self.open_usage(),
@@ -3403,6 +3420,7 @@ impl App {
             }
             KeyCode::Char('x') if prefix == Some('g') => self.open_under_cursor(false),
             KeyCode::Char('t') if prefix == Some('g') => self.switch_tmux_session(),
+            KeyCode::Char('D') if prefix == Some('g') => self.reveal_directory(),
             KeyCode::Char('y') if prefix == Some('g') => self.yank_last_assistant(),
             KeyCode::Char('s') if prefix == Some('g') => {
                 let id = self.current_thread_id.clone();
@@ -3894,6 +3912,7 @@ impl App {
                 }
                 KeyCode::Char('!') if prefix == Some('g') => self.open_shell(),
                 KeyCode::Char('w') if prefix == Some('g') => self.toggle_draft_worktree(),
+                KeyCode::Char('D') if prefix == Some('g') => self.reveal_directory(),
                 KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
                 KeyCode::Char('A') if prefix == Some('g') => self.open_agents(),
                 KeyCode::Char('S') if prefix == Some('g') => self.open_terminals(),
@@ -5532,6 +5551,28 @@ mod tests {
         app.mode = Mode::Normal;
         app.on_mouse(click(2, 20));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// The thread's directory is a path on the machine the server runs on, so where that
+    /// is another machine it is not a directory to open here — it is either nothing or
+    /// somebody else's directory of the same name.
+    #[tokio::test]
+    async fn a_directory_on_another_machine_is_not_opened() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        project(&mut app);
+        watched(&mut app, None, "running");
+        app.local_disk = false;
+
+        app.reveal_directory();
+        let said = app.toast.as_ref().expect("it says why not").0.clone();
+        assert!(said.contains("server's machine"), "{said}");
+
+        // And with no thread at all there is no directory to mean.
+        app.thread = None;
+        app.reveal_directory();
+        assert!(app.toast.unwrap().0.contains("no thread open"));
     }
 
     /// `gx` on a row with a picture opens the picture, which is the one thing on a chat

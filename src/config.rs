@@ -69,7 +69,7 @@ pub const DEFAULT_GIT_COMMAND: &str = "lazygit";
 
 /// The keys tria answers after `g` itself. A program cannot be given one of these,
 /// because the key would never reach it.
-pub const TAKEN_KEYS: &str = "!AESTWaegstwxy";
+pub const TAKEN_KEYS: &str = "!ADESTWaegstwxy";
 
 /// A program bound to `g` and one more key, run in the thread's directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,12 +273,12 @@ mod tests {
     /// loud rather than bound to something that never runs.
     #[test]
     fn a_key_tria_answers_itself_cannot_be_taken() {
-        let (programs, refused) = config("[programs]\nw = \"yazi\"\nbb = \"yazi\"\n").programs();
+        let (programs, refused) =
+            config("[programs]\nw = \"yazi\"\nD = \"yazi\"\nbb = \"yazi\"\n").programs();
         assert_eq!(programs.len(), 1, "only the one tria ships with");
-        assert_eq!(refused.len(), 2, "{refused:?}");
-        assert!(
-            refused.iter().any(|said| said.contains("gw")),
-            "{refused:?}"
-        );
+        assert_eq!(refused.len(), 3, "{refused:?}");
+        for key in ["gw", "gD"] {
+            assert!(refused.iter().any(|said| said.contains(key)), "{refused:?}");
+        }
     }
 }

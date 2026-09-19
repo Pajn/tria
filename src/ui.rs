@@ -2650,6 +2650,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(
             "  gt                      switch to the tmux session for the thread's directory",
         ),
+        Line::from("  gD                      show the thread's directory in the file browser"),
         Line::from("  mouse drag              select chat text; released, it is copied"),
         Line::from("  Ctrl-c                  interrupt the running turn"),
         Line::from(""),

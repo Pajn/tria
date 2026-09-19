@@ -106,6 +106,7 @@ Press `?` inside the app for the full list.
 | `gE` | view the whole conversation in your editor |
 | `gx` | open the link on the cursor's line, else the picture the row has, else the thread's pull request |
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
+| `gD` | show the thread's directory in the machine's file browser (`:reveal`) |
 | `h` `l` `0` `$` `w` `b` | chat focused: move along the line under the cursor |
 | `v` `V` | chat focused: start a selection by character or by line; `y` copies it |
 | `Ctrl-c` | interrupt the running turn, or stop the background work left running without one |
@@ -163,6 +164,7 @@ Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [l
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `project rename <name>`,
 `archive`, `delete!`, `stop`, `stop!`,
 `older`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
+`reveal`,
 `worktree`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`, `usage`, `help`, `q`.
 
 ## New threads
@@ -260,7 +262,7 @@ interactive: one that prints and exits takes the popup with it. A key set to `""
 binding away, including `l`. Each binding also answers to the program's own name on the
 command line, so `:yazi` is `gb`; `:git` stays the name for whatever is on `l`, as does the
 older `git_command` setting, which `programs.l` overrides. The keys tria answers itself —
-`g` `a` `e` `s` `t` `w` `x` `y` `A` `E` `S` `T` `W` `!` — are refused, and tria says which
+`g` `a` `e` `s` `t` `w` `x` `y` `A` `D` `E` `S` `T` `W` `!` — are refused, and tria says which
 when it starts rather than binding a key that would never arrive.
 
 While a program is up, `Ctrl-\` leaves it running and its key comes back to it exactly as it
@@ -420,6 +422,14 @@ context`. It appears for a thread whose last context count was at least 100k tok
 was made over an hour ago, whose provider has a `compact` command to send, and which is
 not running or waiting on an answer — the same rule the desktop app offers it by. Typing
 takes it off the screen, and ignoring it costs nothing.
+
+## The thread's directory
+
+`gD` or `:reveal` hands the thread's working directory — its worktree when it has one, else
+the project root — to whatever this machine browses files with: the Finder, the explorer,
+the desktop's file manager, through the same platform opener a link goes to. The path is the
+server's, so where the server runs on another machine tria says so instead of opening a
+directory of that name here, which would be somebody else's.
 
 ## tmux
 
