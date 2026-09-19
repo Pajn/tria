@@ -321,6 +321,18 @@ what the desktop app's `Monitoring · Stop` sends. `S` or `:stop!` is the harder
 ends the provider session, and every process it started goes with it. Either way the
 conversation stays, and the next message starts a session again.
 
+## When the updates stop
+
+A thread's updates come over a stream of its own. If it ends, tria asks for it again
+from where it got to, and a stream that comes back is a moment of trouble nobody needs
+told about. One that will not come back is another matter: the conversation stops moving
+and looks exactly like one nobody is writing to, which is the worst thing a chat window
+can be quietly wrong about.
+
+So it says so, on a line under the header, for as long as it lasts — `⚠ this thread has
+stopped updating` — and keeps asking every ten seconds until the thread speaks again.
+Opening the thread again, or the next reconnection, also starts a new stream.
+
 ## Usage limits
 
 `:usage` shows what each signed-in account has left of its subscription: a bar per

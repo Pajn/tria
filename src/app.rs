@@ -56,6 +56,12 @@ const PREFIX_TTL: Duration = Duration::from_millis(1200);
 /// something removes one, which is rare and is usually this.
 const WORKTREE_REFRESH: Duration = Duration::from_secs(60);
 
+/// How often to ask again for a thread stream that stopped. The supervisor gives up
+/// after its own few tries, which is right for a stream that has just gone; what it
+/// cannot know is whether the server is back in a minute, and a conversation left
+/// frozen for the rest of the session is the one answer that is always wrong.
+const STREAM_RETRY: Duration = Duration::from_secs(10);
+
 /// How often to re-read the open thread's checkout. The server does not report edits
 /// made outside it, so the working tree counts would otherwise sit still.
 const VCS_REFRESH: Duration = Duration::from_secs(20);
@@ -271,6 +277,17 @@ pub enum AppEvent {
     },
 }
 
+/// The open thread's stream stopped and could not be got back. What is drawn is as far
+/// as it got, which looks exactly like a conversation nobody is writing to, so this
+/// lasts as long as the trouble does rather than the six seconds a toast gets.
+pub struct LostStream {
+    /// The thread it happened to. A thread left since is not the one on the screen.
+    pub thread_id: Id,
+    pub error: String,
+    /// When to ask for the stream again.
+    retry_at: Instant,
+}
+
 /// A transcript as the server read it off disk.
 #[derive(Debug)]
 pub struct TranscriptFile {
@@ -397,6 +414,8 @@ pub struct App {
     vcs_cwd: Option<String>,
     /// Set between asking for a thread and hearing whether it was made.
     pending_create: Option<PendingCreate>,
+    /// Set when the open thread stopped receiving updates, until they come back.
+    pub lost_stream: Option<LostStream>,
     /// The worktree list as it was when it was opened, so it does not move under the
     /// cursor while it is being read.
     pub worktrees: Vec<ThreadWorktree>,
@@ -503,6 +522,7 @@ impl App {
             vcs_remote: None,
             vcs_cwd: None,
             pending_create: None,
+            lost_stream: None,
             worktrees: Vec::new(),
             worktree_selected: 0,
             live_worktrees: HashSet::new(),
@@ -751,6 +771,7 @@ impl App {
         self.transcript = None;
         self.transcript_loading = None;
         self.current_thread_id = Some(thread_id.to_string());
+        self.lost_stream = None;
         self.unseen.remove(thread_id);
         self.thread = None;
         self.draft = None;
@@ -1600,6 +1621,44 @@ impl App {
 
     /// Re-read the checkout every so often, so the working tree counts stay true even
     /// when the edits came from somewhere the server is not watching.
+    /// What is wrong and will not right itself by being ignored, for the line under
+    /// the header. A toast says a thing once and is gone in six seconds; this is for
+    /// the trouble that is still true a minute later, where the screen otherwise looks
+    /// like everything is fine and simply quiet.
+    pub fn trouble(&self) -> Option<String> {
+        let lost = self.lost_stream.as_ref()?;
+        if self.current_thread_id.as_deref() != Some(lost.thread_id.as_str()) {
+            return None;
+        }
+        let error = lost.error.lines().next().unwrap_or(&lost.error);
+        let error: String = error.chars().take(96).collect();
+        Some(format!(
+            "this thread has stopped updating: {error} · asking again"
+        ))
+    }
+
+    /// Ask for a stream that stopped again, every so often, for as long as the thread
+    /// stays open. The supervisor has already given up on it, so nothing else will.
+    fn retry_lost_stream(&mut self) {
+        let Some(thread_id) = self.current_thread_id.clone() else {
+            self.lost_stream = None;
+            return;
+        };
+        let Some(lost) = self.lost_stream.as_mut() else {
+            return;
+        };
+        if lost.thread_id != thread_id {
+            self.lost_stream = None;
+            return;
+        }
+        if Instant::now() < lost.retry_at {
+            return;
+        }
+        lost.retry_at = Instant::now() + STREAM_RETRY;
+        tracing::info!(thread = %thread_id, "asking for the thread's stream again");
+        self.handle.open_thread(&thread_id);
+    }
+
     fn refresh_vcs_periodically(&mut self) {
         if self.vcs_cwd.is_none() || self.vcs_refreshed.elapsed() < VCS_REFRESH {
             return;
@@ -4475,6 +4534,8 @@ impl App {
                 if self.current_thread_id.as_deref() != Some(thread_id.as_str()) {
                     return;
                 }
+                // The thread speaking is the whole of what "the updates are back" means.
+                self.lost_stream = None;
                 match (&mut self.thread, item) {
                     (None, ThreadItem::Snapshot { snapshot }) => {
                         let mut state = ThreadState::from_snapshot(snapshot);
@@ -4527,8 +4588,21 @@ impl App {
                     VcsEvent::Unknown => {}
                 }
             }
-            Update::ThreadStreamError { error } => {
-                self.toast(format!("lost this thread's updates: {error}"), true)
+            Update::ThreadStreamError { thread_id, error } => {
+                if self.current_thread_id.as_deref() != Some(thread_id.as_str()) {
+                    return;
+                }
+                // Said once as it happens, and then left standing under the header:
+                // the toast is what catches the eye, the line is what is still there
+                // when you look up two minutes later.
+                if self.lost_stream.is_none() {
+                    self.toast(format!("lost this thread's updates: {error}"), true);
+                }
+                self.lost_stream = Some(LostStream {
+                    thread_id,
+                    error,
+                    retry_at: Instant::now() + STREAM_RETRY,
+                });
             }
             Update::Error(error) => self.toast(error, true),
         }
@@ -4990,6 +5064,7 @@ fn apply(app: &mut App, event: AppEvent) {
         AppEvent::Tick => {
             app.spinner = app.spinner.wrapping_add(1);
             app.poll_popup();
+            app.retry_lost_stream();
             app.refresh_vcs_periodically();
             app.refresh_worktrees_periodically();
             if app
@@ -5721,6 +5796,59 @@ mod tests {
             "{:?}",
             app.toast
         );
+    }
+
+    /// A thread whose updates have stopped looks exactly like one nobody is writing to,
+    /// which is why the toast was not enough: six seconds later the screen said nothing
+    /// was wrong and the conversation had quietly stopped being the conversation.
+    #[test]
+    fn a_thread_that_has_stopped_updating_says_so_until_it_starts_again() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.current_thread_id = Some("t1".into());
+
+        app.on_update(Update::ThreadStreamError {
+            thread_id: "t1".into(),
+            error: "the thread's stream ended".into(),
+        });
+        let said = app.trouble().expect("the line under the header");
+        assert!(said.contains("stopped updating"), "{said}");
+        assert!(said.contains("the thread's stream ended"), "{said}");
+
+        // It is asked for again, on its own, for as long as the thread stays open.
+        app.retry_lost_stream();
+        assert!(requests.try_recv().is_err(), "not before the interval");
+        app.lost_stream.as_mut().unwrap().retry_at = Instant::now();
+        app.retry_lost_stream();
+        assert!(
+            matches!(requests.try_recv(), Ok(crate::session::Request::OpenThread(id)) if id == "t1"),
+            "the stream is asked for again"
+        );
+
+        // And the thread speaking again is the whole of what "it is back" means.
+        app.on_update(Update::Thread {
+            thread_id: "t1".into(),
+            item: crate::model::ThreadItem::Synchronized,
+        });
+        assert!(app.trouble().is_none());
+    }
+
+    /// The trouble belongs to the thread it happened to. One left in the meantime is not
+    /// the one on the screen, and the thread that is has nothing wrong with it.
+    #[test]
+    fn a_stream_that_stopped_on_a_thread_since_left_is_not_this_thread_s_trouble() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.current_thread_id = Some("t2".into());
+
+        app.on_update(Update::ThreadStreamError {
+            thread_id: "t1".into(),
+            error: "gone".into(),
+        });
+        assert!(app.lost_stream.is_none());
+        assert!(app.trouble().is_none());
     }
 
     /// The fold keys step a level at a time as well as going straight to the ends, and

@@ -114,8 +114,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .height(main_area.width.saturating_sub(4), COMPOSER_MAX_ROWS)
         + 2;
 
-    let [header, chat, approvals, questions, composer, status] = Layout::vertical([
+    // Trouble that outlasts a toast gets a row of its own under the header, and only
+    // takes one when there is some.
+    let trouble = app.trouble();
+    let [header, banner, chat, approvals, questions, composer, status] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(u16::from(trouble.is_some())),
         Constraint::Fill(1),
         Constraint::Length(approval_rows),
         Constraint::Length(question_rows),
@@ -125,6 +129,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     .areas(main_area);
 
     draw_header(frame, app, header);
+    if let Some(trouble) = trouble {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" ⚠ {trouble}"),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ))),
+            banner,
+        );
+    }
     draw_chat(frame, app, chat);
     if let Some(first) = pending.first() {
         draw_approval(

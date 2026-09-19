@@ -221,8 +221,8 @@ async fn dump(origin: &str, cfg: &config::Config, thread_id: &str, seconds: u64)
             session::Update::OlderPage { snapshot, .. } => {
                 println!("older page: {} messages", snapshot.thread.messages.len())
             }
-            session::Update::ThreadStreamError { error } => {
-                println!("thread stream error: {error}")
+            session::Update::ThreadStreamError { thread_id, error } => {
+                println!("thread stream error ({thread_id}): {error}")
             }
             session::Update::Terminals(_)
             | session::Update::TerminalStream(_)

@@ -92,8 +92,10 @@ pub enum Update {
     },
     /// The open thread's stream stopped and asking for it again did not work either,
     /// so nothing is listening to it now. Reopening the thread starts a new one, as does
-    /// the next reconnection.
+    /// the next reconnection. Named, because a thread left in the meantime is no longer
+    /// the one on the screen and its trouble is nobody's to see.
     ThreadStreamError {
+        thread_id: Id,
         error: String,
     },
     Error(String),
@@ -293,9 +295,19 @@ async fn run(
             refresh_vcs(&client, cwd);
         }
         if let Some(open) = open.as_mut() {
-            open.subscription = subscribe_thread(&client, &open.id, open.last_sequence, pagination)
-                .await
-                .ok();
+            // A new socket with no stream on it is the same silence as a stream that
+            // stopped, and is worth the same word: the conversation stops moving either
+            // way, and the reconnection is what looked like the fix.
+            match subscribe_thread(&client, &open.id, open.last_sequence, pagination).await {
+                Ok(subscription) => open.subscription = Some(subscription),
+                Err(err) => {
+                    open.subscription = None;
+                    let _ = updates.send(Update::ThreadStreamError {
+                        thread_id: open.id.clone(),
+                        error: err.to_string(),
+                    });
+                }
+            }
         }
         attempt = 0;
         let _ = updates.send(Update::Status(Status::Connected));
@@ -501,7 +513,10 @@ async fn run(
                             o.attempts += 1;
                             if o.attempts >= STREAM_ATTEMPTS {
                                 o.subscription = None;
-                                let _ = updates.send(Update::ThreadStreamError { error: failed });
+                                let _ = updates.send(Update::ThreadStreamError {
+                                    thread_id: o.id.clone(),
+                                    error: failed,
+                                });
                             } else {
                                 // Only after the first, which is the one a thread being
                                 // made a moment ago answers on its own.
@@ -517,7 +532,10 @@ async fn run(
                                     // not going to change.
                                     Err(err) => {
                                         o.subscription = None;
-                                        let _ = updates.send(Update::ThreadStreamError { error: err.to_string() });
+                                        let _ = updates.send(Update::ThreadStreamError {
+                                            thread_id: o.id.clone(),
+                                            error: err.to_string(),
+                                        });
                                     }
                                 }
                             }
