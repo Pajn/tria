@@ -9,11 +9,24 @@ web, or mobile app for those.
 
 - A T3 Code server, either the desktop app or `npx t3@latest`, on the same machine or reachable
   over the network. It need not already be running: see [Starting the server](#starting-the-server).
-- Rust 1.88 or newer to build.
+- Rust 1.88 or newer, to build it yourself. The prebuilt binaries need nothing.
 
 ## Setup
 
-Build and install:
+A built binary, without a Rust toolchain:
+
+```sh
+cargo binstall tria
+```
+
+Releases carry one for Linux and macOS, on x86-64 and arm64. Anywhere else, and with
+`cargo install`, it is compiled from source:
+
+```sh
+cargo install tria
+```
+
+From a clone:
 
 ```sh
 cargo install --path .

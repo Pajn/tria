@@ -8,6 +8,10 @@ repository = "https://github.com/Pajn/tria"
 readme = "README.md"
 keywords = ["tui", "terminal", "chat", "ratatui", "t3code"]
 categories = ["command-line-utilities", "development-tools"]
+# Repository furniture rather than part of the program: the design notes stay where
+# somebody reading the protocol wants them, and the workflows only mean anything to
+# GitHub. Neither belongs in everybody's registry cache.
+exclude = ["PLAN.md", ".github"]
 
 [dependencies]
 anyhow = "1"
@@ -40,3 +44,11 @@ time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 vt100 = "0.16"
 lucide-icons = { version = "1.47.0", default-features = false }
 fontdue = "0.9.4"
+
+# Where `cargo binstall` looks for a built binary instead of compiling one. The URL is
+# spelled out rather than templated on the archive format, so that what the release
+# workflow writes and what binstall asks for cannot drift apart.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"

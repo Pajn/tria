@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# The release job writes the release and its files.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          # Built on the arm runner: the SDK carries both architectures, and the one C
+          # dependency in the tree — ring — cross-compiles with it.
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      # The binary sits at the root of the archive, which is where the `bin-dir` in
+      # Cargo.toml tells cargo-binstall to look for it.
+      - name: Archive
+        run: |
+          set -euo pipefail
+          archive="tria-${{ matrix.target }}.tar.gz"
+          tar -czf "$archive" -C "target/${{ matrix.target }}/release" tria
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tria-${{ matrix.target }}
+          path: |
+            tria-*.tar.gz
+            tria-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
