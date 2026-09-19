@@ -108,7 +108,9 @@ Press `?` inside the app for the full list.
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
 | `gD` | show the thread's directory in the machine's file browser (`:reveal`) |
 | `h` `l` `0` `$` `w` `b` | chat focused: move along the line under the cursor |
-| `v` `V` | chat focused: start a selection by character or by line; `y` copies it |
+| `v` `V` | start a selection by character or by line, in the chat or in the composer; `y` copies it |
+| `.` | composer focused: the last change again |
+| `gJ` | composer focused: join lines, since `J` opens the next thread |
 | `Ctrl-c` | interrupt the running turn, or stop the background work left running without one. Anywhere something is being typed or a list is open, it is `Esc` instead |
 | mouse wheel | scroll the conversation, or the thread list when the pointer is over it |
 | left click | in the thread list: open a thread, or fold and unfold a section; in the chat: open a link, or fold and unfold a tool group or row; in the composer: put the cursor there and write |
@@ -140,12 +142,22 @@ chat, `?` searches; help is `?` from the composer or `:help`.
 
 In the thread list, `j`/`k` move, `Enter` opens a thread or folds a section.
 
-Every other key in normal mode with the composer focused edits it with Vim semantics. Motions: `h j k l w b e
+With the composer focused, normal mode edits it with Vim semantics. Motions: `h j k l w b e
 W B E 0 ^ $ gg G f F t T ; ,`, all taking counts. Operators `d c y` combine with a motion or a
 text object (`iw aw iW aW`, `i" a"`, `i( a( i[ a[ i{ a{ i< a<`), plus `dd cc yy D C Y x X`. `p P`
 paste from the single register, `r` replaces a character, `~` toggles case, `u` and `Ctrl-r`
-undo and redo. Yanks also go to the system clipboard. The status bar shows a partially typed
-command.
+undo and redo. `v` and `V` select by character or by line — `o` swaps which end moves, the
+operators take the selection, and `iw` and its kind select an object outright. `.` makes the
+last change again, typing what was typed into it. Yanks also go to the system clipboard. The
+status bar shows a partially typed command.
+
+Eight letters are the app's rather than the editor's — `s S J K n m / ?` — and so are the
+digits, which answer an approval when there is one and nothing is written. They are the
+app's only while nothing is half typed at the composer: a count, an operator waiting for its
+motion, or a selection being made gives every one of them back to Vim, so `3J` joins three
+lines and `viws` substitutes a word. What they displace has another way in: `s` is `cl`, `S` is `cc`, and `J` is
+`gJ`. The emulation stops there — no marks, no search within the composer, no macros, no
+registers beyond the unnamed one, and no visual block.
 
 `g` and `z` are keys that have not finished being pressed, and the status bar shows them
 too, beside the rest of a half-typed command. They wait 1.2 seconds for the key that

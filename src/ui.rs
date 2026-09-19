@@ -1619,6 +1619,18 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             " THREADS ",
             Style::default().bg(Color::Cyan).fg(Color::Black).bold(),
         ),
+        (Mode::Normal, Focus::Composer)
+            if app.composer.vim_visual().is_some_and(|v| v.linewise) =>
+        {
+            (
+                " VISUAL LINE ",
+                Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
+            )
+        }
+        (Mode::Normal, Focus::Composer) if app.composer.vim_visual().is_some() => (
+            " VISUAL ",
+            Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
+        ),
         (_, Focus::Chat) if app.chat_visual.is_some_and(|a| a.whole_lines) => (
             " VISUAL LINE ",
             Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
@@ -2828,7 +2840,14 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(
             "  i a I A o O   insert · p P paste · r replace · ~ case · u / Ctrl-r undo / redo",
         ),
+        Line::from("  v V                     select by character or by line · o swaps the ends"),
+        Line::from("  .                       the last change again"),
+        Line::from("  gJ  3J                  join lines, since J itself is the next thread"),
         Line::from("  s / S                   toggle sidebar / settled shelf"),
+        Line::from("  s S J K n m / ? 1-9     the app's, and only while nothing is half typed"),
+        Line::from("                          at the composer: a count, an operator or a"),
+        Line::from("                          selection gives them back · s is cl, S is cc"),
+        Line::from("                          no marks, no search in the composer, no macros"),
         Line::from("  gs                      settle the thread, or bring a settled one back"),
         Line::from("  gw                      new thread: fresh worktree or the project checkout"),
         Line::from(programs),
@@ -3490,6 +3509,33 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A selection in the composer is drawn where it is. `v` is worth having only if you
+    /// can see what it has got hold of, and the mode says so beside it.
+    #[test]
+    fn a_selection_in_the_composer_is_marked() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_saying("hello"));
+        app.composer.set_text("one two");
+        for key in ['0', 'v', 'e'] {
+            app.composer.vim_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(key),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+
+        let buffer = screen(40, &mut app);
+        let area = app.composer_area;
+        let marked = |x: u16| buffer[(area.x + x, area.y)].style().bg == Some(Color::Blue);
+        assert!(marked(0) && marked(1) && marked(2), "the word is marked");
+        assert!(!marked(3), "and the space after it is not");
+        assert!(
+            chat(40, &mut app).contains("VISUAL"),
+            "and the mode says so"
+        );
     }
 
     /// A message wider than the chat is drawn over several rows, and each of them has to

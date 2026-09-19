@@ -43,9 +43,13 @@ impl Composer {
         self.col = 0;
         self.history_index = None;
         self.draft.clear();
+        self.vim_cancel();
+        self.vim_forget_insert();
     }
 
     pub fn set_text(&mut self, text: &str) {
+        self.vim_cancel();
+        self.vim_forget_insert();
         self.lines = text.split('\n').map(str::to_string).collect();
         if self.lines.is_empty() {
             self.lines.push(String::new());
@@ -348,13 +352,17 @@ impl Composer {
         let width = area.width.max(1) as usize;
         let cursor = self.cursor_row(&self.wrapped(width));
         let mut rows: Vec<Line<'static>> = Vec::new();
-        for line in &self.lines {
+        for (index, line) in self.lines.iter().enumerate() {
             let chars: Vec<char> = line.chars().collect();
             let chunks = chars.len().div_ceil(width).max(1);
+            let selected = self.selected_columns(index);
             for chunk in 0..chunks {
                 let start = chunk * width;
                 let end = ((chunk + 1) * width).min(chars.len());
-                rows.push(Line::from(chars[start..end].iter().collect::<String>()));
+                rows.push(match selected {
+                    Some(columns) => marked(&chars[start..end], start, columns),
+                    None => Line::from(chars[start..end].iter().collect::<String>()),
+                });
             }
         }
         if self.is_empty() && self.lines.len() == 1 {
@@ -378,6 +386,36 @@ impl Composer {
             ),
         )
     }
+}
+
+/// A drawn row with the selected part of it marked. `from` is where the row starts in
+/// its line, since a selection is in the line's own columns and a row is a slice of one.
+fn marked(row: &[char], from: usize, (start, end): (usize, usize)) -> Line<'static> {
+    let mark = Style::default().bg(Color::Blue);
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let mut marked = String::new();
+    for (at, ch) in row.iter().enumerate() {
+        let at = from + at;
+        if at >= start && at < end {
+            if !plain.is_empty() {
+                spans.push(Span::raw(std::mem::take(&mut plain)));
+            }
+            marked.push(*ch);
+        } else {
+            if !marked.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut marked), mark));
+            }
+            plain.push(*ch);
+        }
+    }
+    if !marked.is_empty() {
+        spans.push(Span::styled(marked, mark));
+    }
+    if !plain.is_empty() {
+        spans.push(Span::raw(plain));
+    }
+    Line::from(spans)
 }
 
 /// One line as one row of the screen: which line, and the slice of it shown.

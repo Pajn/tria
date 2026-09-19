@@ -3503,6 +3503,9 @@ impl App {
             self.toast("open a thread first (/ or Tab), or n for a new one", false);
             return;
         }
+        // Whatever was half typed or half selected at the composer was meant for the
+        // composer, and drawing a selection nothing is about to act on is a lie.
+        self.composer.vim_cancel();
         self.focus = Focus::Chat;
         let (height, total) = self.chat_viewport;
         if self.scroll == Scroll::Follow {
@@ -4238,6 +4241,10 @@ impl App {
             self.on_chat_key(key, prefix);
             return;
         }
+        // A key that is part of something the composer has already begun — a count, an
+        // operator waiting for its motion, a selection being made — belongs to the
+        // composer. The app only takes a letter that starts nothing.
+        let editing = self.composer.vim_busy();
         let question_pending = self
             .thread
             .as_ref()
@@ -4276,6 +4283,8 @@ impl App {
             KeyCode::Char('W') if prefix == Some('g') => return self.open_worktrees(),
             KeyCode::Char('e') if prefix == Some('g') => return self.edit_composer(),
             KeyCode::Char('E') if prefix == Some('g') => return self.view_conversation(),
+            // `J` is the next thread, so the join Vim puts there is on `gJ`.
+            KeyCode::Char('J') if prefix == Some('g') => return self.composer.vim_join(2),
             KeyCode::Char('a') if prefix == Some('g') => {
                 if question_pending {
                     self.begin_answering();
@@ -4284,11 +4293,11 @@ impl App {
                 }
                 return;
             }
-            KeyCode::Char('g') if !self.composer.vim_pending() => {
+            KeyCode::Char('g') if !editing => {
                 self.pending_prefix = Some(('g', Instant::now()));
                 return;
             }
-            KeyCode::Char('z') => {
+            KeyCode::Char('z') if !editing => {
                 self.pending_prefix = Some(('z', Instant::now()));
                 return;
             }
@@ -4307,26 +4316,30 @@ impl App {
                 self.expanded.clear();
                 return;
             }
-            KeyCode::Char('J') => return self.open_relative(1),
-            KeyCode::Char('K') => return self.open_relative(-1),
+            KeyCode::Char('J') if !editing => return self.open_relative(1),
+            KeyCode::Char('K') if !editing => return self.open_relative(-1),
             KeyCode::Tab => {
                 self.focus_chat();
                 return;
             }
+            // What was half typed at the composer, or half selected in it, was meant for
+            // the composer; it does not follow the focus out.
             KeyCode::BackTab => {
+                self.composer.vim_cancel();
                 self.sidebar_visible = true;
                 self.focus = Focus::Sidebar;
                 return;
             }
-            KeyCode::Char('/') => return self.open_picker(PickerKind::Thread),
-            KeyCode::Char('n') => return self.open_picker(PickerKind::Project),
-            KeyCode::Char('m') => return self.open_picker(PickerKind::Model),
+            KeyCode::Char('/') if !editing => return self.open_picker(PickerKind::Thread),
+            KeyCode::Char('n') if !editing => return self.open_picker(PickerKind::Project),
+            KeyCode::Char('m') if !editing => return self.open_picker(PickerKind::Model),
             KeyCode::Enter if question_pending => {
                 self.begin_answering();
                 return;
             }
             KeyCode::Enter => {
                 if self.thread.is_some() || self.draft.is_some() {
+                    self.composer.vim_cancel();
                     self.composer.checkpoint();
                     self.mode = Mode::Insert;
                 } else {
@@ -4339,17 +4352,15 @@ impl App {
                 self.command_line.clear();
                 return;
             }
-            KeyCode::Char('?') => return self.open_help(),
-            KeyCode::Char('s') if !self.composer.vim_pending() => {
+            KeyCode::Char('?') if !editing => return self.open_help(),
+            KeyCode::Char('s') if !editing => {
                 return self.sidebar_visible = !self.sidebar_visible;
             }
-            KeyCode::Char('S') if !self.composer.vim_pending() => {
+            KeyCode::Char('S') if !editing => {
                 return self.show_settled = !self.show_settled;
             }
             KeyCode::Char(c @ '1'..='9')
-                if approval_pending
-                    && !self.composer.vim_pending()
-                    && self.digits_answer_approval() =>
+                if approval_pending && !editing && self.digits_answer_approval() =>
             {
                 return self.respond_approval(c as usize - '1' as usize);
             }
@@ -4507,6 +4518,7 @@ impl App {
                         if self.chat_area.contains(at) {
                             let line = self.chat_offset() + (at.y - self.chat_area.y) as usize;
                             if self.thread.is_some() {
+                                self.composer.vim_cancel();
                                 self.focus = Focus::Chat;
                                 self.chat_visual = None;
                                 self.set_chat_cursor(line);
@@ -6322,6 +6334,69 @@ mod tests {
         }))
         .expect("an approval the server could have sent");
         ThreadState::from_snapshot(snapshot)
+    }
+
+    /// The app keeps a handful of letters the composer's Vim has no use for, but a key
+    /// that is part of a command already begun is the composer's whatever the letter is:
+    /// `3J` joins three lines rather than walking three threads down the list.
+    #[test]
+    fn a_half_typed_command_keeps_the_keys_the_app_would_take() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.composer.set_text("one\ntwo");
+        let press = |app: &mut App, ch: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+        };
+
+        // Nothing half-typed: the letters are the app's.
+        let sidebar = app.sidebar_visible;
+        press(&mut app, 's');
+        assert_ne!(app.sidebar_visible, sidebar, "s toggles the sidebar");
+        press(&mut app, 's');
+
+        // A count in front of them, and they are the composer's again.
+        for key in ['s', 'S', 'J', 'K', 'n', 'm', '/', '?', 'g', 'z'] {
+            press(&mut app, '2');
+            assert!(app.composer.vim_busy());
+            press(&mut app, key);
+            assert_eq!(app.mode, Mode::Normal, "{key} left normal mode");
+            assert!(app.picker.is_none(), "{key} opened a picker");
+            assert!(
+                app.waiting_prefix().is_none(),
+                "{key} started an app prefix"
+            );
+            app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        assert_eq!(app.sidebar_visible, sidebar, "and the sidebar stayed put");
+    }
+
+    /// A selection is a command half made, so the same rule holds while one is up — and
+    /// leaving the composer lets it go rather than leaving it drawn behind you.
+    #[test]
+    fn a_selection_keeps_the_keys_too() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(awaiting_approval());
+        app.composer.set_text("one two three");
+        app.on_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(app.composer.vim_visual().is_some());
+
+        // `s` substitutes the selection rather than toggling the sidebar.
+        let sidebar = app.sidebar_visible;
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.sidebar_visible, sidebar);
+        assert_eq!(app.mode, Mode::Insert, "and leaves it ready to type");
+        assert_eq!(app.composer.text(), " two three");
+
+        // A selection does not follow the focus out of the composer.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert!(app.composer.vim_visual().is_none());
     }
 
     /// One of the answers to an approval grants a permission for the whole session, and

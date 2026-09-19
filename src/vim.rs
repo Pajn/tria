@@ -75,6 +75,10 @@ enum Pending {
         op: Op,
         inner: bool,
     },
+    /// `i` or `a` in visual mode: the object becomes the selection.
+    Select {
+        inner: bool,
+    },
     Replace,
 }
 
@@ -91,6 +95,74 @@ struct Snapshot {
     col: usize,
 }
 
+/// A selection being made, anchored where it started. The other end is the cursor, so a
+/// selection is extended by moving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Visual {
+    anchor: Pos,
+    pub linewise: bool,
+}
+
+/// What a change did, as what was meant rather than as the keys that meant it: `.`
+/// repeats one by running the same command where the cursor is now. Vim replays the
+/// keystrokes; this replays the command, which comes to the same thing everywhere it
+/// matters and keeps the engine the one place that decides what a command does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum What {
+    /// An operator over a motion, `dw` and its kind.
+    Motion {
+        op: Op,
+        motion: Motion,
+        count: usize,
+    },
+    /// An operator over a text object, `ciw` and its kind.
+    Object {
+        op: Op,
+        object: char,
+        inner: bool,
+        count: usize,
+    },
+    /// The line forms, `dd` and `cc`.
+    Lines {
+        op: Op,
+        count: usize,
+    },
+    /// `D` and `C`.
+    ToLineEnd {
+        op: Op,
+    },
+    /// `x` and `X`.
+    Erase {
+        count: usize,
+        back: bool,
+    },
+    Replace {
+        ch: char,
+        count: usize,
+    },
+    Case {
+        count: usize,
+    },
+    Paste {
+        after: bool,
+        count: usize,
+    },
+    /// Insert entry: the key that opened it, `i a I A o O`.
+    Enter {
+        key: char,
+    },
+    Join {
+        count: usize,
+    },
+}
+
+/// A change and whatever was typed into the insert it opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Change {
+    what: What,
+    typed: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct VimState {
     count: Option<usize>,
@@ -103,6 +175,15 @@ pub struct VimState {
     register: Option<Register>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    visual: Option<Visual>,
+    /// The change `.` repeats.
+    last_change: Option<Change>,
+    /// The text as the insert now being typed found it, so that what is typed into it
+    /// can be read off the buffer when it ends and repeated with the change that opened
+    /// it. Vim records the keys instead; the text they left is the part `.` needs.
+    insert_before: Option<Vec<String>>,
+    /// Set while `.` runs, so a repeat does not record itself as the change to repeat.
+    replaying: bool,
 }
 
 /// What the caller has to do after a key.
@@ -153,9 +234,10 @@ impl Composer {
                     FindKind::TillBackward => 'T',
                 });
             }
+            Pending::Select { .. } => {}
             Pending::Replace => out.push('r'),
         }
-        if let Pending::Object { inner, .. } = self.vim.pending {
+        if let Pending::Object { inner, .. } | Pending::Select { inner } = self.vim.pending {
             out.push(if inner { 'i' } else { 'a' });
         }
         if let Some(n) = self.vim.count {
@@ -168,10 +250,71 @@ impl Composer {
         self.vim.pending = Pending::None;
         self.vim.count = None;
         self.vim.op_count = None;
+        self.vim.visual = None;
+    }
+
+    /// Whether the composer is in the middle of something — a half-typed command or a
+    /// selection being made. The app reads this before taking a key for itself: a key
+    /// that is part of something already begun belongs to the editor.
+    pub fn vim_busy(&self) -> bool {
+        self.vim_pending() || self.vim.visual.is_some()
+    }
+
+    /// Forget an insert that was open: the text has been replaced from outside, so
+    /// whatever stands there now is nobody's typing and `.` should not offer it.
+    pub(crate) fn vim_forget_insert(&mut self) {
+        self.vim.insert_before = None;
+    }
+
+    /// The selection being made, for the status bar and for drawing it.
+    pub fn vim_visual(&self) -> Option<Visual> {
+        self.vim.visual
+    }
+
+    /// The selection as positions in the text, end exclusive. Linewise covers whole
+    /// lines; charwise takes in the character the cursor is on, as Vim does.
+    fn visual_range(&self) -> Option<(Pos, Pos)> {
+        let visual = self.vim.visual?;
+        let cursor = (self.row, self.col);
+        let (start, end) = if visual.anchor <= cursor {
+            (visual.anchor, cursor)
+        } else {
+            (cursor, visual.anchor)
+        };
+        Some(if visual.linewise {
+            ((start.0, 0), (end.0, self.line_len(end.0)))
+        } else {
+            (start, (end.0, (end.1 + 1).min(self.line_len(end.0))))
+        })
+    }
+
+    /// Which characters of a line are selected, as columns, end exclusive. A line inside
+    /// the selection is selected to its end, so a run over several lines reads as one.
+    pub(crate) fn selected_columns(&self, row: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.visual_range()?;
+        if row < start.0 || row > end.0 {
+            return None;
+        }
+        let from = if row == start.0 { start.1 } else { 0 };
+        let to = if row == end.0 {
+            end.1
+        } else {
+            self.line_len(row)
+        };
+        Some((from, to.max(from)))
     }
 
     /// Leaving insert mode: Vim steps the cursor back onto the last typed character.
+    /// What was typed goes to the change that opened the insert, so `.` can type it
+    /// again — read off the buffer rather than out of the keys, so a word backspaced and
+    /// written again repeats as what was left, which is what was meant.
     pub fn leave_insert(&mut self) {
+        if let Some(before) = self.vim.insert_before.take()
+            && let Some(typed) = typed_text(&before, &self.lines)
+            && let Some(change) = self.vim.last_change.as_mut()
+        {
+            change.typed = Some(typed);
+        }
         self.col = self.col.saturating_sub(1);
         self.clamp_normal();
     }
@@ -217,6 +360,24 @@ impl Composer {
         }
         let pending = self.vim.pending;
         match pending {
+            Pending::Select { inner } => {
+                self.vim.pending = Pending::None;
+                let KeyCode::Char(ch) = key.code else {
+                    self.vim_cancel();
+                    return Effect::None;
+                };
+                let count = self.take_count();
+                if let Some((start, end)) = self.text_object(ch, inner, count) {
+                    self.vim.visual = Some(Visual {
+                        anchor: start,
+                        linewise: false,
+                    });
+                    self.row = end.0;
+                    self.col = end.1.saturating_sub(1);
+                    self.clamp_normal();
+                }
+                Effect::None
+            }
             Pending::Find { op, kind } => {
                 let KeyCode::Char(ch) = key.code else {
                     self.vim_cancel();
@@ -234,7 +395,16 @@ impl Composer {
                 };
                 let count = self.take_count();
                 match self.text_object(ch, inner, count) {
-                    Some((start, end)) => self.apply_op(op, start, end, Kind::Exclusive),
+                    Some((start, end)) => {
+                        let effect = self.apply_op(op, start, end, Kind::Exclusive);
+                        let what = What::Object {
+                            op,
+                            object: ch,
+                            inner,
+                            count,
+                        };
+                        self.changed(op, what, effect)
+                    }
                     None => {
                         self.vim_cancel();
                         Effect::None
@@ -248,22 +418,147 @@ impl Composer {
                     return Effect::None;
                 };
                 let count = self.take_count();
-                let len = self.line_len(self.row);
-                if self.col + count > len {
-                    return Effect::None;
-                }
-                self.checkpoint();
-                let row = self.row;
-                let mut chars: Vec<char> = self.lines[row].chars().collect();
-                for c in chars.iter_mut().skip(self.col).take(count) {
-                    *c = ch;
-                }
-                self.lines[row] = chars.into_iter().collect();
-                self.col += count - 1;
-                Effect::None
+                let effect = self.replace_chars(ch, count);
+                self.recorded(What::Replace { ch, count }, effect)
             }
             Pending::Op(op) => self.op_key(op, key.code),
+            Pending::None if self.vim.visual.is_some() => self.visual_key(key.code),
             Pending::None => self.plain_key(key.code),
+        }
+    }
+
+    /// A key with a selection up. The operators take the selection instead of waiting
+    /// for a motion; everything else moves the cursor, which is what extends it.
+    fn visual_key(&mut self, code: KeyCode) -> Effect {
+        match code {
+            KeyCode::Char(c @ '1'..='9') => {
+                self.push_digit(c as usize - '0' as usize);
+                Effect::None
+            }
+            KeyCode::Char('0') if self.vim.count.is_some() => {
+                self.push_digit(0);
+                Effect::None
+            }
+            // The same key again drops the selection; the other one changes what it
+            // covers, as in Vim.
+            KeyCode::Char('v') => {
+                self.set_visual(false);
+                Effect::None
+            }
+            KeyCode::Char('V') => {
+                self.set_visual(true);
+                Effect::None
+            }
+            // Swap the ends, so a selection made in the wrong direction can be grown the
+            // other way rather than started again.
+            KeyCode::Char('o') => {
+                if let Some(visual) = self.vim.visual.as_mut() {
+                    let anchor = std::mem::replace(&mut visual.anchor, (self.row, self.col));
+                    self.row = anchor.0;
+                    self.col = anchor.1;
+                    self.clamp_normal();
+                }
+                Effect::None
+            }
+            KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => self.visual_op(Op::Delete),
+            KeyCode::Char('c') | KeyCode::Char('s') => self.visual_op(Op::Change),
+            KeyCode::Char('y') => self.visual_op(Op::Yank),
+            // The shifted forms take whole lines, whatever the selection covers.
+            KeyCode::Char('D') | KeyCode::Char('X') => {
+                self.whole_lines();
+                self.visual_op(Op::Delete)
+            }
+            KeyCode::Char('S') | KeyCode::Char('C') => {
+                self.whole_lines();
+                self.visual_op(Op::Change)
+            }
+            KeyCode::Char('Y') => {
+                self.whole_lines();
+                self.visual_op(Op::Yank)
+            }
+            KeyCode::Char('~') => {
+                let Some((start, end)) = self.visual_range() else {
+                    return Effect::None;
+                };
+                self.vim.visual = None;
+                self.flip_case(start, end);
+                Effect::None
+            }
+            KeyCode::Char('J') => {
+                let (start, end) = match self.visual_range() {
+                    Some(range) => range,
+                    None => return Effect::None,
+                };
+                self.vim.visual = None;
+                self.row = start.0;
+                self.col = 0;
+                self.join(end.0 - start.0 + 1);
+                Effect::None
+            }
+            KeyCode::Char('i') => {
+                self.vim.pending = Pending::Select { inner: true };
+                Effect::None
+            }
+            KeyCode::Char('a') => {
+                self.vim.pending = Pending::Select { inner: false };
+                Effect::None
+            }
+            KeyCode::Char('f') => self.start_find(None, FindKind::Forward),
+            KeyCode::Char('F') => self.start_find(None, FindKind::Backward),
+            KeyCode::Char('t') => self.start_find(None, FindKind::TillForward),
+            KeyCode::Char('T') => self.start_find(None, FindKind::TillBackward),
+            KeyCode::Char(';') => self.repeat_find(None, false),
+            KeyCode::Char(',') => self.repeat_find(None, true),
+            // A key that means nothing here leaves the selection alone rather than
+            // dropping it: it costs a keystroke to make and `Esc` is how to let it go.
+            _ => match motion_for(code) {
+                Some(motion) => self.run_motion(None, motion),
+                None => Effect::None,
+            },
+        }
+    }
+
+    /// Start a selection, or change or drop the one there is. Asking for the kind it
+    /// already has is how Vim says it is finished with it.
+    fn set_visual(&mut self, linewise: bool) {
+        match self.vim.visual {
+            Some(visual) if visual.linewise == linewise => self.vim.visual = None,
+            Some(_) => {
+                if let Some(visual) = self.vim.visual.as_mut() {
+                    visual.linewise = linewise;
+                }
+            }
+            None => {
+                self.vim.visual = Some(Visual {
+                    anchor: (self.row, self.col),
+                    linewise,
+                });
+            }
+        }
+    }
+
+    /// Apply an operator to the selection, which the operator then ends.
+    fn visual_op(&mut self, op: Op) -> Effect {
+        let Some(visual) = self.vim.visual else {
+            return Effect::None;
+        };
+        let Some((start, end)) = self.visual_range() else {
+            return Effect::None;
+        };
+        self.vim.visual = None;
+        self.vim.count = None;
+        let kind = if visual.linewise {
+            Kind::Linewise
+        } else {
+            Kind::Exclusive
+        };
+        self.apply_op(op, start, end, kind)
+    }
+
+    /// Take whole lines, whatever the selection covers: the shifted operators do.
+    fn whole_lines(&mut self) {
+        if let Some(visual) = self.vim.visual.as_mut() {
+            visual.linewise = true;
         }
     }
 
@@ -292,102 +587,70 @@ impl Composer {
             KeyCode::Char('y') => self.start_op(Op::Yank),
             KeyCode::Char('x') | KeyCode::Delete => {
                 let count = self.take_count();
-                let len = self.line_len(self.row);
-                if len == 0 {
-                    return Effect::None;
-                }
-                let end = (self.row, (self.col + count).min(len));
-                self.apply_op(Op::Delete, (self.row, self.col), end, Kind::Exclusive)
+                let effect = self.erase(count, false);
+                self.recorded(What::Erase { count, back: false }, effect)
             }
             KeyCode::Char('X') => {
                 let count = self.take_count();
-                if self.col == 0 {
-                    return Effect::None;
-                }
-                let start = (self.row, self.col.saturating_sub(count));
-                self.apply_op(Op::Delete, start, (self.row, self.col), Kind::Exclusive)
+                let effect = self.erase(count, true);
+                self.recorded(What::Erase { count, back: true }, effect)
             }
             KeyCode::Char('D') => {
                 self.take_count();
-                self.apply_to_line_end(Op::Delete)
+                let effect = self.apply_to_line_end(Op::Delete);
+                self.recorded(What::ToLineEnd { op: Op::Delete }, effect)
             }
             KeyCode::Char('C') => {
                 self.take_count();
-                self.apply_to_line_end(Op::Change)
+                let effect = self.apply_to_line_end(Op::Change);
+                self.recorded(What::ToLineEnd { op: Op::Change }, effect)
             }
             KeyCode::Char('Y') => {
                 let count = self.take_count();
                 self.apply_lines(Op::Yank, count)
             }
-            KeyCode::Char('p') => self.paste(true),
-            KeyCode::Char('P') => self.paste(false),
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                let after = code == KeyCode::Char('p');
+                let count = self.take_count();
+                let effect = self.paste(after, count);
+                self.recorded(What::Paste { after, count }, effect)
+            }
             KeyCode::Char('r') => {
                 self.vim.pending = Pending::Replace;
                 Effect::None
             }
             KeyCode::Char('~') => {
                 let count = self.take_count();
-                let len = self.line_len(self.row);
-                if len == 0 {
-                    return Effect::None;
-                }
-                self.checkpoint();
-                let row = self.row;
-                let mut chars: Vec<char> = self.lines[row].chars().collect();
-                let end = (self.col + count).min(len);
-                for c in chars.iter_mut().take(end).skip(self.col) {
-                    *c = if c.is_uppercase() {
-                        c.to_lowercase().next().unwrap_or(*c)
-                    } else {
-                        c.to_uppercase().next().unwrap_or(*c)
-                    };
-                }
-                self.lines[row] = chars.into_iter().collect();
-                self.col = end.min(len - 1);
-                Effect::None
+                let effect = self.flip_case_forward(count);
+                self.recorded(What::Case { count }, effect)
             }
             KeyCode::Char('u') => {
                 self.vim_cancel();
                 self.undo();
                 Effect::None
             }
-            KeyCode::Char('i') => {
-                self.vim_cancel();
-                self.checkpoint();
-                Effect::EnterInsert
+            KeyCode::Char('.') => self.repeat(),
+            // Bare `J` opens the next thread and never reaches here. `3J` does, because
+            // a count is the composer's — and a count is the reason to reach for `J`
+            // rather than `gJ`.
+            KeyCode::Char('J') => {
+                let count = self.take_count().max(2);
+                self.join(count);
+                self.recorded(What::Join { count }, Effect::None)
             }
-            KeyCode::Char('a') => {
-                self.vim_cancel();
-                self.checkpoint();
-                self.col = (self.col + 1).min(self.line_len(self.row));
-                Effect::EnterInsert
+            KeyCode::Char('v') => {
+                self.take_count();
+                self.set_visual(false);
+                Effect::None
             }
-            KeyCode::Char('I') => {
-                self.vim_cancel();
-                self.checkpoint();
-                self.col = self.first_non_blank(self.row);
-                Effect::EnterInsert
+            KeyCode::Char('V') => {
+                self.take_count();
+                self.set_visual(true);
+                Effect::None
             }
-            KeyCode::Char('A') => {
-                self.vim_cancel();
-                self.checkpoint();
-                self.col = self.line_len(self.row);
-                Effect::EnterInsert
-            }
-            KeyCode::Char('o') => {
-                self.vim_cancel();
-                self.checkpoint();
-                self.lines.insert(self.row + 1, String::new());
-                self.row += 1;
-                self.col = 0;
-                Effect::EnterInsert
-            }
-            KeyCode::Char('O') => {
-                self.vim_cancel();
-                self.checkpoint();
-                self.lines.insert(self.row, String::new());
-                self.col = 0;
-                Effect::EnterInsert
+            KeyCode::Char(key @ ('i' | 'a' | 'I' | 'A' | 'o' | 'O')) => {
+                let effect = self.enter_insert(key);
+                self.recorded(What::Enter { key }, effect)
             }
             KeyCode::Char('f') => self.start_find(None, FindKind::Forward),
             KeyCode::Char('F') => self.start_find(None, FindKind::Backward),
@@ -437,7 +700,8 @@ impl Composer {
             KeyCode::Char(c) if c == op_char(op) => {
                 self.vim.pending = Pending::None;
                 let count = self.take_count();
-                self.apply_lines(op, count)
+                let effect = self.apply_lines(op, count);
+                self.changed(op, What::Lines { op, count }, effect)
             }
             KeyCode::Char('i') => {
                 self.vim.pending = Pending::Object { op, inner: true };
@@ -479,6 +743,7 @@ impl Composer {
             self.move_to_target(motion, count);
             return Effect::None;
         };
+        let what = What::Motion { op, motion, count };
         // `cw` on a word behaves like `ce`, as in Vim.
         let motion = match motion {
             Motion::WordForward { big }
@@ -515,7 +780,17 @@ impl Composer {
             start = (start.0, 0);
             end = (end.0, self.line_len(end.0));
         }
-        self.apply_op(op, start, end, kind)
+        let effect = self.apply_op(op, start, end, kind);
+        self.changed(op, what, effect)
+    }
+
+    /// Keep a change for `.`, unless it changed nothing: a yank is not a change, and
+    /// Vim does not repeat one.
+    fn changed(&mut self, op: Op, what: What, effect: Effect) -> Effect {
+        match op {
+            Op::Yank => effect,
+            _ => self.recorded(what, effect),
+        }
     }
 
     fn move_to_target(&mut self, motion: Motion, count: usize) {
@@ -851,6 +1126,211 @@ impl Composer {
         }
     }
 
+    // ── The changes themselves ─────────────────────────────────────────
+
+    /// `x` and `X`: characters either side of the cursor.
+    fn erase(&mut self, count: usize, back: bool) -> Effect {
+        if back {
+            if self.col == 0 {
+                return Effect::None;
+            }
+            let start = (self.row, self.col.saturating_sub(count));
+            return self.apply_op(Op::Delete, start, (self.row, self.col), Kind::Exclusive);
+        }
+        let len = self.line_len(self.row);
+        if len == 0 {
+            return Effect::None;
+        }
+        let end = (self.row, (self.col + count).min(len));
+        self.apply_op(Op::Delete, (self.row, self.col), end, Kind::Exclusive)
+    }
+
+    /// `r`: the character under the cursor, and the ones after it with a count.
+    fn replace_chars(&mut self, ch: char, count: usize) -> Effect {
+        let len = self.line_len(self.row);
+        if self.col + count > len {
+            return Effect::None;
+        }
+        self.checkpoint();
+        let row = self.row;
+        let mut chars: Vec<char> = self.lines[row].chars().collect();
+        for c in chars.iter_mut().skip(self.col).take(count) {
+            *c = ch;
+        }
+        self.lines[row] = chars.into_iter().collect();
+        self.col += count - 1;
+        Effect::None
+    }
+
+    /// `~`: the characters from the cursor on, leaving it after them.
+    fn flip_case_forward(&mut self, count: usize) -> Effect {
+        let len = self.line_len(self.row);
+        if len == 0 {
+            return Effect::None;
+        }
+        let end = (self.col + count).min(len);
+        self.flip_case((self.row, self.col), (self.row, end));
+        self.col = end.min(len - 1);
+        Effect::None
+    }
+
+    /// Turn a stretch of text the other way round, cursor left at its start.
+    fn flip_case(&mut self, start: Pos, end: Pos) {
+        let text = self.slice(start, end);
+        if text.is_empty() {
+            return;
+        }
+        let flipped: String = text
+            .chars()
+            .map(|c| {
+                if c.is_uppercase() {
+                    c.to_lowercase().next().unwrap_or(c)
+                } else {
+                    c.to_uppercase().next().unwrap_or(c)
+                }
+            })
+            .collect();
+        self.checkpoint();
+        self.remove(start, end);
+        self.insert_at(start.0, start.1, &flipped);
+        self.row = start.0;
+        self.col = start.1;
+        self.clamp_normal();
+    }
+
+    /// Insert entry: `i a I A o O`, the cursor put where each of them puts it.
+    fn enter_insert(&mut self, key: char) -> Effect {
+        self.vim_cancel();
+        self.checkpoint();
+        match key {
+            'a' => self.col = (self.col + 1).min(self.line_len(self.row)),
+            'I' => self.col = self.first_non_blank(self.row),
+            'A' => self.col = self.line_len(self.row),
+            'o' => {
+                self.lines.insert(self.row + 1, String::new());
+                self.row += 1;
+                self.col = 0;
+            }
+            'O' => {
+                self.lines.insert(self.row, String::new());
+                self.col = 0;
+            }
+            _ => {}
+        }
+        Effect::EnterInsert
+    }
+
+    /// `gJ`, and `J` over a selection: the lines after this one pulled onto it, a single
+    /// space where they meet. `J` itself opens the next thread, so the join is on `gJ`.
+    /// The cursor lands where the join is, as Vim leaves it.
+    pub fn vim_join(&mut self, count: usize) {
+        let count = count.max(2);
+        self.vim_cancel();
+        self.join(count);
+    }
+
+    fn join(&mut self, count: usize) {
+        if self.row + 1 >= self.lines.len() {
+            return;
+        }
+        self.checkpoint();
+        for _ in 0..count.max(2) - 1 {
+            if self.row + 1 >= self.lines.len() {
+                break;
+            }
+            let next = self.lines.remove(self.row + 1);
+            let line = &mut self.lines[self.row];
+            let trimmed = line.trim_end().to_string();
+            let next = next.trim_start();
+            *line = if trimmed.is_empty() {
+                next.to_string()
+            } else if next.is_empty() {
+                trimmed
+            } else {
+                format!("{trimmed} {next}")
+            };
+            self.col = self.lines[self.row]
+                .chars()
+                .count()
+                .saturating_sub(next.chars().count() + 1)
+                .min(self.line_len(self.row));
+        }
+        self.clamp_normal();
+    }
+
+    /// Keep a change for `.`, and where it opened an insert, keep the text as it stands
+    /// so that what is typed next can be read off against it.
+    fn recorded(&mut self, what: What, effect: Effect) -> Effect {
+        if self.vim.replaying {
+            return effect;
+        }
+        self.vim.last_change = Some(Change { what, typed: None });
+        self.vim.insert_before = (effect == Effect::EnterInsert).then(|| self.lines.clone());
+        effect
+    }
+
+    /// `.`: the last change again, where the cursor is now. A change that opened an
+    /// insert types what was typed into it and stays in normal mode, so a repeat is one
+    /// key rather than one key and an `Esc`.
+    fn repeat(&mut self) -> Effect {
+        let count = self.vim.count.take();
+        self.vim.op_count = None;
+        let Some(change) = self.vim.last_change.clone() else {
+            return Effect::None;
+        };
+        self.vim.replaying = true;
+        let effect = self.run_change(change.what, count);
+        self.vim.replaying = false;
+        if effect != Effect::EnterInsert {
+            return effect;
+        }
+        // An insert left without typing anything types nothing again.
+        if let Some(text) = &change.typed {
+            self.insert_str(text);
+            self.col = self.col.saturating_sub(1);
+        }
+        self.clamp_normal();
+        Effect::None
+    }
+
+    /// Run a recorded change. A count typed before `.` replaces the one it was made
+    /// with, as in Vim.
+    fn run_change(&mut self, what: What, count: Option<usize>) -> Effect {
+        match what {
+            What::Motion {
+                op,
+                motion,
+                count: n,
+            } => {
+                self.vim.count = Some(count.unwrap_or(n));
+                self.run_motion(Some(op), motion)
+            }
+            What::Object {
+                op,
+                object,
+                inner,
+                count: n,
+            } => {
+                let n = count.unwrap_or(n);
+                match self.text_object(object, inner, n) {
+                    Some((start, end)) => self.apply_op(op, start, end, Kind::Exclusive),
+                    None => Effect::None,
+                }
+            }
+            What::Lines { op, count: n } => self.apply_lines(op, count.unwrap_or(n)),
+            What::ToLineEnd { op } => self.apply_to_line_end(op),
+            What::Erase { count: n, back } => self.erase(count.unwrap_or(n), back),
+            What::Replace { ch, count: n } => self.replace_chars(ch, count.unwrap_or(n)),
+            What::Case { count: n } => self.flip_case_forward(count.unwrap_or(n)),
+            What::Paste { after, count: n } => self.paste(after, count.unwrap_or(n)),
+            What::Enter { key } => self.enter_insert(key),
+            What::Join { count: n } => {
+                self.join(count.unwrap_or(n));
+                Effect::None
+            }
+        }
+    }
+
     // ── Operators ──────────────────────────────────────────────────────
 
     fn apply_to_line_end(&mut self, op: Op) -> Effect {
@@ -940,8 +1420,7 @@ impl Composer {
         Effect::None
     }
 
-    fn paste(&mut self, after: bool) -> Effect {
-        let count = self.take_count();
+    fn paste(&mut self, after: bool, count: usize) -> Effect {
         let Some(register) = self.vim.register.clone() else {
             return Effect::None;
         };
@@ -1010,6 +1489,28 @@ impl Composer {
         self.col = snapshot.col;
         self.clamp_normal();
     }
+}
+
+/// What an insert added: the one run of characters the text gained while it was open.
+/// `None` where it gained none, or where more than typing changed it — text put there
+/// from somewhere else is not something `.` should type out again.
+fn typed_text(before: &[String], after: &[String]) -> Option<String> {
+    let before: Vec<char> = before.join("\n").chars().collect();
+    let after: Vec<char> = after.join("\n").chars().collect();
+    if after.len() <= before.len() {
+        return None;
+    }
+    let mut head = 0;
+    while head < before.len() && before[head] == after[head] {
+        head += 1;
+    }
+    let mut tail = 0;
+    while tail < before.len() - head
+        && before[before.len() - 1 - tail] == after[after.len() - 1 - tail]
+    {
+        tail += 1;
+    }
+    (head + tail == before.len()).then(|| after[head..after.len() - tail].iter().collect())
 }
 
 fn op_char(op: Op) -> char {
@@ -1203,5 +1704,186 @@ mod tests {
         assert_eq!(c.text(), "xBCd");
         keys(&mut c, "0ry");
         assert_eq!(c.text(), "yBCd");
+    }
+
+    /// Typing into an insert a change opened is part of the change: `.` makes the change
+    /// again and types the same text, without stopping in insert mode on the way.
+    fn typed(c: &mut Composer, text: &str) {
+        c.insert_str(text);
+        c.leave_insert();
+    }
+
+    #[test]
+    fn a_change_can_be_made_again() {
+        let mut c = composer("one two three");
+        keys(&mut c, "dw");
+        assert_eq!(c.text(), "two three");
+        keys(&mut c, ".");
+        assert_eq!(
+            c.text(),
+            "three",
+            "the same change, where the cursor is now"
+        );
+
+        // A change that types: the text goes with it.
+        let mut c = composer("alpha beta");
+        assert_eq!(keys(&mut c, "cw"), vec![Effect::None, Effect::EnterInsert]);
+        typed(&mut c, "ONE");
+        assert_eq!(c.text(), "ONE beta");
+        keys(&mut c, "w.");
+        assert_eq!(c.text(), "ONE ONE", "and is typed again");
+        // Still normal mode: the repeat did the typing itself.
+        assert_eq!(keys(&mut c, "."), vec![Effect::None]);
+
+        // A count before `.` replaces the one the change was made with.
+        let mut c = composer("a b c d e");
+        keys(&mut c, "dw");
+        keys(&mut c, "2.");
+        assert_eq!(c.text(), "d e");
+    }
+
+    /// Backspacing over what you have just typed is part of typing it; reaching further
+    /// back, or having the text replaced from outside, is not something to repeat.
+    #[test]
+    fn what_a_repeat_types_is_what_the_insert_left() {
+        let mut c = composer("x");
+        keys(&mut c, "A");
+        c.insert_str("teh");
+        c.backspace();
+        c.backspace();
+        c.insert_str("he");
+        c.leave_insert();
+        assert_eq!(c.text(), "xthe");
+        keys(&mut c, ".");
+        assert_eq!(c.text(), "xthethe");
+
+        // A draft dropped in from elsewhere is nobody's typing.
+        let mut c = composer("one");
+        keys(&mut c, "A");
+        c.set_text("something else entirely");
+        c.leave_insert();
+        keys(&mut c, ".");
+        assert_eq!(c.text(), "something else entirely");
+    }
+
+    /// A yank is not a change, so `.` after one still repeats the change before it.
+    #[test]
+    fn a_yank_is_not_a_change_to_repeat() {
+        let mut c = composer("one two three four");
+        keys(&mut c, "dw");
+        assert_eq!(c.text(), "two three four");
+        keys(&mut c, "yw.");
+        assert_eq!(c.text(), "three four");
+    }
+
+    #[test]
+    fn a_selection_is_extended_by_moving_and_taken_by_an_operator() {
+        let mut c = composer("one two three");
+        keys(&mut c, "vww");
+        assert_eq!(c.vim_visual().map(|v| v.linewise), Some(false));
+        // The selection takes in the character the cursor is on.
+        assert_eq!(c.selected_columns(0), Some((0, 9)));
+        keys(&mut c, "d");
+        assert_eq!(c.text(), "hree", "up to and including the cursor");
+        assert!(c.vim_visual().is_none(), "the operator ends it");
+
+        // `V` takes whole lines however far along them it started.
+        let mut c = composer("one\ntwo\nthree");
+        keys(&mut c, "jlVj");
+        assert_eq!(c.selected_columns(1), Some((0, 3)));
+        assert_eq!(c.selected_columns(2), Some((0, 5)));
+        assert_eq!(c.selected_columns(0), None);
+        keys(&mut c, "d");
+        assert_eq!(c.text(), "one");
+
+        // A text object is a selection too, and `o` swaps which end moves.
+        let mut c = composer("one two three");
+        keys(&mut c, "wviw");
+        assert_eq!(c.selected_columns(0), Some((4, 7)));
+        keys(&mut c, "oh");
+        assert_eq!(c.selected_columns(0), Some((3, 7)));
+    }
+
+    /// The selection is what the operator works on, and `c` leaves it ready to type.
+    #[test]
+    fn a_selection_can_be_changed_yanked_and_turned_around() {
+        let mut c = composer("keep THIS one");
+        keys(&mut c, "wve");
+        assert_eq!(keys(&mut c, "c"), vec![Effect::EnterInsert]);
+        assert_eq!(c.text(), "keep  one");
+        typed(&mut c, "that");
+        assert_eq!(c.text(), "keep that one");
+
+        let mut c = composer("yank me");
+        let effects = keys(&mut c, "v$y");
+        assert_eq!(effects.last(), Some(&Effect::Yanked("yank me".into())));
+        assert!(c.vim_visual().is_none());
+
+        let mut c = composer("flip me");
+        keys(&mut c, "ve~");
+        assert_eq!(c.text(), "FLIP me");
+
+        // Esc lets a selection go without touching the text.
+        let mut c = composer("leave it");
+        keys(&mut c, "vee");
+        c.vim_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(c.vim_visual().is_none());
+        assert_eq!(c.text(), "leave it");
+    }
+
+    /// `v` and `V` swap between them; the same one again is how Vim says it is done.
+    #[test]
+    fn the_selection_keys_change_and_end_the_selection() {
+        let mut c = composer("one\ntwo");
+        keys(&mut c, "v");
+        assert_eq!(c.vim_visual().map(|v| v.linewise), Some(false));
+        keys(&mut c, "V");
+        assert_eq!(c.vim_visual().map(|v| v.linewise), Some(true));
+        keys(&mut c, "V");
+        assert!(c.vim_visual().is_none());
+    }
+
+    /// `J` is the next thread, so joining is `gJ`, and it joins the way Vim's `J` does:
+    /// one space where the lines meet, whatever the indentation was.
+    #[test]
+    fn lines_are_joined_with_one_space() {
+        let mut c = composer("one\n   two\nthree");
+        c.vim_join(2);
+        assert_eq!(c.text(), "one two\nthree");
+        assert_eq!((c.row, c.col), (0, 3), "the cursor is where the join is");
+        // A count joins that many lines; over a selection, all of them. Bare `J` opens
+        // the next thread and never reaches the composer, but `3J` does.
+        let mut c = composer("a\nb\nc\nd");
+        c.vim_join(3);
+        assert_eq!(c.text(), "a b c\nd");
+        let mut c = composer("a\nb\nc\nd");
+        keys(&mut c, "3J");
+        assert_eq!(c.text(), "a b c\nd");
+        keys(&mut c, ".");
+        assert_eq!(c.text(), "a b c d");
+        let mut c = composer("a\nb\nc\nd");
+        keys(&mut c, "VjjJ");
+        assert_eq!(c.text(), "a b c\nd");
+        // Nothing under the last line to join to it.
+        let mut c = composer("only");
+        c.vim_join(2);
+        assert_eq!(c.text(), "only");
+    }
+
+    /// The composer says when it is in the middle of something, and the app asks before
+    /// taking a letter for itself: `3` then `s` is a count and a substitute, not a count
+    /// and the sidebar.
+    #[test]
+    fn a_half_typed_command_says_so() {
+        let mut c = composer("one two");
+        assert!(!c.vim_busy());
+        keys(&mut c, "3");
+        assert!(c.vim_busy(), "a count is the start of a command");
+        keys(&mut c, "d");
+        assert!(c.vim_busy(), "and so is an operator with no motion yet");
+        c.vim_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!c.vim_busy());
+        keys(&mut c, "v");
+        assert!(c.vim_busy(), "so is a selection being made");
     }
 }
