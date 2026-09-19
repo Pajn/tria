@@ -1634,6 +1634,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Yellow),
         ));
     }
+    // `g` and `z` are keys that have not finished being pressed, so they are shown in
+    // the same place as the rest of a command that is halfway typed. Where they wait
+    // indefinitely this is the only sign that one is waiting at all.
+    if let Some(prefix) = app.waiting_prefix() {
+        spans.push(Span::styled(
+            format!("{prefix} "),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     // A partly typed command in insert mode is the same thing and is shown the same way.
     if app.literal_next {
         spans.push(Span::styled("^V ", Style::default().fg(Color::Yellow)));
@@ -2826,6 +2835,17 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  mouse drag              select chat text; released, it is copied"),
         Line::from("  Ctrl-c                  interrupt the running turn, or the background work"),
         Line::from("                          left without one; anywhere else, it is Esc"),
+        // The setting as it stands rather than as it ships: somebody reading this to
+        // find out how long the pair holds together wants the answer, not the default.
+        Line::from("  g  z                    shown on the status bar while they wait"),
+        Line::from(format!(
+            "                          for the key after them · {}",
+            match app.prefix_timeout {
+                None => "no limit".to_string(),
+                Some(ttl) => format!("{:.1}s", ttl.as_secs_f32()),
+            }
+        )),
+        Line::from("                          set by prefix_timeout_ms, 0 for no limit"),
         Line::from(""),
         Line::from(Span::styled("Insert", Style::default().bold())),
         Line::from("  Enter send · Alt-Enter / Ctrl-j newline · Esc or Ctrl-c normal"),
@@ -2919,6 +2939,7 @@ mod tests {
     use base64::Engine;
     use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
+    use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -3022,6 +3043,36 @@ mod tests {
         let bottom = drawn(90, 24, &app);
         assert!(bottom.contains("file-39.txt"), "{bottom}");
         assert!(!bottom.contains("file-0.txt"), "{bottom}");
+    }
+
+    fn status_line(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        terminal
+            .draw(|frame| draw_status(frame, app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect()
+    }
+
+    /// `g` on its own is a key that has not finished being pressed. Nothing said so, so
+    /// a `g` that had quietly timed out and a `g` still waiting looked the same, and
+    /// with the timeout turned off the only sign of one left pending is this.
+    #[test]
+    fn a_prefix_waiting_for_its_second_key_is_on_the_screen() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        assert!(!status_line(&app).contains(" g "));
+
+        app.pending_prefix = Some(('g', Instant::now()));
+        assert!(status_line(&app).contains(" g "), "{}", status_line(&app));
+
+        // And it goes when its moment does, so the screen is not saying it is waiting
+        // for a key it has already given up on.
+        app.pending_prefix = Some(('g', Instant::now() - Duration::from_secs(5)));
+        assert!(!status_line(&app).contains(" g "), "{}", status_line(&app));
     }
 
     /// A config with two signed-in accounts, in the shape the server sends one. The

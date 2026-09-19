@@ -147,6 +147,19 @@ paste from the single register, `r` replaces a character, `~` toggles case, `u` 
 undo and redo. Yanks also go to the system clipboard. The status bar shows a partially typed
 command.
 
+`g` and `z` are keys that have not finished being pressed, and the status bar shows them
+too, beside the rest of a half-typed command. They wait 1.2 seconds for the key that
+completes them and then give it back, so a `g` pressed by mistake does not swallow the
+next key. The config file says how long:
+
+```toml
+prefix_timeout_ms = 3000
+```
+
+Zero waits for as long as it takes, which is what Vim calls `notimeout`: `gA` is then `gA`
+however long the pause in the middle, and the `g` on the status bar is what says one is
+still waiting.
+
 | Insert mode | |
 | --- | --- |
 | `Enter` | send |

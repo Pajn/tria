@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,16 @@ pub struct Config {
     /// The last model picked, used for the next new thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<crate::model::ModelSelection>,
+    /// How long `g` and `z` wait for the key that completes them, in milliseconds.
+    /// Zero waits for as long as it takes. Unset is `DEFAULT_PREFIX_TIMEOUT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_timeout_ms: Option<u64>,
 }
+
+/// How long `g` and `z` wait for the key after them before giving it back. Long enough
+/// not to be in the way of typing `gA`, short enough that a `g` pressed by mistake is
+/// not still sitting there a moment later.
+pub const DEFAULT_PREFIX_TIMEOUT: Duration = Duration::from_millis(1200);
 
 /// How much of the sidebar one thread is given.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -170,6 +179,18 @@ impl Config {
         (programs, refused)
     }
 
+    /// How long `g` and `z` wait for the key that completes them. `None` is for as long
+    /// as it takes, which is what `0` asks for and what vim calls `notimeout`: the pair
+    /// is shown on screen while it waits, so one left pending is visible rather than
+    /// lying in wait for the next key.
+    pub fn prefix_timeout(&self) -> Option<Duration> {
+        match self.prefix_timeout_ms {
+            None => Some(DEFAULT_PREFIX_TIMEOUT),
+            Some(0) => None,
+            Some(ms) => Some(Duration::from_millis(ms)),
+        }
+    }
+
     pub fn git_command(&self) -> String {
         self.git_command
             .clone()
@@ -267,6 +288,18 @@ mod tests {
 
         // Nothing is a way of taking the binding away.
         assert!(config("[programs]\nl = \"\"\n").programs().0.is_empty());
+    }
+
+    /// `g` and `z` wait for the key after them, and how long is the config's to say.
+    /// Zero is the one worth spelling out: it is not "do not wait", it is "wait".
+    #[test]
+    fn nought_waits_for_as_long_as_it_takes() {
+        assert_eq!(config("").prefix_timeout(), Some(DEFAULT_PREFIX_TIMEOUT));
+        assert_eq!(
+            config("prefix_timeout_ms = 3000").prefix_timeout(),
+            Some(Duration::from_millis(3000))
+        );
+        assert_eq!(config("prefix_timeout_ms = 0").prefix_timeout(), None);
     }
 
     /// A key tria answers itself would never reach the program, so it is refused out

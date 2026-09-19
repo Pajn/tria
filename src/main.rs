@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
                 refused,
                 editor: cfg.editor(),
                 model: cfg.model.clone(),
+                prefix_timeout: cfg.prefix_timeout(),
             };
             app::run(origin, token, launch).await
         }

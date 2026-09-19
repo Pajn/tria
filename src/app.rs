@@ -50,7 +50,6 @@ const TICK: Duration = Duration::from_millis(120);
 /// enough that a stream which never stops still gets drawn.
 const BATCH: usize = 512;
 const TOAST_TTL: Duration = Duration::from_secs(6);
-const PREFIX_TTL: Duration = Duration::from_millis(1200);
 
 /// How often to look for worktrees that have gone from the disk. They only go when
 /// something removes one, which is rare and is usually this.
@@ -369,7 +368,8 @@ pub struct App {
     pub open_levels: u8,
     pub toast: Option<(String, Instant, bool)>,
     pub spinner: usize,
-    pending_prefix: Option<(char, Instant)>,
+    /// The `g` or `z` waiting for the key that completes it, and when it was pressed.
+    pub(crate) pending_prefix: Option<(char, Instant)>,
     /// Filled by the renderer each frame so key handling can page correctly.
     pub chat_viewport: (usize, usize),
     /// First visible sidebar row; the renderer reads and clamps it.
@@ -433,6 +433,9 @@ pub struct App {
     /// The worktree list as it was when it was opened, so it does not move under the
     /// cursor while it is being read.
     pub worktrees: Vec<ThreadWorktree>,
+    /// How long `g` and `z` wait for the key that completes them. `None` waits for as
+    /// long as it takes, which is what the config asks for with `0`.
+    pub prefix_timeout: Option<Duration>,
     /// Set by `Ctrl-v` in insert mode: the next key goes in as a character.
     pub literal_next: bool,
     /// Set while a forced removal is waiting to be agreed to.
@@ -542,6 +545,7 @@ impl App {
             pending_create: None,
             lost_stream: None,
             worktrees: Vec::new(),
+            prefix_timeout: Some(crate::config::DEFAULT_PREFIX_TIMEOUT),
             literal_next: false,
             worktree_confirm: None,
             worktree_selected: 0,
@@ -4116,7 +4120,22 @@ impl App {
 
     fn take_prefix(&mut self) -> Option<char> {
         let (prefix, at) = self.pending_prefix.take()?;
-        (at.elapsed() < PREFIX_TTL).then_some(prefix)
+        match self.prefix_timeout {
+            Some(ttl) => (at.elapsed() < ttl).then_some(prefix),
+            None => Some(prefix),
+        }
+    }
+
+    /// The prefix waiting for the key that completes it, for the status bar. `g` on its
+    /// own is a key that has not finished being pressed, and a key that is waiting is
+    /// worth seeing — the more so where it waits indefinitely, since then the only sign
+    /// of one pressed by mistake is the one on the screen.
+    pub fn waiting_prefix(&self) -> Option<char> {
+        let (prefix, at) = self.pending_prefix?;
+        match self.prefix_timeout {
+            Some(ttl) => (at.elapsed() < ttl).then_some(prefix),
+            None => Some(prefix),
+        }
     }
 
     fn on_normal_key(&mut self, key: KeyEvent) {
@@ -5158,6 +5177,8 @@ pub struct Launch {
     pub model: Option<ModelSelection>,
     /// Whether tria had to start the server it is about to talk to.
     pub started_server: bool,
+    /// How long `g` and `z` wait for the key after them; `None` is indefinitely.
+    pub prefix_timeout: Option<Duration>,
 }
 
 /// Ask where a project's icon is and fetch it. `sourcePath` is the server saying it found
@@ -5288,6 +5309,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
         app.toast(format!("config: {}", launch.refused.join(", ")), true);
     }
     app.editor = launch.editor;
+    app.prefix_timeout = launch.prefix_timeout;
     app.new_thread_model = launch.model;
     if launch.started_server {
         // Said again here because the line printed before the screen was taken over is
@@ -5912,6 +5934,49 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         // Something that is not a picture is not written out at all.
         assert_eq!(write_picture("bm90IGEgcGljdHVyZQ=="), None);
+    }
+
+    /// `g` waits for the key that finishes it, and how long is the config's to say —
+    /// including forever, for anyone who would rather `gA` never came out as `A`.
+    #[test]
+    fn how_long_g_waits_is_the_config_s_to_say() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let pressed_g_a_moment_ago = |app: &mut App| {
+            app.pending_prefix = Some(('g', Instant::now() - Duration::from_secs(5)))
+        };
+
+        // The default gives it back after its moment has passed, so the key that
+        // follows is the key it is rather than half of a pair.
+        pressed_g_a_moment_ago(&mut app);
+        assert_eq!(app.waiting_prefix(), None, "nothing is shown as waiting");
+        assert_eq!(app.take_prefix(), None);
+
+        // Waiting indefinitely is what `prefix_timeout_ms = 0` asks for.
+        app.prefix_timeout = None;
+        pressed_g_a_moment_ago(&mut app);
+        assert_eq!(app.waiting_prefix(), Some('g'), "and it says it is waiting");
+        assert_eq!(app.take_prefix(), Some('g'));
+        assert_eq!(app.waiting_prefix(), None, "taking it is the end of it");
+    }
+
+    /// The pair only has to hold together for as long as it is configured to. With no
+    /// timeout at all, a `g` pressed and left is still a `g` whenever the next key lands.
+    #[test]
+    fn a_prefix_that_waits_is_still_there_to_be_completed() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.prefix_timeout = None;
+        app.focus = Focus::Chat;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(app.waiting_prefix(), Some('z'));
+        // Long enough that the default would have given up on it.
+        app.pending_prefix = Some(('z', Instant::now() - Duration::from_secs(60)));
+        app.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE));
+        assert_eq!(app.open_levels, MOST_OPEN_LEVELS, "zR, not R");
     }
 
     fn ctrl(c: char) -> KeyEvent {
