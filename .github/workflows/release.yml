@@ -30,7 +30,7 @@ jobs:
           - target: x86_64-apple-darwin
             runner: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # rustup reads rust-toolchain.toml, here and for the target, which it adds to the
       # toolchain that file names rather than to whatever the runner had as its default.
       - run: rustup show active-toolchain
