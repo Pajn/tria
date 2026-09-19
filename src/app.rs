@@ -216,6 +216,19 @@ pub struct ThreadWorktree {
     /// What the checkout has that is not committed, once the server has said. `None`
     /// until then, and for a worktree it could not read.
     pub changes: Option<bool>,
+    /// The files behind that verdict, which is what a forced removal would take.
+    pub files: Vec<crate::model::VcsFile>,
+}
+
+/// A forced removal waiting to be agreed to. Removing a worktree is ordinarily safe —
+/// the branch stays, so nothing committed is lost — and git refuses one with anything
+/// uncommitted in it, which is the check worth having. Overriding that check is the one
+/// thing in this list that destroys work, and untracked files are not anywhere else, so
+/// it says what it would take before it takes it.
+pub struct WorktreeConfirm {
+    /// The worktree, looked up again each frame so what is listed stays the live list.
+    pub path: String,
+    pub offset: usize,
 }
 
 /// A thread being composed that does not exist on the server yet.
@@ -247,6 +260,7 @@ pub enum AppEvent {
     WorktreeChecked {
         path: String,
         changes: bool,
+        files: Vec<crate::model::VcsFile>,
     },
     /// A worktree was removed, or was not.
     WorktreeRemoved {
@@ -419,6 +433,8 @@ pub struct App {
     /// The worktree list as it was when it was opened, so it does not move under the
     /// cursor while it is being read.
     pub worktrees: Vec<ThreadWorktree>,
+    /// Set while a forced removal is waiting to be agreed to.
+    pub worktree_confirm: Option<WorktreeConfirm>,
     pub worktree_selected: usize,
     /// The worktrees that are still on the disk, so the sidebar can mark the threads
     /// holding one without asking the disk about every row it draws.
@@ -524,6 +540,7 @@ impl App {
             pending_create: None,
             lost_stream: None,
             worktrees: Vec::new(),
+            worktree_confirm: None,
             worktree_selected: 0,
             live_worktrees: HashSet::new(),
             worktrees_checked: None,
@@ -1935,6 +1952,7 @@ impl App {
                     settled: thread.is_settled(),
                     running: thread.is_running(),
                     changes: None,
+                    files: Vec::new(),
                 })
             })
             .collect();
@@ -1994,26 +2012,38 @@ impl App {
         self.mode = Mode::Worktrees;
         // What each one has uncommitted, asked for all at once: the answer decides
         // whether it can go, and a list of this size is a handful of calls.
-        for worktree in &self.worktrees {
-            let handle = self.handle.clone();
-            let events = self.events.clone();
-            let path = worktree.path.clone();
-            tokio::spawn(async move {
-                let result = handle
-                    .call("vcs.refreshStatus", json!({ "cwd": path.clone() }))
-                    .await;
-                if let Ok(status) = result {
-                    let changes = status
-                        .get("hasWorkingTreeChanges")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let _ = events.send(AppEvent::WorktreeChecked { path, changes });
-                }
-            });
+        let paths: Vec<String> = self.worktrees.iter().map(|w| w.path.clone()).collect();
+        for path in paths {
+            self.check_worktree(path);
         }
     }
 
+    /// Ask the server what a worktree is holding. The status behind this is cached and
+    /// can be behind the disk, so it is asked rather than read, and it is asked again
+    /// before anything is destroyed on the strength of it.
+    fn check_worktree(&self, path: String) {
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result = handle
+                .call("vcs.refreshStatus", json!({ "cwd": path.clone() }))
+                .await;
+            let Ok(status) = result else { return };
+            let Ok(local) = serde_json::from_value::<crate::model::VcsLocal>(status) else {
+                return;
+            };
+            let _ = events.send(AppEvent::WorktreeChecked {
+                path,
+                changes: local.has_working_tree_changes,
+                files: local.working_tree.files,
+            });
+        });
+    }
+
     fn on_worktrees_key(&mut self, key: KeyEvent) {
+        if self.worktree_confirm.is_some() {
+            return self.on_worktree_confirm_key(key);
+        }
         let count = self.worktrees.len();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
@@ -2026,7 +2056,7 @@ impl App {
             KeyCode::Char('g') => self.worktree_selected = 0,
             KeyCode::Char('G') => self.worktree_selected = count.saturating_sub(1),
             KeyCode::Char('x') | KeyCode::Char('d') => self.remove_worktree(false),
-            KeyCode::Char('X') | KeyCode::Char('D') => self.remove_worktree(true),
+            KeyCode::Char('X') | KeyCode::Char('D') => self.confirm_force_remove(),
             KeyCode::Enter | KeyCode::Char('l') => {
                 if let Some(worktree) = self.worktrees.get(self.worktree_selected) {
                     let thread_id = worktree.thread_id.clone();
@@ -2038,16 +2068,66 @@ impl App {
         }
     }
 
-    /// Hand a worktree back. Without `force` git refuses one with anything uncommitted
-    /// in it, which is the check worth having and is git's to make: it counts what is
-    /// not tracked as well, which a status does not.
-    fn remove_worktree(&mut self, force: bool) {
+    /// The box is a question with two answers, and the rest of its keys move through
+    /// the list of what would be lost, which can be longer than the box is tall.
+    fn on_worktree_confirm_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some((_, worktree)) = self.confirming_worktree() else {
+            // The worktree went while the question was up; there is nothing to answer.
+            self.worktree_confirm = None;
+            return;
+        };
+        let last = worktree.files.len().saturating_sub(1);
+        let Some(confirm) = self.worktree_confirm.as_mut() else {
+            return;
+        };
+        let by = |offset: usize, delta: isize| {
+            (offset as isize + delta).clamp(0, last as isize) as usize
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.worktree_confirm = None,
+            KeyCode::Enter => {
+                if let Some(confirm) = self.worktree_confirm.take() {
+                    self.remove_worktree_at(&confirm.path, true);
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => confirm.offset = by(confirm.offset, 1),
+            KeyCode::Char('k') | KeyCode::Up => confirm.offset = by(confirm.offset, -1),
+            KeyCode::Char('d') if ctrl => confirm.offset = by(confirm.offset, 5),
+            KeyCode::Char('u') if ctrl => confirm.offset = by(confirm.offset, -5),
+            KeyCode::Char('g') | KeyCode::Home => confirm.offset = 0,
+            KeyCode::Char('G') | KeyCode::End => confirm.offset = last,
+            _ => {}
+        }
+    }
+
+    /// `X`: the removal git would refuse. Nothing uncommitted means there is nothing
+    /// for it to refuse over and nothing to lose, so that one goes straight through —
+    /// the question is only worth asking where there is an answer worth having.
+    fn confirm_force_remove(&mut self) {
         let Some(worktree) = self.worktrees.get(self.worktree_selected) else {
             return;
         };
+        // The reasons it cannot go at all are worth giving before the question rather
+        // than after it: agreeing to lose the files and then being told no is a worse
+        // conversation than being told no.
+        if let Some(refusal) = self.worktree_held(worktree) {
+            return self.toast(refusal, true);
+        }
+        if worktree.changes == Some(false) {
+            return self.remove_worktree(true);
+        }
+        let path = worktree.path.clone();
+        // Asked again on the way in: the server's status is cached, and a list of files
+        // somebody is about to agree to lose should be the one that is there now.
+        self.check_worktree(path.clone());
+        self.worktree_confirm = Some(WorktreeConfirm { path, offset: 0 });
+    }
+
+    /// Why a worktree is not tria's to remove, whatever git thinks of it.
+    fn worktree_held(&self, worktree: &ThreadWorktree) -> Option<&'static str> {
         if worktree.running {
-            self.toast("that thread is still running", true);
-            return;
+            return Some("that thread is still running");
         }
         // A shell sitting in it would be left in a directory that is not there.
         if self
@@ -2055,7 +2135,29 @@ impl App {
             .iter()
             .any(|t| t.is_live() && t.cwd == worktree.path)
         {
-            self.toast("a terminal is open in it", true);
+            return Some("a terminal is open in it");
+        }
+        None
+    }
+
+    /// Hand a worktree back. Without `force` git refuses one with anything uncommitted
+    /// in it, which is the check worth having and is git's to make: it counts what is
+    /// not tracked as well, which a status does not.
+    fn remove_worktree(&mut self, force: bool) {
+        if let Some(worktree) = self.worktrees.get(self.worktree_selected) {
+            let path = worktree.path.clone();
+            self.remove_worktree_at(&path, force);
+        }
+    }
+
+    /// Remove the worktree at `path`, named rather than pointed at: a question that was
+    /// answered about one worktree must not be carried out on another.
+    fn remove_worktree_at(&mut self, path: &str, force: bool) {
+        let Some(worktree) = self.worktrees.iter().find(|w| w.path == path) else {
+            return;
+        };
+        if let Some(refusal) = self.worktree_held(worktree) {
+            self.toast(refusal, true);
             return;
         }
         let path = worktree.path.clone();
@@ -2073,10 +2175,23 @@ impl App {
         });
     }
 
-    fn on_worktree_checked(&mut self, path: String, changes: bool) {
+    fn on_worktree_checked(
+        &mut self,
+        path: String,
+        changes: bool,
+        files: Vec<crate::model::VcsFile>,
+    ) {
         if let Some(worktree) = self.worktrees.iter_mut().find(|w| w.path == path) {
             worktree.changes = Some(changes);
+            worktree.files = files;
         }
+    }
+
+    /// The worktree a forced removal is waiting on, if one is.
+    pub fn confirming_worktree(&self) -> Option<(&WorktreeConfirm, &ThreadWorktree)> {
+        let confirm = self.worktree_confirm.as_ref()?;
+        let worktree = self.worktrees.iter().find(|w| w.path == confirm.path)?;
+        Some((confirm, worktree))
     }
 
     fn on_worktree_removed(&mut self, path: String, result: Result<(), String>) {
@@ -2084,6 +2199,13 @@ impl App {
             Ok(()) => {
                 self.worktrees.retain(|w| w.path != path);
                 self.live_worktrees.remove(&path);
+                if self
+                    .worktree_confirm
+                    .as_ref()
+                    .is_some_and(|c| c.path == path)
+                {
+                    self.worktree_confirm = None;
+                }
                 self.worktree_selected = self
                     .worktree_selected
                     .min(self.worktrees.len().saturating_sub(1));
@@ -4195,7 +4317,18 @@ impl App {
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
         // Overlays own the screen; the wheel and clicks would land on hidden widgets.
-        if matches!(self.mode, Mode::Picker | Mode::Help) {
+        // All of them, not only the two: a list drawn over the chat is as much in the
+        // way as the picker is, and one of them is a question about destroying work.
+        if matches!(
+            self.mode,
+            Mode::Picker
+                | Mode::Help
+                | Mode::Tasks
+                | Mode::Usage
+                | Mode::Agents
+                | Mode::Terminals
+                | Mode::Worktrees
+        ) {
             return;
         }
         if self.mode == Mode::TerminalPane {
@@ -5094,7 +5227,11 @@ fn apply(app: &mut App, event: AppEvent) {
         AppEvent::ThreadCreated(thread_id) => app.on_thread_created(thread_id),
         AppEvent::CreateRefused { thread_id, error } => app.on_create_refused(thread_id, error),
         AppEvent::UsageRead(read) => app.on_usage_read(read),
-        AppEvent::WorktreeChecked { path, changes } => app.on_worktree_checked(path, changes),
+        AppEvent::WorktreeChecked {
+            path,
+            changes,
+            files,
+        } => app.on_worktree_checked(path, changes, files),
         AppEvent::WorktreeRemoved { path, result } => app.on_worktree_removed(path, result),
         AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
         AppEvent::Dispatched(Ok(())) => {}
@@ -5811,6 +5948,126 @@ mod tests {
             "{:?}",
             app.toast
         );
+    }
+
+    /// The next thing the UI asked the server for. The calls go out from a task of
+    /// their own, so there is a moment between the key and the request.
+    async fn asked(
+        requests: &mut mpsc::UnboundedReceiver<crate::session::Request>,
+    ) -> Option<crate::session::Request> {
+        tokio::time::timeout(std::time::Duration::from_millis(500), requests.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// That nothing was asked for. Given the same moment to arrive as anything else,
+    /// so that "nothing happened" is not just "nothing happened yet".
+    async fn asked_nothing(
+        requests: &mut mpsc::UnboundedReceiver<crate::session::Request>,
+    ) -> bool {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        requests.try_recv().is_err()
+    }
+
+    fn holding(app: &mut App, changes: Option<bool>) -> String {
+        let worktree = ThreadWorktree {
+            thread_id: "t1".into(),
+            title: "a thread".into(),
+            project: "p".into(),
+            project_cwd: "/src/p".into(),
+            path: "/worktrees/p/w-1".into(),
+            branch: Some("tria/1".into()),
+            settled: true,
+            running: false,
+            changes,
+            files: Vec::new(),
+        };
+        let path = worktree.path.clone();
+        app.worktrees = vec![worktree];
+        app.worktree_selected = 0;
+        app.mode = Mode::Worktrees;
+        path
+    }
+
+    /// `X` is one shift away from `x` in a list moved through with `j` and `k`, and it
+    /// is the only key here that destroys work: git refuses a worktree with anything
+    /// uncommitted in it, untracked files are in no commit anywhere, and a reflexive
+    /// `dd` used to take one of each. So it asks first.
+    #[tokio::test]
+    async fn forcing_a_dirty_worktree_out_asks_before_it_does_it() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        holding(&mut app, Some(true));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        assert!(app.worktree_confirm.is_some(), "it asks");
+        // Nothing has been removed: the only call out is the re-read of the checkout,
+        // so that what is listed is what is there now rather than what was cached.
+        assert!(matches!(
+            asked(&mut requests).await,
+            Some(crate::session::Request::Call { tag, .. }) if tag == "vcs.refreshStatus"
+        ));
+
+        // And saying no leaves it exactly as it was.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.worktree_confirm.is_none());
+        assert_eq!(app.worktrees.len(), 1);
+        assert_eq!(app.mode, Mode::Worktrees, "the list is still there");
+        assert!(asked_nothing(&mut requests).await, "nothing was removed");
+
+        // Saying yes is what removes it.
+        app.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        let _ = asked(&mut requests).await;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.worktree_confirm.is_none());
+        assert!(matches!(
+            asked(&mut requests).await,
+            Some(crate::session::Request::Call { tag, payload, .. })
+                if tag == "vcs.removeWorktree" && payload["force"] == true
+        ));
+    }
+
+    /// Nothing uncommitted means git would not have refused and there is nothing to
+    /// lose, so there is no question worth asking.
+    #[tokio::test]
+    async fn forcing_a_clean_worktree_out_just_does_it() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        holding(&mut app, Some(false));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        assert!(app.worktree_confirm.is_none());
+        assert!(matches!(
+            asked(&mut requests).await,
+            Some(crate::session::Request::Call { tag, .. }) if tag == "vcs.removeWorktree"
+        ));
+    }
+
+    /// The reasons a worktree cannot go at all are given before the question. Agreeing
+    /// to lose the files and only then being told no is a worse conversation.
+    #[tokio::test]
+    async fn a_worktree_that_cannot_go_says_so_instead_of_asking() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        holding(&mut app, Some(true));
+        app.worktrees[0].running = true;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        assert!(app.worktree_confirm.is_none());
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|(m, _, _)| m.contains("still running")),
+            "{:?}",
+            app.toast
+        );
+        assert!(asked_nothing(&mut requests).await);
     }
 
     /// A thread whose updates have stopped looks exactly like one nobody is writing to,

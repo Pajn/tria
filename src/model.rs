@@ -319,6 +319,23 @@ pub struct VcsWorkingTree {
     pub insertions: u32,
     #[serde(default)]
     pub deletions: u32,
+    /// A row per file, which is what git would refuse to throw away. Untracked ones are
+    /// in here too, a directory nothing tracks appearing as the directory; they carry no
+    /// line counts, but neither does a file whose mode alone changed, so the two cannot
+    /// be told apart from here and are not labelled as though they could.
+    #[serde(default)]
+    pub files: Vec<VcsFile>,
+}
+
+/// One uncommitted file, as the server counts it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VcsFile {
+    pub path: String,
+    #[serde(default)]
+    pub insertions: u32,
+    #[serde(default)]
+    pub deletions: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -198,6 +198,14 @@ worktree with modified or untracked files in it, which is the check worth having
 how you say you meant it. A worktree the server made for a thread is the only kind offered:
 one that a project is rooted in is a place to work rather than something left over.
 
+`X` is the one key in that list that destroys work, and it sits on the shift of the one that
+does not, so it asks first: a box naming the worktree and listing every uncommitted and
+untracked file in it, re-read from the checkout as it opens rather than taken from the cache.
+`Enter` removes it, `Esc` or `q` keeps it, and `j`/`k` move through the list when it is longer
+than the box. A worktree with nothing uncommitted has nothing to lose and nothing for git to
+refuse over, so `X` on one of those removes it without asking. The branch is named in the box
+too, because it stays: what goes is the checkout.
+
 Removing a worktree leaves its branch, so nothing committed is lost by clearing them out.
 Threads that are done with a worktree still on the disk are marked `⌂` in the sidebar, and the
 settled section says how many there are.

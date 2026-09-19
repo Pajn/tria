@@ -2081,6 +2081,140 @@ fn draw_worktrees(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     frame.render_widget(Paragraph::new(text), inner);
+    draw_worktree_confirm(frame, app, area);
+}
+
+/// The question a forced removal asks first, over the list it was asked from. Everything
+/// else in that list is recoverable — a removed worktree leaves its branch behind — and
+/// this is the one thing that is not, so it shows the work it would take rather than
+/// asking about it in the abstract.
+fn draw_worktree_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let Some((confirm, worktree)) = app.confirming_worktree() else {
+        return;
+    };
+    let width = 76.min(area.width);
+    let inner_width = width.saturating_sub(4) as usize;
+    let dim = Style::default().fg(Color::DarkGray);
+    let warn = Style::default().fg(Color::Red);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            fit(&worktree.title, inner_width.saturating_sub(2)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", fit(&worktree.path, inner_width.saturating_sub(2))),
+        dim,
+    )));
+    // What survives this, which is most of it: the branch is not the worktree, and
+    // anything committed to it is still there afterwards.
+    lines.push(Line::from(vec![
+        Span::styled("  ", dim),
+        Span::styled(
+            worktree
+                .branch
+                .clone()
+                .unwrap_or_else(|| "no branch".into()),
+            Style::default().fg(Color::Blue),
+        ),
+        Span::styled(" stays · only the checkout goes", dim),
+    ]));
+    lines.push(Line::from(""));
+
+    // The list of what goes, which is the whole point of asking.
+    let files = &worktree.files;
+    match (worktree.changes, files.is_empty()) {
+        (None, true) => lines.push(Line::from(Span::styled(
+            "  still asking the server what is in it",
+            dim,
+        ))),
+        (Some(true), true) => lines.push(Line::from(Span::styled(
+            "  it has uncommitted work in it, which the server did not list",
+            warn,
+        ))),
+        (_, false) => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {} uncommitted or untracked file{} would go with it:",
+                    files.len(),
+                    if files.len() == 1 { "" } else { "s" }
+                ),
+                warn,
+            )));
+        }
+        (Some(false), true) => lines.push(Line::from(Span::styled(
+            "  nothing uncommitted in it now",
+            dim,
+        ))),
+    }
+    // Room for the rest of the box: the border, the title, the path, the branch, the
+    // blank, the count, the line saying how many are below, the blank, and the hint.
+    let room = (area.height.saturating_sub(10)).max(1) as usize;
+    let first = confirm.offset.min(files.len().saturating_sub(1));
+    let first = first.min(files.len().saturating_sub(room.min(files.len())));
+    for file in files.iter().skip(first).take(room) {
+        // No label on a file with no line counts: an untracked one and a file whose
+        // mode alone changed both come through with none, and saying which would be
+        // making it up.
+        let counts = match (file.insertions, file.deletions) {
+            (0, 0) => String::new(),
+            (added, 0) => format!("  +{added}"),
+            (0, removed) => format!("  −{removed}"),
+            (added, removed) => format!("  +{added} −{removed}"),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    "    {}",
+                    fit(&file.path, inner_width.saturating_sub(4 + counts.len()))
+                ),
+                Style::default(),
+            ),
+            Span::styled(counts, dim),
+        ]));
+    }
+    let below = files.len().saturating_sub(first + room);
+    if below > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("    ⋯ {below} more · j k to move through them"),
+            dim,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  Enter", warn.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            if files.is_empty() {
+                " removes it and anything in it for good  ·  "
+            } else {
+                " removes it and these files for good  ·  "
+            },
+            dim,
+        ),
+        Span::styled("Esc", Style::default()),
+        Span::styled(" or ", dim),
+        Span::styled("q", Style::default()),
+        Span::styled(" keeps it", dim),
+    ]));
+
+    let text = Text::from(lines);
+    let height = (text.lines.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered().border_style(warn).title(Span::styled(
+        " remove this worktree and lose what is in it? ",
+        warn.add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(text), inner);
 }
 
 fn draw_terminals(frame: &mut Frame, app: &App, area: Rect) {
@@ -2656,7 +2790,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("                          c opens a new one, x closes, r restarts"),
         Line::from("  in the pane             every key goes to the shell · Ctrl-\\ detaches"),
         Line::from("  gW                      worktrees threads are holding: Enter opens the"),
-        Line::from("                          thread, x removes one, X removes it anyway"),
+        Line::from("                          thread, x removes one, X removes a dirty one after"),
+        Line::from("                          showing what would go with it"),
         Line::from(
             "  ge                      composer: edit the draft · chat: view the block under the cursor",
         ),
@@ -2777,6 +2912,7 @@ mod tests {
     use base64::Engine;
     use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
+    use tokio::sync::mpsc;
 
     use super::*;
     use crate::app::ThreadWorktree;
@@ -2792,6 +2928,7 @@ mod tests {
             settled: true,
             running: false,
             changes: Some(false),
+            files: Vec::new(),
         }
     }
 
@@ -2810,6 +2947,74 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn dirty(app: &mut App, files: &[(&str, u32, u32)]) {
+        let mut worktree = worktree(1);
+        worktree.changes = Some(true);
+        worktree.files = files
+            .iter()
+            .map(|(path, insertions, deletions)| crate::model::VcsFile {
+                path: (*path).into(),
+                insertions: *insertions,
+                deletions: *deletions,
+            })
+            .collect();
+        let path = worktree.path.clone();
+        app.worktrees = vec![worktree];
+        app.worktree_confirm = Some(crate::app::WorktreeConfirm { path, offset: 0 });
+    }
+
+    /// Removing a worktree is ordinarily safe — the branch stays — and git refuses one
+    /// with anything uncommitted in it. `X` overrides that refusal, which is the one key
+    /// in the list that destroys work, and untracked files are nowhere else. So it shows
+    /// the work first.
+    #[test]
+    fn forcing_a_worktree_out_says_what_would_go_with_it() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        dirty(
+            &mut app,
+            &[("notes.md", 0, 0), ("src/lib.rs", 12, 3), ("out/", 0, 0)],
+        );
+        let drawn = drawn(90, 24, &app);
+
+        assert!(drawn.contains("remove this worktree"), "{drawn}");
+        assert!(
+            drawn.contains("3 uncommitted or untracked files"),
+            "{drawn}"
+        );
+        for path in ["notes.md", "src/lib.rs", "out/"] {
+            assert!(drawn.contains(path), "{path} is not in:\n{drawn}");
+        }
+        // The counts are there where there are any, and nothing is labelled where the
+        // server cannot say: an untracked file and a mode change both come with none.
+        assert!(drawn.contains("+12 −3"), "{drawn}");
+        assert!(drawn.contains("Enter"), "{drawn}");
+        assert!(drawn.contains("Esc"), "{drawn}");
+    }
+
+    /// The list can be longer than the box, so it moves.
+    #[test]
+    fn a_long_list_of_losses_can_be_read_through() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let many: Vec<(String, u32, u32)> =
+            (0..40).map(|n| (format!("file-{n}.txt"), 0, 0)).collect();
+        let many: Vec<(&str, u32, u32)> =
+            many.iter().map(|(p, i, d)| (p.as_str(), *i, *d)).collect();
+        dirty(&mut app, &many);
+
+        let top = drawn(90, 24, &app);
+        assert!(top.contains("file-0.txt"), "{top}");
+        assert!(top.contains("more"), "it says there are more: {top}");
+
+        app.worktree_confirm.as_mut().unwrap().offset = 39;
+        let bottom = drawn(90, 24, &app);
+        assert!(bottom.contains("file-39.txt"), "{bottom}");
+        assert!(!bottom.contains("file-0.txt"), "{bottom}");
     }
 
     /// A config with two signed-in accounts, in the shape the server sends one. The
