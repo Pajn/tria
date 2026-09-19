@@ -38,6 +38,20 @@ pub struct Block {
     /// Images an open row left room for, in text-line indices before wrapping. The lines
     /// they sit on are blank; the renderer draws over them.
     pub images: Vec<Placed>,
+    /// Every picture the block's rows have, under the key of the row that has it, open
+    /// or shut and whether or not this terminal could draw it. Drawing is not the only
+    /// thing anybody wants a picture for: it can be handed to the machine's own viewer
+    /// instead, and a terminal that draws nothing is exactly where that is worth doing.
+    pub pictures: Vec<(String, Picture)>,
+}
+
+/// Where a picture itself is, as opposed to where it was drawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Picture {
+    /// A file on the machine the tool ran on, which is this one or nowhere.
+    File(String),
+    /// The picture as the provider wrote it into a transcript: base64, no file anywhere.
+    Data(String),
 }
 
 /// Where in a block an image goes. How large it is the drawing cache already knows.
@@ -165,7 +179,7 @@ pub fn build(
                 entry.status = "completed".to_string();
             }
         }
-        let (text, rows, images) = render_work(
+        let (text, rows, images, pictures) = render_work(
             pending,
             is_expanded,
             open_levels >= 2,
@@ -186,6 +200,7 @@ pub fn build(
             rows,
             exports,
             images,
+            pictures,
         });
         pending.clear();
     };
@@ -219,6 +234,7 @@ pub fn build(
                         format!("## {role}\n\n{}\n", message.text.trim_end()),
                     )],
                     images: Vec::new(),
+                    pictures: Vec::new(),
                 });
             }
             Item::Activity(activity) => {
@@ -243,6 +259,7 @@ pub fn build(
                         format!("## proposed plan\n\n{}\n", plan.plan_markdown.trim_end()),
                     )],
                     images: Vec::new(),
+                    pictures: Vec::new(),
                 });
             }
         }
@@ -261,6 +278,7 @@ pub fn build(
             rows: Vec::new(),
             exports: Vec::new(),
             images: Vec::new(),
+            pictures: Vec::new(),
         });
     }
     blocks
@@ -757,7 +775,7 @@ fn render_work(
     group_key: &str,
     width: u16,
     height: u16,
-) -> (Text<'static>, Rows, Vec<Placed>) {
+) -> (Text<'static>, Rows, Vec<Placed>, Vec<(String, Picture)>) {
     let running = entries.iter().filter(|e| e.status == "inProgress").count();
     let failed = entries
         .iter()
@@ -766,6 +784,7 @@ fn render_work(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut rows: Rows = Vec::new();
     let mut images: Vec<Placed> = Vec::new();
+    let mut pictures: Vec<(String, Picture)> = Vec::new();
     let mut header = vec![
         Span::styled(
             if expanded { "▾ " } else { "▸ " },
@@ -812,7 +831,7 @@ fn render_work(
         foldable: true,
     });
     if !expanded {
-        return (Text::from(lines), rows, images);
+        return (Text::from(lines), rows, images, pictures);
     }
     let dim = Style::default().fg(Color::DarkGray);
     for entry in entries {
@@ -825,6 +844,14 @@ fn render_work(
         } else {
             "▸ "
         };
+        // Whether or not the row is open, and whether or not this terminal can draw it:
+        // a picture belongs to the row that has it, and opening it elsewhere is asking
+        // for the picture rather than for the cells it would have been drawn in.
+        for image in &entry.images {
+            if let Some(picture) = Picture::of(image.source) {
+                pictures.push((key.clone(), picture));
+            }
+        }
         let first = lines.len();
         let mut spans = vec![
             Span::raw("  "),
@@ -909,7 +936,20 @@ fn render_work(
             foldable: entry.has_more(),
         });
     }
-    (Text::from(lines), rows, images)
+    (Text::from(lines), rows, images, pictures)
+}
+
+impl Picture {
+    /// Where a row's picture is, given what it was drawn from. Bytes and pixels are
+    /// pictures tria made rather than ones anybody sent — the furniture it draws around
+    /// the conversation — and no row has one, so there is nothing there to open.
+    fn of(source: picture::Source<'_>) -> Option<Self> {
+        match source {
+            picture::Source::File(path) => Some(Picture::File(path.to_string())),
+            picture::Source::Data(data) => Some(Picture::Data(data.to_string())),
+            picture::Source::Bytes(_) | picture::Source::Pixels { .. } => None,
+        }
+    }
 }
 
 /// What to say in place of an image that cannot be drawn.
@@ -1137,7 +1177,8 @@ mod tests {
         let entries = work(&rows);
         assert!(entries[0].has_more(), "an image is something to unfold");
         let open = HashSet::from(["work-1/t1".to_string()]);
-        let (text, regions, images) = render_work(&entries, true, false, &open, "work-1", 80, 24);
+        let (text, regions, images, _) =
+            render_work(&entries, true, false, &open, "work-1", 80, 24);
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].key, "t1/1");
         let size = picture::place(
@@ -1199,9 +1240,50 @@ mod tests {
         let entries = work(&rows);
         assert!(entries[0].has_more(), "the file is something to unfold");
         let open = HashSet::from(["work-1/t2".to_string()]);
-        let (_, _, images) = render_work(&entries, true, false, &open, "work-1", 80, 24);
+        let (_, _, images, _) = render_work(&entries, true, false, &open, "work-1", 80, 24);
         assert_eq!(images.len(), 1);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A row keeps hold of its picture even where none of it can be drawn: a folded row,
+    /// a file that is not there, a terminal that draws nothing. That is the row the
+    /// picture can be opened from, and those are the cases where opening it elsewhere is
+    /// the only way to see it at all.
+    #[test]
+    fn a_row_keeps_its_picture_even_where_it_cannot_be_drawn() {
+        picture::draw_in_halfblocks();
+        let missing: Activity = serde_json::from_value(json!({
+            "id": "a-image",
+            "kind": "tool.completed",
+            "tone": "info",
+            "summary": "Image view",
+            "createdAt": "1",
+            "payload": {
+                "itemType": "image_view",
+                "toolCallId": "t1",
+                "status": "completed",
+                "title": "Image view",
+                "data": { "imagePath": "/tmp/tria-no-such-picture.png", "toolName": "Read" },
+            },
+        }))
+        .unwrap();
+        let rows = [missing];
+        let entries = work(&rows);
+        let open = HashSet::from(["work-1/t1".to_string()]);
+        let (_, _, images, pictures) = render_work(&entries, true, false, &open, "work-1", 80, 24);
+        // Nothing to draw: the file is not there, so no lines were left for it.
+        assert!(images.is_empty());
+        assert_eq!(
+            pictures,
+            [(
+                "work-1/t1".to_string(),
+                Picture::File("/tmp/tria-no-such-picture.png".to_string())
+            )]
+        );
+        // And the same while the row is shut, which is the state a picture is easiest to
+        // want out of the way in.
+        let (_, _, _, shut) = render_work(&entries, true, false, &HashSet::new(), "work-1", 80, 24);
+        assert_eq!(shut, pictures);
     }
 
     /// The text of a result still reads as text when an image came with it, and the
@@ -1258,7 +1340,7 @@ mod tests {
         let rows = [run];
         let entries = work(&rows);
         let text = |all_open| {
-            let (text, _, _) =
+            let (text, _, _, _) =
                 render_work(&entries, true, all_open, &HashSet::new(), "work-1", 80, 24);
             text.to_string()
         };
@@ -1287,7 +1369,8 @@ mod tests {
             ),
         ];
         let entries = work(&rows);
-        let (_, regions, _) = render_work(&entries, true, false, &HashSet::new(), "work-1", 80, 24);
+        let (_, regions, _, _) =
+            render_work(&entries, true, false, &HashSet::new(), "work-1", 80, 24);
         let keys: Vec<(&str, bool)> = regions
             .iter()
             .map(|region| (region.key.as_str(), region.foldable))

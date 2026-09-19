@@ -437,6 +437,9 @@ pub struct App {
     /// Text to push to the clipboard after the next frame is drawn.
     pub clipboard_pending: Option<String>,
     pub work_ranges: Vec<crate::timeline::Region>,
+    /// Every picture the open rows have, under the key the row that has it is keyed by.
+    /// Filled by the renderer with each frame, like the regions above it.
+    pub chat_pictures: Vec<(String, crate::timeline::Picture)>,
     quit: bool,
 }
 
@@ -523,6 +526,7 @@ impl App {
             selection: None,
             clipboard_pending: None,
             work_ranges: Vec::new(),
+            chat_pictures: Vec::new(),
             quit: false,
         }
     }
@@ -2689,13 +2693,46 @@ impl App {
 
     // ── Pull requests ──────────────────────────────────────────────────
 
-    /// `gx`: the link under the chat cursor when there is one, else the thread's pull
-    /// request. Vim opens the link under the cursor with this key, and a chat line with a
-    /// link on it is the case where that is what you meant.
+    /// `gx`: the link under the chat cursor when there is one, then the picture the row
+    /// under it has, and failing both the thread's pull request. Vim opens the link under
+    /// the cursor with this key, and a chat line with a link on it is the case where that
+    /// is what you meant; a picture is the other thing on a line that is somewhere else
+    /// really, and the terminal only ever shows a thumbnail of it.
     fn open_under_cursor(&mut self, pick: bool) {
-        match self.link_at_cursor() {
-            Some(url) => self.open_url(&url),
-            None => self.open_pull_request(pick),
+        if let Some(url) = self.link_at_cursor() {
+            self.open_url(&url);
+            return;
+        }
+        if let Some(picture) = self.picture_at_cursor() {
+            self.open_picture(picture);
+            return;
+        }
+        self.open_pull_request(pick);
+    }
+
+    /// The picture the row under the chat cursor has, open or shut. The cursor is inside
+    /// that row wherever it is on the picture itself, since the lines it was drawn over
+    /// belong to the row that opened it.
+    fn picture_at_cursor(&self) -> Option<crate::timeline::Picture> {
+        let (key, _) = self.region_at(self.chat_cursor)?;
+        self.chat_pictures
+            .iter()
+            .find(|(row, _)| *row == key)
+            .map(|(_, picture)| picture.clone())
+    }
+
+    /// Hand a picture to whatever this machine opens pictures with. One the provider
+    /// wrote into a transcript is not a file anywhere, so it is written out first: a
+    /// viewer opens paths, and the temporary file is named after what is in it, so
+    /// opening the same picture twice writes it once.
+    fn open_picture(&mut self, picture: crate::timeline::Picture) {
+        use crate::timeline::Picture;
+        match picture {
+            Picture::File(path) => self.open_url(&path),
+            Picture::Data(data) => match write_picture(&data) {
+                Some(path) => self.open_url(&path),
+                None => self.toast("that picture is not one tria can write out", true),
+            },
         }
     }
 
@@ -4827,6 +4864,29 @@ pub struct Launch {
 
 /// Ask where a project's icon is and fetch it. `sourcePath` is the server saying it found
 /// one; without it the URL leads to nothing and there is no icon to draw.
+/// Write a picture that came as base64 to a file, and say where. Named after the bytes
+/// themselves so that the same picture is the same file: a viewer left open on it sees
+/// the same path the next time, and the temporary directory does not fill up with copies.
+fn write_picture(data: &str) -> Option<String> {
+    use base64::Engine;
+    use std::hash::{Hash, Hasher};
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .ok()?;
+    // What kind of picture it is is in the bytes, and the viewer is likely to want it in
+    // the name: a file called `.bin` opens in a text editor.
+    let format = image::guess_format(&bytes).ok()?;
+    let extension = format.extensions_str().first().copied()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let path = std::env::temp_dir().join(format!("tria-{:016x}.{extension}", hasher.finish()));
+    if !path.exists() {
+        std::fs::write(&path, &bytes).ok()?;
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
 async fn favicon_bytes(handle: &session::Handle, origin: &str, cwd: &str) -> Option<Vec<u8>> {
     let answer = handle
         .call(
@@ -5472,6 +5532,61 @@ mod tests {
         app.mode = Mode::Normal;
         app.on_mouse(click(2, 20));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// `gx` on a row with a picture opens the picture, which is the one thing on a chat
+    /// line that is really somewhere else: the terminal only ever drew a thumbnail.
+    #[test]
+    fn the_picture_under_the_cursor_is_the_one_that_opens() {
+        use crate::timeline::{Picture, Region};
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.work_ranges = vec![
+            Region {
+                first: 0,
+                end: 9,
+                key: "work-1".into(),
+                foldable: true,
+            },
+            Region {
+                first: 2,
+                end: 8,
+                key: "work-1/t1".into(),
+                foldable: true,
+            },
+        ];
+        app.chat_pictures = vec![("work-1/t1".into(), Picture::File("/tmp/shot.png".into()))];
+
+        // Anywhere in the row, including the lines the picture was drawn over.
+        app.chat_cursor = 5;
+        assert_eq!(
+            app.picture_at_cursor(),
+            Some(Picture::File("/tmp/shot.png".into()))
+        );
+        // The group around it is not the row, and has no picture of its own.
+        app.chat_cursor = 1;
+        assert_eq!(app.picture_at_cursor(), None);
+    }
+
+    /// A picture that came inside a transcript is not a file anywhere, so opening it
+    /// means writing it out — and writing the same picture twice is the same file.
+    #[test]
+    fn a_picture_with_no_file_is_given_one() {
+        use base64::Engine;
+        let data = crate::picture::test_png(8, 8);
+        let path = write_picture(&data).expect("a png is a picture");
+        assert!(path.ends_with(".png"), "{path}");
+        assert_eq!(write_picture(&data).as_deref(), Some(path.as_str()));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            base64::engine::general_purpose::STANDARD
+                .decode(&data)
+                .unwrap()
+        );
+        std::fs::remove_file(&path).unwrap();
+        // Something that is not a picture is not written out at all.
+        assert_eq!(write_picture("bm90IGEgcGljdHVyZQ=="), None);
     }
 
     /// The fold keys step a level at a time as well as going straight to the ends, and

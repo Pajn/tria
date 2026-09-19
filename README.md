@@ -104,7 +104,7 @@ Press `?` inside the app for the full list.
 | `g!` | a shell in the popup, in the thread's directory |
 | `ge` | composer focused: edit the draft in your editor, read back on exit. Chat focused: view the message, plan, tool row, or tool group under the cursor |
 | `gE` | view the whole conversation in your editor |
-| `gx` | open the link on the cursor's line, else the thread's pull request |
+| `gx` | open the link on the cursor's line, else the picture the row has, else the thread's pull request |
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
 | `h` `l` `0` `$` `w` `b` | chat focused: move along the line under the cursor |
 | `v` `V` | chat focused: start a selection by character or by line; `y` copies it |
@@ -283,8 +283,8 @@ ones it opened and leaves the desktop app's own alone.
 ## Links
 
 URLs in the conversation are underlined, and clicking one opens it in the browser. With the
-chat focused, `gx` opens the link on the cursor's line, falling back to the thread's pull
-request when the line has none.
+chat focused, `gx` opens the link on the cursor's line, falling back to the picture the row
+under the cursor has, and then to the thread's pull request.
 
 Links are found on the drawn screen rather than in the message text, so one that wraps across
 two lines is still whole, and the same goes for a URL inside a tool row or a plan. Trailing
@@ -447,7 +447,12 @@ wire, and keep what they sent and what they got back.
 
 An image the agent read is drawn rather than named: unfolding the row puts the picture under
 the line, as wide as the chat and at most half as tall, scrolling with the conversation like
-any other lines. The summary the server sends holds the path the tool read and not the
+any other lines. It is fitted to that room rather than cropped, so a tall screenshot comes
+out whole and small; `gx` on the row hands the picture to whatever this machine opens
+pictures with, which is where to read one the terminal has shrunk past reading. That works
+from a folded row too, and on a terminal that cannot draw pictures at all. A picture that
+came inside a subagent's transcript is not a file anywhere, so it is written to a temporary
+one first, named after the bytes so the same picture is always the same file. The summary the server sends holds the path the tool read and not the
 picture, so the file is read from disk — which works when the server is on this machine, and
 is why an image row against a remote server has nothing to unfold. A subagent's transcript is
 the exception again: the provider's file carries its pictures inside it, and those draw

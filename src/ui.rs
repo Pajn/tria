@@ -1131,6 +1131,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         };
         app.chat_viewport = (height, cache.total);
         app.work_ranges.clear();
+        app.chat_pictures.clear();
         app.block_ranges.clear();
         app.message_starts.clear();
         if app.focus == Focus::Chat {
@@ -1161,6 +1162,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             if let Some((key, _)) = exports.first() {
                 app.block_ranges.push((start, end, key.clone()));
             }
+            app.chat_pictures.extend(block.pictures.iter().cloned());
             if let BlockKey::Work(key) = &block.key {
                 app.work_ranges.push(timeline::Region {
                     first: start,
@@ -2642,7 +2644,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(programs),
         Line::from("  g!                      a shell in the pane"),
         Line::from(
-            "  gx                      open the link under the cursor, else the pull request",
+            "  gx                      open the link, picture, or pull request under the cursor",
         ),
         Line::from("  click a link            open it in the browser"),
         Line::from(
