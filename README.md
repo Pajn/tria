@@ -109,6 +109,7 @@ Press `?` inside the app for the full list.
 | `gE` | view the whole conversation in your editor |
 | `gx` | open the link on the cursor's line, else the picture under the cursor, else the thread's pull request |
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
+| `gP` | split a tmux pane beside tria, in the thread's directory (`:split`) |
 | `gD` | show the thread's directory in the machine's file browser (`:reveal`) |
 | `h` `l` `0` `$` `w` `b` | chat focused: move along the line under the cursor |
 | `v` `V` | start a selection by character or by line, in the chat or in the composer; `y` copies it |
@@ -214,7 +215,7 @@ Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [l
 `older`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
 `reveal`,
 `worktree`, `worktrees`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`,
-`usage`, `reconnect`, `help`, `q`.
+`usage`, `split`, `reconnect`, `help`, `q`.
 
 The line is the same one-line editor as the rest of the client, so it takes the same keys:
 `Ctrl-w` rubs out a word and `Ctrl-u` the line, `Ctrl-a` and `Ctrl-e` go to the ends, and
@@ -350,7 +351,7 @@ interactive: one that prints and exits takes the popup with it. A key set to `""
 binding away, including `l`. Each binding also answers to the program's own name on the
 command line, so `:yazi` is `gb`; `:git` stays the name for whatever is on `l`, as does the
 older `git_command` setting, which `programs.l` overrides. The keys tria answers itself —
-`g` `a` `e` `s` `t` `w` `x` `y` `A` `D` `E` `S` `T` `W` `!` — are refused, and tria says which
+`g` `a` `e` `s` `t` `w` `x` `y` `A` `D` `E` `P` `S` `T` `W` `!` — are refused, and tria says which
 when it starts rather than binding a key that would never arrive.
 
 While a program is up, `Ctrl-\` leaves it running and its key comes back to it exactly as it
@@ -598,6 +599,16 @@ the thread's working directory: the worktree when the thread has one, else the p
 The name is the directory's last path component, with `.` and `:` replaced by `_` because
 tmux reserves them. If no such session exists, tria creates it in that directory first. This
 suits a one-session-per-checkout layout.
+
+`gP` or `:split` stays where you are instead: it splits tria's own pane and opens a shell in
+the other half, in the same directory, in the session and window already on screen. tmux
+puts the cursor in a pane it has just made, so the shell has the keys as soon as it is there.
+The split is side by side, since tria is a tall window and a shell under it would have a
+dozen rows. Nothing is said afterwards — the new pane is on screen with the cursor in it.
+
+Both want the directory to be one this machine has. The path is the server's, so where the
+server runs elsewhere tria says so rather than handing tmux a path that is somebody else's
+directory here.
 
 ## Tool output
 

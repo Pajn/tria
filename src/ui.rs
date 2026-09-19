@@ -2911,6 +2911,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(
             "  gt                      switch to the tmux session for the thread's directory",
         ),
+        Line::from("  gP                      split a tmux pane beside tria, in that directory"),
         Line::from("  gD                      show the thread's directory in the file browser"),
         Line::from("  mouse drag              select chat text; released, it is copied"),
         Line::from("  Ctrl-c                  interrupt the running turn, or the background work"),
@@ -2954,7 +2955,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :approve [n]  :stop  :stop! (the session)  :older  :answer  :dismiss  :reconnect  :sidebar  :worktrees  :q",
+            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :approve [n]  :stop  :stop! (the session)  :older  :answer  :dismiss  :reconnect  :sidebar  :worktrees  :split  :q",
         ),
         Line::from("  the line takes the editing keys above, Up/Down for the commands"),
         Line::from("  run this session, and Tab to complete a name or a listed argument"),

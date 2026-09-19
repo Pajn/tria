@@ -156,6 +156,7 @@ const COMMANDS: &[&str] = &[
     "settled",
     "shell",
     "sidebar",
+    "split",
     "stop",
     "stop!",
     "tasks",
@@ -3175,15 +3176,55 @@ impl App {
         self.open_url(&dir);
     }
 
-    /// `gt` and `:tmux`: switch the tmux client to the session named after the thread's
-    /// directory, creating it there first when it does not exist.
-    fn switch_tmux_session(&mut self) {
+    /// The thread's directory, for the keys that hand it to tmux: this has to be running
+    /// inside tmux, and the directory has to be one this machine has. The path is the
+    /// server's, so on another machine it is either not a directory here or, worse, a
+    /// different one — and tmux would open something at the wrong place rather than fail.
+    fn tmux_directory(&mut self) -> Option<String> {
         if std::env::var_os("TMUX").is_none() {
             self.toast("not running inside tmux", true);
-            return;
+            return None;
         }
         let Some(dir) = self.thread_directory() else {
             self.toast("no thread open", true);
+            return None;
+        };
+        if !self.local_disk {
+            self.toast("the thread's directory is on the server's machine", true);
+            return None;
+        }
+        Some(dir)
+    }
+
+    /// `gP` and `:split`: open a tmux pane beside this one, in the thread's directory.
+    ///
+    /// It splits tria's own pane, so the shell arrives in the session and the window
+    /// already on screen — which is the whole difference between this and `gt`, where
+    /// the thread's session is somewhere else to be switched to and back from. tmux
+    /// moves the focus to a pane it has just made, and says nothing afterwards: the new
+    /// pane is right there with the cursor in it, and a toast would be announcing what
+    /// is already on screen.
+    fn split_tmux_pane(&mut self) {
+        let Some(dir) = self.tmux_directory() else {
+            return;
+        };
+        // Tria's own pane, rather than whichever one tmux last called the active one.
+        let pane = std::env::var("TMUX_PANE").ok();
+        let args = split_args(&dir, pane.as_deref());
+        match std::process::Command::new("tmux").args(&args).output() {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                self.toast(format!("tmux split-window failed: {err}"), true);
+            }
+            Err(err) => self.toast(format!("could not run tmux: {err}"), true),
+        }
+    }
+
+    /// `gt` and `:tmux`: switch the tmux client to the session named after the thread's
+    /// directory, creating it there first when it does not exist.
+    fn switch_tmux_session(&mut self) {
+        let Some(dir) = self.tmux_directory() else {
             return;
         };
         let name = tmux_session_name(&dir);
@@ -3715,6 +3756,7 @@ impl App {
             "sidebar" => self.sidebar_visible = !self.sidebar_visible,
             "pr" | "pull" => self.open_pull_request(true),
             "tmux" => self.switch_tmux_session(),
+            "split" => self.split_tmux_pane(),
             "reveal" | "dir" => self.reveal_directory(),
             // `:git` is what the `l` binding has always been called, whatever is on it.
             "git" | "lazygit" => self.open_program('l'),
@@ -3984,6 +4026,7 @@ impl App {
             }
             KeyCode::Char('x') if prefix == Some('g') => self.open_under_cursor(false),
             KeyCode::Char('t') if prefix == Some('g') => self.switch_tmux_session(),
+            KeyCode::Char('P') if prefix == Some('g') => self.split_tmux_pane(),
             KeyCode::Char('D') if prefix == Some('g') => self.reveal_directory(),
             KeyCode::Char('y') if prefix == Some('g') => self.yank_last_assistant(),
             KeyCode::Char('s') if prefix == Some('g') => {
@@ -4535,6 +4578,7 @@ impl App {
             KeyCode::Char('g') if prefix == Some('g') => return self.composer.vim_top(),
             KeyCode::Char('x') if prefix == Some('g') => return self.open_under_cursor(false),
             KeyCode::Char('t') if prefix == Some('g') => return self.switch_tmux_session(),
+            KeyCode::Char('P') if prefix == Some('g') => return self.split_tmux_pane(),
             KeyCode::Char('y') if prefix == Some('g') => return self.yank_last_assistant(),
             KeyCode::Char('s') if prefix == Some('g') => {
                 let id = self.current_thread_id.clone();
@@ -5551,6 +5595,24 @@ fn run_external(terminal: &mut ratatui::DefaultTerminal, external: &ExternalComm
         Ok(status) => anyhow::bail!("exited with {status}"),
         Err(err) => Err(err.into()),
     }
+}
+
+/// The tmux command that opens the pane, as its arguments.
+///
+/// Side by side rather than one above the other: tria is a tall window and a shell
+/// under it would have a dozen rows, where beside it both halves keep their height.
+fn split_args(dir: &str, pane: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "split-window".to_string(),
+        "-h".to_string(),
+        "-c".to_string(),
+        dir.to_string(),
+    ];
+    if let Some(pane) = pane {
+        args.push("-t".to_string());
+        args.push(pane.to_string());
+    }
+    args
 }
 
 /// tmux session name for a directory: its last path component, with the characters tmux
@@ -7655,7 +7717,7 @@ mod tests {
         assert_eq!(app.shell.projects["p"].title, "p");
     }
 
-    use super::tmux_session_name;
+    use super::{split_args, tmux_session_name};
 
     #[test]
     fn search_matching_is_smartcase() {
@@ -7675,6 +7737,22 @@ mod tests {
         );
         assert_eq!(tmux_session_name("/home/me/work/app.v2/"), "app_v2");
         assert_eq!(tmux_session_name("main"), "main");
+    }
+
+    /// The pane is a split of tria's own, named rather than left to whichever pane tmux
+    /// last called the active one, and it starts where the thread works.
+    #[test]
+    fn the_pane_is_a_split_of_this_one_in_the_threads_directory() {
+        assert_eq!(
+            split_args("/home/me/work/app", Some("%3")),
+            ["split-window", "-h", "-c", "/home/me/work/app", "-t", "%3"]
+        );
+        // Outside a pane tmux names, the split is of whichever one is active — which,
+        // with tria on screen, is tria's.
+        assert_eq!(
+            split_args("/home/me/work/app", None),
+            ["split-window", "-h", "-c", "/home/me/work/app"]
+        );
     }
 }
 
