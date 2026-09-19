@@ -107,6 +107,78 @@ pub struct SearchInput {
     origin: usize,
 }
 
+/// A `Tab` completion running on the command line.
+#[derive(Debug)]
+pub struct Completing {
+    /// Where the word being completed starts, in characters from the start of the line.
+    at: usize,
+    /// The word as it was typed, to come back to after the last candidate.
+    typed: String,
+    pub options: Vec<String>,
+    /// Which candidate is in the line; one past the last means the typed word is back.
+    pub index: usize,
+}
+
+/// What the server calls the ways a thread is allowed to act on its own.
+const RUNTIME_MODES: &[&str] = &[
+    "approval-required",
+    "auto-accept-edits",
+    "auto",
+    "full-access",
+];
+
+/// The commands `Tab` offers, one name apiece: the aliases run but are not suggested,
+/// since a list with two names for the same thing is a longer list and no more use.
+const COMMANDS: &[&str] = &[
+    "agents",
+    "answer",
+    "approve",
+    "archive",
+    "delete!",
+    "dismiss",
+    "edit",
+    "effort",
+    "git",
+    "help",
+    "mode",
+    "model",
+    "new",
+    "older",
+    "perm",
+    "pr",
+    "project",
+    "q",
+    "reconnect",
+    "rename",
+    "reveal",
+    "settle",
+    "settled",
+    "shell",
+    "sidebar",
+    "stop",
+    "stop!",
+    "tasks",
+    "terminals",
+    "tmux",
+    "unsettle",
+    "usage",
+    "view",
+    "wake",
+    "worktree",
+    "worktrees",
+];
+
+/// Where the word the cursor is in begins, in characters from the start of the line.
+fn word_start(line: &str, cursor: usize) -> usize {
+    line.chars()
+        .take(cursor)
+        .collect::<Vec<char>>()
+        .iter()
+        .rposition(|c| c.is_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     /// Keys edit the composer with Vim motions; the chat scrolls with Ctrl keys.
@@ -364,7 +436,11 @@ pub struct App {
     pub mode: Mode,
     pub focus: Focus,
     pub composer: Composer,
-    pub command_line: String,
+    /// The `:` line. A one-line editor rather than a string, so that it has the keys
+    /// and the history every other field in the client has.
+    pub command_line: Composer,
+    /// The `Tab` completion running on the command line, if one is.
+    pub completing: Option<Completing>,
     pub picker: Option<Picker>,
     pub question: Option<QuestionDraft>,
     /// The one-line field a custom answer is typed into.
@@ -538,7 +614,8 @@ impl App {
             mode: Mode::Normal,
             focus: Focus::Composer,
             composer: Composer::new(),
-            command_line: String::new(),
+            command_line: Composer::new(),
+            completing: None,
             picker: None,
             question: None,
             custom_answer: Composer::new(),
@@ -1829,7 +1906,7 @@ impl App {
                 self.composer.insert_str(text);
             }
             Mode::QuestionCustom => self.custom_answer.insert_str(&one_line(text)),
-            Mode::Command => self.command_line.push_str(&one_line(text)),
+            Mode::Command => self.command_line.insert_str(&one_line(text)),
             Mode::Picker => {
                 if let Some(picker) = self.picker.as_mut() {
                     picker.query.push_str(&one_line(text));
@@ -3570,14 +3647,8 @@ impl App {
                 _ => self.toast("usage: :mode plan|default", true),
             },
             "perm" | "permissions" => {
-                let valid = [
-                    "approval-required",
-                    "auto-accept-edits",
-                    "auto",
-                    "full-access",
-                ];
-                if !valid.contains(&arg) {
-                    self.toast(format!("usage: :perm {}", valid.join("|")), true);
+                if !RUNTIME_MODES.contains(&arg) {
+                    self.toast(format!("usage: :perm {}", RUNTIME_MODES.join("|")), true);
                 } else if let Some(id) = thread_id.as_deref() {
                     self.dispatch(commands::runtime_mode_set(id, arg));
                 } else if let Some(d) = self.draft.as_mut() {
@@ -4067,10 +4138,7 @@ impl App {
             KeyCode::Char('m') => self.open_picker(PickerKind::Model),
             KeyCode::Char('s') => self.sidebar_visible = !self.sidebar_visible,
             KeyCode::Char('S') => self.show_settled = !self.show_settled,
-            KeyCode::Char(':') => {
-                self.mode = Mode::Command;
-                self.command_line.clear();
-            }
+            KeyCode::Char(':') => self.open_command_line(),
             _ => {}
         }
     }
@@ -4438,10 +4506,7 @@ impl App {
                 KeyCode::BackTab => self.focus_chat(),
                 KeyCode::Char('/') => self.open_picker(PickerKind::Thread),
                 KeyCode::Char('n') => self.open_picker(PickerKind::Project),
-                KeyCode::Char(':') => {
-                    self.mode = Mode::Command;
-                    self.command_line.clear();
-                }
+                KeyCode::Char(':') => self.open_command_line(),
                 KeyCode::Char('?') => self.open_help(),
                 _ => {}
             }
@@ -4558,8 +4623,7 @@ impl App {
                 return;
             }
             KeyCode::Char(':') => {
-                self.mode = Mode::Command;
-                self.command_line.clear();
+                self.open_command_line();
                 return;
             }
             KeyCode::Char('?') if !editing => return self.open_help(),
@@ -4834,28 +4898,146 @@ impl App {
         }
     }
 
+    /// Start a command, on an empty line with no completion carried over from the last.
+    fn open_command_line(&mut self) {
+        self.mode = Mode::Command;
+        self.command_line.clear();
+        self.completing = None;
+    }
+
+    /// The `:` line takes the same editing keys as every other field — `Ctrl-w`,
+    /// `Ctrl-a`, `Ctrl-u`, the arrows, the word motions — with history on the arrows
+    /// and `Tab` completion of the command's name and of the arguments that come from
+    /// a fixed list.
     fn on_command_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Only `Tab` carries anything over from the key before it; anything else is a
+        // line that has changed under the completion, so the candidates are dropped.
+        if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.completing = None;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.command_line.clear();
             }
             KeyCode::Enter => {
-                let line = std::mem::take(&mut self.command_line);
+                let line = self.command_line.text();
                 self.mode = Mode::Normal;
+                if !line.trim().is_empty() {
+                    self.command_line.push_history(line.clone());
+                }
+                self.command_line.clear();
                 self.run_command(&line);
             }
-            KeyCode::Backspace => {
-                if self.command_line.pop().is_none() {
-                    self.mode = Mode::Normal;
-                }
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.command_line.clear()
-            }
-            KeyCode::Char(c) => self.command_line.push(c),
-            _ => {}
+            // An empty line with nothing left to rub out is a command given up on.
+            KeyCode::Backspace if self.command_line.text().is_empty() => self.mode = Mode::Normal,
+            KeyCode::Tab => self.complete_command(false),
+            KeyCode::BackTab => self.complete_command(true),
+            KeyCode::Up => self.command_line.history_prev(),
+            KeyCode::Down => self.command_line.history_next(),
+            KeyCode::Char('p') if ctrl => self.command_line.history_prev(),
+            KeyCode::Char('n') if ctrl => self.command_line.history_next(),
+            _ => edit_key(&mut self.command_line, key),
         }
+    }
+
+    /// `Tab` on the command line. The first one puts the first candidate in, and each
+    /// one after moves to the next, coming back round through what was typed — so a
+    /// completion that guessed wrong is undone by tabbing past the end of the list
+    /// rather than by rubbing the word out.
+    fn complete_command(&mut self, backward: bool) {
+        if let Some(running) = self.completing.as_mut() {
+            // One stop past the last candidate is the word as it was typed.
+            let stops = running.options.len() + 1;
+            running.index = if backward {
+                (running.index + stops - 1) % stops
+            } else {
+                (running.index + 1) % stops
+            };
+            let at = running.at;
+            let word = running
+                .options
+                .get(running.index)
+                .unwrap_or(&running.typed)
+                .clone();
+            self.set_command_word(at, &word);
+            return;
+        }
+        let line = self.command_line.text();
+        let cursor = self.command_line.column();
+        let at = word_start(&line, cursor);
+        let typed: String = line.chars().take(cursor).skip(at).collect();
+        let options = self.command_candidates(&line, at, &typed);
+        let Some(first) = options.first().cloned() else {
+            return;
+        };
+        self.completing = Some(Completing {
+            at,
+            typed,
+            options,
+            index: 0,
+        });
+        self.set_command_word(at, &first);
+    }
+
+    /// Put `word` in place of the one between `at` and the cursor, and leave the cursor
+    /// at the end of it.
+    fn set_command_word(&mut self, at: usize, word: &str) {
+        let line = self.command_line.text();
+        let cursor = self.command_line.column();
+        let before: String = line.chars().take(at).collect();
+        let after: String = line.chars().skip(cursor).collect();
+        self.command_line
+            .set_text(&format!("{before}{word}{after}"));
+        self.command_line.set_column(at + word.chars().count());
+    }
+
+    /// What the word starting at `at` could be, in the order they are offered.
+    fn command_candidates(&self, line: &str, at: usize, typed: &str) -> Vec<String> {
+        let before: String = line.chars().take(at).collect();
+        let mut pool: Vec<String> = if before.trim().is_empty() {
+            // The first word names the command, and every program bound to a key
+            // answers to its own name as well.
+            COMMANDS
+                .iter()
+                .map(|name| (*name).to_string())
+                .chain(self.programs.iter().map(|p| p.name().to_string()))
+                .collect()
+        } else {
+            self.argument_candidates(before.trim())
+        };
+        pool.sort();
+        pool.dedup();
+        let typed = typed.to_lowercase();
+        pool.retain(|option| option.to_lowercase().starts_with(&typed));
+        pool
+    }
+
+    /// What can follow a command, for the ones whose argument comes from a list this
+    /// client knows. The rest take a name or a title that nothing here can guess, and
+    /// are left alone rather than offered a wrong guess.
+    fn argument_candidates(&self, before: &str) -> Vec<String> {
+        let mut words = before.split_whitespace();
+        let name = words.next().unwrap_or_default();
+        // Only the first argument: past that these all take free text.
+        if words.next().is_some() {
+            return Vec::new();
+        }
+        let fixed: &[&str] = match name {
+            "mode" => &["plan", "default"],
+            "perm" | "permissions" => RUNTIME_MODES,
+            "project" => &["rename"],
+            // The efforts are the model's own, and a model that has none offers none.
+            "effort" | "e" => {
+                return self
+                    .effort_descriptor()
+                    .map(|d| d.options.iter().map(|o| o.id.clone()).collect())
+                    .unwrap_or_default();
+            }
+            _ => &[],
+        };
+        fixed.iter().map(|value| (*value).to_string()).collect()
     }
 
     fn on_picker_key(&mut self, key: KeyEvent) {
@@ -6467,6 +6649,126 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    /// Type a line, character by character, as somebody at the keyboard would.
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The `:` line was a string with a push and a pop: no cursor to move, no way to
+    /// rub out a word, and every command typed out in full every time. It is the same
+    /// one-line editor the rest of the client uses now, so it has all of that.
+    #[test]
+    fn the_command_line_edits_like_every_other_field() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+
+        typed(&mut app, ":project rename a name");
+        assert_eq!(app.mode, Mode::Command);
+        app.on_key(ctrl('w'));
+        assert_eq!(app.command_line.text(), "project rename a ");
+
+        // The cursor moves, and what is typed goes in where it is.
+        app.on_key(ctrl('a'));
+        typed(&mut app, "x");
+        assert_eq!(app.command_line.text(), "xproject rename a ");
+        app.on_key(plain(KeyCode::Delete));
+        app.on_key(plain(KeyCode::Backspace));
+        assert_eq!(app.command_line.text(), "roject rename a ");
+        app.on_key(ctrl('e'));
+        app.on_key(ctrl('u'));
+        assert!(app.command_line.text().is_empty());
+
+        // And an empty line with nothing left to rub out is a command given up on.
+        app.on_key(plain(KeyCode::Backspace));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// A command run once is on the arrow keys, so the long ones are typed once.
+    #[test]
+    fn the_command_line_remembers_what_was_run() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+
+        typed(&mut app, ":sidebar");
+        app.on_key(plain(KeyCode::Enter));
+        typed(&mut app, ":settled");
+        app.on_key(plain(KeyCode::Enter));
+
+        typed(&mut app, ":");
+        app.on_key(plain(KeyCode::Up));
+        assert_eq!(app.command_line.text(), "settled");
+        app.on_key(plain(KeyCode::Up));
+        assert_eq!(app.command_line.text(), "sidebar");
+        app.on_key(plain(KeyCode::Down));
+        assert_eq!(app.command_line.text(), "settled");
+        app.on_key(plain(KeyCode::Down));
+        assert_eq!(
+            app.command_line.text(),
+            "",
+            "and back to what was being typed"
+        );
+    }
+
+    /// `Tab` offers the commands that start the way the word does, and tabbing past the
+    /// last one gives back what was typed rather than leaving a wrong guess in the line.
+    #[test]
+    fn tab_completes_a_command_and_cycles_through_the_rest() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+
+        typed(&mut app, ":sett");
+        app.on_key(plain(KeyCode::Tab));
+        assert_eq!(app.command_line.text(), "settle");
+        app.on_key(plain(KeyCode::Tab));
+        assert_eq!(app.command_line.text(), "settled");
+        app.on_key(plain(KeyCode::Tab));
+        assert_eq!(app.command_line.text(), "sett", "round to what was typed");
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.command_line.text(), "settled", "and back the other way");
+
+        // A word that is nobody's prefix is left exactly as it is.
+        app.on_key(plain(KeyCode::Esc));
+        typed(&mut app, ":zzz");
+        app.on_key(plain(KeyCode::Tab));
+        assert_eq!(app.command_line.text(), "zzz");
+        assert!(app.completing.is_none());
+    }
+
+    /// The arguments that come from a fixed list are completed too; the ones that are a
+    /// name or a title are left alone, since guessing at one would only be in the way.
+    #[test]
+    fn tab_completes_the_arguments_that_come_from_a_list() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+
+        typed(&mut app, ":perm auto");
+        app.on_key(plain(KeyCode::Tab));
+        assert_eq!(app.command_line.text(), "perm auto");
+        app.on_key(plain(KeyCode::Tab));
+        assert_eq!(app.command_line.text(), "perm auto-accept-edits");
+
+        app.on_key(plain(KeyCode::Esc));
+        typed(&mut app, ":mode p");
+        app.on_key(plain(KeyCode::Tab));
+        assert_eq!(app.command_line.text(), "mode plan");
+
+        // `:rename` takes a title, which nothing here can guess at.
+        app.on_key(plain(KeyCode::Esc));
+        typed(&mut app, ":rename some");
+        app.on_key(plain(KeyCode::Tab));
+        assert_eq!(app.command_line.text(), "rename some");
+    }
+
     /// `Ctrl-c` is how a great many people leave insert mode, and it used to reach past
     /// the message being written to the turn behind it: a key pressed to stop typing
     /// stopped the agent instead. In vim it is Esc under another name, so it is here.
@@ -6506,7 +6808,7 @@ mod tests {
         app.thread = Some(running_thread());
 
         app.mode = Mode::Command;
-        app.command_line = "delete!".into();
+        app.command_line.set_text("delete!");
         app.on_key(ctrl('c'));
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.command_line.is_empty(), "and takes the command with it");
@@ -6586,7 +6888,7 @@ mod tests {
         app.mode = Mode::Command;
         app.command_line.clear();
         app.on_paste("model\nsonnet\n");
-        assert_eq!(app.command_line, "model sonnet");
+        assert_eq!(app.command_line.text(), "model sonnet");
 
         app.mode = Mode::QuestionCustom;
         app.on_paste("do it\nthis way\n");

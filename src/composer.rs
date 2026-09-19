@@ -281,6 +281,16 @@ impl Composer {
         (chars[offset..end].iter().collect(), col - offset)
     }
 
+    /// Where the cursor is on its row, in characters.
+    pub fn column(&self) -> usize {
+        self.col
+    }
+
+    /// Put the cursor on the row, at the end of it when it is asked for past that.
+    pub fn set_column(&mut self, col: usize) {
+        self.col = col.min(char_len(self.line()));
+    }
+
     /// Number of screen rows needed at `width`, between 1 and `max`.
     pub fn height(&self, width: u16, max: u16) -> u16 {
         let width = width.max(1) as usize;

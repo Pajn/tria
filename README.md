@@ -207,8 +207,21 @@ Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [l
 `archive`, `delete!`, `approve [n]`, `stop`, `stop!`,
 `older`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
 `reveal`,
-`worktree`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`, `usage`,
-`reconnect`, `help`, `q`.
+`worktree`, `worktrees`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`,
+`usage`, `reconnect`, `help`, `q`.
+
+The line is the same one-line editor as the rest of the client, so it takes the same keys:
+`Ctrl-w` rubs out a word and `Ctrl-u` the line, `Ctrl-a` and `Ctrl-e` go to the ends, and
+the arrows, `Alt-b` and `Alt-f` move by character and by word. `Backspace` on an empty line
+still leaves. `Up` and `Down`, or `Ctrl-p` and `Ctrl-n`, walk back through the commands run
+this session.
+
+`Tab` completes the command's name, and the names of the programs `[programs]` binds. The
+candidates are listed beside the line, each `Tab` takes the next and `Shift-Tab` the one
+before, and tabbing past the last gives back what was typed rather than leaving a wrong
+guess in the line. An argument that comes from a fixed list completes the same way —
+`mode`, `perm`, `project`, and whichever efforts the model offers. The ones that take a
+title or a name do not: there is nothing here to complete those against.
 
 ## Approvals
 

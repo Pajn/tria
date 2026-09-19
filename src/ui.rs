@@ -1574,12 +1574,43 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     if app.mode == Mode::Command {
-        let line = Line::from(vec![
+        // The line scrolls inside the row rather than wrapping, as the custom answer
+        // field does: the status bar is one row and there is no second one to take.
+        let (visible, cursor) = app
+            .command_line
+            .line_window(area.width.saturating_sub(1) as usize);
+        let mut spans = vec![
             Span::styled(":", Style::default().fg(Color::Yellow)),
-            Span::raw(app.command_line.clone()),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
-        frame.set_cursor_position((area.x + 1 + app.command_line.chars().count() as u16, area.y));
+            Span::raw(visible.clone()),
+        ];
+        // What else `Tab` would offer, so that cycling is a choice being made rather
+        // than words appearing one after another for no stated reason.
+        if let Some(running) = &app.completing
+            && running.options.len() > 1
+        {
+            let used = 1 + visible.chars().count() + 2;
+            let mut room = (area.width as usize).saturating_sub(used);
+            if room > 0 {
+                spans.push(Span::raw("  "));
+                for (i, option) in running.options.iter().enumerate() {
+                    let width = option.chars().count() + 1;
+                    if width > room {
+                        spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+                        break;
+                    }
+                    room -= width;
+                    let style = if i == running.index {
+                        Style::default().bg(Color::Yellow).fg(Color::Black)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    spans.push(Span::styled(option.clone(), style));
+                    spans.push(Span::raw(" "));
+                }
+            }
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        frame.set_cursor_position((area.x + 1 + cursor as u16, area.y));
         return;
     }
     if app.mode == Mode::Search
@@ -2915,8 +2946,10 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :approve [n]  :stop  :stop! (the session)  :older  :answer  :dismiss  :reconnect  :sidebar  :q",
+            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :approve [n]  :stop  :stop! (the session)  :older  :answer  :dismiss  :reconnect  :sidebar  :worktrees  :q",
         ),
+        Line::from("  the line takes the editing keys above, Up/Down for the commands"),
+        Line::from("  run this session, and Tab to complete a name or a listed argument"),
     ]);
     let width = 72.min(area.width);
     // Wrapped, so a line longer than the popup is folded rather than cut off its end.
