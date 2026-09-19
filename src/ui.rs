@@ -2,9 +2,11 @@
 //! composer, status line. Overlays: picker and help.
 
 use std::collections::HashSet;
+use std::num::NonZeroU16;
 
 use ratatui::{
     Frame,
+    buffer::{Buffer, CellDiffOption},
     layout::{Constraint, Layout, Position, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -169,6 +171,37 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Worktrees => draw_worktrees(frame, app, area),
         Mode::TerminalPane => draw_terminal_pane(frame, app, area),
         _ => {}
+    }
+
+    pin_emoji_widths(frame.buffer_mut());
+}
+
+/// Tell the diff how wide an emoji presentation sequence really is.
+///
+/// A symbol carrying U+FE0F is two columns wide, and by default the diff hedges: it
+/// writes the emoji and then a blank over the column the emoji covers, in case the
+/// terminal drew the sequence one column wide. A terminal that gives the sequence the two
+/// columns Unicode asks for has already moved its cursor past both, so that blank lands
+/// on the column *after* the emoji and every cell printed after it in the same run slides
+/// one column right. The line reads as mangled until something forces a full repaint.
+///
+/// Pinning the width takes the hedge off: the emoji is then diffed like any other wide
+/// symbol, the way a CJK glyph already is, and the next cell printed comes with a cursor
+/// move of its own.
+fn pin_emoji_widths(buffer: &mut Buffer) {
+    for cell in &mut buffer.content {
+        if cell.diff_option != CellDiffOption::None {
+            continue;
+        }
+        let symbol = cell.symbol();
+        if !symbol.contains('\u{FE0F}') {
+            continue;
+        }
+        if let Some(width) = NonZeroU16::new(symbol.width() as u16)
+            && width.get() > 1
+        {
+            cell.diff_option = CellDiffOption::ForcedWidth(width);
+        }
     }
 }
 
@@ -3049,7 +3082,10 @@ fn hash_set(set: &HashSet<String>) -> u64 {
 #[cfg(test)]
 mod tests {
     use base64::Engine;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{
+        Terminal,
+        backend::{Backend, CrosstermBackend, TestBackend},
+    };
     use serde_json::json;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -4122,5 +4158,46 @@ mod tests {
         drawn(24, 4, &app);
         app.worktrees.clear();
         drawn(24, 4, &app);
+    }
+
+    /// The escape sequences a backend writes to turn `before` into `after`.
+    fn emitted(before: &str, after: &str) -> String {
+        let area = Rect::new(0, 0, 20, 1);
+        let [before, after] = [before, after].map(|text| {
+            let mut buffer = Buffer::empty(area);
+            buffer.set_string(0, 0, text, Style::default());
+            pin_emoji_widths(&mut buffer);
+            buffer
+        });
+        let mut written = Vec::new();
+        CrosstermBackend::new(&mut written)
+            .draw(before.diff(&after).into_iter())
+            .unwrap();
+        String::from_utf8(written).unwrap()
+    }
+
+    /// Where in the stream the cursor is sent, as `row;column`.
+    fn cursor_moves(stream: &str) -> Vec<String> {
+        stream
+            .split('\u{1b}')
+            .filter_map(|part| part.strip_prefix('['))
+            .filter_map(|part| part.split_once('H'))
+            .map(|(move_to, _)| move_to.to_string())
+            .collect()
+    }
+
+    /// Two columns of emoji have to be stepped over the same way two columns of CJK are.
+    /// Printed one after the other with no move in between, whatever follows the emoji
+    /// lands a column too far right and the rest of the line reads as mangled.
+    #[test]
+    fn a_wide_emoji_is_stepped_over_like_any_other_wide_symbol() {
+        let filler = "aaaa aaaa aaaa";
+        let emoji = emitted(
+            filler,
+            "and \u{1F3F3}\u{FE0F}\u{200D}\u{26A7}\u{FE0F}in the mid",
+        );
+        let cjk = emitted(filler, "and \u{30B3}in the mid");
+        assert_eq!(cursor_moves(&emoji), cursor_moves(&cjk));
+        assert_eq!(cursor_moves(&emoji), ["1;2", "1;7"]);
     }
 }
