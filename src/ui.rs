@@ -1150,6 +1150,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         };
         app.chat_viewport = (height, cache.total);
         app.work_ranges.clear();
+        app.picture_ranges.clear();
         app.chat_pictures.clear();
         app.block_ranges.clear();
         app.message_starts.clear();
@@ -1182,6 +1183,14 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.block_ranges.push((start, end, key.clone()));
             }
             app.chat_pictures.extend(block.pictures.iter().cloned());
+            if matches!(block.key, BlockKey::Message(_)) {
+                app.picture_ranges
+                    .extend(rows.iter().map(|region| timeline::Region {
+                        first: start + region.first,
+                        end: start + region.end,
+                        ..region.clone()
+                    }));
+            }
             if let BlockKey::Work(key) = &block.key {
                 app.work_ranges.push(timeline::Region {
                     first: start,
@@ -3292,6 +3301,73 @@ mod tests {
         }))
         .unwrap();
         crate::state::ThreadState::from_snapshot(snapshot)
+    }
+
+    /// The same thread, with the agent doing the talking: markdown, and so pictures.
+    fn thread_answering(text: &str) -> crate::state::ThreadState {
+        let snapshot: crate::model::ThreadDetailSnapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p1", "title": "Test",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "m"},
+                "runtimeMode": "full-access", "latestTurn": null, "session": null,
+                "messages": [{"id": "m1", "role": "assistant", "text": text}],
+                "activities": []
+            }
+        }))
+        .unwrap();
+        crate::state::ThreadState::from_snapshot(snapshot)
+    }
+
+    /// An agent that has taken a screenshot writes it out and then shows it. The chat
+    /// draws the picture under the caption, and the lines it goes on are the picture's,
+    /// so `gx` anywhere on it opens the file.
+    #[test]
+    fn a_picture_a_message_shows_is_drawn_in_the_chat() {
+        crate::picture::draw_in_halfblocks();
+        let path = std::env::temp_dir().join("tria-a-chat-picture.png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(crate::picture::test_png(120, 60))
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_answering(&format!(
+            "Here it is.\n\n![the viewer serving a run]({})\n",
+            path.display()
+        )));
+
+        let buffer = screen(60, &mut app);
+        let region = app
+            .picture_ranges
+            .first()
+            .cloned()
+            .expect("the message has a picture");
+        assert_eq!(
+            app.chat_pictures,
+            [(
+                region.key.clone(),
+                crate::timeline::Picture::File(path.to_string_lossy().into_owned())
+            )],
+            "and `gx` opens the file itself"
+        );
+        // Half-blocks are colour rather than glyphs, so a drawn row is a painted one.
+        let painted = |y: u16| {
+            (0..buffer.area.width).any(|x| {
+                buffer[(x, y)]
+                    .style()
+                    .bg
+                    .is_some_and(|bg| bg != Color::Reset)
+            })
+        };
+        let top = app.chat_area.y + (region.first + 1 - app.chat_offset()) as u16;
+        assert!(painted(top), "the picture starts under its caption");
+        assert!(
+            painted(app.chat_area.y + (region.end - 1 - app.chat_offset()) as u16),
+            "and runs to the end of the lines it was given"
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// The list is where somebody looks to find out what happened while they were

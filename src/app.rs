@@ -483,6 +483,10 @@ pub struct App {
     /// Text to push to the clipboard after the next frame is drawn.
     pub clipboard_pending: Option<String>,
     pub work_ranges: Vec<crate::timeline::Region>,
+    /// Content-line range of every picture a message's own markdown put in the chat. A
+    /// work row is found by the region it folds; a message folds nothing, so its pictures
+    /// are found by the lines they were given.
+    pub picture_ranges: Vec<crate::timeline::Region>,
     /// Every picture the open rows have, under the key the row that has it is keyed by.
     /// Filled by the renderer with each frame, like the regions above it.
     pub chat_pictures: Vec<(String, crate::timeline::Picture)>,
@@ -579,6 +583,7 @@ impl App {
             selection: None,
             clipboard_pending: None,
             work_ranges: Vec::new(),
+            picture_ranges: Vec::new(),
             chat_pictures: Vec::new(),
             quit: false,
         }
@@ -2965,15 +2970,29 @@ impl App {
         self.open_pull_request(pick);
     }
 
-    /// The picture the row under the chat cursor has, open or shut. The cursor is inside
-    /// that row wherever it is on the picture itself, since the lines it was drawn over
-    /// belong to the row that opened it.
+    /// The picture under the chat cursor: the one the row it is in has, open or shut, or
+    /// the one a message drew there. The cursor is inside the row wherever it is on the
+    /// picture itself, since the lines it was drawn over belong to the row that opened it.
     fn picture_at_cursor(&self) -> Option<crate::timeline::Picture> {
-        let (key, _) = self.region_at(self.chat_cursor)?;
+        let key = match self.region_at(self.chat_cursor) {
+            Some((key, _)) => key,
+            None => self.picture_range_at(self.chat_cursor)?,
+        };
         self.chat_pictures
             .iter()
             .find(|(row, _)| *row == key)
             .map(|(_, picture)| picture.clone())
+    }
+
+    /// What a message's picture is known by, where one was drawn on this line. The
+    /// smallest range wins, so two pictures on one line are told apart by the lines they
+    /// were each drawn on.
+    fn picture_range_at(&self, line: usize) -> Option<String> {
+        self.picture_ranges
+            .iter()
+            .filter(|region| region.first <= line && line < region.end)
+            .min_by_key(|region| region.end - region.first)
+            .map(|region| region.key.clone())
     }
 
     /// Hand a picture to whatever this machine opens pictures with. One the provider
@@ -5974,6 +5993,27 @@ mod tests {
         // The group around it is not the row, and has no picture of its own.
         app.chat_cursor = 1;
         assert_eq!(app.picture_at_cursor(), None);
+
+        // A picture a message drew belongs to no row at all: it answers for the caption
+        // and the lines under it, and `gx` opens it from any of them.
+        app.picture_ranges = vec![Region {
+            first: 20,
+            end: 26,
+            key: "msg:m1/0".into(),
+            foldable: false,
+        }];
+        app.chat_pictures
+            .push(("msg:m1/0".into(), Picture::File("/tmp/shown.png".into())));
+        for line in [20, 25] {
+            app.chat_cursor = line;
+            assert_eq!(
+                app.picture_at_cursor(),
+                Some(Picture::File("/tmp/shown.png".into())),
+                "line {line}"
+            );
+        }
+        app.chat_cursor = 26;
+        assert_eq!(app.picture_at_cursor(), None, "and no further");
     }
 
     /// A picture that came inside a transcript is not a file anywhere, so opening it

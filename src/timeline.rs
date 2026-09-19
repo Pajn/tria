@@ -16,6 +16,10 @@ pub const USER_MARK: &str = "▌";
 const STREAM_CURSOR: &str = "▍";
 /// Where an image starts, lined up with the output of the row it belongs to.
 const IMAGE_INDENT: u16 = 6;
+/// What `tui_markdown` writes where a markdown image was, the alt text after it. It is
+/// all a renderer that cannot see pictures can do, and it is what marks the place one
+/// goes.
+const IMAGE_MARK: &str = "[img]";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BlockKey {
@@ -218,23 +222,36 @@ pub fn build(
                     "user" => "you",
                     other => other,
                 };
+                let mut images = Vec::new();
+                let mut rows = Vec::new();
+                let mut pictures = Vec::new();
                 let text = match message.role.as_str() {
                     // A subagent transcript opens with the brief it was given, which is
                     // the agent's instruction rather than anything the user typed.
                     "user" | "prompt" => render_user(&message.text, role),
                     "system" => render_system(&message.text),
-                    _ => render_assistant(&message.text, message.streaming),
+                    _ => {
+                        let mut text = render_assistant(&message.text, message.streaming);
+                        (images, rows, pictures) = place_message_images(
+                            &message.id,
+                            &message.text,
+                            &mut text,
+                            width,
+                            height,
+                        );
+                        text
+                    }
                 };
                 blocks.push(Block {
                     key: BlockKey::Message(message.id.clone()),
                     text,
-                    rows: Vec::new(),
+                    rows,
                     exports: vec![(
                         format!("msg:{}", message.id),
                         format!("## {role}\n\n{}\n", message.text.trim_end()),
                     )],
-                    images: Vec::new(),
-                    pictures: Vec::new(),
+                    images,
+                    pictures,
                 });
             }
             Item::Activity(activity) => {
@@ -899,7 +916,11 @@ fn render_work(
                 ]));
             }
             for image in &entry.images {
-                match picture::place(&image.key, image.source, image_room(width, height)) {
+                match picture::place(
+                    &image.key,
+                    image.source,
+                    image_room(width, height, IMAGE_INDENT),
+                ) {
                     // Blank lines, which the renderer draws the image over once it knows
                     // where on the screen they landed.
                     Some(size) => {
@@ -962,13 +983,162 @@ fn missing(image: &ToolImage<'_>) -> &'static str {
     }
 }
 
-/// The room one image is given: what the row leaves of the width, and half the window,
-/// so what follows an open image is still in view.
-fn image_room(width: u16, height: u16) -> Size {
-    Size::new(
-        width.saturating_sub(IMAGE_INDENT + 2),
-        (height / 2).clamp(4, 24),
-    )
+/// The room one image is given: what the text around it leaves of the width, and half
+/// the window, so what follows an image is still in view.
+fn image_room(width: u16, height: u16, indent: u16) -> Size {
+    Size::new(width.saturating_sub(indent + 2), (height / 2).clamp(4, 24))
+}
+
+/// The pictures a message's own markdown points at, drawn under the lines that name them.
+///
+/// `tui_markdown` cannot see a picture, so it writes the marker and the alt text where
+/// one was. That line is left as the caption and the picture is drawn under it, read from
+/// the file the markdown names — which is what an agent writes when it takes a screenshot
+/// and then shows it. Markers and sources are paired by the order they come in: the
+/// rendered text no longer says which image any marker was, and both are the document's
+/// own order.
+///
+/// The regions are the lines each picture answers for, so the picture under the cursor
+/// can be opened where the terminal draws it small or not at all. They fold nothing: a
+/// message has no rows to fold.
+fn place_message_images(
+    id: &str,
+    source: &str,
+    rendered: &mut Text<'static>,
+    width: u16,
+    height: u16,
+) -> (Vec<Placed>, Vec<Region>, Vec<(String, Picture)>) {
+    let mut placed = Vec::new();
+    let mut regions = Vec::new();
+    let mut pictures = Vec::new();
+    // Parsing markdown is not free and a thread is rebuilt often, so the cheap question
+    // comes first: most messages have no image in them at all.
+    if !source.contains("![") {
+        return (placed, regions, pictures);
+    }
+    let mut sources = image_sources(source).into_iter();
+    let mut taken = 0usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rendered.lines.len());
+    for mut line in std::mem::take(&mut rendered.lines) {
+        let marks: Vec<usize> = line
+            .spans
+            .iter()
+            .enumerate()
+            .filter(|(_, span)| span.content.trim_end() == IMAGE_MARK)
+            .map(|(at, _)| at)
+            .collect();
+        // What this one line has: each picture and the rows it asked for, none of which
+        // can be given out until the caption itself has a line number.
+        let mut here: Vec<(String, u16)> = Vec::new();
+        let mut shown = Vec::new();
+        let mut note = None;
+        for mark in marks {
+            let Some(source) = sources.next() else { break };
+            let key = format!("msg:{id}/{taken}");
+            taken += 1;
+            let Some(path) = image_file(&source) else {
+                continue;
+            };
+            pictures.push((key.clone(), Picture::File(path.clone())));
+            // A message sits against the left edge, so its pictures do too.
+            let room = image_room(width, height, 0);
+            match picture::place(&key, picture::Source::File(&path), room) {
+                Some(size) => {
+                    // The marker says there is a picture that cannot be shown. It is
+                    // shown, so what is left is the caption it was written with.
+                    shown.push(mark);
+                    here.push((key, size.height));
+                }
+                None => {
+                    note = note.or_else(|| missing_file(&path));
+                    here.push((key, 0));
+                }
+            }
+        }
+        if !shown.is_empty() {
+            let mut at = 0;
+            line.spans.retain(|_| {
+                let keep = !shown.contains(&at);
+                at += 1;
+                keep
+            });
+        }
+        if let Some(note) = note {
+            line.spans.push(Span::styled(
+                format!(" · {note}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        let caption = lines.len();
+        lines.push(line);
+        for (key, rows) in here {
+            if rows > 0 {
+                placed.push(Placed {
+                    line: lines.len(),
+                    indent: 0,
+                    key: key.clone(),
+                });
+                // Blank lines, which the renderer draws the picture over once it knows
+                // where on the screen they landed.
+                lines.extend(std::iter::repeat_n(Line::default(), rows as usize));
+            }
+            regions.push(Region {
+                first: caption,
+                end: lines.len(),
+                key,
+                foldable: false,
+            });
+        }
+    }
+    rendered.lines = lines;
+    (placed, regions, pictures)
+}
+
+/// Every image a piece of markdown points at, in the order they appear. Read with the
+/// options `tui_markdown` renders with: the two have to agree on what an image is, since
+/// each marker is matched to a source by where it comes in the text.
+fn image_sources(text: &str) -> Vec<String> {
+    use pulldown_cmark::{Event, Options, Parser, Tag};
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    options.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    options.insert(Options::ENABLE_SUPERSCRIPT);
+    options.insert(Options::ENABLE_SUBSCRIPT);
+    options.insert(Options::ENABLE_MATH);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_DEFINITION_LIST);
+    options.insert(Options::ENABLE_GFM);
+    options.insert(Options::ENABLE_TABLES);
+    Parser::new_ext(text, options)
+        .filter_map(|event| match event {
+            Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.into_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The file a markdown image names, where it names one at all. An agent showing a
+/// picture has just written it somewhere and names it in full; a relative source has no
+/// directory here to be relative to, and one over the web is not something the timeline
+/// goes and fetches.
+fn image_file(source: &str) -> Option<String> {
+    let path = source.strip_prefix("file://").unwrap_or(source);
+    path.starts_with('/').then(|| path.to_string())
+}
+
+/// What to say beside a caption whose picture was not drawn. A path that is gone is worth
+/// saying, and so is one that was never ours to follow. A terminal that draws no pictures
+/// at all has already said so by drawing none of them, and has no need to say it again on
+/// every line.
+fn missing_file(path: &str) -> Option<&'static str> {
+    if !picture::reads_files() {
+        return Some("that file is on the machine the server runs on");
+    }
+    std::fs::metadata(path)
+        .is_err()
+        .then_some("nothing at that path now")
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -1184,7 +1354,7 @@ mod tests {
         let size = picture::place(
             &images[0].key,
             picture::Source::Data(&data),
-            image_room(80, 24),
+            image_room(80, 24, IMAGE_INDENT),
         )
         .unwrap();
         let reserved = images[0].line..images[0].line + size.height as usize;
@@ -1453,6 +1623,118 @@ mod tests {
             ),
         ];
         assert_eq!(work(&rows)[0].status, "completed");
+    }
+
+    /// A picture in a message is a picture: the marker `tui_markdown` leaves is the
+    /// caption, the picture is drawn under it, and the file it names is the one that can
+    /// be opened elsewhere. This is what the desktop app shows and tria used to write off
+    /// as `[img]`.
+    #[test]
+    fn a_picture_a_message_points_at_is_drawn_under_it() {
+        picture::draw_in_halfblocks();
+        let path = std::env::temp_dir().join("tria-a-message-picture.png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(picture::test_png(160, 80))
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let path = path.to_str().unwrap().to_string();
+        let source = format!("Here it is.\n\n![the viewer serving a run]({path})\n");
+        let mut text = render_assistant(&source, false);
+        let (images, regions, pictures) = place_message_images("m1", &source, &mut text, 80, 24);
+
+        assert_eq!(images.len(), 1, "the picture took its room");
+        assert_eq!(
+            pictures,
+            [("msg:m1/0".to_string(), Picture::File(path.clone()))]
+        );
+        let caption = images[0].line - 1;
+        let said: String = text.lines[caption]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(said.contains("the viewer serving a run"), "{said:?}");
+        assert!(
+            !said.contains(IMAGE_MARK),
+            "the marker stands in for a picture nobody can see: {said:?}"
+        );
+        // The lines under it are blank and belong to the picture, so a cursor anywhere on
+        // it is on something that can be opened.
+        for line in images[0].line..regions[0].end {
+            assert_eq!(
+                text.lines[line].spans,
+                Vec::new(),
+                "line {line} is left blank"
+            );
+        }
+        assert_eq!(regions[0].first, caption);
+        assert!(regions[0].end > images[0].line);
+        assert!(!regions[0].foldable, "a message has no rows to fold");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A screenshot is often written somewhere temporary and cleaned up later. The
+    /// caption says so rather than leaving a picture that never appears, and the path is
+    /// still there to be opened in case the file comes back.
+    #[test]
+    fn a_picture_whose_file_is_gone_says_so() {
+        picture::draw_in_halfblocks();
+        let source = "![a run](/tmp/tria-no-such-message-picture.png)".to_string();
+        let mut text = render_assistant(&source, false);
+        let (images, regions, pictures) = place_message_images("m2", &source, &mut text, 80, 24);
+        assert!(images.is_empty(), "nothing was drawn");
+        assert_eq!(regions.len(), 1, "the caption is still the picture's line");
+        assert_eq!(pictures.len(), 1);
+        let said: String = text.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(said.contains("nothing at that path now"), "{said:?}");
+        assert!(
+            said.contains(IMAGE_MARK),
+            "and it is still a marker: {said:?}"
+        );
+    }
+
+    /// Two pictures on one line — a table of them, side by side — are told apart by
+    /// where they came in the text, which is the only thing the rendered markers keep.
+    /// What is not a file here is left as the marker it already was.
+    #[test]
+    fn pictures_are_matched_to_the_markers_in_order() {
+        picture::draw_in_halfblocks();
+        let source = "![one](/tmp/tria-one.png) and ![two](/tmp/tria-two.png), then \
+                      ![three](relative.png) and ![four](https://example.com/four.png)"
+            .to_string();
+        let mut text = render_assistant(&source, false);
+        let (_, _, pictures) = place_message_images("m3", &source, &mut text, 80, 24);
+        assert_eq!(
+            pictures,
+            [
+                (
+                    "msg:m3/0".to_string(),
+                    Picture::File("/tmp/tria-one.png".into())
+                ),
+                (
+                    "msg:m3/1".to_string(),
+                    Picture::File("/tmp/tria-two.png".into())
+                ),
+            ],
+            "the two files, in the order they were written"
+        );
+    }
+
+    /// A message with no image in it is left exactly as it was rendered, markdown and
+    /// all: the cheap check comes before the parse, and neither may touch the text.
+    #[test]
+    fn a_message_without_a_picture_is_left_alone() {
+        picture::draw_in_halfblocks();
+        let source = "A paragraph with `code` and a [link](http://example.com).".to_string();
+        let before = render_assistant(&source, false);
+        let mut text = render_assistant(&source, false);
+        let (images, regions, pictures) = place_message_images("m4", &source, &mut text, 80, 24);
+        assert!(images.is_empty() && regions.is_empty() && pictures.is_empty());
+        assert_eq!(text.lines.len(), before.lines.len());
     }
 }
 // ── Wrapping ───────────────────────────────────────────────────────────

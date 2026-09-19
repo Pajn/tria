@@ -104,7 +104,7 @@ Press `?` inside the app for the full list.
 | `g!` | a shell in the popup, in the thread's directory |
 | `ge` | composer focused: edit the draft in your editor, read back on exit. Chat focused: view the message, plan, tool row, or tool group under the cursor |
 | `gE` | view the whole conversation in your editor |
-| `gx` | open the link on the cursor's line, else the picture the row has, else the thread's pull request |
+| `gx` | open the link on the cursor's line, else the picture under the cursor, else the thread's pull request |
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
 | `gD` | show the thread's directory in the machine's file browser (`:reveal`) |
 | `h` `l` `0` `$` `w` `b` | chat focused: move along the line under the cursor |
@@ -326,8 +326,9 @@ ones it opened and leaves the desktop app's own alone.
 ## Links
 
 URLs in the conversation are underlined, and clicking one opens it in the browser. With the
-chat focused, `gx` opens the link on the cursor's line, falling back to the picture the row
-under the cursor has, and then to the thread's pull request.
+chat focused, `gx` opens the link on the cursor's line, falling back to the picture under the
+cursor — the one its tool row has, or the one its message shows — and then to the thread's
+pull request.
 
 Links are found on the drawn screen rather than in the message text, so one that wraps across
 two lines is still whole, and the same goes for a URL inside a tool row or a plan. Trailing
@@ -559,6 +560,16 @@ picture, so the file is read from disk — which works when the server is on thi
 is why an image row against a remote server has nothing to unfold. A subagent's transcript is
 the exception again: the provider's file carries its pictures inside it, and those draw
 wherever the server runs.
+
+A picture the agent points at in what it writes is drawn as well. An agent that takes a
+screenshot writes the file out and then shows it, which in markdown is an image: what it
+called the picture is kept as the caption and the picture goes under it, in the same room and
+by the same rules as a tool row's. There is nothing to unfold — a message's picture is part of the message
+— and `gx` on the caption or on the picture itself opens the file. The path is read from the
+disk under us, as a tool row's is, so the caption says whose disk it was when that is somewhere
+else, and says `nothing at that path now` when the file has been cleaned up since. A source
+that is not a path in full is left as the marker the markdown reader wrote: a relative one has
+no directory here to be relative to, and the chat does not fetch over the web.
 
 How it is drawn is up to the terminal, which is asked once at startup: the kitty, iTerm2, or
 sixel graphics protocol where it speaks one, and half-blocks where it speaks none, which is
