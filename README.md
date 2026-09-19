@@ -197,6 +197,12 @@ that only mean something in a message: it is one line, so there is no newline to
 long answer scrolls inside its row rather than wrapping, `Enter` confirms it, and `Esc`
 goes back to the options without keeping it.
 
+So is every other line in the client: the `:` command line, a picker's query, and the `/`
+search over the chat. All of them are the same one-line editor, so the cursor moves, a
+word goes with `Ctrl-w`, and a long one scrolls inside its row. A picker keeps `Ctrl-k`
+for itself — in a list, moving the cursor up a row is worth more than killing to the end
+of a line that short — and `Ctrl-j`, `Ctrl-n`, `Ctrl-p` with it.
+
 A paste arrives as one event and goes wherever typing would: the composer in either mode,
 the command line, a picker's query, the chat search, the custom answer. The fields that
 hold one line fold the paste onto one rather than keeping only what came before the first

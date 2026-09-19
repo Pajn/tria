@@ -372,10 +372,11 @@ fn apply_links(frame: &mut Frame, app: &mut App, chat: Rect) {
 
 fn apply_search_highlights(frame: &mut Frame, app: &App, chat: Rect) {
     let query = match (&app.search_input, &app.search) {
-        (Some(input), _) if app.mode == Mode::Search => input.query.as_str(),
-        (_, Some(search)) if app.focus == Focus::Chat => search.query.as_str(),
+        (Some(input), _) if app.mode == Mode::Search => input.query.text(),
+        (_, Some(search)) if app.focus == Focus::Chat => search.query.clone(),
         _ => return,
     };
+    let query = query.as_str();
     if query.is_empty() || app.thread.is_none() {
         return;
     }
@@ -1617,12 +1618,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         && let Some(input) = &app.search_input
     {
         let prompt = if input.backward { "?" } else { "/" };
+        let (visible, cursor) = input
+            .query
+            .line_window(area.width.saturating_sub(1) as usize);
         let line = Line::from(vec![
             Span::styled(prompt, Style::default().fg(Color::Yellow)),
-            Span::raw(input.query.clone()),
+            Span::raw(visible),
         ]);
         frame.render_widget(Paragraph::new(line), area);
-        frame.set_cursor_position((area.x + 1 + input.query.chars().count() as u16, area.y));
+        frame.set_cursor_position((area.x + 1 + cursor as u16, area.y));
         return;
     }
     let (mode_label, mode_style) = match (app.mode, app.focus) {
@@ -1845,17 +1849,19 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, popup);
     let [query_area, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+    // The line scrolls inside its row rather than wrapping: the row below it is the
+    // list, and a query that pushed it down would be a query in the way of the answer.
+    let (visible, cursor) = picker
+        .query
+        .line_window(query_area.width.saturating_sub(2) as usize);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("> ", Style::default().fg(Color::Magenta)),
-            Span::raw(picker.query.clone()),
+            Span::raw(visible),
         ])),
         query_area,
     );
-    frame.set_cursor_position((
-        query_area.x + 2 + picker.query.chars().count() as u16,
-        query_area.y,
-    ));
+    frame.set_cursor_position((query_area.x + 2 + cursor as u16, query_area.y));
 
     let items = picker.filtered();
     // A project is drawn with what it is known by, in room kept at the front of the row:
@@ -2939,7 +2945,9 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  Up/Down or Ctrl-p/n     prompt history"),
         Line::from("  ← → Home End Ctrl-a/e  move · Alt-arrow or Alt-b/f by word"),
         Line::from("  Ctrl-w Ctrl-k Ctrl-u    kill word / to end / to start"),
-        Line::from("  the same keys edit a custom answer under ga, where Enter confirms it"),
+        Line::from("  the same keys edit every other line in the client: a custom answer"),
+        Line::from("  under ga, the : command line, a picker's query, and / in the chat"),
+        Line::from("  (in a picker Ctrl-k is the list's, and moves the cursor up a row)"),
         Line::from(""),
         Line::from(Span::styled("Commands", Style::default().bold())),
         Line::from("  :new [project]  :model  :effort [level]  :mode plan|default"),
@@ -3942,7 +3950,7 @@ mod tests {
         app.mode = Mode::Picker;
         app.picker = Some(crate::app::Picker {
             kind: PickerKind::Project,
-            query: String::new(),
+            query: crate::composer::Composer::new(),
             selected: 1,
             items: vec![
                 crate::app::PickerItem {
@@ -4020,7 +4028,7 @@ mod tests {
         app.mode = Mode::Picker;
         app.picker = Some(crate::app::Picker {
             kind: PickerKind::Project,
-            query: String::new(),
+            query: crate::composer::Composer::new(),
             selected: 0,
             items: vec![crate::app::PickerItem {
                 label: "shelfie".into(),

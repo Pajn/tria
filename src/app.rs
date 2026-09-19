@@ -100,9 +100,10 @@ pub struct Search {
 }
 
 /// A search being typed: the query so far, its direction, and where the cursor was.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SearchInput {
-    pub query: String,
+    /// A one-line editor rather than a string, for the cursor and the keys that move it.
+    pub query: Composer,
     pub backward: bool,
     origin: usize,
 }
@@ -207,7 +208,9 @@ pub struct PickerItem {
 #[derive(Debug)]
 pub struct Picker {
     pub kind: PickerKind,
-    pub query: String,
+    /// What is being searched for, or the new title while a project is being renamed.
+    /// A one-line editor rather than a string, for the cursor and the keys that move it.
+    pub query: Composer,
     pub selected: usize,
     pub items: Vec<PickerItem>,
     /// The project being renamed, while one is: the query line is its new title.
@@ -221,7 +224,7 @@ impl Picker {
         if self.renaming.is_some() {
             return self.items.iter().collect();
         }
-        let query = self.query.to_lowercase();
+        let query = self.query.text().to_lowercase();
         let mut scored: Vec<(i64, &PickerItem)> = self
             .items
             .iter()
@@ -1909,7 +1912,7 @@ impl App {
             Mode::Command => self.command_line.insert_str(&one_line(text)),
             Mode::Picker => {
                 if let Some(picker) = self.picker.as_mut() {
-                    picker.query.push_str(&one_line(text));
+                    picker.query.insert_str(&one_line(text));
                     if picker.renaming.is_none() {
                         picker.selected = 0;
                     }
@@ -1919,7 +1922,7 @@ impl App {
                 let Some(input) = self.search_input.as_mut() else {
                     return;
                 };
-                input.query.push_str(&one_line(text));
+                input.query.insert_str(&one_line(text));
                 self.incremental_search();
             }
             Mode::TerminalPane => self.paste_into_pane(text),
@@ -3473,7 +3476,7 @@ impl App {
         }
         self.picker = Some(Picker {
             kind,
-            query: String::new(),
+            query: Composer::new(),
             selected: 0,
             items,
             renaming: None,
@@ -3534,7 +3537,7 @@ impl App {
         };
         if let Some(project) = picker.renaming {
             self.mode = Mode::Normal;
-            self.rename_project(&project, picker.query.trim());
+            self.rename_project(&project, picker.query.text().trim());
             return;
         }
         let Some(item) = picker.filtered().get(picker.selected).map(|i| (*i).clone()) else {
@@ -4148,7 +4151,7 @@ impl App {
     fn start_search(&mut self, backward: bool) {
         self.chat_count = None;
         self.search_input = Some(SearchInput {
-            query: String::new(),
+            query: Composer::new(),
             backward,
             origin: self.chat_cursor,
         });
@@ -4170,48 +4173,39 @@ impl App {
             KeyCode::Enter => {
                 let input = self.search_input.take().unwrap();
                 self.mode = Mode::Normal;
-                if input.query.is_empty() {
+                let query = input.query.text();
+                if query.is_empty() {
                     // Bare Enter repeats the last search, as in Vim.
                     self.search_next(false);
                     return;
                 }
                 let search = Search {
-                    query: input.query,
+                    query,
                     backward: input.backward,
                 };
                 self.search = Some(search.clone());
                 self.jump_to_match(&search, input.origin, false);
             }
-            KeyCode::Backspace => {
-                input.query.pop();
+            // Everything else edits the line, with the same keys as every other field.
+            _ => {
+                edit_key(&mut input.query, key);
                 self.incremental_search();
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                input.query.clear();
-                self.incremental_search();
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                input.query.push(c);
-                self.incremental_search();
-            }
-            _ => {}
         }
     }
 
     /// While typing, the cursor previews the first match from where the search started.
     fn incremental_search(&mut self) {
-        let Some(input) = self.search_input.clone() else {
+        let Some(input) = self.search_input.as_ref() else {
             return;
         };
-        if input.query.is_empty() {
-            self.set_chat_cursor(input.origin);
+        let (query, backward, origin) = (input.query.text(), input.backward, input.origin);
+        if query.is_empty() {
+            self.set_chat_cursor(origin);
             return;
         }
-        let search = Search {
-            query: input.query,
-            backward: input.backward,
-        };
-        if let Some((line, _)) = self.find_match(&search, input.origin) {
+        let search = Search { query, backward };
+        if let Some((line, _)) = self.find_match(&search, origin) {
             self.set_chat_cursor(line);
         }
     }
@@ -5074,7 +5068,7 @@ impl App {
                 match chosen {
                     Some((project, title)) => {
                         picker.renaming = Some(project);
-                        picker.query = title;
+                        picker.query.set_text(&title);
                     }
                     None => self.toast("no project under the cursor", true),
                 }
@@ -5091,25 +5085,18 @@ impl App {
                 picker.selected = (picker.selected + 1).min(count.saturating_sub(1))
             }
             KeyCode::Char('k') if ctrl => picker.selected = picker.selected.saturating_sub(1),
-            KeyCode::Backspace => {
-                picker.query.pop();
-                if picker.renaming.is_none() {
+            // Everything else edits the line, with the same keys as every other field.
+            // `Ctrl-k` is the exception above: in a list it moves the cursor up, which
+            // is worth more here than killing to the end of a line this short.
+            _ => {
+                let before = picker.query.text();
+                edit_key(&mut picker.query, key);
+                // A list filtered by something else is a list whose rows have moved, so
+                // the row under the cursor is not the one that was under it.
+                if picker.query.text() != before && picker.renaming.is_none() {
                     picker.selected = 0;
                 }
             }
-            KeyCode::Char('u') if ctrl => {
-                picker.query.clear();
-                if picker.renaming.is_none() {
-                    picker.selected = 0;
-                }
-            }
-            KeyCode::Char(c) if !ctrl => {
-                picker.query.push(c);
-                if picker.renaming.is_none() {
-                    picker.selected = 0;
-                }
-            }
-            _ => {}
         }
     }
 
@@ -6690,6 +6677,56 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal);
     }
 
+    /// The picker's query and the chat search were strings with a push and a pop too.
+    /// They are the same one-line editor as everything else now, less the keys the list
+    /// under the query has already claimed.
+    #[test]
+    fn a_picker_query_and_a_search_edit_like_every_other_field() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        project(&mut app);
+
+        app.open_picker(PickerKind::Project);
+        typed(&mut app, "one two");
+        app.on_key(ctrl('w'));
+        assert_eq!(app.picker.as_ref().unwrap().query.text(), "one ");
+        app.on_key(ctrl('a'));
+        typed(&mut app, "x");
+        assert_eq!(app.picker.as_ref().unwrap().query.text(), "xone ");
+        // Ctrl-k belongs to the list, which has a row above the one selected.
+        app.picker.as_mut().unwrap().selected = 1;
+        app.on_key(ctrl('k'));
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0);
+        assert_eq!(
+            app.picker.as_ref().unwrap().query.text(),
+            "xone ",
+            "and takes nothing off the line"
+        );
+
+        // A filter that changed puts the cursor back on the first row of the answer.
+        app.picker.as_mut().unwrap().selected = 1;
+        app.on_key(plain(KeyCode::Backspace));
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0);
+
+        app.on_key(plain(KeyCode::Esc));
+        app.thread = Some(running_thread());
+        app.focus = Focus::Chat;
+        app.start_search(false);
+        typed(&mut app, "one two");
+        app.on_key(ctrl('w'));
+        app.on_key(ctrl('a'));
+        typed(&mut app, "x");
+        assert_eq!(
+            app.search_input
+                .as_ref()
+                .expect("a search is open")
+                .query
+                .text(),
+            "xone "
+        );
+    }
+
     /// A command run once is on the arrow keys, so the long ones are typed once.
     #[test]
     fn the_command_line_remembers_what_was_run() {
@@ -6898,7 +6935,7 @@ mod tests {
         app.open_picker(PickerKind::Project);
         app.on_paste("a query\n");
         assert_eq!(
-            app.picker.as_ref().expect("the picker is up").query,
+            app.picker.as_ref().expect("the picker is up").query.text(),
             "a query"
         );
 
@@ -6909,7 +6946,8 @@ mod tests {
             app.search_input
                 .as_ref()
                 .expect("a search is being typed")
-                .query,
+                .query
+                .text(),
             "needle"
         );
     }
@@ -7582,7 +7620,7 @@ mod tests {
         press(&mut app, KeyCode::Char('r'), true);
         // The name it already has is there to be edited, and the list stays put.
         let picker = app.picker.as_ref().expect("the list is still open");
-        assert_eq!(picker.query, "p");
+        assert_eq!(picker.query.text(), "p");
         assert_eq!(picker.renaming.as_deref(), Some("p"));
         press(&mut app, KeyCode::Backspace, false);
         for letter in "shelf".chars() {
