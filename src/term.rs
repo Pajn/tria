@@ -73,6 +73,18 @@ impl vt100::Callbacks for Answers {
     }
 }
 
+/// What joins the parts of an emoji built out of several, and what vt100 ends a cell on.
+const ZERO_WIDTH_JOINER: char = '\u{200D}';
+
+/// One of the two letters a flag is spelled with, alone in a cell.
+fn is_regional(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('\u{1F1E6}'..='\u{1F1FF}'), None)
+    )
+}
+
 pub struct Pane {
     pub thread_id: String,
     pub terminal_id: String,
@@ -117,6 +129,47 @@ impl Pane {
 
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    /// What is at a cell, with whatever vt100 cut it away from put back, and how many
+    /// columns those pieces were spread over.
+    ///
+    /// vt100 ends a cell at a zero-width joiner and starts the next one with what the
+    /// joiner was joining to, and it gives each of the two letters a flag is spelled
+    /// with a cell of its own. Drawn a column apart the pieces overlap, because the
+    /// first of them is two columns wide and the second lands on its right half: that
+    /// is why a trans flag came out as the symbol it is joined to, and a Swedish one as
+    /// the letter E.
+    pub fn cluster_at(&self, row: u16, col: u16) -> (String, u16) {
+        let screen = self.screen();
+        let Some(cell) = screen.cell(row, col) else {
+            return (String::new(), 1);
+        };
+        let columns = |cell: &vt100::Cell| if cell.is_wide() { 2 } else { 1 };
+        let mut text = cell.contents().to_string();
+        let mut span = columns(cell);
+        // A cluster can be cut more than once: a family is a person per cell.
+        while text.ends_with(ZERO_WIDTH_JOINER) {
+            let Some(next) = screen.cell(row, col + span) else {
+                break;
+            };
+            let joined = next.contents();
+            if joined.is_empty() {
+                break;
+            }
+            text.push_str(joined);
+            span += columns(next);
+        }
+        // A flag is two letters with no joiner between them, so it is paired by what
+        // the letters are. Two of them make one flag and the next pair makes the next.
+        if is_regional(&text)
+            && let Some(next) = screen.cell(row, col + span)
+            && is_regional(next.contents())
+        {
+            text.push_str(next.contents());
+            span += columns(next);
+        }
+        (text, span)
     }
 
     pub fn size(&self) -> (u16, u16) {
@@ -460,6 +513,42 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    /// vt100 cuts an emoji built out of several at every joiner, and gives each letter
+    /// of a flag its own cell. Drawn a cell apart the pieces land on top of each other
+    /// — the trans flag came out as the symbol alone — so they are put back together.
+    #[test]
+    fn an_emoji_cut_across_cells_is_put_back_together() {
+        let whole = |text: &str| {
+            let mut pane = Pane::new("t".into(), "x".into(), "s".into(), 20, 3);
+            let _ = pane.feed(text);
+            pane.cluster_at(0, 0)
+        };
+
+        let trans = "\u{1F3F3}\u{FE0F}\u{200D}\u{26A7}\u{FE0F}";
+        assert_eq!(whole(trans), (trans.to_string(), 2));
+        let rainbow = "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}";
+        assert_eq!(whole(rainbow), (rainbow.to_string(), 3));
+        // Cut twice, and a person is two columns apiece.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(whole(family), (family.to_string(), 6));
+        assert_eq!(
+            whole("\u{1F1F8}\u{1F1EA}"),
+            ("\u{1F1F8}\u{1F1EA}".into(), 2)
+        );
+
+        // Two flags are two flags, rather than one four-letter run.
+        let mut pane = Pane::new("t".into(), "x".into(), "s".into(), 20, 3);
+        let _ = pane.feed("\u{1F1F8}\u{1F1EA}\u{1F1F3}\u{1F1F4}");
+        assert_eq!(pane.cluster_at(0, 0), ("\u{1F1F8}\u{1F1EA}".into(), 2));
+        assert_eq!(pane.cluster_at(0, 2), ("\u{1F1F3}\u{1F1F4}".into(), 2));
+
+        // What vt100 already keeps whole is left alone.
+        assert_eq!(whole("\u{1F680}"), ("\u{1F680}".into(), 2));
+        assert_eq!(whole("1\u{FE0F}\u{20E3}"), ("1\u{FE0F}\u{20E3}".into(), 1));
+        assert_eq!(whole("e\u{301}"), ("e\u{301}".into(), 1));
+        assert_eq!(whole("a"), ("a".into(), 1));
     }
 
     /// A program that has not asked for bracketed paste gets the text plain, because

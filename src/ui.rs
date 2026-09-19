@@ -1986,18 +1986,16 @@ fn draw_terminal_pane(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let buffer = frame.buffer_mut();
     for row in 0..inner.height {
-        for col in 0..inner.width {
+        let mut col = 0;
+        while col < inner.width {
             let Some(cell) = screen.cell(row, col) else {
+                col += 1;
                 continue;
             };
             if cell.is_wide_continuation() {
+                col += 1;
                 continue;
             }
-            let Some(target) = buffer.cell_mut(Position::new(inner.x + col, inner.y + row)) else {
-                continue;
-            };
-            let contents = cell.contents();
-            target.set_symbol(if contents.is_empty() { " " } else { contents });
             let mut style = Style::default()
                 .fg(vt_color(cell.fgcolor(), Color::Reset))
                 .bg(vt_color(cell.bgcolor(), Color::Reset));
@@ -2016,7 +2014,24 @@ fn draw_terminal_pane(frame: &mut Frame, app: &mut App, area: Rect) {
             if cell.inverse() {
                 style = style.add_modifier(Modifier::REVERSED);
             }
-            target.set_style(style);
+            // An emoji vt100 spread over several cells goes back together, drawn once
+            // at the first of them rather than each piece over the one before it.
+            let (contents, span) = pane.cluster_at(row, col);
+            if let Some(target) = buffer.cell_mut(Position::new(inner.x + col, inner.y + row)) {
+                target.set_symbol(if contents.is_empty() { " " } else { &contents });
+                target.set_style(style);
+            }
+            // The rest of the columns it came from keep its colours, so the background
+            // does not break where the glyph is narrower than the cells it was in.
+            for extra in 1..span {
+                if let Some(target) =
+                    buffer.cell_mut(Position::new(inner.x + col + extra, inner.y + row))
+                {
+                    target.set_symbol(" ");
+                    target.set_style(style);
+                }
+            }
+            col += span;
         }
     }
 
@@ -3546,6 +3561,37 @@ mod tests {
         // A provider with no way to compact has nothing to offer.
         app.config.providers[0].slash_commands.clear();
         assert!(!chat(80, &mut app).contains("tokens from earlier"));
+    }
+
+    /// An emoji vt100 spread over several cells is drawn once, whole, at the first of
+    /// them. Drawn a cell apart the pieces overlapped and the last one won, which is
+    /// how a trans flag in a shell prompt came out as the symbol on its own.
+    // A draw tells the server the size it drew at, which wants a runtime to send on.
+    #[tokio::test]
+    async fn an_emoji_in_the_pane_is_drawn_whole() {
+        let trans = "\u{1F3F3}\u{FE0F}\u{200D}\u{26A7}\u{FE0F}";
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_answering("here"));
+        app.mode = Mode::TerminalPane;
+        let mut pane = crate::term::Pane::new("t1".into(), "term".into(), "shell".into(), 40, 8);
+        let _ = pane.feed(&format!("{trans} ~ $ "));
+        app.pane = Some(pane);
+
+        let buffer = screen(60, &mut app);
+        let drawn: Vec<String> = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+        assert!(
+            drawn.iter().any(|symbol| symbol == trans),
+            "the flag is drawn as one thing, whole"
+        );
+        assert!(
+            !drawn.iter().any(|symbol| symbol == "\u{26A7}\u{FE0F}"),
+            "and the symbol it is joined to is not drawn on top of it"
+        );
     }
 
     fn screen(width: u16, app: &mut App) -> ratatui::buffer::Buffer {
