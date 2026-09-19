@@ -45,7 +45,7 @@ const COMPOSER_MAX_ROWS: u16 = 8;
 /// Cached rendered chat blocks with their wrapped heights.
 #[derive(Default)]
 pub struct ChatCache {
-    key: Option<(String, u64, u16, u16, u64, bool, usize)>,
+    key: Option<(String, u64, u16, u16, u64, u8, usize)>,
     blocks: Vec<CachedBlock>,
     total: usize,
     /// Every content line as displayed, filled on demand for search.
@@ -1051,7 +1051,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         inner.width,
         inner.height,
         expanded_hash,
-        app.expand_all,
+        app.open_levels,
         app.spinner % 8,
     );
     CACHE.with(|cache| {
@@ -1072,7 +1072,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             let blocks = timeline::build(
                 thread,
                 &app.expanded,
-                app.expand_all,
+                app.open_levels,
                 inner.width,
                 inner.height,
             );
@@ -2601,7 +2601,10 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  n                       new thread (pick project; ^R renames one)"),
         Line::from("  m                       change model"),
         Line::from("  i / Enter               write a message"),
-        Line::from("  za  zR  zM              toggle / expand all / collapse all tool groups"),
+        Line::from("  za                      fold or unfold the tool group or row here"),
+        Line::from(
+            "  zr  zm  zR  zM          open or shut a level: groups, then the calls in them",
+        ),
         Line::from("  1..9                    answer a pending approval (otherwise a count)"),
         Line::from(
             "  ga                      answer the agent's question (digits, Space, c custom, Enter)",

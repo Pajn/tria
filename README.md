@@ -89,7 +89,9 @@ Press `?` inside the app for the full list.
 | `gw` | new thread: start it in a fresh worktree, or the project's checkout |
 | `m` | change model |
 | `i` `a` `I` `A` `o` `O` or `Enter` | write a message (Vim insert entry) |
-| `za` `zR` `zM` | toggle / expand all / collapse all tool groups; `za` on a tool row inside an open group expands that row |
+| `za` | fold or unfold the tool group or row under the cursor; `za` on a row inside an open group opens what that call kept |
+| `zr` `zm` | open or shut one level everywhere: the groups, then what every call in them kept |
+| `zR` `zM` | open every level at once, or shut them all and let go of the folds opened by hand |
 | `1`..`9` | answer a pending approval; otherwise a count for the next motion |
 | `ga` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `gy` | copy the last assistant message (OSC 52) |
@@ -428,6 +430,13 @@ tmux reserves them. If no such session exists, tria creates it in that directory
 suits a one-session-per-checkout layout.
 
 ## Tool output
+
+Tool calls fold in two levels. A run of them collapses to one line saying how many there are
+and what the last one was; opening that gives a line per call; opening a call gives what the
+server kept of it. `za` works on whatever is under the cursor, a group or a row. `zr` and `zm`
+open and shut a level across the whole conversation, so `zr zr` is every call and everything
+in it, which `zR` does in one. `zM` shuts them all, and is the one key that also lets go of
+the folds opened by hand.
 
 Expanding a tool row shows what the server sends: the command or tool input, the first line
 of the output or a line count, changed files, and the status. The server projects tool

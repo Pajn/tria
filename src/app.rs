@@ -39,6 +39,10 @@ const NEW_THREAD_DRAFT_KEY: &str = "\0new-thread";
 
 /// Rows moved per mouse wheel notch.
 const MOUSE_SCROLL_LINES: usize = 3;
+/// The levels the work folds have: the groups of tool calls, and what each call in an
+/// open group kept — its input, its output, the files it touched. Opening past this is
+/// opening what is already open.
+const MOST_OPEN_LEVELS: u8 = 2;
 const TICK: Duration = Duration::from_millis(120);
 
 /// How many events waiting at once are applied before the screen is drawn. Enough that a
@@ -328,7 +332,10 @@ pub struct App {
     pub show_snoozed: bool,
     pub scroll: Scroll,
     pub expanded: HashSet<String>,
-    pub expand_all: bool,
+    /// How many levels of the work folds stand open whatever anybody folded by hand:
+    /// none, the groups, or the groups and every call inside them. `zr` and `zm` step it
+    /// a level at a time, `zR` and `zM` go straight to the ends.
+    pub open_levels: u8,
     pub toast: Option<(String, Instant, bool)>,
     pub spinner: usize,
     pending_prefix: Option<(char, Instant)>,
@@ -462,7 +469,7 @@ impl App {
             show_snoozed: true,
             scroll: Scroll::Follow,
             expanded: HashSet::new(),
-            expand_all: false,
+            open_levels: 0,
             toast: None,
             spinner: 0,
             pending_prefix: None,
@@ -3410,9 +3417,15 @@ impl App {
             KeyCode::Char('z') => self.pending_prefix = Some(('z', Instant::now())),
             KeyCode::Char('a') if prefix == Some('z') => self.fold_at(cursor, true),
             KeyCode::Enter | KeyCode::Char(' ') => self.fold_at(cursor, false),
-            KeyCode::Char('R') if prefix == Some('z') => self.expand_all = true,
+            KeyCode::Char('R') if prefix == Some('z') => self.open_levels = MOST_OPEN_LEVELS,
+            KeyCode::Char('r') if prefix == Some('z') => {
+                self.open_levels = (self.open_levels + 1).min(MOST_OPEN_LEVELS);
+            }
+            KeyCode::Char('m') if prefix == Some('z') => {
+                self.open_levels = self.open_levels.saturating_sub(1);
+            }
             KeyCode::Char('M') if prefix == Some('z') => {
-                self.expand_all = false;
+                self.open_levels = 0;
                 self.expanded.clear();
             }
             // `v` takes the text a character at a time, `V` whole lines; either one
@@ -3927,9 +3940,17 @@ impl App {
                 return;
             }
             KeyCode::Char('a') if prefix == Some('z') => return self.toggle_work_group(),
-            KeyCode::Char('R') if prefix == Some('z') => return self.expand_all = true,
+            KeyCode::Char('R') if prefix == Some('z') => {
+                return self.open_levels = MOST_OPEN_LEVELS;
+            }
+            KeyCode::Char('r') if prefix == Some('z') => {
+                return self.open_levels = (self.open_levels + 1).min(MOST_OPEN_LEVELS);
+            }
+            KeyCode::Char('m') if prefix == Some('z') => {
+                return self.open_levels = self.open_levels.saturating_sub(1);
+            }
             KeyCode::Char('M') if prefix == Some('z') => {
-                self.expand_all = false;
+                self.open_levels = 0;
                 self.expanded.clear();
                 return;
             }
@@ -5451,6 +5472,42 @@ mod tests {
         app.mode = Mode::Normal;
         app.on_mouse(click(2, 20));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// The fold keys step a level at a time as well as going straight to the ends, and
+    /// stepping past either end stays there rather than wrapping round to the other.
+    #[test]
+    fn the_fold_keys_step_a_level_at_a_time() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.focus = Focus::Chat;
+        let press = |app: &mut App, key: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+            app.on_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        };
+
+        press(&mut app, 'r');
+        assert_eq!(app.open_levels, 1, "the groups");
+        press(&mut app, 'r');
+        assert_eq!(app.open_levels, 2, "and what is inside the calls in them");
+        press(&mut app, 'r');
+        assert_eq!(app.open_levels, MOST_OPEN_LEVELS, "and no further");
+        press(&mut app, 'm');
+        assert_eq!(app.open_levels, 1);
+        press(&mut app, 'm');
+        assert_eq!(app.open_levels, 0);
+        press(&mut app, 'm');
+        assert_eq!(app.open_levels, 0, "and no further the other way");
+        press(&mut app, 'R');
+        assert_eq!(app.open_levels, MOST_OPEN_LEVELS);
+
+        // Shutting everything also lets go of the folds opened one at a time, which is
+        // what makes it the one key that leaves the conversation as it was read.
+        app.expanded.insert("work-1".to_string());
+        press(&mut app, 'M');
+        assert_eq!(app.open_levels, 0);
+        assert!(app.expanded.is_empty());
     }
 
     /// Leaving a thread drops the status of the checkout it was in, because the next

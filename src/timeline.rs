@@ -109,12 +109,14 @@ fn item_time<'a>(item: &'a Item<'a>) -> &'a str {
     }
 }
 
-/// Build the ordered blocks for a thread. `expanded` holds work-group keys shown in full.
+/// Build the ordered blocks for a thread. `expanded` holds the keys of groups and calls
+/// opened by hand; `open_levels` opens them wholesale, one level for the groups and two
+/// for what is inside every call in them.
 /// The height is the chat's own: it bounds how much of the window one image may take.
 pub fn build(
     thread: &ThreadState,
     expanded: &HashSet<String>,
-    expand_all: bool,
+    open_levels: u8,
     width: u16,
     height: u16,
 ) -> Vec<Block> {
@@ -155,7 +157,7 @@ pub fn build(
         }
         let key = anchor.take().unwrap_or_else(|| format!("work-{index}"));
         *index += 1;
-        let is_expanded = expand_all || expanded.contains(&key);
+        let is_expanded = open_levels >= 1 || expanded.contains(&key);
         // Providers do not always emit a completion for every parallel call. Once the
         // turn that owned an entry is over, "in progress" can only be stale.
         for entry in pending.iter_mut() {
@@ -163,7 +165,15 @@ pub fn build(
                 entry.status = "completed".to_string();
             }
         }
-        let (text, rows, images) = render_work(pending, is_expanded, expanded, &key, width, height);
+        let (text, rows, images) = render_work(
+            pending,
+            is_expanded,
+            open_levels >= 2,
+            expanded,
+            &key,
+            width,
+            height,
+        );
         let mut exports = vec![(key.clone(), export_group(pending))];
         exports.extend(
             pending
@@ -741,6 +751,8 @@ fn export_group(entries: &[WorkEntry<'_>]) -> String {
 fn render_work(
     entries: &[WorkEntry<'_>],
     expanded: bool,
+    // Every call in the group open, not only the ones opened by hand.
+    all_open: bool,
     expanded_keys: &HashSet<String>,
     group_key: &str,
     width: u16,
@@ -805,7 +817,7 @@ fn render_work(
     let dim = Style::default().fg(Color::DarkGray);
     for entry in entries {
         let key = row_key(group_key, entry);
-        let open = entry.has_more() && expanded_keys.contains(&key);
+        let open = entry.has_more() && (all_open || expanded_keys.contains(&key));
         let marker = if !entry.has_more() {
             "  "
         } else if open {
@@ -1125,7 +1137,7 @@ mod tests {
         let entries = work(&rows);
         assert!(entries[0].has_more(), "an image is something to unfold");
         let open = HashSet::from(["work-1/t1".to_string()]);
-        let (text, regions, images) = render_work(&entries, true, &open, "work-1", 80, 24);
+        let (text, regions, images) = render_work(&entries, true, false, &open, "work-1", 80, 24);
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].key, "t1/1");
         let size = picture::place(
@@ -1187,7 +1199,7 @@ mod tests {
         let entries = work(&rows);
         assert!(entries[0].has_more(), "the file is something to unfold");
         let open = HashSet::from(["work-1/t2".to_string()]);
-        let (_, _, images) = render_work(&entries, true, &open, "work-1", 80, 24);
+        let (_, _, images) = render_work(&entries, true, false, &open, "work-1", 80, 24);
         assert_eq!(images.len(), 1);
         std::fs::remove_file(&path).unwrap();
     }
@@ -1219,6 +1231,45 @@ mod tests {
         assert_eq!(entries[0].images.len(), 1);
     }
 
+    /// The second level opens what every call kept, which is the one the group's own
+    /// level cannot reach: a group open is a list of calls a line each.
+    #[test]
+    fn the_second_level_opens_what_the_calls_kept() {
+        let run: Activity = serde_json::from_value(json!({
+            "id": "a-run",
+            "kind": "tool.completed",
+            "tone": "info",
+            "summary": "Bash",
+            "createdAt": "1",
+            "payload": {
+                "itemType": "command_execution",
+                "toolCallId": "t9",
+                "status": "completed",
+                "title": "Bash",
+                "data": {
+                    "command": "cargo test",
+                    "result": { "type": "tool_result", "content": [
+                        { "type": "text", "text": "142 passed" },
+                    ]},
+                },
+            },
+        }))
+        .unwrap();
+        let rows = [run];
+        let entries = work(&rows);
+        let text = |all_open| {
+            let (text, _, _) =
+                render_work(&entries, true, all_open, &HashSet::new(), "work-1", 80, 24);
+            text.to_string()
+        };
+        // A group open is the call on its line, and no more than that.
+        assert!(text(false).contains("cargo test"));
+        assert!(!text(false).contains("142 passed"), "{}", text(false));
+        // A level deeper is what the call came back with, without any one of them having
+        // to be asked for by name the way a fold opened by hand is.
+        assert!(text(true).contains("142 passed"), "{}", text(true));
+    }
+
     /// Every row of an expanded group owns its lines, whether or not it has anything to
     /// unfold. Without that, a click on a row the server kept no payload for lands on the
     /// group instead and shuts the whole thing.
@@ -1236,7 +1287,7 @@ mod tests {
             ),
         ];
         let entries = work(&rows);
-        let (_, regions, _) = render_work(&entries, true, &HashSet::new(), "work-1", 80, 24);
+        let (_, regions, _) = render_work(&entries, true, false, &HashSet::new(), "work-1", 80, 24);
         let keys: Vec<(&str, bool)> = regions
             .iter()
             .map(|region| (region.key.as_str(), region.foldable))
