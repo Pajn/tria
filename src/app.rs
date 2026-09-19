@@ -271,6 +271,13 @@ pub enum AppEvent {
         thread_id: Id,
         error: String,
     },
+    /// The server would not take a message sent to a thread that already exists. The
+    /// text comes back with it: it left the composer when it was sent.
+    SendRefused {
+        thread_id: Id,
+        text: String,
+        error: String,
+    },
     /// The config was read again for the usage window, or was not.
     UsageRead(Result<Box<ServerConfig>, String>),
     /// A non-command RPC finished; `ok` is the toast for the success case.
@@ -1008,6 +1015,62 @@ impl App {
         });
     }
 
+    /// Send a message to a thread that already exists, keeping hold of the text until
+    /// the server has taken it. The composer is emptied when a message goes, because
+    /// that is what sending looks like; a message the server refuses has to come back,
+    /// or the only copy of it is one keypress of history away and nothing says so.
+    fn dispatch_message(&self, command: Value, thread_id: Id, text: String) {
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            match handle.dispatch(command).await {
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = events.send(AppEvent::SendRefused {
+                        thread_id,
+                        text,
+                        error: error.to_string(),
+                    });
+                }
+            }
+        });
+    }
+
+    /// A message that was not sent goes back where it was written: into the composer if
+    /// that is still where you are and nothing has been written since, and into the
+    /// thread's parked draft if you have gone elsewhere. Where neither is free, what was
+    /// typed is not lost — it is in the composer's history — and the toast says so
+    /// rather than writing over whatever took its place.
+    fn on_send_refused(&mut self, thread_id: Id, text: String, error: String) {
+        let here = self.current_thread_id.as_deref() == Some(thread_id.as_str());
+        if here && self.composer.is_empty() {
+            self.composer.set_text(&text);
+            // Sending leaves you in insert mode with an empty composer, which is where
+            // the text goes back to. Anywhere else — a list, a pane, the chat — the view
+            // is left where it is and the text is simply there when you come back to it.
+            if matches!(self.mode, Mode::Normal | Mode::Insert) {
+                self.focus = Focus::Composer;
+            }
+            if self.mode != Mode::Insert {
+                self.composer.clamp_normal();
+            }
+            self.toast(format!("not sent: {error}"), true);
+            return;
+        }
+        if !here && !self.drafts.contains_key(thread_id.as_str()) {
+            self.drafts.insert(thread_id.to_string(), text);
+            self.toast(
+                format!("not sent: {error} · the message is back in that thread"),
+                true,
+            );
+            return;
+        }
+        self.toast(
+            format!("not sent: {error} · it is in the composer's history (Ctrl-p)"),
+            true,
+        );
+    }
+
     /// Subscribe to a thread the server has just made, unless the view has moved on in
     /// the meantime: a thread opened since the message was sent is the one wanted.
     fn on_thread_created(&mut self, thread_id: Id) {
@@ -1116,7 +1179,7 @@ impl App {
                 &shell.interaction_mode,
                 None,
             );
-            self.dispatch(command);
+            self.dispatch_message(command, thread.id().to_string(), text.clone());
         } else {
             self.toast(
                 "no thread open; press n for a new thread or / to pick one",
@@ -5353,6 +5416,11 @@ fn apply(app: &mut App, event: AppEvent) {
         AppEvent::Update(update) => app.on_update(*update),
         AppEvent::ThreadCreated(thread_id) => app.on_thread_created(thread_id),
         AppEvent::CreateRefused { thread_id, error } => app.on_create_refused(thread_id, error),
+        AppEvent::SendRefused {
+            thread_id,
+            text,
+            error,
+        } => app.on_send_refused(thread_id, text, error),
         AppEvent::UsageRead(read) => app.on_usage_read(read),
         AppEvent::WorktreeChecked {
             path,
@@ -6334,6 +6402,67 @@ mod tests {
         }))
         .expect("an approval the server could have sent");
         ThreadState::from_snapshot(snapshot)
+    }
+
+    /// Sending empties the composer, which is what sending looks like — but a message
+    /// the server would not take never went anywhere, and what was typed is the work.
+    /// It comes back to where it was written.
+    #[tokio::test]
+    async fn a_message_the_server_refuses_comes_back() {
+        let (handle, requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        // Nothing is listening for commands, so the send fails the way a send fails.
+        drop(requests);
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+        app.current_thread_id = Some("t1".into());
+        app.mode = Mode::Insert;
+        app.composer.set_text("the message");
+
+        app.send_message();
+        assert!(app.composer.is_empty(), "the message left on its way out");
+
+        let refusal = tokio::time::timeout(Duration::from_millis(500), sent.recv())
+            .await
+            .expect("the refusal comes back")
+            .expect("an event");
+        assert!(
+            matches!(&refusal, AppEvent::SendRefused { thread_id, text, .. }
+                if thread_id == "t1" && text == "the message"),
+            "the refusal carries the message it refused"
+        );
+        apply(&mut app, refusal);
+        assert_eq!(app.composer.text(), "the message");
+        assert_eq!(app.focus, Focus::Composer);
+        let said = app.toast.as_ref().expect("it says why").0.clone();
+        assert!(said.starts_with("not sent:"), "{said}");
+    }
+
+    /// Where the composer is not free, putting the message back would write over
+    /// something else somebody typed. It goes to the thread it was meant for if that
+    /// draft is free, and otherwise it stays in the history and the toast says so.
+    #[test]
+    fn a_refused_message_does_not_write_over_what_took_its_place() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+        app.current_thread_id = Some("t1".into());
+
+        // Something written since: the composer is left alone.
+        app.composer.set_text("the next one");
+        app.on_send_refused("t1".into(), "the message".into(), "refused".into());
+        assert_eq!(app.composer.text(), "the next one");
+        assert!(app.toast.as_ref().unwrap().0.contains("history"));
+
+        // Somewhere else entirely: it waits in the thread it was written in.
+        app.current_thread_id = Some("t2".into());
+        app.on_send_refused("t1".into(), "the message".into(), "refused".into());
+        assert_eq!(
+            app.drafts.get("t1").map(String::as_str),
+            Some("the message")
+        );
+        assert_eq!(app.composer.text(), "the next one");
     }
 
     /// The app keeps a handful of letters the composer's Vim has no use for, but a key

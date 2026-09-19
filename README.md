@@ -518,8 +518,17 @@ from the config file, else `$VISUAL`, else `$EDITOR`, else `nvim`; Vim-like edit
 for read-only views. Like `gl`, this uses a tmux popup inside tmux and takes over the
 terminal otherwise. `:edit` and `:view` are the command forms.
 
-Unsent composer text stays with its thread: switch away and back and the half-written
-message is still there. New-thread drafts have a slot of their own.
+Unsent composer text stays with its thread for as long as tria is running: switch away and
+back and the half-written message is still there. New-thread drafts have a slot of their
+own. Nothing is written to disk, so quitting is quitting.
+
+Sending empties the composer, which is what sending looks like. A message the server will
+not take never went anywhere, so it comes back: into the composer if that is still where
+you are and nothing has been written since, and into the thread's parked draft if you have
+gone elsewhere. Where neither is free it is not lost either — every sent message goes into
+the composer's history, and the toast says to reach for it with `Ctrl-p`. The same holds
+for the message that would have started a new thread: the draft comes back with it, so the
+project, the model and the worktree choice are as you left them.
 
 A thread you come back to after a long gap says what it is still carrying, where the
 composer's usual hint goes: `101k tokens from earlier · /compact resumes with less
