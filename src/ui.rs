@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Position, Rect},
+    layout::{Constraint, Layout, Position, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
@@ -32,6 +32,9 @@ const MARK: usize = 3;
 /// the picture, which is two rows tall and so needs four columns to come out square, and
 /// one to stand it off the text.
 const ICON_COLUMN: usize = 5;
+/// The largest a drawn icon is made, however much room it was given. Past this it is a
+/// line drawing with more pixels than the lines have detail.
+const MOST_ICON_PIXELS: u32 = 64;
 const COMPOSER_MAX_ROWS: u16 = 8;
 
 /// Cached rendered chat blocks with their wrapped heights.
@@ -717,6 +720,48 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
 /// The project's icon on the right of a thread's two lines, drawn over the room the
 /// rows left for it. A picture goes on after the list, the way the project picker draws
 /// one; an emoji is a character and sits on the title's line.
+/// Draw what a project is known by over the room a row kept for it, and say whether
+/// anything went there. The drawn icon it was chosen from the set is first, since
+/// somebody picked it; failing that the icon its checkout carries. Both are pictures and
+/// so go on after the list rather than into it, over the room the text left.
+///
+/// An emoji is not here: it is a character, and a character belongs in the line.
+fn draw_project_picture(frame: &mut Frame, app: &App, project: &str, area: Rect) -> bool {
+    if area.width == 0 || area.height == 0 {
+        return false;
+    }
+    if let Some((name, colour)) = app.project_lucide(project) {
+        // The icon is made at the size of the room rather than made once and shrunk: a
+        // line drawing that has been resized is a line drawing with grey lines.
+        let cell = picture::cell_size().unwrap_or(Size::new(8, 16));
+        let side = (area.width as u32 * cell.width as u32)
+            .min(area.height as u32 * cell.height as u32)
+            .min(MOST_ICON_PIXELS);
+        if let Some(drawn) = crate::lucide::draw(name, colour, side) {
+            let key = format!("lucide:{name}:{}", colour.unwrap_or_default());
+            let source = picture::Source::Pixels {
+                bytes: &drawn.bytes,
+                width: drawn.side,
+                height: drawn.side,
+                alpha: true,
+            };
+            if picture::place(&key, source, area.as_size()).is_some() {
+                picture::draw(frame, &key, area, SignedPosition::from((0, 0)));
+                return true;
+            }
+        }
+    }
+    let Some(bytes) = app.favicon(project) else {
+        return false;
+    };
+    let key = format!("favicon:{project}:{}", area.height);
+    if picture::place(&key, picture::Source::Bytes(bytes), area.as_size()).is_some() {
+        picture::draw(frame, &key, area, SignedPosition::from((0, 0)));
+        return true;
+    }
+    false
+}
+
 fn draw_sidebar_icons(frame: &mut Frame, app: &App, inner: Rect, rows: &[SidebarRow]) {
     let mut line = 0usize;
     for row in rows.iter().skip(app.sidebar_offset) {
@@ -747,22 +792,13 @@ fn draw_sidebar_icons(frame: &mut Frame, app: &App, inner: Rect, rows: &[Sidebar
             frame.render_widget(Paragraph::new(Line::from(emoji.to_string())), area);
             continue;
         }
-        let Some(bytes) = app.favicon(project) else {
-            continue;
-        };
-        let key = format!("favicon:{project}:{room}");
         let area = Rect {
             x: inner.right().saturating_sub(ICON_COLUMN as u16 - 1),
             y,
             width: 4,
             height: room as u16,
         };
-        if area.height == 0 {
-            continue;
-        }
-        if picture::place(&key, picture::Source::Bytes(bytes), area.as_size()).is_some() {
-            picture::draw(frame, &key, area, SignedPosition::from((0, 0)));
-        }
+        draw_project_picture(frame, app, project, area);
     }
 }
 
@@ -1774,19 +1810,13 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
             if app.project_emoji(&item.key).is_some() {
                 continue;
             }
-            let Some(bytes) = app.favicon(&item.key) else {
-                continue;
-            };
-            let key = format!("favicon:{}", item.key);
             let area = Rect {
                 x: list_area.x + 2,
                 y: list_area.y + row as u16,
                 width: 2,
                 height: 1,
             };
-            if picture::place(&key, picture::Source::Bytes(bytes), area.as_size()).is_some() {
-                picture::draw(frame, &key, area, SignedPosition::from((0, 0)));
-            }
+            draw_project_picture(frame, app, &item.key, area);
         }
     }
 }
@@ -3322,6 +3352,60 @@ mod tests {
         let store = row("What do I need");
         assert_eq!(painted(store), 0);
         assert!(text(store).contains("📚"), "{}", text(store));
+    }
+
+    /// The set the desktop app draws a project's icon from is a set of pictures, which
+    /// a terminal can be given as pixels like any other picture.
+    #[test]
+    fn a_project_named_a_drawn_icon_is_drawn_with_it() {
+        picture::draw_in_halfblocks();
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.sidebar_layout = SidebarLayout::TwoLine;
+        app.shell.apply(crate::model::ShellItem::Snapshot {
+            snapshot: serde_json::from_value(json!({
+                "snapshotSequence": 1,
+                "projects": [
+                    {"id": "p1", "title": "mobile", "workspaceRoot": "/src/mobile",
+                     "projectIcon": {"kind": "lucide", "name": "file-json", "color": "blue"}}
+                ],
+                "threads": [
+                    {"id": "t1", "projectId": "p1", "title": "Nx cache invalidation",
+                     "modelSelection": {"instanceId": "i", "model": "m"},
+                     "createdAt": "2026-01-01T00:00:01Z"}
+                ]
+            }))
+            .unwrap(),
+        });
+        let buffer = screen(100, &mut app);
+
+        let titled = (0..buffer.area.height)
+            .find(|y| {
+                (0..SIDEBAR_WIDTH)
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains("Nx cache")
+            })
+            .unwrap();
+        // Half blocks are colour, so the icon is the cells that have any, and it takes
+        // the four columns kept for it on both of the thread's lines.
+        let painted = |y: u16| {
+            (0..SIDEBAR_WIDTH)
+                .filter(|x| buffer[(*x, y)].bg != Color::Reset)
+                .count()
+        };
+        assert_eq!(painted(titled), 4);
+        assert_eq!(painted(titled + 1), 4);
+        // And it is drawn in the colour it was named in.
+        let blue = (0..SIDEBAR_WIDTH).any(|x| {
+            matches!(buffer[(x, titled)].fg, Color::Rgb(r, g, b) if b > r && b > g)
+                || matches!(buffer[(x, titled)].bg, Color::Rgb(r, g, b) if b > r && b > g)
+        });
+        assert!(
+            blue,
+            "the icon is drawn in the colour the project was given"
+        );
     }
 
     /// Selecting a thread marks its status column down both lines: the whole of two

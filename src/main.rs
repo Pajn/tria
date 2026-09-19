@@ -5,6 +5,7 @@ mod composer;
 mod config;
 mod discovery;
 mod kitty;
+mod lucide;
 mod model;
 mod picture;
 mod question;

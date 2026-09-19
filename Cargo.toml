@@ -33,3 +33,5 @@ unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 vt100 = "0.16"
+lucide-icons = { version = "1.47.0", default-features = false }
+fontdue = "0.9.4"

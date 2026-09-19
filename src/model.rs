@@ -42,16 +42,22 @@ pub struct Project {
     pub default_thread_env_mode: Option<String>,
 }
 
-/// The icon a project was given. The other kind is a name from a drawing set, which is
-/// a picture a terminal has no way to draw, so it is taken as no icon at all.
+/// The icon a project was given: a character, or a name and a colour from the drawing
+/// set both this and the desktop app draw from. A kind neither of those is no icon at
+/// all, since nothing here knows what it would look like.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ProjectIcon {
     Emoji {
         emoji: String,
     },
+    Lucide {
+        name: String,
+        #[serde(default)]
+        color: Option<String>,
+    },
     #[serde(other)]
-    Drawn,
+    Unknown,
 }
 
 impl Project {
@@ -59,6 +65,14 @@ impl Project {
     pub fn emoji(&self) -> Option<&str> {
         match &self.project_icon {
             Some(ProjectIcon::Emoji { emoji }) => Some(emoji),
+            _ => None,
+        }
+    }
+
+    /// The drawn icon the project was given, as its name and the colour to draw it in.
+    pub fn lucide(&self) -> Option<(&str, Option<&str>)> {
+        match &self.project_icon {
+            Some(ProjectIcon::Lucide { name, color }) => Some((name, color.as_deref())),
             _ => None,
         }
     }

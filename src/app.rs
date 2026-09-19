@@ -2762,6 +2762,12 @@ impl App {
         self.shell.projects.get(project)?.emoji()
     }
 
+    /// The drawn icon a project was given, as its name and colour. Chosen by hand like
+    /// the emoji, so it too wins over the icon the server went looking for.
+    pub fn project_lucide(&self, project: &str) -> Option<(&str, Option<&str>)> {
+        self.shell.projects.get(project)?.lucide()
+    }
+
     /// Hand a project an icon, for a test that draws one.
     #[cfg(test)]
     pub fn give_favicon(&mut self, project: &str, bytes: Vec<u8>) {

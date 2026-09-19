@@ -110,6 +110,15 @@ pub fn ask_terminal(local_files: bool) {
     });
 }
 
+/// How many pixels a character cell is, where the terminal has said. A picture made for
+/// a given number of cells is made at their size rather than near it.
+pub fn cell_size() -> Option<Size> {
+    STORE.with(|store| {
+        let font = store.borrow().picker.as_ref()?.font_size();
+        Some(Size::new(font.width, font.height))
+    })
+}
+
 /// Whether an image named by a path can be shown at all, which is what tells a row with
 /// nothing but a path whether it has anything to unfold.
 pub fn reads_files() -> bool {

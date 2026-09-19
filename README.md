@@ -197,8 +197,14 @@ server's, so it is the name everywhere — this sidebar, the desktop app, the ne
 connect. It is `^R` rather than `r` because the letters in that list go to the search.
 
 The project list `n` opens draws each project with what it is known by: the emoji it was
-given, or failing that the icon its checkout carries, where the terminal can draw pictures at
-all. An icon from a drawing set is neither, and the project is drawn with its name alone.
+given, the icon it was named from the Lucide set, or failing both the icon its checkout
+carries — the last two where the terminal can draw pictures at all.
+
+A named icon arrives as a name and a colour, since the picture itself is nobody's to send.
+Lucide publishes the set as a font, so tria looks the name up there and draws the character
+into pixels at the size of the room it has, in the colour the icon was given. A name from a
+set newer than the one tria was built against is not drawn, and the project falls back to
+the icon its checkout carries.
 
 The looking is the server's: the icon the project names, then the one its `t3.json` names in
 `iconPath`, then the usual places a favicon lives, then whatever the project's `index.html`
