@@ -415,6 +415,8 @@ pub struct App {
     pub links: Vec<Link>,
     /// Programs bound to `g` and a key, from the config file.
     pub programs: Vec<crate::config::Program>,
+    /// How much of the sidebar one thread is given, from the config file.
+    pub sidebar_layout: crate::config::SidebarLayout,
     /// Editor for `ge` and `gE`.
     pub editor: String,
     /// A program to run in the terminal in tria's place; the event loop picks it up.
@@ -506,6 +508,7 @@ impl App {
                 key: 'l',
                 command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
             }],
+            sidebar_layout: crate::config::SidebarLayout::default(),
             editor: "nvim".to_string(),
             pending_external: None,
             popup: None,
@@ -552,6 +555,62 @@ impl App {
             ids.extend(sections.settled.iter().map(|t| t.id.clone()));
         }
         ids
+    }
+
+    /// How many lines a sidebar row is drawn in. One each, until the two-line layout
+    /// gives a thread a second for the branch it is on; a section header keeps its one
+    /// wherever it is.
+    pub fn sidebar_row_height(&self, row: &SidebarRow) -> usize {
+        match (self.sidebar_layout, row) {
+            (crate::config::SidebarLayout::TwoLine, SidebarRow::Thread { .. }) => 2,
+            _ => 1,
+        }
+    }
+
+    /// The row drawn `line` lines down the list, for a click to land on.
+    pub fn sidebar_row_at(&self, rows: &[SidebarRow], line: usize) -> Option<usize> {
+        let mut bottom = 0;
+        for (index, row) in rows.iter().enumerate().skip(self.sidebar_offset) {
+            bottom += self.sidebar_row_height(row);
+            if line < bottom {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// The furthest the list can be scrolled: the first row that still leaves every row
+    /// after it room to be drawn.
+    pub fn sidebar_max_offset(&self, rows: &[SidebarRow], height: usize) -> usize {
+        let mut used = 0;
+        for (index, row) in rows.iter().enumerate().rev() {
+            used += self.sidebar_row_height(row);
+            if used > height {
+                return index + 1;
+            }
+        }
+        0
+    }
+
+    /// An offset that has `selected` on screen, moving the list as little as it takes.
+    pub fn sidebar_offset_showing(
+        &self,
+        rows: &[SidebarRow],
+        selected: usize,
+        height: usize,
+    ) -> usize {
+        let mut offset = self.sidebar_offset.min(selected);
+        while offset < selected {
+            let used: usize = rows[offset..=selected]
+                .iter()
+                .map(|row| self.sidebar_row_height(row))
+                .sum();
+            if used <= height {
+                break;
+            }
+            offset += 1;
+        }
+        offset
     }
 
     /// Rows of the sidebar list, including section headers.
@@ -3956,9 +4015,9 @@ impl App {
                     MOUSE_SCROLL_LINES as isize
                 };
                 if in_sidebar {
-                    let len = self.sidebar_rows().len();
+                    let rows = self.sidebar_rows();
                     let height = self.sidebar_inner.map_or(0, |r| r.height as usize);
-                    let max = len.saturating_sub(height);
+                    let max = self.sidebar_max_offset(&rows, height);
                     self.sidebar_offset =
                         (self.sidebar_offset as isize + delta).clamp(0, max as isize) as usize;
                 } else {
@@ -3969,8 +4028,11 @@ impl App {
                 let Some(inner) = self.sidebar_inner else {
                     return;
                 };
-                let index = self.sidebar_offset + (mouse.row - inner.y) as usize;
                 let rows = self.sidebar_rows();
+                let index = match self.sidebar_row_at(&rows, (mouse.row - inner.y) as usize) {
+                    Some(index) => index,
+                    None => return,
+                };
                 match rows.get(index) {
                     Some(SidebarRow::Thread { id, .. }) => {
                         let id = id.clone();
@@ -4713,6 +4775,7 @@ pub enum SidebarRow {
 /// External programs tria hands the terminal to, from the config file.
 pub struct Launch {
     pub programs: Vec<crate::config::Program>,
+    pub sidebar_layout: crate::config::SidebarLayout,
     /// Bindings the config asked for that tria could not give, to be said out loud once
     /// the screen exists to say them on.
     pub refused: Vec<String>,
@@ -4818,6 +4881,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     app.local_disk = local_files;
     app.origin = origin;
     app.programs = launch.programs;
+    app.sidebar_layout = launch.sidebar_layout;
     if !launch.refused.is_empty() {
         app.toast(format!("config: {}", launch.refused.join(", ")), true);
     }

@@ -24,9 +24,24 @@ pub struct Config {
     /// empty turns starting one off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_command: Option<String>,
+    /// How the thread list draws a thread: `one-line` or `two-line`. Unset is
+    /// `one-line`, which is the list tria has always drawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_layout: Option<String>,
     /// The last model picked, used for the next new thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<crate::model::ModelSelection>,
+}
+
+/// How much of the sidebar one thread is given.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SidebarLayout {
+    /// A row each: the status glyph, the title, and the project on the right.
+    #[default]
+    OneLine,
+    /// Two rows each: the title, then the branch it is on, with the project's icon
+    /// beside them both.
+    TwoLine,
 }
 
 impl Config {
@@ -103,6 +118,22 @@ impl Config {
         self.server_command
             .clone()
             .unwrap_or_else(|| crate::server::DEFAULT_COMMAND.to_string())
+    }
+
+    /// How the thread list draws a thread, and the reason a setting was not taken.
+    /// An unknown layout is refused rather than guessed at, since the two are told
+    /// apart by name and a typo would otherwise be a list that looks unchanged.
+    pub fn sidebar_layout(&self) -> (SidebarLayout, Option<String>) {
+        match self.sidebar_layout.as_deref().map(str::trim) {
+            None | Some("") | Some("one-line") => (SidebarLayout::OneLine, None),
+            Some("two-line") => (SidebarLayout::TwoLine, None),
+            Some(other) => (
+                SidebarLayout::default(),
+                Some(format!(
+                    "sidebar_layout {other:?} is neither one-line nor two-line"
+                )),
+            ),
+        }
     }
 
     /// The programs `g` will run, and the reasons any of them was refused.

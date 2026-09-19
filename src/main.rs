@@ -83,10 +83,13 @@ async fn main() -> Result<()> {
             // Only here: the chat is what a person opens expecting it to work, and the
             // subcommands are for a server that is already up.
             let (origin, started) = server::ensure(known, &cfg.server_command()).await?;
-            let (programs, refused) = cfg.programs();
+            let (programs, mut refused) = cfg.programs();
+            let (sidebar_layout, refused_layout) = cfg.sidebar_layout();
+            refused.extend(refused_layout);
             let launch = app::Launch {
                 started_server: started,
                 programs,
+                sidebar_layout,
                 refused,
                 editor: cfg.editor(),
                 model: cfg.model.clone(),

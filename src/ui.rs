@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{App, Focus, Mode, PickerKind, Scroll, Section, SidebarRow, approval_options},
+    config::SidebarLayout,
     model::ThreadStatus,
     picture,
     session::Status,
@@ -27,6 +28,10 @@ const MIN_WIDTH_FOR_SIDEBAR: u16 = 90;
 /// Columns kept in front of a project's name for what it is drawn with. Two for the
 /// picture or the emoji, one to stand it off the name.
 const MARK: usize = 3;
+/// Columns the two-line thread list keeps on its right for the project's icon: four for
+/// the picture, which is two rows tall and so needs four columns to come out square, and
+/// one to stand it off the text.
+const ICON_COLUMN: usize = 5;
 const COMPOSER_MAX_ROWS: u16 = 8;
 
 /// Cached rendered chat blocks with their wrapped heights.
@@ -527,9 +532,29 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let rows = app.sidebar_rows();
     let width = inner.width as usize;
     let dim = Style::default().fg(Color::DarkGray);
+    let two_line = app.sidebar_layout == SidebarLayout::TwoLine;
+    // Selection is drawn by hand so the wheel can scroll the list without the
+    // selected row dragging the viewport back.
+    let selected = if rows.is_empty() {
+        None
+    } else if focused {
+        Some(app.sidebar_selected.min(rows.len() - 1))
+    } else {
+        rows.iter().position(
+            |row| matches!(row, SidebarRow::Thread { id, .. } if Some(id) == app.current_thread_id.as_ref()),
+        )
+    };
+    let highlight = if focused {
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM)
+    };
     let items: Vec<ListItem> = rows
         .iter()
-        .map(|row| match row {
+        .enumerate()
+        .map(|(index, row)| match row {
             SidebarRow::Header {
                 section,
                 count,
@@ -589,28 +614,64 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     ThreadStatus::Done | ThreadStatus::Idle => ("·", dim),
                 };
                 let is_current = app.current_thread_id.as_ref() == Some(id);
-                // The glyph carries the status; the right column always names the project.
-                let mut right = app.shell.project_title(&t.project_id).to_string();
                 // A worktree of its own, still on the disk. Marked only where the thread
                 // is done with it, since that is when it is leavings rather than a
                 // workplace.
-                if *parked && app.holds_worktree(t) {
+                let holds_worktree = *parked && app.holds_worktree(t);
+                let glyph_style = if *parked { dim } else { glyph_style };
+                let mut title_style = if *parked { dim } else { Style::default() };
+                if is_current {
+                    title_style = title_style.add_modifier(Modifier::BOLD);
+                }
+                if two_line {
+                    // The project is the icon drawn over the right of both lines, so the
+                    // text stops short of it whether or not this project has one.
+                    let title_width = width.saturating_sub(ICON_COLUMN + 4);
+                    let title = fit(&t.title, title_width);
+                    // What the thread is working in: its own branch, the checkout tria
+                    // is watching when this is the thread whose checkout that is, and
+                    // failing both the project it belongs to, which is the one thing
+                    // about it that is always known.
+                    let mut under = t.branch.clone().or_else(|| {
+                        is_current
+                            .then(|| app.vcs.as_ref().and_then(|vcs| vcs.ref_name.clone()))
+                            .flatten()
+                    });
+                    if under.is_none() {
+                        under = Some(app.shell.project_title(&t.project_id).to_string());
+                    }
+                    let mut under = fit(&under.unwrap_or_default(), title_width);
+                    if holds_worktree {
+                        under = fit(&format!("⌂ {under}"), title_width);
+                    }
+                    // The mark is the status column over both lines: a bar beside the
+                    // thread, which says which row is selected without covering the two
+                    // lines it is made of.
+                    let (status, rest) = if Some(index) == selected {
+                        (glyph_style.patch(highlight), highlight)
+                    } else {
+                        (glyph_style, Style::default())
+                    };
+                    return ListItem::new(vec![
+                        Line::from(vec![
+                            Span::styled(format!(" {glyph} "), status),
+                            Span::styled(title, title_style),
+                        ]),
+                        Line::from(vec![Span::styled("   ", rest), Span::styled(under, dim)]),
+                    ]);
+                }
+                // The glyph carries the status; the right column always names the project.
+                let mut right = app.shell.project_title(&t.project_id).to_string();
+                if holds_worktree {
                     right = format!("⌂ {right}");
                 }
                 let right_style = dim;
                 let right_width = right.chars().count().min(14);
                 let title_width = width.saturating_sub(right_width + 4);
                 let title = fit(&t.title, title_width);
-                let mut title_style = if *parked { dim } else { Style::default() };
-                if is_current {
-                    title_style = title_style.add_modifier(Modifier::BOLD);
-                }
                 let padding = " ".repeat(title_width.saturating_sub(title.chars().count()) + 1);
                 ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!(" {glyph} "),
-                        if *parked { dim } else { glyph_style },
-                    ),
+                    Span::styled(format!(" {glyph} "), glyph_style),
                     Span::styled(title, title_style),
                     Span::raw(padding),
                     Span::styled(fit(&right, right_width), right_style),
@@ -619,29 +680,16 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    // Selection is drawn by hand so the wheel can scroll the list without the
-    // selected row dragging the viewport back.
-    let selected = if rows.is_empty() {
-        None
-    } else if focused {
-        Some(app.sidebar_selected.min(rows.len() - 1))
-    } else {
-        rows.iter().position(
-            |row| matches!(row, SidebarRow::Thread { id, .. } if Some(id) == app.current_thread_id.as_ref()),
-        )
-    };
-    let highlight = if focused {
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM)
-    };
     let items: Vec<ListItem> = items
         .into_iter()
+        .zip(rows.iter())
         .enumerate()
-        .map(|(i, item)| {
-            if Some(i) == selected {
+        .map(|(i, (item, row))| {
+            // A two-line thread has taken the mark into its status column already; the
+            // same block over two lines and the whole width is a lot of paint to say
+            // one row is selected.
+            let marks_itself = two_line && matches!(row, SidebarRow::Thread { .. });
+            if Some(i) == selected && !marks_itself {
                 item.style(highlight)
             } else {
                 item
@@ -650,21 +698,72 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let height = inner.height as usize;
-    let max_offset = rows.len().saturating_sub(height);
+    let max_offset = app.sidebar_max_offset(&rows, height);
     app.sidebar_offset = app.sidebar_offset.min(max_offset);
     if app.sidebar_reveal {
         app.sidebar_reveal = false;
         if let Some(sel) = selected {
-            if sel < app.sidebar_offset {
-                app.sidebar_offset = sel;
-            } else if height > 0 && sel >= app.sidebar_offset + height {
-                app.sidebar_offset = sel + 1 - height;
-            }
+            app.sidebar_offset = app.sidebar_offset_showing(&rows, sel, height);
         }
     }
     let mut state = ListState::default().with_offset(app.sidebar_offset);
     let list = List::new(items);
     frame.render_stateful_widget(list, inner, &mut state);
+    if two_line {
+        draw_sidebar_icons(frame, app, inner, &rows);
+    }
+}
+
+/// The project's icon on the right of a thread's two lines, drawn over the room the
+/// rows left for it. A picture goes on after the list, the way the project picker draws
+/// one; an emoji is a character and sits on the title's line.
+fn draw_sidebar_icons(frame: &mut Frame, app: &App, inner: Rect, rows: &[SidebarRow]) {
+    let mut line = 0usize;
+    for row in rows.iter().skip(app.sidebar_offset) {
+        let height = app.sidebar_row_height(row);
+        if line >= inner.height as usize {
+            break;
+        }
+        let y = inner.y + line as u16;
+        line += height;
+        let SidebarRow::Thread { id, .. } = row else {
+            continue;
+        };
+        let Some(thread) = app.shell.threads.get(id) else {
+            continue;
+        };
+        let project = &thread.project_id;
+        // The last line of a row that only half fits is not there to draw on.
+        let room = (inner.bottom().saturating_sub(y) as usize).min(height);
+        if let Some(emoji) = app.project_emoji(project) {
+            // Two cells of character in a column four wide, so it sits where the middle
+            // of a picture would be rather than against the text.
+            let area = Rect {
+                x: inner.right().saturating_sub(ICON_COLUMN as u16 - 2),
+                y,
+                width: 2,
+                height: 1,
+            };
+            frame.render_widget(Paragraph::new(Line::from(emoji.to_string())), area);
+            continue;
+        }
+        let Some(bytes) = app.favicon(project) else {
+            continue;
+        };
+        let key = format!("favicon:{project}:{room}");
+        let area = Rect {
+            x: inner.right().saturating_sub(ICON_COLUMN as u16 - 1),
+            y,
+            width: 4,
+            height: room as u16,
+        };
+        if area.height == 0 {
+            continue;
+        }
+        if picture::place(&key, picture::Source::Bytes(bytes), area.as_size()).is_some() {
+            picture::draw(frame, &key, area, SignedPosition::from((0, 0)));
+        }
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -3092,6 +3191,171 @@ mod tests {
         };
         assert!(tint(y));
         assert!(!tint(y - 1));
+    }
+
+    /// A sidebar with threads in two projects, one of them in a worktree.
+    fn with_threads(app: &mut App) {
+        app.shell.apply(crate::model::ShellItem::Snapshot {
+            snapshot: serde_json::from_value(json!({
+                "snapshotSequence": 1,
+                "projects": [
+                    {"id": "p1", "title": "tria", "workspaceRoot": "/src/tria"},
+                    {"id": "p2", "title": "shelfie", "workspaceRoot": "/src/shelfie",
+                     "projectIcon": {"kind": "emoji", "emoji": "📚"}}
+                ],
+                "threads": [
+                    {"id": "t1", "projectId": "p1",
+                     "title": "Can we add a way to stop an active monitor",
+                     "modelSelection": {"instanceId": "i", "model": "m"},
+                     "createdAt": "2026-01-01T00:00:03Z"},
+                    {"id": "t2", "projectId": "p1",
+                     "title": "Nx cache invalidation PR 8683",
+                     "branch": "t3code/mobile-update-publish",
+                     "worktreePath": "/worktrees/t3code-afa6757e",
+                     "modelSelection": {"instanceId": "i", "model": "m"},
+                     "createdAt": "2026-01-01T00:00:02Z"},
+                    {"id": "t3", "projectId": "p2",
+                     "title": "What do I need to do to get this on playstore?",
+                     "modelSelection": {"instanceId": "i", "model": "m"},
+                     "createdAt": "2026-01-01T00:00:01Z"}
+                ]
+            }))
+            .unwrap(),
+        });
+    }
+
+    fn icon_bytes() -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(picture::test_png(64, 64))
+            .unwrap()
+    }
+
+    /// The sidebar's own columns, without the border it ends in.
+    fn sidebar_text(app: &mut App) -> String {
+        let buffer = screen(100, app);
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..SIDEBAR_WIDTH - 1)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The layout the config can ask for: the title on one line, what the thread is
+    /// working in on the next, and the project drawn once beside both of them.
+    #[test]
+    fn a_thread_takes_two_lines_in_the_two_line_layout() {
+        picture::draw_in_halfblocks();
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.sidebar_layout = SidebarLayout::TwoLine;
+        with_threads(&mut app);
+        app.give_favicon("p1", icon_bytes());
+
+        let lines: Vec<String> = sidebar_text(&mut app).lines().map(str::to_string).collect();
+        let row = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} should be listed"))
+        };
+        // A thread the server gave a branch says which one under its title.
+        let nx = row("Nx cache invalidation");
+        assert!(
+            lines[nx + 1].contains("t3code/mobile-update-pu"),
+            "{}",
+            lines[nx + 1]
+        );
+        // One running in the project's own checkout has no branch of its own to name,
+        // so it names the project, which is the thing about it that is always known.
+        let stop = row("Can we add a way to sto");
+        assert!(lines[stop + 1].trim() == "tria", "{}", lines[stop + 1]);
+        // And the rows that follow start two lines apart, not one.
+        assert_eq!(nx, stop + 2);
+    }
+
+    /// The project's icon is drawn over the right of both the thread's lines, which is
+    /// what a two-row picture needs four columns to do.
+    #[test]
+    fn the_project_icon_spans_both_lines_of_its_thread() {
+        picture::draw_in_halfblocks();
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.sidebar_layout = SidebarLayout::TwoLine;
+        with_threads(&mut app);
+        app.give_favicon("p1", icon_bytes());
+        let buffer = screen(100, &mut app);
+
+        let text = |y: u16| {
+            (0..SIDEBAR_WIDTH)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let row = |needle: &str| {
+            (0..buffer.area.height)
+                .find(|y| text(*y).contains(needle))
+                .unwrap_or_else(|| panic!("{needle} should be listed"))
+        };
+        // Half blocks are colour rather than glyphs: a cell of the picture is one with
+        // a background of its own.
+        let painted = |y: u16| {
+            (0..SIDEBAR_WIDTH)
+                .filter(|x| buffer[(*x, y)].bg != Color::Reset)
+                .count()
+        };
+        let titled = row("Nx cache invalidation");
+        assert_eq!(painted(titled), 4, "the icon is four columns wide");
+        assert_eq!(painted(titled + 1), 4, "and is on the branch's line too");
+        // It is on the right, past everything the text could reach.
+        let first = (0..SIDEBAR_WIDTH)
+            .find(|x| buffer[(*x, titled)].bg != Color::Reset)
+            .unwrap();
+        assert_eq!(first, SIDEBAR_WIDTH - 5);
+
+        // A project given an emoji is drawn with that instead, on the title's line.
+        let store = row("What do I need");
+        assert_eq!(painted(store), 0);
+        assert!(text(store).contains("📚"), "{}", text(store));
+    }
+
+    /// Selecting a thread marks its status column down both lines: the whole of two
+    /// lines in a block is more paint than a selection needs, and a bar beside them
+    /// still says the two are one row.
+    #[test]
+    fn selecting_a_two_line_thread_marks_its_status_column() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.sidebar_layout = SidebarLayout::TwoLine;
+        with_threads(&mut app);
+        app.focus = crate::app::Focus::Sidebar;
+        // The header is row zero, so the first thread is row one.
+        app.sidebar_selected = 1;
+        let buffer = screen(100, &mut app);
+
+        let marked = |y: u16| {
+            (0..SIDEBAR_WIDTH - 1)
+                .filter(|x| buffer[(*x, y)].style().bg == Some(Color::DarkGray))
+                .collect::<Vec<_>>()
+        };
+        let titled = (0..buffer.area.height)
+            .find(|y| {
+                (0..SIDEBAR_WIDTH)
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains("Can we add a way")
+            })
+            .unwrap();
+        // The status column, and none of the title or the line under it.
+        assert_eq!(marked(titled), vec![0, 1, 2], "the title's line");
+        assert_eq!(marked(titled + 1), vec![0, 1, 2], "the branch's line");
+        assert!(marked(titled + 2).is_empty(), "and nothing else is marked");
     }
 
     /// A project the server found an icon for is drawn with it, in room the label left;

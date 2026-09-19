@@ -460,6 +460,19 @@ each already says more than "look at me". This is only for as long as tria is ru
 what you have read is not written down, so a thread is never unread because of something that
 happened before tria started.
 
+The list draws a thread on one line. The config file can give it two instead, which buys room
+for the title by putting what the thread is working in under it, and draws the project as an
+icon spanning both lines rather than a label competing with the title for the same row:
+
+```toml
+sidebar_layout = "two-line"
+```
+
+The second line is the thread's branch; a thread working in the project's own checkout has no
+branch of its own recorded, so it says the project's name instead, and the open thread falls
+back to the ref its checkout is on. `⌂` in front of it means a settled thread still holds a
+worktree. The other value is `one-line`, which is the default.
+
 ## Other subcommands
 
 - `tria probe` connects, prints the server config keys and the thread list, and exits.
