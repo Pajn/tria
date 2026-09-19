@@ -71,6 +71,8 @@ pub enum Mode {
     Search,
     /// Listing the agent's background tasks that have not reported an end.
     Tasks,
+    /// Listing what the providers' subscriptions have left.
+    Usage,
     /// Listing the worktrees the server made for threads, to be rid of them.
     Worktrees,
     /// Listing the subagents the thread has run, with their state and their reports.
@@ -246,6 +248,8 @@ pub enum AppEvent {
         thread_id: Id,
         error: String,
     },
+    /// The config was read again for the usage window, or was not.
+    UsageRead(Result<Box<ServerConfig>, String>),
     /// A non-command RPC finished; `ok` is the toast for the success case.
     Called {
         result: Result<(), String>,
@@ -298,6 +302,9 @@ pub struct App {
     /// that has moved on from one the server merely mentioned again.
     marks: HashMap<Id, String>,
     pub config: ServerConfig,
+    /// Whether the config is being read again for the usage window, so that holding `r`
+    /// asks once rather than once a keypress.
+    usage_pending: bool,
     pub status: Status,
     pub thread: Option<ThreadState>,
     pub current_thread_id: Option<Id>,
@@ -433,6 +440,7 @@ impl App {
             unseen: HashSet::new(),
             marks: HashMap::new(),
             config: ServerConfig::default(),
+            usage_pending: false,
             status: Status::Connecting,
             thread: None,
             current_thread_id: None,
@@ -2020,6 +2028,72 @@ impl App {
         }
     }
 
+    // ── Usage limits ───────────────────────────────────────────────────
+
+    /// What each signed-in account has left of its subscription. The server probes the
+    /// providers and puts the answer on the config, so this is the config's own copy,
+    /// as old as the last time it was read.
+    pub fn usage_accounts(&self) -> Vec<&crate::model::Provider> {
+        self.config
+            .providers
+            .iter()
+            .filter(|provider| provider.usage_limits.is_some())
+            .collect()
+    }
+
+    /// The provider instance the next message would be spent from: the open thread's,
+    /// or the draft's when a new thread is being written.
+    pub fn current_provider_instance(&self) -> Option<&str> {
+        self.current_model_selection()
+            .map(|selection| selection.instance_id.as_str())
+    }
+
+    /// Show them, and ask for them again while they are being read: the config is
+    /// fetched once per connection, so by the time anybody asks, the figures on it are
+    /// as old as the session.
+    fn open_usage(&mut self) {
+        self.mode = Mode::Usage;
+        self.refresh_usage();
+    }
+
+    /// Read the config again for the sake of the quota on it. The answer arrives as the
+    /// config update it is, so everything else the config says is refreshed with it.
+    fn refresh_usage(&mut self) {
+        if self.usage_pending {
+            return;
+        }
+        self.usage_pending = true;
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let read = handle
+                .call("server.getConfig", json!({}))
+                .await
+                .and_then(|value| Ok(serde_json::from_value::<ServerConfig>(value)?))
+                .map(Box::new)
+                .map_err(|error| error.to_string());
+            let _ = events.send(AppEvent::UsageRead(read));
+        });
+    }
+
+    /// The config as it is now, or the news that it could not be read. Everything else
+    /// the config says is taken with it: it is one answer and it is all of it.
+    fn on_usage_read(&mut self, read: Result<Box<ServerConfig>, String>) {
+        self.usage_pending = false;
+        match read {
+            Ok(config) => self.config = *config,
+            Err(error) => self.toast(format!("usage: {error}"), true),
+        }
+    }
+
+    fn on_usage_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.mode = Mode::Normal,
+            KeyCode::Char('r') => self.refresh_usage(),
+            _ => {}
+        }
+    }
+
     // ── Subagents ──────────────────────────────────────────────────────
 
     /// The conversation on screen: a subagent's transcript when one is open, otherwise
@@ -2945,6 +3019,7 @@ impl App {
             "tmux" => self.switch_tmux_session(),
             // `:git` is what the `l` binding has always been called, whatever is on it.
             "git" | "lazygit" => self.open_program('l'),
+            "usage" | "limits" => self.open_usage(),
             "tasks" | "jobs" => self.open_tasks(),
             "agents" | "subagents" => self.open_agents(),
             "terminals" | "shells" => self.open_terminals(),
@@ -3624,6 +3699,7 @@ impl App {
             Mode::Command => self.on_command_key(key),
             Mode::Search => self.on_search_key(key),
             Mode::Tasks => self.on_tasks_key(key),
+            Mode::Usage => self.on_usage_key(key),
             Mode::Agents => self.on_agents_key(key),
             Mode::Terminals => self.on_terminals_key(key),
             Mode::Worktrees => self.on_worktrees_key(key),
@@ -4718,6 +4794,7 @@ fn apply(app: &mut App, event: AppEvent) {
         AppEvent::Update(update) => app.on_update(*update),
         AppEvent::ThreadCreated(thread_id) => app.on_thread_created(thread_id),
         AppEvent::CreateRefused { thread_id, error } => app.on_create_refused(thread_id, error),
+        AppEvent::UsageRead(read) => app.on_usage_read(read),
         AppEvent::WorktreeChecked { path, changes } => app.on_worktree_checked(path, changes),
         AppEvent::WorktreeRemoved { path, result } => app.on_worktree_removed(path, result),
         AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
@@ -4997,6 +5074,36 @@ mod tests {
         press(&mut app, 'g');
         press(&mut app, 'q');
         assert_eq!(app.pending_pane_command, None);
+    }
+
+    /// The figures on the config are as old as the connection that fetched them, so
+    /// asking to see them asks the server for them again.
+    #[tokio::test]
+    async fn opening_the_usage_window_reads_the_quota_again() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+
+        app.run_command("usage");
+        tokio::task::yield_now().await;
+        assert_eq!(app.mode, Mode::Usage);
+
+        let asked = std::iter::from_fn(|| requests.try_recv().ok()).filter(|request| {
+            matches!(request, crate::session::Request::Call { tag, .. } if tag == "server.getConfig")
+        });
+        assert_eq!(asked.count(), 1, "the config was not read again");
+        // The window is drawn from the config, so asking again while the first ask is
+        // still out would only be a second answer to the same question.
+        app.on_usage_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        tokio::task::yield_now().await;
+        let again = std::iter::from_fn(|| requests.try_recv().ok()).count();
+        assert_eq!(again, 0, "it asked twice for one answer");
+
+        // Once the answer is in, it can be asked for again.
+        app.on_usage_read(Ok(Box::default()));
+        app.on_usage_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        tokio::task::yield_now().await;
+        assert_eq!(std::iter::from_fn(|| requests.try_recv().ok()).count(), 1);
     }
 
     /// A thread the server says is monitoring. The liveness sits on the list row,

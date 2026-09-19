@@ -131,6 +131,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Picker => draw_picker(frame, app, area),
         Mode::Help => draw_help(frame, app, area),
         Mode::Tasks => draw_tasks(frame, app, area),
+        Mode::Usage => draw_usage(frame, app, area),
         Mode::Agents => draw_agents(frame, app, area),
         Mode::Terminals => draw_terminals(frame, app, area),
         Mode::Worktrees => draw_worktrees(frame, app, area),
@@ -2248,6 +2249,161 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
+/// What each signed-in account has left of its subscription: one row per rolling
+/// window, as the provider last reported it to the server. The figures are a probe's
+/// answer rather than a live count, so the panel says how old they are.
+fn draw_usage(frame: &mut Frame, app: &App, area: Rect) {
+    let accounts = app.usage_accounts();
+    let now = crate::commands::now_iso();
+    let dim = Style::default().fg(Color::DarkGray);
+    let width = 64.min(area.width);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if accounts.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no account here reports a quota",
+            dim,
+        )));
+    }
+    // The account this thread is talking to is the one the next message is spent from.
+    let current = app.current_provider_instance();
+    let mut oldest: Option<&str> = None;
+    for account in &accounts {
+        let Some(limits) = &account.usage_limits else {
+            continue;
+        };
+        if !limits.checked_at.is_empty()
+            && oldest.is_none_or(|kept| limits.checked_at.as_str() < kept)
+        {
+            oldest = Some(&limits.checked_at);
+        }
+        let mine = current.is_some_and(|instance| instance == account.instance_id);
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {}", account.label()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(if mine { "  · this thread" } else { "" }, dim),
+        ]));
+        if let Some(unavailable) = &limits.unavailable {
+            let reason = match unavailable.reason.as_str() {
+                "unsupported" => "no quota to report".to_string(),
+                _ => unavailable
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "could not be read".to_string()),
+            };
+            lines.push(Line::from(Span::styled(format!("    {reason}"), dim)));
+        }
+        let mut windows: Vec<&crate::model::UsageWindow> = limits.windows.iter().collect();
+        windows.sort_by_key(|window| window.rank());
+        for window in windows {
+            let percent = window.used_percent.clamp(0.0, 100.0);
+            let resets = window
+                .resets_at
+                .as_deref()
+                .map(|at| reset_label(&now, at))
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("    {:<14}", fit(&window.label, 14)),
+                    Style::default(),
+                ),
+                Span::styled(meter(percent), meter_style(percent)),
+                Span::styled(format!(" {percent:>3.0}%  "), meter_style(percent)),
+                Span::styled(resets, dim),
+            ]));
+        }
+    }
+    if let Some(checked_at) = oldest {
+        let age = elapsed_label(checked_at, &now);
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            if age.is_empty() {
+                "  r reads them again · Esc to close".to_string()
+            } else {
+                format!("  read {age} ago · r reads them again · Esc to close")
+            },
+            dim,
+        )));
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  r reads them again · Esc to close",
+            dim,
+        )));
+    }
+    let text = Text::from(lines);
+    let height = (text.lines.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" usage limits ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
+}
+
+/// A quota as a bar. Sixteen cells, so one cell is a little over six percent and a
+/// window barely touched still shows something.
+fn meter(percent: f64) -> String {
+    const CELLS: usize = 16;
+    let filled = ((percent / 100.0 * CELLS as f64).round() as usize).min(CELLS);
+    format!("{}{}", "█".repeat(filled), "░".repeat(CELLS - filled))
+}
+
+/// Green while there is room, amber once the end is in sight, red when it is nearly
+/// gone — the same reading as the desktop's bars.
+fn meter_style(percent: f64) -> Style {
+    let colour = if percent >= 90.0 {
+        Color::Red
+    } else if percent >= 70.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+    Style::default().fg(colour)
+}
+
+/// When the window comes back. Coarser than an elapsed label where a quota window is: a
+/// weekly reset is days away and its minutes are not worth the width. A reset already
+/// due is not counted down to — the figures are a probe's answer, and one taken before
+/// the reset says nothing about after it.
+fn reset_label(now: &str, at: &str) -> String {
+    let parse = |text: &str| {
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()
+    };
+    let (Some(now), Some(at)) = (parse(now), parse(at)) else {
+        return String::new();
+    };
+    let seconds = (at - now).whole_seconds();
+    if seconds <= 0 {
+        return "resetting".to_string();
+    }
+    // Up to the minute rather than down to it: a window is back when it is back, and a
+    // reset two hours and fifty-nine seconds away is not two hours away.
+    let minutes = (seconds + 59) / 60;
+    if minutes < 60 {
+        format!("resets in {minutes}m")
+    } else if minutes < 24 * 60 {
+        format!("resets in {}h{:02}", minutes / 60, minutes % 60)
+    } else {
+        let (days, hours) = (minutes / (24 * 60), minutes % (24 * 60) / 60);
+        match hours {
+            0 => format!("resets in {days}d"),
+            hours => format!("resets in {days}d {hours}h"),
+        }
+    }
+}
+
 /// A token count the way the desktop writes one: `840`, `9.4k`, `101k`, `1.2m`.
 pub fn tokens_label(value: u64) -> String {
     let thousands = value as f64 / 1_000.0;
@@ -2371,7 +2527,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :pr  :tasks  :agents  :terminals  :tmux  :settle  :unsettle  :wake  :settled  :stop  :stop! (the session)  :older  :answer  :dismiss  :sidebar  :q",
+            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :stop  :stop! (the session)  :older  :answer  :dismiss  :sidebar  :q",
         ),
     ]);
     let width = 72.min(area.width);
@@ -2482,6 +2638,140 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A config with two signed-in accounts, in the shape the server sends one. The
+    /// times are relative to the clock the panel reads, which is the real one.
+    fn with_limits(app: &mut App) {
+        let at = |minutes: i64| {
+            (time::OffsetDateTime::now_utc() + time::Duration::minutes(minutes))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        app.config = serde_json::from_value(json!({
+            "providers": [
+                {
+                    "instanceId": "claudeAgent", "driver": "claudeAgent", "enabled": true,
+                    "installed": true, "status": "ready", "models": [],
+                    "usageLimits": {
+                        "checkedAt": at(-6),
+                        // Out of order on the wire, and in order on the screen.
+                        "windows": [
+                            {"id": "seven_day", "kind": "weekly", "label": "Weekly",
+                             "usedPercent": 16, "resetsAt": at(4 * 24 * 60 + 180)},
+                            {"id": "five_hour", "kind": "session", "label": "Session",
+                             "usedPercent": 4, "resetsAt": at(150)}
+                        ]
+                    }
+                },
+                {
+                    "instanceId": "claudeAgent_claude_2", "driver": "claudeAgent",
+                    "displayName": "second account", "enabled": true, "installed": true,
+                    "status": "ready", "models": [],
+                    "usageLimits": {
+                        "checkedAt": at(-1),
+                        "windows": [
+                            {"id": "five_hour", "kind": "session", "label": "Session",
+                             "usedPercent": 14, "resetsAt": at(11)},
+                            {"id": "seven_day", "kind": "weekly", "label": "Weekly",
+                             "usedPercent": 87, "resetsAt": at(2 * 24 * 60)}
+                        ]
+                    }
+                },
+                {
+                    "instanceId": "codex", "driver": "codex", "enabled": false,
+                    "installed": false, "status": "unavailable", "models": []
+                }
+            ]
+        }))
+        .unwrap();
+    }
+
+    fn usage_screen(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(70, 16)).unwrap();
+        terminal
+            .draw(|frame| draw_usage(frame, app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every account that reports a quota, each window in the order it runs out, with
+    /// how full it is and when it comes back.
+    #[test]
+    fn the_usage_window_says_what_is_left_of_each_subscription() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        with_limits(&mut app);
+        let screen = usage_screen(&app);
+
+        // The session window is drawn first however the provider ordered it.
+        let rows: Vec<&str> = screen
+            .lines()
+            .filter(|line| line.contains("Session") || line.contains("Weekly"))
+            .collect();
+        assert!(rows[0].contains("Session") && rows[1].contains("Weekly"));
+        assert!(rows[0].contains("4%"), "the bar is labelled: {}", rows[0]);
+        assert!(rows[0].contains("resets in 2h30"), "{}", rows[0]);
+        assert!(rows[1].contains("resets in 4d 3h"), "{}", rows[1]);
+        // A round number of days is not padded out with an hour count of nothing.
+        assert!(!rows[3].contains("2d 0h"), "{}", rows[3]);
+        // A window under the hour is counted in minutes, not rounded away.
+        assert!(rows[2].contains("resets in 11m"), "{}", rows[2]);
+        // The bar fills with what is used: 87% of sixteen cells is fourteen.
+        assert_eq!(rows[3].matches('█').count(), 14);
+        assert_eq!(rows[3].matches('░').count(), 2);
+        // An account with no quota to report is not an account with an empty one.
+        assert!(!screen.contains("codex"));
+        assert!(screen.contains("read 6m ago"));
+        // Nothing says which account this thread is on, because there is no thread.
+        assert!(!screen.contains("this thread"));
+    }
+
+    /// The account the next message is spent from is the one worth finding first.
+    #[test]
+    fn the_account_this_thread_is_on_is_marked() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        with_limits(&mut app);
+        app.thread = Some(crate::state::ThreadState::from_snapshot(
+            serde_json::from_value(json!({
+                "snapshotSequence": 1,
+                "thread": {
+                    "id": "t1", "projectId": "p", "title": "t1",
+                    "modelSelection": {"instanceId": "claudeAgent_claude_2", "model": "m"},
+                    "messages": [], "activities": []
+                }
+            }))
+            .unwrap(),
+        ));
+        let screen = usage_screen(&app);
+        let marked: Vec<&str> = screen
+            .lines()
+            .filter(|line| line.contains("this thread"))
+            .collect();
+        assert_eq!(marked.len(), 1);
+        assert!(marked[0].contains("second account"), "{}", marked[0]);
+    }
+
+    /// A server that reports no quota at all, which is every server without a
+    /// subscription signed in to it.
+    #[test]
+    fn a_config_with_no_quota_on_it_says_so() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(handle, events);
+        assert!(usage_screen(&app).contains("no account here reports a quota"));
     }
 
     /// The whole way through: a program in the pane sends a picture, and it lands on the

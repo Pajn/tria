@@ -161,7 +161,7 @@ Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [l
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `project rename <name>`,
 `archive`, `delete!`, `stop`, `stop!`,
 `older`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
-`worktree`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`, `help`, `q`.
+`worktree`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`, `usage`, `help`, `q`.
 
 ## New threads
 
@@ -294,6 +294,17 @@ interrupt sent with no turn to name — `Ctrl-c`, `:stop`, or `s` in the list, w
 what the desktop app's `Monitoring · Stop` sends. `S` or `:stop!` is the harder one: it
 ends the provider session, and every process it started goes with it. Either way the
 conversation stays, and the next message starts a session again.
+
+## Usage limits
+
+`:usage` shows what each signed-in account has left of its subscription: a bar per
+rolling window — Claude's five-hour session, the weekly allowance — with how full it is
+and when it comes back. The account the next message would be spent from is marked, which
+is worth knowing on a server with more than one signed in.
+
+The figures are the provider's own, taken by the server when it last probed, so the panel
+says how old they are and `r` asks again. An account with no quota to report — an API key,
+a cloud endpoint — is not listed; one whose quota could not be read says so.
 
 ## Subagents
 

@@ -769,6 +769,10 @@ pub struct Provider {
     pub models: Vec<Model>,
     #[serde(default)]
     pub slash_commands: Vec<SlashCommand>,
+    /// What the subscription behind this account has left, when the provider reports it
+    /// at all. An API key or a cloud endpoint has no quota to report and carries none.
+    #[serde(default)]
+    pub usage_limits: Option<UsageLimits>,
 }
 
 impl Provider {
@@ -781,6 +785,63 @@ impl Provider {
             && self.installed
             && self.availability.as_deref() != Some("unavailable")
             && self.status != "disabled"
+    }
+}
+
+/// The quota the provider last reported for the account signed in to this instance.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageLimits {
+    /// When the figures were taken, which is not now: they are a probe's answer, and a
+    /// stale one is worth reading as long as it says how old it is.
+    #[serde(default)]
+    pub checked_at: String,
+    #[serde(default)]
+    pub windows: Vec<UsageWindow>,
+    /// Set when there is nothing to report: an account that can never report a quota,
+    /// or a probe that failed this time.
+    #[serde(default)]
+    pub unavailable: Option<UsageUnavailable>,
+}
+
+/// One rolling quota window, such as Claude's five-hour session or a weekly allowance.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageWindow {
+    #[serde(default)]
+    pub id: String,
+    /// `session`, `weekly`, `monthly` or `other`, which is what orders the rows.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub used_percent: f64,
+    #[serde(default)]
+    pub resets_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageUnavailable {
+    /// `unsupported` for an account with no quota to report, `probeFailed` for one
+    /// whose quota could not be read this time.
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+impl UsageWindow {
+    /// Where the row sits: the window that runs out first is the one worth reading
+    /// first, and a provider is free to send them in any order.
+    pub fn rank(&self) -> u8 {
+        match self.kind.as_str() {
+            "session" => 0,
+            "weekly" => 1,
+            "monthly" => 2,
+            _ => 3,
+        }
     }
 }
 
