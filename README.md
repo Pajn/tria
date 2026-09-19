@@ -196,15 +196,21 @@ rename <name>` does the same for the project the open thread belongs to. The nam
 server's, so it is the name everywhere — this sidebar, the desktop app, the next client to
 connect. It is `^R` rather than `r` because the letters in that list go to the search.
 
-The project list `n` opens draws each project with what it is known by: the emoji it was
-given, the icon it was named from the Lucide set, or failing both the icon its checkout
-carries — the last two where the terminal can draw pictures at all.
+The project list `n` opens draws each project with what it is known by, in the order the
+desktop app uses it: the emoji it was given, the icon it was named from the Lucide set, the
+icon its checkout carries, and failing all three a guess at what the project is, read from
+its name. Everything but the emoji is a picture, so it needs a terminal that can draw one.
 
 A named icon arrives as a name and a colour, since the picture itself is nobody's to send.
 Lucide publishes the set as a font, so tria looks the name up there and draws the character
-into pixels at the size of the room it has, in the colour the icon was given. A name from a
-set newer than the one tria was built against is not drawn, and the project falls back to
-the icon its checkout carries.
+into pixels at the size of the room it has. A name from a set newer than the one tria was
+built against is not drawn, and the project falls back to the icon its checkout carries.
+
+The guess is the desktop app's own: the name is cut into words, each is looked up in a table
+that knows what a backend, a docs site or a mobile app is called, and a name that says
+nothing keeps one of five generic icons, picked by hashing it so that it stays the same icon.
+Neither end sends this to the other — both work it out — so tria copies the rules rather than
+inventing its own, and a project looks like itself in both.
 
 The looking is the server's: the icon the project names, then the one its `t3.json` names in
 `iconPath`, then the usual places a favicon lives, then whatever the project's `index.html`

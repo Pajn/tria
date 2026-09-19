@@ -721,41 +721,55 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
 /// rows left for it. A picture goes on after the list, the way the project picker draws
 /// one; an emoji is a character and sits on the title's line.
 /// Draw what a project is known by over the room a row kept for it, and say whether
-/// anything went there. The drawn icon it was chosen from the set is first, since
-/// somebody picked it; failing that the icon its checkout carries. Both are pictures and
-/// so go on after the list rather than into it, over the room the text left.
+/// anything went there. In the order the desktop app draws them: the icon somebody chose
+/// for it from the drawing set, failing that the one its checkout carries, and failing
+/// both a guess at what the project is from its name. All three are pictures and so go
+/// on after the list rather than into it, over the room the text left.
 ///
 /// An emoji is not here: it is a character, and a character belongs in the line.
 fn draw_project_picture(frame: &mut Frame, app: &App, project: &str, area: Rect) -> bool {
     if area.width == 0 || area.height == 0 {
         return false;
     }
-    if let Some((name, colour)) = app.project_lucide(project) {
-        // The icon is made at the size of the room rather than made once and shrunk: a
-        // line drawing that has been resized is a line drawing with grey lines.
-        let cell = picture::cell_size().unwrap_or(Size::new(8, 16));
-        let side = (area.width as u32 * cell.width as u32)
-            .min(area.height as u32 * cell.height as u32)
-            .min(MOST_ICON_PIXELS);
-        if let Some(drawn) = crate::lucide::draw(name, colour, side) {
-            let key = format!("lucide:{name}:{}", colour.unwrap_or_default());
-            let source = picture::Source::Pixels {
-                bytes: &drawn.bytes,
-                width: drawn.side,
-                height: drawn.side,
-                alpha: true,
-            };
-            if picture::place(&key, source, area.as_size()).is_some() {
-                picture::draw(frame, &key, area, SignedPosition::from((0, 0)));
-                return true;
-            }
+    if let Some((name, colour)) = app.project_lucide(project)
+        && draw_drawn_icon(frame, name, colour, area)
+    {
+        return true;
+    }
+    if let Some(bytes) = app.favicon(project) {
+        let key = format!("favicon:{project}:{}", area.height);
+        if picture::place(&key, picture::Source::Bytes(bytes), area.as_size()).is_some() {
+            picture::draw(frame, &key, area, SignedPosition::from((0, 0)));
+            return true;
         }
     }
-    let Some(bytes) = app.favicon(project) else {
+    // Nothing chosen and no icon in the checkout: the name is all there is to go on, and
+    // a guess at what the project is beats a blank column.
+    match app.project_guessed_icon(project) {
+        Some((name, colour)) => draw_drawn_icon(frame, name, Some(colour), area),
+        None => false,
+    }
+}
+
+/// Draw an icon from the drawing set over `area`, at the size that room comes to in
+/// pixels — a line drawing that has been resized is a line drawing with grey lines, so
+/// it is made the size it is wanted rather than made once and shrunk.
+fn draw_drawn_icon(frame: &mut Frame, name: &str, colour: Option<&str>, area: Rect) -> bool {
+    let cell = picture::cell_size().unwrap_or(Size::new(8, 16));
+    let side = (area.width as u32 * cell.width as u32)
+        .min(area.height as u32 * cell.height as u32)
+        .min(MOST_ICON_PIXELS);
+    let Some(drawn) = crate::lucide::draw(name, colour, side) else {
         return false;
     };
-    let key = format!("favicon:{project}:{}", area.height);
-    if picture::place(&key, picture::Source::Bytes(bytes), area.as_size()).is_some() {
+    let key = format!("lucide:{name}:{}", colour.unwrap_or_default());
+    let source = picture::Source::Pixels {
+        bytes: &drawn.bytes,
+        width: drawn.side,
+        height: drawn.side,
+        alpha: true,
+    };
+    if picture::place(&key, source, area.as_size()).is_some() {
         picture::draw(frame, &key, area, SignedPosition::from((0, 0)));
         return true;
     }

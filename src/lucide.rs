@@ -66,6 +66,241 @@ pub fn draw(name: &str, colour: Option<&str>, side: u32) -> Option<Drawn> {
     })
 }
 
+/// The classes a project's name is read for, in the order they are tried, each with the
+/// icon and colour it is drawn in. This is the desktop app's own table: a project nobody
+/// gave an icon and whose checkout carries none is still drawn, and drawn the same in
+/// both, which is the whole point of copying the guess rather than inventing one.
+const CLASSES: &[(&str, &str, &[&str])] = &[
+    (
+        "bot",
+        "violet",
+        &["ai", "agent", "bot", "gpt", "llm", "ml", "model", "neural"],
+    ),
+    (
+        "smartphone",
+        "lime",
+        &[
+            "android",
+            "expo",
+            "ios",
+            "mobile",
+            "native",
+            "reactnative",
+            "swift",
+        ],
+    ),
+    (
+        "monitor",
+        "indigo",
+        &[
+            "desktop", "electron", "linux", "mac", "macos", "tauri", "windows",
+        ],
+    ),
+    (
+        "book-open",
+        "amber",
+        &[
+            "book",
+            "docs",
+            "documentation",
+            "guide",
+            "handbook",
+            "manual",
+            "wiki",
+        ],
+    ),
+    (
+        "shield-check",
+        "teal",
+        &["auth", "identity", "oauth", "security", "sso", "vault"],
+    ),
+    (
+        "database",
+        "cyan",
+        &[
+            "analytics",
+            "data",
+            "database",
+            "db",
+            "mongo",
+            "mysql",
+            "postgres",
+            "redis",
+            "sql",
+            "storage",
+        ],
+    ),
+    (
+        "cloud-cog",
+        "sky",
+        &[
+            "aws",
+            "azure",
+            "cloud",
+            "deploy",
+            "devops",
+            "docker",
+            "gcp",
+            "infra",
+            "kubernetes",
+            "terraform",
+        ],
+    ),
+    (
+        "server",
+        "blue",
+        &["api", "backend", "gateway", "server", "service", "worker"],
+    ),
+    (
+        "terminal",
+        "green",
+        &[
+            "automation",
+            "bash",
+            "cli",
+            "command",
+            "script",
+            "shell",
+            "terminal",
+        ],
+    ),
+    (
+        "package",
+        "orange",
+        &[
+            "component",
+            "kit",
+            "lib",
+            "library",
+            "package",
+            "plugin",
+            "sdk",
+            "toolkit",
+        ],
+    ),
+    (
+        "flask-conical",
+        "yellow",
+        &["benchmark", "e2e", "fixture", "spec", "test", "testing"],
+    ),
+    (
+        "shopping-bag",
+        "rose",
+        &["cart", "commerce", "market", "shop", "store"],
+    ),
+    ("gamepad-2", "emerald", &["game", "gaming", "play"]),
+    (
+        "music",
+        "fuchsia",
+        &["audio", "music", "podcast", "radio", "sound"],
+    ),
+    ("video", "red", &["film", "movie", "stream", "video"]),
+    (
+        "image",
+        "pink",
+        &["camera", "gallery", "image", "photo", "picture"],
+    ),
+    (
+        "globe-2",
+        "sky",
+        &[
+            "browser", "frontend", "nextjs", "react", "site", "svelte", "ui", "vue", "web",
+            "website",
+        ],
+    ),
+];
+
+/// What a name nothing above matched is drawn with. Which one is the name's own hash, so
+/// a project keeps the icon it has had rather than taking a new one every release.
+const GENERIC: &[(&str, &str)] = &[
+    ("code-2", "blue"),
+    ("braces", "purple"),
+    ("circuit-board", "teal"),
+    ("folder-code", "orange"),
+    ("layers-3", "fuchsia"),
+];
+
+/// The icon and colour a project falls back to, read out of its name the way the desktop
+/// app reads it. Nothing about this is sent over the wire — both ends guess, so both
+/// ends have to guess alike.
+pub fn guess(title: &str, workspace_root: &str) -> (&'static str, &'static str) {
+    // A project with no title of its own is the directory it sits in.
+    let name = match title.trim() {
+        "" => workspace_root
+            .rsplit(['/', '\\'])
+            .find(|part| !part.is_empty())
+            .unwrap_or("project"),
+        title => title,
+    };
+    let words = words(name);
+    let mut best: Option<(&'static str, &'static str)> = None;
+    let mut best_score = 0;
+    for (icon, colour, terms) in CLASSES {
+        let score: u32 = words
+            .iter()
+            .map(|word| {
+                terms
+                    .iter()
+                    .map(|term| term_score(word, term))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .sum();
+        // Strictly better, so a tie is settled by the order of the table.
+        if score > best_score {
+            best = Some((icon, colour));
+            best_score = score;
+        }
+    }
+    best.unwrap_or_else(|| GENERIC[stable_index(&name.to_lowercase(), GENERIC.len())])
+}
+
+/// A name in the words it is made of: `nix-config` is two, and so is `NixConfig`.
+fn words(name: &str) -> Vec<String> {
+    let mut spaced = String::new();
+    let mut last: Option<char> = None;
+    for ch in name.chars() {
+        if ch.is_ascii_uppercase()
+            && last.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        {
+            spaced.push(' ');
+        }
+        spaced.push(ch);
+        last = Some(ch);
+    }
+    spaced
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit())
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// How much a word says a project is of a class: the term itself is worth most, and a
+/// word a long term starts or ends is worth something. A short term matches only whole,
+/// since three letters inside a longer word are a coincidence.
+fn term_score(word: &str, term: &str) -> u32 {
+    if word == term {
+        3
+    } else if term.len() >= 4 && (word.starts_with(term) || word.ends_with(term)) {
+        1
+    } else {
+        0
+    }
+}
+
+/// The desktop app's hash, which is FNV-1a over the name as the language it is written
+/// in counts characters — sixteen bits at a time — so that the same name lands on the
+/// same icon here.
+fn stable_index(value: &str, length: usize) -> usize {
+    let mut hash: u32 = 2_166_136_261;
+    for unit in value.encode_utf16() {
+        hash ^= u32::from(unit);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash as usize % length
+}
+
 /// What an icon is drawn in. The names are the palette the icon was chosen from; the
 /// shades are the light end of it, since a terminal is dark far more often than not and
 /// the dark end disappears into it. A colour this does not know, including none at all,
@@ -129,6 +364,37 @@ mod tests {
     fn a_name_the_set_does_not_have_is_not_drawn() {
         assert!(draw("not-a-lucide-icon", None, 32).is_none());
         assert!(draw("file-json", None, 0).is_none());
+    }
+
+    /// The guess reads the name for what the project is, and a name that says nothing
+    /// still gets an icon rather than a blank.
+    #[test]
+    fn a_project_with_no_icon_is_guessed_at_from_its_name() {
+        // A word the table knows, wherever in the name it is.
+        assert_eq!(guess("backend", "/src/backend").0, "server");
+        assert_eq!(guess("shell-scripts", "/src/shell-scripts").0, "terminal");
+        assert_eq!(guess("docs-site", "/src/docs-site").0, "book-open");
+        // Two classes matching is settled by the order of the table, as it is there.
+        assert_eq!(guess("react-native-true-image", "/src/rn").0, "smartphone");
+        // CamelCase is words too.
+        assert_eq!(guess("MyTestSpec", "/src/spec").0, "flask-conical");
+        // A name that matches nothing keeps one of the generic icons, and keeps the
+        // same one: it is the name's own hash that picks it.
+        assert_eq!(guess("tria", "/src/tria"), ("folder-code", "orange"));
+        assert_eq!(
+            guess("nix-config", "/src/nix-config"),
+            ("circuit-board", "teal")
+        );
+        assert_eq!(guess("tria", "/elsewhere"), guess("Tria", "/src/tria"));
+        // A project with no name of its own is the directory it sits in.
+        assert_eq!(guess("  ", "/src/backend/"), guess("backend", ""));
+        // And every icon the guess can land on is one the set actually has.
+        for (name, _) in GENERIC {
+            assert!(draw(name, None, 32).is_some(), "{name}");
+        }
+        for (name, _, _) in CLASSES {
+            assert!(draw(name, None, 32).is_some(), "{name}");
+        }
     }
 
     /// A colour nobody has heard of is still an icon; it is the grey one.

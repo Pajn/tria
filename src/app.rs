@@ -2768,6 +2768,18 @@ impl App {
         self.shell.projects.get(project)?.lucide()
     }
 
+    /// The icon a project falls back to, which is a guess at what it is from its name.
+    /// Nobody sends this: the desktop app works it out for itself, and so does this, out
+    /// of the same name and by the same rules, so that a project nobody has given an
+    /// icon still looks like itself in both.
+    pub fn project_guessed_icon(&self, project: &str) -> Option<(&'static str, &'static str)> {
+        let project = self.shell.projects.get(project)?;
+        Some(crate::lucide::guess(
+            &project.title,
+            &project.workspace_root,
+        ))
+    }
+
     /// Hand a project an icon, for a test that draws one.
     #[cfg(test)]
     pub fn give_favicon(&mut self, project: &str, bytes: Vec<u8>) {
