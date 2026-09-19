@@ -421,12 +421,72 @@ fn tilde(code: u32, modifier: u8) -> String {
     }
 }
 
+/// Encode pasted text for `terminal.write`.
+///
+/// Newlines become carriage returns, which is what Return sends and so what a shell
+/// reads as the end of a line. The other control bytes are dropped: nothing in a paste
+/// is meant as an escape sequence, and one that ended the paste early would hand the
+/// rest of the text to the program as keys nobody typed.
+///
+/// A program that has turned bracketed paste on gets the text between the markers, so
+/// that it can tell a paste from typing and hold a multi-line one back until it is read.
+pub fn encode_paste(text: &str, bracketed: bool) -> String {
+    let mut out = String::with_capacity(text.len() + 12);
+    if bracketed {
+        out.push_str("\x1b[200~");
+    }
+    let mut after_cr = false;
+    for ch in text.chars() {
+        match ch {
+            '\r' => out.push('\r'),
+            // A CRLF is one line ending, not two.
+            '\n' if !after_cr => out.push('\r'),
+            '\n' => {}
+            '\t' => out.push('\t'),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {}
+            c => out.push(c),
+        }
+        after_cr = ch == '\r';
+    }
+    if bracketed {
+        out.push_str("\x1b[201~");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    /// A program that has not asked for bracketed paste gets the text plain, because
+    /// the markers would be typed into it as characters.
+    #[test]
+    fn a_paste_is_bracketed_only_for_a_program_that_asked() {
+        assert_eq!(encode_paste("ls -l", false), "ls -l");
+        assert_eq!(encode_paste("ls -l", true), "\x1b[200~ls -l\x1b[201~");
+    }
+
+    #[test]
+    fn a_pasted_line_ending_is_one_carriage_return() {
+        assert_eq!(encode_paste("one\ntwo", false), "one\rtwo");
+        assert_eq!(encode_paste("one\r\ntwo", false), "one\rtwo");
+        assert_eq!(encode_paste("one\rtwo", false), "one\rtwo");
+    }
+
+    /// Control bytes in the text are not keys anybody pressed, and an end marker hidden
+    /// in a paste would hand the rest of it to the program as typing.
+    #[test]
+    fn a_paste_carries_no_escape_sequences() {
+        assert_eq!(
+            encode_paste("safe\x1b[201~rm -rf /", true),
+            "\x1b[200~safe[201~rm -rf /\x1b[201~"
+        );
+        assert_eq!(encode_paste("a\x07b\x7f", false), "ab");
+        assert_eq!(encode_paste("a\tb", false), "a\tb", "a tab is a tab");
     }
 
     #[test]

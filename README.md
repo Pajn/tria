@@ -197,6 +197,11 @@ that only mean something in a message: it is one line, so there is no newline to
 long answer scrolls inside its row rather than wrapping, `Enter` confirms it, and `Esc`
 goes back to the options without keeping it.
 
+A paste arrives as one event and goes wherever typing would: the composer in either mode,
+the command line, a picker's query, the chat search, the custom answer. The fields that
+hold one line fold the paste onto one rather than keeping only what came before the first
+newline.
+
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `project rename <name>`,
 `archive`, `delete!`, `approve [n]`, `stop`, `stop!`,
@@ -341,6 +346,12 @@ pays it once: closing the popup closes the terminal and opens another in its pla
 shell is already at a prompt when you next ask for one. Leaving a thread lets go of the
 one it was keeping. The pane also answers the capability queries a full-screen program sends
 on startup, so nothing waits on a timeout.
+
+A paste in the pane reaches the program as a paste. One that has asked for bracketed paste
+gets the text between the markers, so a shell holds a multi-line paste at the prompt instead
+of running every line but the last; one that has not gets it plain. Line endings arrive as
+carriage returns, which is what Return sends, and the other control bytes are dropped, since
+nothing in pasted text is meant as an escape sequence.
 
 `g!` or `:shell` opens a plain shell in the same popup, in the thread's directory. Exiting it,
 with `Ctrl-d` or `exit`, closes the popup. Both of these are scratch sessions: tria closes the

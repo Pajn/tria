@@ -162,6 +162,17 @@ impl Picker {
     }
 }
 
+/// Fold a paste onto one line, for the fields that are one line. Cutting it off at the
+/// first newline would silently lose the rest of what was pasted, and a query or a
+/// command spread over lines was never going to be typed that way anyway.
+fn one_line(text: &str) -> String {
+    text.lines()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
 fn fuzzy_score(query: &str, label: &str, detail: &str) -> Option<i64> {
     if query.is_empty() {
         return Some(0);
@@ -1793,6 +1804,57 @@ impl App {
         let Some(data) = crate::term::encode_key(&key, app_cursor) else {
             return;
         };
+        self.write_to_pane(data);
+    }
+
+    /// Text the terminal handed over in one piece. Every place that takes typing takes
+    /// a paste as well: dropping it is the one answer that looks like the app is broken,
+    /// because nothing on screen says the keystrokes went nowhere.
+    fn on_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        match self.mode {
+            Mode::Insert => self.composer.insert_str(text),
+            // Normal mode still has the composer under the cursor, so a paste lands
+            // there. The mode is left alone: the keys after a paste should mean what
+            // they meant before it.
+            Mode::Normal => {
+                self.composer.vim_cancel();
+                self.composer.insert_str(text);
+            }
+            Mode::QuestionCustom => self.custom_answer.insert_str(&one_line(text)),
+            Mode::Command => self.command_line.push_str(&one_line(text)),
+            Mode::Picker => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.query.push_str(&one_line(text));
+                    if picker.renaming.is_none() {
+                        picker.selected = 0;
+                    }
+                }
+            }
+            Mode::Search => {
+                let Some(input) = self.search_input.as_mut() else {
+                    return;
+                };
+                input.query.push_str(&one_line(text));
+                self.incremental_search();
+            }
+            Mode::TerminalPane => self.paste_into_pane(text),
+            _ => {}
+        }
+    }
+
+    /// Hand a paste to the program in the attached terminal.
+    fn paste_into_pane(&mut self, text: &str) {
+        let Some(pane) = self.pane.as_mut() else {
+            return;
+        };
+        // As with typing, a paste is a reason to be looking at the live screen again.
+        if pane.scrollback() > 0 {
+            pane.scroll(isize::MIN / 2);
+        }
+        let data = crate::term::encode_paste(text, pane.screen().bracketed_paste());
         self.write_to_pane(data);
     }
 
@@ -5454,17 +5516,7 @@ fn apply(app: &mut App, event: AppEvent) {
     match event {
         AppEvent::Terminal(Event::Key(key)) => app.on_key(key),
         AppEvent::Terminal(Event::Mouse(mouse)) => app.on_mouse(mouse),
-        AppEvent::Terminal(Event::Paste(text)) => {
-            if app.mode == Mode::Insert {
-                app.composer.insert_str(&text);
-            } else if app.mode == Mode::Picker {
-                if let Some(p) = app.picker.as_mut() {
-                    p.query.push_str(text.trim());
-                }
-            } else if app.mode == Mode::Command {
-                app.command_line.push_str(text.trim());
-            }
-        }
+        AppEvent::Terminal(Event::Paste(text)) => app.on_paste(&text),
         AppEvent::Terminal(Event::FocusGained) => {
             app.terminal_focus = crate::notify::Focus::Focused
         }
@@ -6441,6 +6493,88 @@ mod tests {
             app.on_key(ctrl('q'));
             assert!(!app.quit, "{mode:?}");
         }
+    }
+
+    /// A paste is one event carrying the whole text, and every mode that takes typing
+    /// has to take it. Dropping it looks to somebody using the client like the paste
+    /// key is broken, because nothing on screen says where the text went.
+    #[test]
+    fn a_paste_lands_wherever_typing_would() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+
+        app.mode = Mode::Insert;
+        app.on_paste("first\nsecond");
+        assert_eq!(
+            app.composer.text(),
+            "first\nsecond",
+            "the composer keeps lines"
+        );
+
+        // Normal mode still has the composer under the cursor, and stays normal mode.
+        app.composer.clear();
+        app.mode = Mode::Normal;
+        app.on_paste("from normal");
+        assert_eq!(app.composer.text(), "from normal");
+        assert_eq!(app.mode, Mode::Normal);
+
+        // The one-line fields take the whole paste, folded rather than cut short.
+        app.mode = Mode::Command;
+        app.command_line.clear();
+        app.on_paste("model\nsonnet\n");
+        assert_eq!(app.command_line, "model sonnet");
+
+        app.mode = Mode::QuestionCustom;
+        app.on_paste("do it\nthis way\n");
+        assert_eq!(app.custom_answer.text(), "do it this way");
+
+        project(&mut app);
+        app.open_picker(PickerKind::Project);
+        app.on_paste("a query\n");
+        assert_eq!(
+            app.picker.as_ref().expect("the picker is up").query,
+            "a query"
+        );
+
+        app.mode = Mode::Normal;
+        app.start_search(false);
+        app.on_paste("needle\n");
+        assert_eq!(
+            app.search_input
+                .as_ref()
+                .expect("a search is being typed")
+                .query,
+            "needle"
+        );
+    }
+
+    /// The attached terminal gets a paste as a paste: the program on the other end can
+    /// tell it from typing, and a shell holds a multi-line one back instead of running
+    /// every line but the last.
+    #[tokio::test]
+    async fn a_paste_reaches_the_attached_terminal() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.mode = Mode::TerminalPane;
+        let mut pane = crate::term::Pane::new("t1".into(), "term".into(), "shell".into(), 80, 24);
+        // The shell says it wants pastes bracketed, the way a shell with a line editor does.
+        let _ = pane.feed("\x1b[?2004h");
+        app.pane = Some(pane);
+
+        app.on_paste("one\ntwo");
+        let Some(crate::session::Request::Call { tag, payload, .. }) = asked(&mut requests).await
+        else {
+            panic!("the paste was not written to the terminal");
+        };
+        assert_eq!(tag, "terminal.write");
+        assert_eq!(
+            payload["data"].as_str(),
+            Some("\x1b[200~one\rtwo\x1b[201~"),
+            "between the markers, with a carriage return for the line"
+        );
     }
 
     /// A thread sitting on an approval, in the shape the server sends one.

@@ -2823,6 +2823,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  gS                      terminals for this thread: Enter attaches,"),
         Line::from("                          c opens a new one, x closes, r restarts"),
         Line::from("  in the pane             every key goes to the shell · Ctrl-\\ detaches"),
+        Line::from("                          a paste goes to the shell as a paste"),
         Line::from("  gW                      worktrees threads are holding: Enter opens the"),
         Line::from("                          thread, x removes one, X removes a dirty one after"),
         Line::from("                          showing what would go with it"),
