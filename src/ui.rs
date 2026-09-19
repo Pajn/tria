@@ -1552,7 +1552,7 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
     });
     let placeholder = match resume.as_deref() {
         Some(resume) => resume,
-        None if insert => "type a message · Enter sends · Alt-Enter newline · Esc normal",
+        None if insert => "type a message · Enter sends · Ctrl-v Enter newline · Esc normal",
         None => "i or a click to write · d c y w b f t motions edit",
     };
     app.composer_area = text_area;
@@ -1633,6 +1633,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             format!("{} ", app.composer.vim_pending_label()),
             Style::default().fg(Color::Yellow),
         ));
+    }
+    // A partly typed command in insert mode is the same thing and is shown the same way.
+    if app.literal_next {
+        spans.push(Span::styled("^V ", Style::default().fg(Color::Yellow)));
     }
     let (dot, dot_style, conn_label) = match &app.status {
         Status::Connected => ("●", Style::default().fg(Color::Green), String::new()),
@@ -2820,10 +2824,13 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         Line::from("  gD                      show the thread's directory in the file browser"),
         Line::from("  mouse drag              select chat text; released, it is copied"),
-        Line::from("  Ctrl-c                  interrupt the running turn"),
+        Line::from("  Ctrl-c                  interrupt the running turn, or the background work"),
+        Line::from("                          left without one; anywhere else, it is Esc"),
         Line::from(""),
         Line::from(Span::styled("Insert", Style::default().bold())),
-        Line::from("  Enter send · Alt-Enter / Ctrl-j newline · Esc normal"),
+        Line::from("  Enter send · Alt-Enter / Ctrl-j newline · Esc or Ctrl-c normal"),
+        Line::from("  Ctrl-v or Ctrl-q        the next key as a character: Ctrl-v Enter is a"),
+        Line::from("                          newline where Enter would send"),
         Line::from("  Up/Down or Ctrl-p/n     prompt history"),
         Line::from("  ← → Home End Ctrl-a/e  move · Alt-arrow or Alt-b/f by word"),
         Line::from("  Ctrl-w Ctrl-k Ctrl-u    kill word / to end / to start"),

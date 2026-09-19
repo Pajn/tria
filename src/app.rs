@@ -433,6 +433,8 @@ pub struct App {
     /// The worktree list as it was when it was opened, so it does not move under the
     /// cursor while it is being read.
     pub worktrees: Vec<ThreadWorktree>,
+    /// Set by `Ctrl-v` in insert mode: the next key goes in as a character.
+    pub literal_next: bool,
     /// Set while a forced removal is waiting to be agreed to.
     pub worktree_confirm: Option<WorktreeConfirm>,
     pub worktree_selected: usize,
@@ -540,6 +542,7 @@ impl App {
             pending_create: None,
             lost_stream: None,
             worktrees: Vec::new(),
+            literal_next: false,
             worktree_confirm: None,
             worktree_selected: 0,
             live_worktrees: HashSet::new(),
@@ -4034,6 +4037,11 @@ impl App {
             return;
         }
         self.selection = None;
+        // A pending `Ctrl-v` belongs to the message being written and to nothing else,
+        // so it does not follow the focus out of insert mode.
+        if self.mode != Mode::Insert {
+            self.literal_next = false;
+        }
         // The attached terminal takes every key, including Ctrl-c, before the global
         // chords: interrupting the shell is the whole point of that key there.
         if self.mode == Mode::TerminalPane {
@@ -4041,20 +4049,20 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        // Global chords.
-        if ctrl && key.code == KeyCode::Char('q') {
-            self.quit = true;
-            return;
-        }
+        // Ctrl-c, the one global chord. In vim it is Esc under another name: it leaves
+        // what is being typed. So it does here, whatever is being typed — a message, a
+        // command, a search, a list — rather than reaching past the thing in front of
+        // you to the turn behind it. Normal mode is where there is nothing to leave,
+        // and that is where it stops the turn.
         if ctrl && key.code == KeyCode::Char('c') {
-            if self.thread.as_ref().is_some_and(|t| t.is_running()) {
+            if self.mode != Mode::Normal {
+                return self.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            }
+            let running = self.thread.as_ref().is_some_and(|t| t.is_running());
+            if running || self.background_alive() {
                 self.interrupt();
-            } else if self.mode == Mode::Normal {
-                self.toast("nothing running · :q to quit", false);
             } else {
-                self.mode = Mode::Normal;
-                self.picker = None;
-                self.command_line.clear();
+                self.toast("nothing running · :q to quit", false);
             }
             return;
         }
@@ -4482,10 +4490,18 @@ impl App {
     }
 
     fn on_insert_key(&mut self, key: KeyEvent) {
+        if std::mem::take(&mut self.literal_next) {
+            return self.insert_literal(key);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
+            // As in vim, where `Ctrl-q` is `Ctrl-v` under another name: the next key
+            // goes in as the character it stands for rather than as the key it is.
+            // `Enter` is the one worth having — it sends a message, and this is how
+            // you put one inside a message instead.
+            KeyCode::Char('v') | KeyCode::Char('q') if ctrl => self.literal_next = true,
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.composer.leave_insert();
@@ -4511,6 +4527,19 @@ impl App {
             _ => {
                 edit_key(&mut self.composer, key);
             }
+        }
+    }
+
+    /// The key after `Ctrl-v`, as a character. Only the ones that stand for one: a
+    /// message is text, and a control character written into it is no use to anybody
+    /// reading it at the other end. Anything else drops the literal and does nothing,
+    /// `Esc` included, which is how to change your mind about it.
+    fn insert_literal(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c) => self.composer.insert_char(c),
+            KeyCode::Enter => self.composer.newline(),
+            KeyCode::Tab => self.composer.insert_char('\t'),
+            _ => {}
         }
     }
 
@@ -5885,7 +5914,117 @@ mod tests {
         assert_eq!(write_picture("bm90IGEgcGljdHVyZQ=="), None);
     }
 
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// `Ctrl-c` is how a great many people leave insert mode, and it used to reach past
+    /// the message being written to the turn behind it: a key pressed to stop typing
+    /// stopped the agent instead. In vim it is Esc under another name, so it is here.
+    #[tokio::test]
+    async fn ctrl_c_leaves_what_is_being_typed_rather_than_stopping_the_turn() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+        app.mode = Mode::Insert;
+        app.composer.set_text("half a message");
+
+        app.on_key(ctrl('c'));
+        assert_eq!(app.mode, Mode::Normal, "it leaves insert mode");
+        assert_eq!(
+            app.composer.text(),
+            "half a message",
+            "and keeps the message"
+        );
+        assert!(asked_nothing(&mut requests).await, "the turn is untouched");
+
+        // From normal mode, where there is nothing to leave, it stops the turn.
+        app.on_key(ctrl('c'));
+        assert!(matches!(
+            asked(&mut requests).await,
+            Some(crate::session::Request::Dispatch { .. })
+        ));
+    }
+
+    /// Everything else being typed leaves the same way, rather than the picker staying
+    /// up while the turn behind it is interrupted.
+    #[tokio::test]
+    async fn ctrl_c_closes_whatever_is_in_front_of_the_conversation() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+
+        app.mode = Mode::Command;
+        app.command_line = "delete!".into();
+        app.on_key(ctrl('c'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.command_line.is_empty(), "and takes the command with it");
+
+        project(&mut app);
+        app.open_picker(PickerKind::Project);
+        assert_eq!(app.mode, Mode::Picker, "the picker is up to be closed");
+        app.on_key(ctrl('c'));
+        assert!(app.picker.is_none());
+        assert_eq!(app.mode, Mode::Normal);
+
+        assert!(asked_nothing(&mut requests).await, "the turn is untouched");
+    }
+
+    /// `Ctrl-q` quit the whole client on one keystroke, from any mode, undocumented,
+    /// taking every unsent draft with it. In vim it is `Ctrl-v`: the next key as the
+    /// character it stands for. `Enter` is the one worth having, since `Enter` sends.
+    #[test]
+    fn ctrl_q_writes_the_next_key_instead_of_quitting() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+        app.mode = Mode::Insert;
+        app.composer.set_text("one");
+
+        app.on_key(ctrl('q'));
+        assert!(!app.quit, "it does not quit");
+        assert!(app.literal_next, "the next key is spoken for");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.composer.text(),
+            "one\n",
+            "a newline, not a sent message"
+        );
+        assert!(!app.literal_next);
+
+        // Ctrl-v is the same key under vim's own name, and a tab is a tab.
+        app.on_key(ctrl('v'));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.composer.text(), "one\n\t");
+
+        // And nothing quits on a keystroke any more, in any mode.
+        for mode in [Mode::Normal, Mode::Insert, Mode::Picker, Mode::Worktrees] {
+            app.mode = mode;
+            app.on_key(ctrl('q'));
+            assert!(!app.quit, "{mode:?}");
+        }
+    }
+
     /// A thread sitting on an approval, in the shape the server sends one.
+    /// A thread with a turn going, in the shape the server sends one.
+    fn running_thread() -> ThreadState {
+        let snapshot: ThreadDetailSnapshot = serde_json::from_value(serde_json::json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p", "title": "Test",
+                "modelSelection": {"instanceId": "instance", "model": "a-model"},
+                "runtimeMode": "full-access", "session": {"status": "running"},
+                "latestTurn": {"turnId": "turn", "state": "running"},
+                "messages": [], "activities": []
+            }
+        }))
+        .expect("a running turn the server could have sent");
+        ThreadState::from_snapshot(snapshot)
+    }
+
     fn awaiting_approval() -> ThreadState {
         let snapshot: ThreadDetailSnapshot = serde_json::from_value(serde_json::json!({
             "snapshotSequence": 1,

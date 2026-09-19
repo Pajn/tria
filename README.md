@@ -109,7 +109,7 @@ Press `?` inside the app for the full list.
 | `gD` | show the thread's directory in the machine's file browser (`:reveal`) |
 | `h` `l` `0` `$` `w` `b` | chat focused: move along the line under the cursor |
 | `v` `V` | chat focused: start a selection by character or by line; `y` copies it |
-| `Ctrl-c` | interrupt the running turn, or stop the background work left running without one |
+| `Ctrl-c` | interrupt the running turn, or stop the background work left running without one. Anywhere something is being typed or a list is open, it is `Esc` instead |
 | mouse wheel | scroll the conversation, or the thread list when the pointer is over it |
 | left click | in the thread list: open a thread, or fold and unfold a section; in the chat: open a link, or fold and unfold a tool group or row; in the composer: put the cursor there and write |
 | drag | select text in the conversation; releasing copies it (OSC 52) |
@@ -151,13 +151,22 @@ command.
 | --- | --- |
 | `Enter` | send |
 | `Alt-Enter` or `Ctrl-j` | newline |
+| `Ctrl-v` or `Ctrl-q` | the next key as the character it stands for: `Ctrl-v` `Enter` is a newline, `Ctrl-v` `Tab` a tab |
 | `Up` `Down` or `Ctrl-p` `Ctrl-n` | prompt history |
 | `←` `→` `Home` `End`, `Ctrl-a` `Ctrl-e` | move the cursor; `Alt` with an arrow, or `Alt-b` `Alt-f`, moves by word |
 | `Backspace` `Delete`, `Ctrl-w` `Ctrl-k` `Ctrl-u` | delete a character, the word before the cursor, to the end, to the start |
-| `Esc` | back to normal mode |
+| `Esc` or `Ctrl-c` | back to normal mode |
 
-The custom answer typed after `ga` then `c` is edited with those same keys. It is one line:
-a long answer scrolls inside its row rather than wrapping, `Enter` confirms it, and `Esc`
+Quitting is `:q`, and only `:q`. No key does it on its own, because the composer holds
+unsent messages that nothing writes to disk, and a chord that throws them away is not one
+to find by accident. `Ctrl-v` and `Ctrl-q` mean in insert mode what they mean in Vim,
+which is why neither is a quit: the next key goes in as the character it stands for.
+`Alt-Enter` is the usual way to write a newline where `Enter` sends, but a terminal has to
+be willing to send it; `Ctrl-v` `Enter` needs nothing of the terminal and always works.
+
+The custom answer typed after `ga` then `c` is edited with those same keys, less the ones
+that only mean something in a message: it is one line, so there is no newline to write. A
+long answer scrolls inside its row rather than wrapping, `Enter` confirms it, and `Esc`
 goes back to the options without keeping it.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
