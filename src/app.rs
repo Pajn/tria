@@ -1079,14 +1079,28 @@ impl App {
         );
     }
 
+    /// Whether a digit answers the approval rather than starting a count. Only with
+    /// nothing written: a draft in the composer means the digits are being typed at the
+    /// composer, and one of the answers is a permission granted for the whole session.
+    /// An approval arrives on its own schedule, so the guard has to be the state of the
+    /// composer rather than the timing of the key.
+    pub fn digits_answer_approval(&self) -> bool {
+        self.composer.is_empty()
+    }
+
     fn respond_approval(&mut self, index: usize) {
         let Some(thread) = &self.thread else { return };
         let pending = thread.pending_approvals();
         let Some(approval) = pending.first() else {
+            self.toast("no approval pending", true);
             return;
         };
         let options = approval_options(approval);
         let Some(option) = options.get(index) else {
+            self.toast(
+                format!("this approval has {} answers to pick from", options.len()),
+                true,
+            );
             return;
         };
         let command =
@@ -3148,6 +3162,16 @@ impl App {
                 }
             }
             "delete" => self.toast("use :delete! to confirm deleting this thread", true),
+            // Always available, because the digits are not: a draft in the composer
+            // takes them, and an approval still has to be answerable then.
+            "approve" | "allow" => match if arg.is_empty() {
+                Some(1)
+            } else {
+                arg.parse::<usize>().ok().filter(|n| *n >= 1)
+            } {
+                Some(n) => self.respond_approval(n - 1),
+                None => self.toast("usage: :approve [n], the number beside the answer", true),
+            },
             "stop" | "interrupt" => self.interrupt(),
             // The harder one, for when the interrupt does not take: the session itself.
             "stop!" => self.stop_session(),
@@ -4049,7 +4073,11 @@ impl App {
             KeyCode::Char('S') if !self.composer.vim_pending() => {
                 return self.show_settled = !self.show_settled;
             }
-            KeyCode::Char(c @ '1'..='9') if approval_pending && !self.composer.vim_pending() => {
+            KeyCode::Char(c @ '1'..='9')
+                if approval_pending
+                    && !self.composer.vim_pending()
+                    && self.digits_answer_approval() =>
+            {
                 return self.respond_approval(c as usize - '1' as usize);
             }
             KeyCode::Esc => {
@@ -5628,6 +5656,71 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         // Something that is not a picture is not written out at all.
         assert_eq!(write_picture("bm90IGEgcGljdHVyZQ=="), None);
+    }
+
+    /// A thread sitting on an approval, in the shape the server sends one.
+    fn awaiting_approval() -> ThreadState {
+        let snapshot: ThreadDetailSnapshot = serde_json::from_value(serde_json::json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p", "title": "Test",
+                "modelSelection": {"instanceId": "instance", "model": "a-model"},
+                "runtimeMode": "approval-required", "latestTurn": null, "session": null,
+                "messages": [],
+                "activities": [{
+                    "id": "a1", "kind": "approval.requested",
+                    "payload": {"requestId": "r1", "requestKind": "bash"}
+                }]
+            }
+        }))
+        .expect("an approval the server could have sent");
+        ThreadState::from_snapshot(snapshot)
+    }
+
+    /// One of the answers to an approval grants a permission for the whole session, and
+    /// an approval arrives whenever the agent reaches one — including in the middle of a
+    /// message being written. A count typed at the composer must not answer it: `2w` is
+    /// two words, not "allow this for the session".
+    #[tokio::test]
+    async fn a_count_typed_at_the_composer_does_not_answer_an_approval() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(awaiting_approval());
+        app.composer.set_text("half a message");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(
+            sent.try_recv().is_err(),
+            "a digit with something written answers nothing"
+        );
+        assert!(
+            app.composer.vim_pending(),
+            "it is the count it looks like instead"
+        );
+
+        // With nothing written there is no other reading of it, and it answers as before.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.composer.clear();
+        app.on_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|(m, _, _)| m == "Allow for session"),
+            "{:?}",
+            app.toast
+        );
+
+        // And `:approve` answers whatever the composer holds, which is what makes the
+        // guard something other than a way of being unable to answer.
+        app.composer.set_text("half a message");
+        app.toast = None;
+        app.run_command("approve 3");
+        assert!(
+            app.toast.as_ref().is_some_and(|(m, _, _)| m == "Deny"),
+            "{:?}",
+            app.toast
+        );
     }
 
     /// The fold keys step a level at a time as well as going straight to the ends, and

@@ -92,7 +92,7 @@ Press `?` inside the app for the full list.
 | `za` | fold or unfold the tool group or row under the cursor; `za` on a row inside an open group opens what that call kept |
 | `zr` `zm` | open or shut one level everywhere: the groups, then what every call in them kept |
 | `zR` `zM` | open every level at once, or shut them all and let go of the folds opened by hand |
-| `1`..`9` | answer a pending approval; otherwise a count for the next motion |
+| `1`..`9` | answer a pending approval, with nothing written in the composer; otherwise a count for the next motion |
 | `ga` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `gy` | copy the last assistant message (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
@@ -162,10 +162,20 @@ goes back to the options without keeping it.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `project rename <name>`,
-`archive`, `delete!`, `stop`, `stop!`,
+`archive`, `delete!`, `approve [n]`, `stop`, `stop!`,
 `older`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
 `reveal`,
 `worktree`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`, `usage`, `help`, `q`.
+
+## Approvals
+
+The agent stops for an approval whenever its permissions say it should, and the panel
+that appears numbers the answers. `1`..`9` answer it — but only with nothing written in
+the composer. One of those answers grants a permission for the rest of the session, and
+an approval arrives when the agent reaches one rather than when you are ready for it, so
+a count typed at a half-written message would otherwise answer it: `2w` is two words, not
+"allow this for the session". With a draft in the composer the digits stay the
+composer's and the panel says so; `:approve <n>` answers it whatever is written there.
 
 ## New threads
 

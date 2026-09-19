@@ -127,7 +127,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_header(frame, app, header);
     draw_chat(frame, app, chat);
     if let Some(first) = pending.first() {
-        draw_approval(frame, first, pending.len(), approvals);
+        draw_approval(
+            frame,
+            first,
+            pending.len(),
+            app.digits_answer_approval(),
+            approvals,
+        );
     }
     if let Some(question) = &user_input {
         draw_question(frame, app, question, questions);
@@ -1250,6 +1256,7 @@ fn draw_approval(
     frame: &mut Frame,
     approval: &crate::state::PendingApproval,
     count: usize,
+    digits: bool,
     area: Rect,
 ) {
     let style = Style::default().fg(Color::Yellow);
@@ -1291,8 +1298,14 @@ fn draw_approval(
             Style::default(),
         ));
     }
+    // The digits belong to the composer while something is written there, so say
+    // what does answer rather than leaving a number that no longer does.
     spans.push(Span::styled(
-        "(normal mode)",
+        if digits {
+            "(normal mode)"
+        } else {
+            "(:approve 1 — the composer has the digits)"
+        },
         Style::default().fg(Color::DarkGray),
     ));
     lines.push(Line::from(spans));
@@ -2607,7 +2620,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(
             "  zr  zm  zR  zM          open or shut a level: groups, then the calls in them",
         ),
-        Line::from("  1..9                    answer a pending approval (otherwise a count)"),
+        Line::from("  1..9                    answer a pending approval, with nothing written in"),
+        Line::from("                          the composer; :approve <n> answers it whatever is"),
         Line::from(
             "  ga                      answer the agent's question (digits, Space, c custom, Enter)",
         ),
@@ -2666,7 +2680,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :stop  :stop! (the session)  :older  :answer  :dismiss  :sidebar  :q",
+            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :approve [n]  :stop  :stop! (the session)  :older  :answer  :dismiss  :sidebar  :q",
         ),
     ]);
     let width = 72.min(area.width);
