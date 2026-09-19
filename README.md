@@ -38,11 +38,14 @@ with mode 0600. `tria` finds a local server through the runtime file the server 
 T3 home directory. For a remote server pass `--url https://host:port` to `tria pair` and it is
 remembered.
 
-Then run:
+Then run `tria` for the thread list, or, in a project you want to work on:
 
 ```sh
-tria
+tria open
 ```
+
+which opens that project with a new thread ready to write, and adds the project to the
+server first where there is none for it yet.
 
 ## Starting the server
 
@@ -213,6 +216,14 @@ a count typed at a half-written message would otherwise answer it: `2w` is two w
 composer's and the panel says so; `:approve <n>` answers it whatever is written there.
 
 ## New threads
+
+`tria open` starts tria on the project for the directory you are in, with a draft ready to
+write: it is the way in from a checkout rather than from the thread list. `tria open <path>`
+names another directory. A directory inside a project opens that project — `src/` of a
+checkout is the checkout — and one the server has no project for adds it first, for the
+repository the directory is in, named after it. The directory has to be one: a path that is
+not there is said on the terminal before the screen is taken over. A project belongs to the
+server, so adding one adds it for the desktop app too.
 
 `n` picks a project and opens a draft; the message you write starts the thread. The header says
 where it will run: `⌂ project checkout on <branch>`, or `⌂ new worktree off <branch>`, which
@@ -635,6 +646,8 @@ worktree. The other value is `one-line`, which is the default.
 
 ## Other subcommands
 
+- `tria open [path]` opens the project for a directory, adding it when there is none. It is
+  the chat, not a subcommand that prints and exits.
 - `tria probe` connects, prints the server config keys and the thread list, and exits.
 - `tria dump <thread-id>` opens a thread through the same connection code as the UI and prints
   reduced state for a few seconds. Both are useful when checking a new server release.

@@ -489,6 +489,12 @@ pub struct App {
     pub selection: Option<Selection>,
     /// Text to push to the clipboard after the next frame is drawn.
     pub clipboard_pending: Option<String>,
+    /// The directory `tria open` named, held until there is a project for it: the list
+    /// of projects arrives after the screen does, and a project tria asks for arrives
+    /// after that again.
+    open_at: Option<String>,
+    /// Whether the project for `open_at` has been asked for, so it is asked for once.
+    open_asked: bool,
     pub work_ranges: Vec<crate::timeline::Region>,
     /// Content-line range of every picture a message's own markdown put in the chat. A
     /// work row is found by the region it folds; a message folds nothing, so its pictures
@@ -589,6 +595,8 @@ impl App {
             block_ranges: Vec::new(),
             selection: None,
             clipboard_pending: None,
+            open_at: None,
+            open_asked: false,
             work_ranges: Vec::new(),
             picture_ranges: Vec::new(),
             chat_pictures: Vec::new(),
@@ -860,6 +868,52 @@ impl App {
         let next = (current + delta).clamp(0, threads.len() as isize - 1) as usize;
         let id = threads[next].clone();
         self.open_thread(&id);
+    }
+
+    /// The project a directory belongs to: the one whose checkout it is, or failing
+    /// that the innermost one it sits inside. Opening `src/` of a project is opening
+    /// that project, not asking for a second one alongside it.
+    fn project_for(&self, root: &str) -> Option<Id> {
+        let inside = |project_root: &str| {
+            root == project_root
+                || root.starts_with(project_root)
+                    && root[project_root.len()..].starts_with(std::path::MAIN_SEPARATOR)
+        };
+        self.shell
+            .projects
+            .values()
+            .filter(|project| inside(&project.workspace_root))
+            .max_by_key(|project| project.workspace_root.len())
+            .map(|project| project.id.clone())
+    }
+
+    /// What `tria open` asked for, once the project list has arrived: a new thread in
+    /// the project the directory belongs to. Where it belongs to none, the project is
+    /// made first — for the checkout the directory is in, since that is what a project
+    /// usually is — and this runs again when the server sends it back.
+    fn open_where_asked(&mut self) {
+        let Some(root) = self.open_at.clone() else {
+            return;
+        };
+        if let Some(project) = self.project_for(&root) {
+            self.open_at = None;
+            self.open_asked = false;
+            self.start_new_thread(&project);
+            return;
+        }
+        if self.open_asked {
+            return;
+        }
+        self.open_asked = true;
+        let root = crate::workspace::checkout_root(&root).unwrap_or(root);
+        let title = crate::workspace::title(&root);
+        tracing::info!(%root, %title, "adding a project");
+        self.toast(format!("adding {title}…"), false);
+        self.dispatch(crate::commands::project_create(
+            &crate::commands::new_id(),
+            &title,
+            &root,
+        ));
     }
 
     fn start_new_thread(&mut self, project_id: &str) {
@@ -3244,7 +3298,18 @@ impl App {
             }
         };
         if items.is_empty() {
-            self.toast("nothing to pick from", true);
+            // The project list is the one that can be empty on a server that is working
+            // perfectly well, and it is the first thing somebody meets. So it says what
+            // to do about it rather than only that there is nothing here.
+            self.toast(
+                match kind {
+                    PickerKind::Project => {
+                        "no projects yet · run `tria open` in one to add it".to_string()
+                    }
+                    _ => "nothing to pick from".to_string(),
+                },
+                true,
+            );
             return;
         }
         self.picker = Some(Picker {
@@ -4841,8 +4906,14 @@ impl App {
                     self.current_thread_id = None;
                     self.toast("thread was removed", false);
                 }
+                if self.shell.synchronized {
+                    self.open_where_asked();
+                }
                 if self.current_thread_id.is_none()
                     && self.draft.is_none()
+                    // A directory was named and its project is on its way; whatever
+                    // thread happens to be first is not what was asked for.
+                    && self.open_at.is_none()
                     && self.shell.synchronized
                     && let Some(first) = self.visible_threads().first().cloned()
                 {
@@ -5313,6 +5384,8 @@ pub struct Launch {
     pub prefix_timeout: Option<Duration>,
     /// When a thread that has stopped working is announced to the desktop.
     pub notify: crate::notify::When,
+    /// The directory `tria open` named, if it was `tria open`.
+    pub open_at: Option<String>,
 }
 
 /// Ask where a project's icon is and fetch it. `sourcePath` is the server saying it found
@@ -5457,6 +5530,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     app.prefix_timeout = launch.prefix_timeout;
     app.notify = launch.notify;
     app.new_thread_model = launch.model;
+    app.open_at = launch.open_at;
     if launch.started_server {
         // Said again here because the line printed before the screen was taken over is
         // gone, and starting a server that outlives tria is worth knowing about.
@@ -6404,6 +6478,104 @@ mod tests {
         ThreadState::from_snapshot(snapshot)
     }
 
+    fn shell_with(app: &mut App, projects: serde_json::Value) {
+        app.on_update(crate::session::Update::Shell(
+            crate::model::ShellItem::Snapshot {
+                snapshot: serde_json::from_value(json!({
+                    "snapshotSequence": 1,
+                    "projects": projects,
+                    "threads": [],
+                }))
+                .expect("a shell the server could send"),
+            },
+        ));
+        app.on_update(crate::session::Update::Shell(
+            crate::model::ShellItem::Synchronized,
+        ));
+    }
+
+    fn project_json(id: &str, title: &str, root: &str) -> serde_json::Value {
+        json!({"id": id, "title": title, "workspaceRoot": root})
+    }
+
+    /// `tria open` in a directory the server already has a project for goes straight to
+    /// a new thread in it — and so does one run inside that project, since `src/` of a
+    /// project is that project rather than a second one beside it.
+    #[tokio::test]
+    async fn opening_a_directory_starts_a_thread_in_its_project() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.new_thread_model = Some(crate::model::ModelSelection {
+            instance_id: "instance".into(),
+            model: "a-model".into(),
+            options: Vec::new(),
+        });
+        app.open_at = Some("/src/tria/src".into());
+
+        shell_with(
+            &mut app,
+            json!([
+                project_json("p1", "tria", "/src/tria"),
+                project_json("p2", "other", "/src/other"),
+                // A project further in wins over one it sits inside.
+                project_json("p3", "inner", "/src/tria/src/inner"),
+            ]),
+        );
+
+        let draft = app.draft.as_ref().expect("a new thread is waiting");
+        assert_eq!(draft.project_id, "p1");
+        assert_eq!(app.mode, Mode::Insert);
+        assert!(app.open_at.is_none(), "the directory has been dealt with");
+        assert!(
+            sent_no_command(&mut requests).await,
+            "a project that exists is not made again"
+        );
+    }
+
+    /// A directory with no project of its own gets one — for the checkout it is in,
+    /// named after it — and the thread waits for the server to send the project back.
+    #[tokio::test]
+    async fn opening_a_directory_that_is_not_a_project_adds_one() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.new_thread_model = Some(crate::model::ModelSelection {
+            instance_id: "instance".into(),
+            model: "a-model".into(),
+            options: Vec::new(),
+        });
+        // The repository tria itself is in, so the checkout is a real one.
+        let here = std::env::current_dir().unwrap().display().to_string();
+        app.open_at = Some(format!("{here}/src"));
+
+        shell_with(&mut app, json!([project_json("p2", "other", "/src/other")]));
+        assert!(app.draft.is_none(), "there is no project to draft in yet");
+
+        let command = sent_command(&mut requests)
+            .await
+            .expect("it asks for the project");
+        assert_eq!(command["type"], "project.create");
+        assert_eq!(command["workspaceRoot"], here, "the checkout, not src/");
+        assert_eq!(command["title"], "tria");
+
+        // Asked for once, however many times the list changes in the meantime.
+        shell_with(&mut app, json!([project_json("p2", "other", "/src/other")]));
+        assert!(sent_no_command(&mut requests).await);
+
+        // And when the server sends it back, that is the thread.
+        app.on_update(crate::session::Update::Shell(
+            crate::model::ShellItem::ProjectUpserted {
+                sequence: 2,
+                project: serde_json::from_value(project_json("p9", "tria", &here)).unwrap(),
+            },
+        ));
+        assert_eq!(
+            app.draft.as_ref().map(|d| d.project_id.as_str()),
+            Some("p9")
+        );
+    }
+
     /// Sending empties the composer, which is what sending looks like — but a message
     /// the server would not take never went anywhere, and what was typed is the work.
     /// It comes back to where it was written.
@@ -6594,6 +6766,34 @@ mod tests {
             tokio::task::yield_now().await;
         }
         requests.try_recv().is_err()
+    }
+
+    /// The first command dispatched, past whatever subscribing and looking-up goes out
+    /// beside it.
+    async fn sent_command(
+        requests: &mut mpsc::UnboundedReceiver<crate::session::Request>,
+    ) -> Option<Value> {
+        loop {
+            match asked(requests).await? {
+                crate::session::Request::Dispatch { command, .. } => return Some(command),
+                _ => continue,
+            }
+        }
+    }
+
+    /// That no command was dispatched, whatever else was asked for.
+    async fn sent_no_command(
+        requests: &mut mpsc::UnboundedReceiver<crate::session::Request>,
+    ) -> bool {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        while let Ok(request) = requests.try_recv() {
+            if matches!(request, crate::session::Request::Dispatch { .. }) {
+                return false;
+            }
+        }
+        true
     }
 
     fn holding(app: &mut App, changes: Option<bool>) -> String {

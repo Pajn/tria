@@ -21,6 +21,7 @@ mod transcript;
 mod ui;
 mod vim;
 mod wire;
+mod workspace;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -39,6 +40,9 @@ struct Cli {
 enum Command {
     /// Exchange a pairing credential (or /pair#token= URL) for a stored bearer token.
     Pair { credential: String },
+    /// Open a directory's project, ready for a new thread, adding the project when the
+    /// directory is not one yet. Defaults to the directory you are in.
+    Open { path: Option<String> },
     /// Connect and print the server config plus the project and thread list, then exit.
     Probe,
     /// Open a thread through the supervisor and print reduced state for a few seconds.
@@ -75,38 +79,51 @@ async fn main() -> Result<()> {
             let origin = known.context("no running local server found")?;
             probe(&origin, &cfg).await
         }
-        None => {
-            let token = cfg.token.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no token stored; run `tria pair <credential>` first (mint one with `t3 pair`)"
-                )
-            })?;
-            init_logging()?;
-            // Only here: the chat is what a person opens expecting it to work, and the
-            // subcommands are for a server that is already up.
-            let (origin, started) = server::ensure(known, &cfg.server_command()).await?;
-            let (programs, mut refused) = cfg.programs();
-            let (sidebar_layout, refused_layout) = cfg.sidebar_layout();
-            refused.extend(refused_layout);
-            let (notify, refused_notify) = cfg.notify();
-            refused.extend(refused_notify);
-            let launch = app::Launch {
-                started_server: started,
-                programs,
-                sidebar_layout,
-                refused,
-                editor: cfg.editor(),
-                model: cfg.model.clone(),
-                prefix_timeout: cfg.prefix_timeout(),
-                notify,
-            };
-            app::run(origin, token, launch).await
+        // The directory is read before anything else: a path that is not there is worth
+        // saying on the terminal it was typed at, rather than in a toast behind a screen
+        // that has already been taken over.
+        Some(Command::Open { path }) => {
+            let open_at = workspace::root(path.as_deref())?;
+            chat(known, &cfg, Some(open_at)).await
         }
+        None => chat(known, &cfg, None).await,
         Some(Command::Dump { thread_id, seconds }) => {
             let origin = known.context("no running local server found")?;
             dump(&origin, &cfg, &thread_id, seconds).await
         }
     }
+}
+
+/// Take over the terminal and talk to the server, starting one where none is running.
+/// `open_at` is the directory `tria open` named, which becomes a new thread in the
+/// project for it once the project list has arrived.
+async fn chat(known: Option<String>, cfg: &config::Config, open_at: Option<String>) -> Result<()> {
+    let token = cfg.token.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no token stored; run `tria pair <credential>` first (mint one with `t3 pair`)"
+        )
+    })?;
+    init_logging()?;
+    // Only here: the chat is what a person opens expecting it to work, and the
+    // subcommands are for a server that is already up.
+    let (origin, started) = server::ensure(known, &cfg.server_command()).await?;
+    let (programs, mut refused) = cfg.programs();
+    let (sidebar_layout, refused_layout) = cfg.sidebar_layout();
+    refused.extend(refused_layout);
+    let (notify, refused_notify) = cfg.notify();
+    refused.extend(refused_notify);
+    let launch = app::Launch {
+        started_server: started,
+        programs,
+        sidebar_layout,
+        refused,
+        editor: cfg.editor(),
+        model: cfg.model.clone(),
+        prefix_timeout: cfg.prefix_timeout(),
+        notify,
+        open_at,
+    };
+    app::run(origin, token, launch).await
 }
 
 async fn probe(origin: &str, cfg: &config::Config) -> Result<()> {

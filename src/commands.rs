@@ -163,6 +163,22 @@ pub fn meta_update_title(thread_id: &str, title: &str) -> Value {
     })
 }
 
+/// Add a project for a directory. The server takes the root as it is given, beyond
+/// making it absolute, and refuses a directory it already has an active project for —
+/// so the project list is the thing to look in before asking for this. The directory
+/// has to be there: tria never asks the server to make one, since a path that is not
+/// there is a path somebody has mistyped.
+pub fn project_create(project_id: &str, title: &str, workspace_root: &str) -> Value {
+    json!({
+        "type": "project.create",
+        "commandId": new_id(),
+        "projectId": project_id,
+        "title": title,
+        "workspaceRoot": workspace_root,
+        "createdAt": now_iso(),
+    })
+}
+
 /// Rename a project. The title is the server's own, so every client that draws the
 /// project — this one, the desktop app — is renaming it for all of them.
 pub fn project_rename(project_id: &str, title: &str) -> Value {
