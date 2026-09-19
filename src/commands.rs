@@ -110,6 +110,18 @@ pub fn turn_interrupt(thread_id: &str, turn_id: Option<&str>) -> Value {
     command
 }
 
+/// Stop the thread's provider session. The protocol has no stop for one background task,
+/// and monitors and backgrounded commands are the session's own processes, so this is
+/// what ends them. The conversation is untouched: the next message starts a session again.
+pub fn session_stop(thread_id: &str) -> Value {
+    json!({
+        "type": "thread.session.stop",
+        "commandId": new_id(),
+        "threadId": thread_id,
+        "createdAt": now_iso(),
+    })
+}
+
 pub fn approval_respond(thread_id: &str, request_id: &str, decision: &str) -> Value {
     json!({
         "type": "thread.approval.respond",

@@ -468,6 +468,15 @@ impl ThreadState {
                 .is_some_and(|s| s.status == "running" || s.status == "starting")
     }
 
+    /// What the server says is still alive in this thread's session after the turn
+    /// settled: `working` for agent work, `monitoring` for a watch loop, nothing when
+    /// there is none. It is the server's own registry of live tasks rather than a fold
+    /// of the activities, so it knows about work that started before the history this
+    /// client loaded — which, for a watcher left running for hours, is most of them.
+    pub fn background_liveness(&self) -> Option<&str> {
+        self.detail.shell.background_liveness.as_deref()
+    }
+
     /// The subagents this thread has run, oldest first.
     ///
     /// They live in the same `task.*` activities as the background tasks and are told
@@ -488,11 +497,28 @@ impl ThreadState {
         })
     }
 
+    /// Whether the provider session that owned this work has ended. Monitors and
+    /// backgrounded commands are its processes, and nothing settles their rows when it
+    /// goes: the server ends a task it saw finish, and a killed session finishes
+    /// nothing. An interrupted session is not ended — that is a turn aborted, and a
+    /// watch loop outlives the turn that started it — and a thread with no session row
+    /// has said nothing either way.
+    fn session_ended(&self) -> bool {
+        self.detail
+            .shell
+            .session
+            .as_ref()
+            .is_some_and(|session| matches!(session.status.as_str(), "stopped" | "error"))
+    }
+
     /// Background tasks the agent started that have not reported an end: monitors and
     /// backgrounded commands, but not the subagents that share these activities. A task
     /// is done once any of its activities carries a status or an `endedAt`; this work
     /// outlives its turn, so the turn is not used to settle it.
     pub fn running_tasks(&self) -> Vec<RunningTask> {
+        if self.session_ended() {
+            return Vec::new();
+        }
         let mut open: Vec<RunningTask> = Vec::new();
         let mut agents: Vec<&str> = Vec::new();
         for activity in &self.detail.activities {
@@ -931,6 +957,38 @@ mod tests {
             "task.completed",
             json!({"taskId": "t-2", "status": "failed"}),
         ));
+        assert!(state.running_tasks().is_empty());
+    }
+
+    /// A session that is killed takes its watch loops with it and settles nothing: the
+    /// rows that started them are the last word the thread ever hears. So the session's
+    /// own end is what ends them, and stopping it is how a monitor is stopped at all.
+    #[test]
+    fn a_stopped_session_leaves_no_background_work_running() {
+        let mut state = thread();
+        state.apply_event(task_event(
+            11,
+            "task.started",
+            json!({"taskId": "t-1", "title": "watch build", "taskType": "monitor",
+                   "agentKind": "background"}),
+        ));
+        assert_eq!(state.running_tasks().len(), 1);
+
+        // A turn aborted is not the session ending, and a watcher outlives its turn.
+        state.detail.shell.session = Some(crate::model::Session {
+            status: "interrupted".into(),
+            provider_name: None,
+            active_turn_id: None,
+            last_error: None,
+        });
+        assert_eq!(state.running_tasks().len(), 1);
+
+        state.detail.shell.session = Some(crate::model::Session {
+            status: "stopped".into(),
+            provider_name: None,
+            active_turn_id: None,
+            last_error: None,
+        });
         assert!(state.running_tasks().is_empty());
     }
 

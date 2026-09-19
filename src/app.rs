@@ -973,20 +973,32 @@ impl App {
         self.scroll = Scroll::Follow;
     }
 
+    /// Stop what the session is doing. Usually that is the turn, and the turn is named.
+    /// But a watcher outlives the turn that started it, and then there is no turn to
+    /// name: the interrupt goes without one and the session stops the watch loop, which
+    /// is what the desktop's `Monitoring · Stop` sends and the only per-watcher stop
+    /// there is.
     fn interrupt(&mut self) {
         let Some(thread) = &self.thread else { return };
-        if !thread.is_running() {
+        let running = thread.is_running();
+        let thread_id = thread.id().to_string();
+        let turn_id = running
+            .then_some(thread.detail.shell.latest_turn.as_ref())
+            .flatten()
+            .map(|t| t.turn_id.clone());
+        if !running && !self.background_alive() {
             self.toast("nothing running", false);
             return;
         }
-        let turn_id = thread
-            .detail
-            .shell
-            .latest_turn
-            .as_ref()
-            .map(|t| t.turn_id.clone());
-        self.dispatch(commands::turn_interrupt(thread.id(), turn_id.as_deref()));
-        self.toast("interrupting…", false);
+        self.dispatch(commands::turn_interrupt(&thread_id, turn_id.as_deref()));
+        self.toast(
+            if running {
+                "interrupting…"
+            } else {
+                "stopping the background work…"
+            },
+            false,
+        );
     }
 
     fn respond_approval(&mut self, index: usize) {
@@ -1950,6 +1962,64 @@ impl App {
         self.mode = Mode::Tasks;
     }
 
+    /// What the server says the session is still running after the turn settled:
+    /// `working`, `monitoring`, or nothing. The server keeps this register itself,
+    /// which is the whole of its worth: a watch loop started hours ago has long since
+    /// fallen off the end of the activities this client loaded, so its rows are no
+    /// answer to whether it is still going.
+    ///
+    /// It is read from the thread list, which is where the server puts it. A thread
+    /// detail snapshot carries no liveness at all — the open thread only has one once a
+    /// list update has been folded into it, which may be long after it was opened.
+    pub fn background_liveness(&self) -> Option<&str> {
+        self.current_thread_id
+            .as_deref()
+            .and_then(|id| self.shell.threads.get(id))
+            .and_then(|thread| thread.background_liveness.as_deref())
+            .or_else(|| {
+                self.thread
+                    .as_ref()
+                    .and_then(|thread| thread.background_liveness())
+            })
+    }
+
+    /// Whether anything is running in the background: what the server's register says,
+    /// or failing that a task in the loaded history with no reported end.
+    fn background_alive(&self) -> bool {
+        self.background_liveness().is_some()
+            || self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.running_tasks().is_empty())
+    }
+
+    /// Hand the session the harder stop. The interrupt asks it to stop what it is doing;
+    /// this ends the session outright, which is the only thing left when a watcher will
+    /// not let go — every process it started goes with it. The conversation stays, and
+    /// the next message starts a session again.
+    fn stop_session(&mut self) {
+        let Some(thread) = &self.thread else {
+            self.toast("no thread open", true);
+            return;
+        };
+        let thread_id = thread.id().to_string();
+        self.dispatch(commands::session_stop(&thread_id));
+        self.toast("stopping the session…", false);
+    }
+
+    /// The task list is a list to read; what there is to do from it is stop the work it
+    /// shows. It stays open afterwards, because the rows clearing is the confirmation.
+    fn on_tasks_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('T') => {
+                self.mode = Mode::Normal
+            }
+            KeyCode::Char('s') => self.interrupt(),
+            KeyCode::Char('S') => self.stop_session(),
+            _ => {}
+        }
+    }
+
     // ── Subagents ──────────────────────────────────────────────────────
 
     /// The conversation on screen: a subagent's transcript when one is open, otherwise
@@ -2868,6 +2938,8 @@ impl App {
             }
             "delete" => self.toast("use :delete! to confirm deleting this thread", true),
             "stop" | "interrupt" => self.interrupt(),
+            // The harder one, for when the interrupt does not take: the session itself.
+            "stop!" => self.stop_session(),
             "sidebar" => self.sidebar_visible = !self.sidebar_visible,
             "pr" | "pull" => self.open_pull_request(true),
             "tmux" => self.switch_tmux_session(),
@@ -3551,14 +3623,7 @@ impl App {
             Mode::Insert => self.on_insert_key(key),
             Mode::Command => self.on_command_key(key),
             Mode::Search => self.on_search_key(key),
-            Mode::Tasks => {
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('T')
-                ) {
-                    self.mode = Mode::Normal;
-                }
-            }
+            Mode::Tasks => self.on_tasks_key(key),
             Mode::Agents => self.on_agents_key(key),
             Mode::Terminals => self.on_terminals_key(key),
             Mode::Worktrees => self.on_worktrees_key(key),
@@ -4932,6 +4997,109 @@ mod tests {
         press(&mut app, 'g');
         press(&mut app, 'q');
         assert_eq!(app.pending_pane_command, None);
+    }
+
+    /// A thread the server says is monitoring. The liveness sits on the list row,
+    /// which is the only place the server puts it, and the thread's own history holds no
+    /// row for the watcher — the usual shape of one left running for hours, since the
+    /// loaded history only reaches so far back.
+    fn watched(app: &mut App, liveness: Option<&str>, session: &str) {
+        let mut row = listed("t1", Some(("turn", "completed")));
+        row["session"] = json!({ "status": session });
+        if let Some(liveness) = liveness {
+            row["backgroundLiveness"] = json!(liveness);
+        }
+        upsert(app, row);
+        app.current_thread_id = Some("t1".into());
+        app.thread = Some(crate::state::ThreadState::from_snapshot(
+            serde_json::from_value(json!({
+                "snapshotSequence": 1,
+                "thread": {
+                    "id": "t1", "projectId": "p", "title": "t1",
+                    "modelSelection": {"instanceId": "i", "model": "m"},
+                    "session": {"status": session},
+                    "latestTurn": {
+                        "turnId": "turn", "state": "completed",
+                        "requestedAt": "2026-01-01T00:00:00Z"
+                    },
+                    "messages": [], "activities": []
+                }
+            }))
+            .unwrap(),
+        ));
+    }
+
+    fn dispatched(
+        requests: &mut mpsc::UnboundedReceiver<crate::session::Request>,
+    ) -> Vec<serde_json::Value> {
+        std::iter::from_fn(|| requests.try_recv().ok())
+            .filter_map(|request| match request {
+                crate::session::Request::Dispatch { command, .. } => Some(command),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A watcher outlives the turn that started it, so by the time it is worth stopping
+    /// there is no turn to name and nothing is "running". The interrupt still goes —
+    /// without a turn id, which is what the desktop's `Monitoring · Stop` sends — and
+    /// the session stops the watch loop.
+    #[tokio::test]
+    async fn a_thread_only_monitoring_can_still_be_stopped() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        watched(&mut app, Some("monitoring"), "idle");
+        assert!(!app.thread.as_ref().unwrap().is_running());
+        // The detail snapshot carries no liveness; the list row is where it lives.
+        assert_eq!(app.background_liveness(), Some("monitoring"));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT));
+        assert_eq!(app.mode, Mode::Tasks);
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        tokio::task::yield_now().await;
+
+        let commands = dispatched(&mut requests);
+        let interrupt = commands
+            .iter()
+            .find(|command| command["type"] == "thread.turn.interrupt")
+            .expect("the watcher was never stopped");
+        assert_eq!(interrupt["threadId"], "t1");
+        // No turn is running, and naming one that is not would be naming the wrong one.
+        assert!(interrupt["turnId"].is_null());
+        // The list stays open: the rows clearing is what says it worked.
+        assert_eq!(app.mode, Mode::Tasks);
+    }
+
+    /// With nothing running and nothing watching, the interrupt is not sent at all.
+    #[tokio::test]
+    async fn a_quiet_thread_has_nothing_to_interrupt() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        watched(&mut app, None, "ready");
+
+        app.run_command("stop");
+        tokio::task::yield_now().await;
+        assert!(dispatched(&mut requests).is_empty());
+    }
+
+    /// The harder stop, for a watcher that will not let go of the session.
+    #[tokio::test]
+    async fn the_session_itself_can_be_stopped() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        watched(&mut app, Some("monitoring"), "idle");
+
+        app.run_command("stop!");
+        tokio::task::yield_now().await;
+
+        let stopped = dispatched(&mut requests)
+            .iter()
+            .any(|command| command["type"] == "thread.session.stop" && command["threadId"] == "t1");
+        assert!(stopped, "the session was never stopped");
     }
 
     /// A thread as the list has it, on a given turn in a given state.

@@ -174,7 +174,10 @@ advertised.
   `toolUseId`, and sometimes `isBackgrounded`. A task has ended once an activity carries a
   `status` or an `endedAt`; monitors outlive their turn, so the turn cannot settle them.
   There is no per-task stop command: `thread.turn.interrupt` and `thread.session.stop` are
-  the only stops a client can dispatch.
+  the only stops a client can dispatch. `turnId` on the interrupt is optional and only
+  marks the turn as interrupted in the projection — the interrupt reaches the provider
+  either way, so one sent without a turn is what stops a watch loop that has outlived its
+  turn. That is what the desktop's `Monitoring · Stop` dispatches.
 - **Reasoning is not on the wire.** Only assistant text becomes messages; reasoning items are
   filtered server-side. Nothing to render.
 - **Session**: `{ status: idle|starting|running|ready|interrupted|stopped|error,
@@ -268,9 +271,12 @@ session as it was.
 
 There is no per-task stop. Background tasks — the `task.started`/`updated`/`completed`
 activities — carry no command to cancel one. What exists is `thread.turn.interrupt`,
-`thread.session.stop` (with an optional `onlyIfSettled`), `terminal.close` and
-`terminal.restart` for shells, and `server.signalProcess` (`SIGINT` or `SIGKILL`) for host
-processes listed by `server.getProcessDiagnostics`. The last one refuses the server's own pid,
+which the server hands to the provider as `interruptTurn(threadId)` whether or not a
+`turnId` came with it, so it stops a watch loop that no turn is holding;
+`thread.session.stop` (with an optional `onlyIfSettled`), which ends the session and every
+process it started; `terminal.close` and `terminal.restart` for shells; and
+`server.signalProcess` (`SIGINT` or `SIGKILL`) for host processes listed by
+`server.getProcessDiagnostics`. The last one refuses the server's own pid,
 requires a `startTimeMs` identity match so a recycled pid cannot be hit, and only signals
 processes it classifies as `server-child`, `provider-root`, or `terminal-root`.
 

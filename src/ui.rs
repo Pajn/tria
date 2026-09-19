@@ -1526,12 +1526,16 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::styled(label, status_style(status)));
             }
         }
+        // A count when the rows for it were loaded, the mark alone when all there is to
+        // go on is the server saying something is still running.
         let tasks = thread.running_tasks().len();
-        if tasks > 0 {
-            spans.push(Span::styled(
-                format!("  ⚙ {tasks} bg"),
-                Style::default().fg(Color::Blue),
-            ));
+        let background = match (tasks, app.background_liveness()) {
+            (0, None) => None,
+            (0, Some(_)) => Some("  ⚙ bg".to_string()),
+            (count, _) => Some(format!("  ⚙ {count} bg")),
+        };
+        if let Some(background) = background {
+            spans.push(Span::styled(background, Style::default().fg(Color::Blue)));
         }
         let agents = thread
             .subagents()
@@ -2143,17 +2147,42 @@ fn tokens(total: u64) -> String {
     }
 }
 
-/// The agent's unfinished background tasks. Informational: the protocol has no per-task
-/// stop, so the panel points at the turn-level interrupt instead.
+/// The agent's unfinished background tasks, and what the server says is still live in
+/// the thread even when no row for it was loaded. The protocol has no per-task stop: the
+/// stop offered here is the session's own, which is what the desktop's `Monitoring ·
+/// Stop` sends too.
 fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
     let tasks = app.running_tasks();
+    let liveness = app.background_liveness();
     let now = crate::commands::now_iso();
     let mut lines: Vec<Line<'static>> = Vec::new();
     if tasks.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no background tasks running",
-            Style::default().fg(Color::DarkGray),
-        )));
+        match liveness {
+            // The server keeps its own register of what is still running, and it is
+            // older than anything on screen: a watcher left going for hours started in
+            // activities that have long since fallen off the end of the loaded history.
+            // So it is said plainly rather than answered with "nothing running".
+            Some(label) => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(" {} ", app.spinner_frame()),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        format!("the server says this thread is {label}"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    "   it started before the history tria loaded",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            None => lines.push(Line::from(Span::styled(
+                "  no background tasks running",
+                Style::default().fg(Color::DarkGray),
+            ))),
+        }
     }
     let width = 76.min(area.width) as usize;
     for task in &tasks {
@@ -2189,7 +2218,11 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  Ctrl-c interrupts the turn · no per-task stop exists · Esc to close",
+        "  s stops it, as Ctrl-c does · S stops the whole session",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Esc to close",
         Style::default().fg(Color::DarkGray),
     )));
     let text = Text::from(lines);
@@ -2204,7 +2237,12 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_style(Style::default().fg(Color::Cyan))
-        .title(format!(" background tasks ({}) ", tasks.len()));
+        .title(match (tasks.len(), liveness) {
+            // Nothing to count, but something running: a count of zero would read as
+            // the opposite of what the panel is saying.
+            (0, Some(_)) => " background tasks ".to_string(),
+            (count, _) => format!(" background tasks ({count}) "),
+        });
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
@@ -2282,7 +2320,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  gy                      yank last assistant message (OSC 52)"),
         Line::from(programs.clone()),
         Line::from("  g!                      a shell in the pane; exiting it closes the popup"),
-        Line::from("  gT                      background tasks still running in this thread"),
+        Line::from("  gT                      background tasks still running in this thread:"),
+        Line::from("                          s stops it as Ctrl-c does, S stops the session"),
         Line::from("  gA                      subagents this thread has run: Enter reads one's"),
         Line::from("                          transcript (r re-reads a running one), y yanks its"),
         Line::from("                          report"),
@@ -2332,7 +2371,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :pr  :tasks  :agents  :terminals  :tmux  :settle  :unsettle  :wake  :settled  :stop  :older  :answer  :dismiss  :sidebar  :q",
+            "  :pr  :tasks  :agents  :terminals  :tmux  :settle  :unsettle  :wake  :settled  :stop  :stop! (the session)  :older  :answer  :dismiss  :sidebar  :q",
         ),
     ]);
     let width = 72.min(area.width);

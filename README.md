@@ -94,7 +94,7 @@ Press `?` inside the app for the full list.
 | `ga` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `gy` | copy the last assistant message (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
-| `gT` | list the agent's background tasks that are still running |
+| `gT` | list the agent's background tasks that are still running; `s` stops them, `S` the session |
 | `gA` | list the subagents the thread has run; `Enter` reads one's transcript (`r` re-reads a running one), `y` yanks its report |
 | `gS` | list the thread's terminals; attach to one, or close, restart, open a new one |
 | `gW` | list the worktrees threads are holding; remove the ones that are done with |
@@ -106,7 +106,7 @@ Press `?` inside the app for the full list.
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
 | `h` `l` `0` `$` `w` `b` | chat focused: move along the line under the cursor |
 | `v` `V` | chat focused: start a selection by character or by line; `y` copies it |
-| `Ctrl-c` | interrupt the running turn |
+| `Ctrl-c` | interrupt the running turn, or stop the background work left running without one |
 | mouse wheel | scroll the conversation, or the thread list when the pointer is over it |
 | left click | in the thread list: open a thread, or fold and unfold a section; in the chat: open a link, or fold and unfold a tool group or row; in the composer: put the cursor there and write |
 | drag | select text in the conversation; releasing copies it (OSC 52) |
@@ -159,7 +159,7 @@ goes back to the options without keeping it.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `project rename <name>`,
-`archive`, `delete!`, `stop`,
+`archive`, `delete!`, `stop`, `stop!`,
 `older`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
 `worktree`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`, `help`, `q`.
 
@@ -281,9 +281,19 @@ itself.
 
 The agent runs monitors and background commands that outlive the turn that started them.
 `gT` or `:tasks` lists the ones with no reported end, with how long each has been running,
-and the status bar shows a count. There is no per-task stop in the protocol, so stopping
-means interrupting the turn with `Ctrl-c`. Work the agent delegated to a subagent is not
-background work and is listed by `gA` instead.
+and the status bar shows a count. Work the agent delegated to a subagent is not background
+work and is listed by `gA` instead.
+
+A watcher that has been going for hours started further back than the history tria
+loads, so there is no row left for the list to show. The server keeps its own register of
+what is still running in a thread, and the panel says what that register says when it has
+nothing else to show: `the server says this thread is monitoring`.
+
+There is no per-task stop in the protocol. What stops a watcher is the session's own
+interrupt sent with no turn to name — `Ctrl-c`, `:stop`, or `s` in the list, which is
+what the desktop app's `Monitoring · Stop` sends. `S` or `:stop!` is the harder one: it
+ends the provider session, and every process it started goes with it. Either way the
+conversation stays, and the next message starts a session again.
 
 ## Subagents
 
@@ -297,7 +307,7 @@ They come from the same `task.*` activities as the background tasks, told apart 
 `agentKind` the server stamps on each one as it ingests it. So `gT` lists monitors and
 backgrounded commands, `gA` lists subagents, and neither shows the other. Like a background
 task, a subagent has no stop of its own in the protocol: `Ctrl-c` interrupts the turn that
-started it.
+started it, and stopping the session ends everything running in it.
 
 A subagent can run more than once under the same identity. The row then reads `run 2`, and
 shows the current run rather than the last one's outcome. If the provider session dies with
