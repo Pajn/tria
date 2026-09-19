@@ -1497,6 +1497,22 @@ impl App {
 
     fn on_question_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // The panel answers a question about the thread, so the keys that go and look at
+        // the thread — `gy`, `gE`, a program on `g<key>` — are worth having here too. The
+        // panel keeps its own letters: only what follows `g` is read this way.
+        let prefix = self.take_prefix();
+        if prefix == Some('g') {
+            if key.code == KeyCode::Char('e') {
+                self.edit_composer();
+            } else {
+                self.global_prefix_key(key);
+            }
+            return;
+        }
+        if key.code == KeyCode::Char('g') && !ctrl {
+            self.pending_prefix = Some(('g', Instant::now()));
+            return;
+        }
         let Some(draft) = self.question.as_mut() else {
             self.mode = Mode::Normal;
             return;
@@ -4001,6 +4017,9 @@ impl App {
         // A key that moves the cursor within a line is only itself: `gl` opens git and
         // Ctrl-b pages up.
         let plain = prefix.is_none() && !ctrl;
+        if prefix == Some('g') && self.global_prefix_key(key) {
+            return;
+        }
         match key.code {
             KeyCode::Char(c @ '0'..='9') if c != '0' || self.chat_count.is_some() => {
                 let current = self.chat_count.unwrap_or(0);
@@ -4046,28 +4065,7 @@ impl App {
                     self.load_older();
                 }
             }
-            KeyCode::Char('x') if prefix == Some('g') => self.open_under_cursor(false),
-            KeyCode::Char('t') if prefix == Some('g') => self.switch_tmux_session(),
-            KeyCode::Char('P') if prefix == Some('g') => self.split_tmux_pane(),
-            KeyCode::Char('N') if prefix == Some('g') => self.new_tmux_window(),
-            KeyCode::Char('D') if prefix == Some('g') => self.reveal_directory(),
-            KeyCode::Char('y') if prefix == Some('g') => self.yank_last_assistant(),
-            KeyCode::Char('s') if prefix == Some('g') => {
-                let id = self.current_thread_id.clone();
-                self.toggle_settled(id);
-            }
-            KeyCode::Char(key) if prefix == Some('g') && self.bound(key) => self.open_program(key),
-            KeyCode::Char('!') if prefix == Some('g') => self.open_shell(),
-            KeyCode::Char('w') if prefix == Some('g') => self.toggle_draft_worktree(),
-            KeyCode::Char('T') if prefix == Some('g') => self.open_tasks(),
-            KeyCode::Char('A') if prefix == Some('g') => self.open_agents(),
-            KeyCode::Char('S') if prefix == Some('g') => self.open_terminals(),
-            KeyCode::Char('W') if prefix == Some('g') => self.open_worktrees(),
             KeyCode::Char('e') if prefix == Some('g') => self.view_at_cursor(),
-            KeyCode::Char('E') if prefix == Some('g') => self.view_conversation(),
-            KeyCode::Char('a') if prefix == Some('g') => {
-                self.begin_answering();
-            }
             KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
             KeyCode::Char('G') => {
                 self.chat_count = None;
@@ -4509,6 +4507,54 @@ impl App {
         };
     }
 
+    /// The `g` motions that mean the same thing wherever they are pressed: they look
+    /// past whatever has the focus at the thread, the session, or the machine behind it.
+    /// Returns whether the key was one of them, so a caller can go on to the motions its
+    /// own focus is what gives meaning — `gg`, `ge`, `gJ`.
+    ///
+    /// Every letter here is spoken for in [`crate::config::TAKEN_KEYS`], so a program
+    /// bound to `g<key>` can never be one of them and is safe to try last.
+    fn global_prefix_key(&mut self, key: KeyEvent) -> bool {
+        // A chord after `g` is still the chord: `g` then Ctrl-y scrolls a line, it does
+        // not yank.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return false;
+        }
+        let KeyCode::Char(c) = key.code else {
+            return false;
+        };
+        match c {
+            'x' => self.open_under_cursor(false),
+            't' => self.switch_tmux_session(),
+            'P' => self.split_tmux_pane(),
+            'N' => self.new_tmux_window(),
+            'D' => self.reveal_directory(),
+            'y' => self.yank_last_assistant(),
+            'E' => self.view_conversation(),
+            '!' => self.open_shell(),
+            'w' => self.toggle_draft_worktree(),
+            'T' => self.open_tasks(),
+            'A' => self.open_agents(),
+            'S' => self.open_terminals(),
+            'W' => self.open_worktrees(),
+            's' => {
+                let id = self.current_thread_id.clone();
+                self.toggle_settled(id);
+            }
+            'a' => {
+                if !self.begin_answering() {
+                    self.toast("no question pending", false);
+                }
+            }
+            bound if self.bound(bound) => self.open_program(bound),
+            _ => return false,
+        }
+        true
+    }
+
     fn take_prefix(&mut self) -> Option<char> {
         let (prefix, at) = self.pending_prefix.take()?;
         match self.prefix_timeout {
@@ -4589,6 +4635,9 @@ impl App {
             .as_ref()
             .is_some_and(|t| !t.pending_approvals().is_empty());
         // Chat and app keys first; whatever is left edits the composer.
+        if prefix == Some('g') && self.global_prefix_key(key) {
+            return;
+        }
         match key.code {
             KeyCode::Char('d') if ctrl => return self.scroll_by(height as isize / 2),
             KeyCode::Char('u') if ctrl => return self.scroll_by(-(height as isize / 2)),
@@ -4599,37 +4648,9 @@ impl App {
             KeyCode::PageDown => return self.scroll_by(height as isize),
             KeyCode::PageUp => return self.scroll_by(-(height as isize)),
             KeyCode::Char('g') if prefix == Some('g') => return self.composer.vim_top(),
-            KeyCode::Char('x') if prefix == Some('g') => return self.open_under_cursor(false),
-            KeyCode::Char('t') if prefix == Some('g') => return self.switch_tmux_session(),
-            KeyCode::Char('P') if prefix == Some('g') => return self.split_tmux_pane(),
-            KeyCode::Char('N') if prefix == Some('g') => return self.new_tmux_window(),
-            KeyCode::Char('y') if prefix == Some('g') => return self.yank_last_assistant(),
-            KeyCode::Char('s') if prefix == Some('g') => {
-                let id = self.current_thread_id.clone();
-                self.toggle_settled(id);
-                return;
-            }
-            KeyCode::Char(key) if prefix == Some('g') && self.bound(key) => {
-                return self.open_program(key);
-            }
-            KeyCode::Char('!') if prefix == Some('g') => return self.open_shell(),
-            KeyCode::Char('w') if prefix == Some('g') => return self.toggle_draft_worktree(),
-            KeyCode::Char('T') if prefix == Some('g') => return self.open_tasks(),
-            KeyCode::Char('A') if prefix == Some('g') => return self.open_agents(),
-            KeyCode::Char('S') if prefix == Some('g') => return self.open_terminals(),
-            KeyCode::Char('W') if prefix == Some('g') => return self.open_worktrees(),
             KeyCode::Char('e') if prefix == Some('g') => return self.edit_composer(),
-            KeyCode::Char('E') if prefix == Some('g') => return self.view_conversation(),
             // `J` is the next thread, so the join Vim puts there is on `gJ`.
             KeyCode::Char('J') if prefix == Some('g') => return self.composer.vim_join(2),
-            KeyCode::Char('a') if prefix == Some('g') => {
-                if question_pending {
-                    self.begin_answering();
-                } else {
-                    self.toast("no question pending", false);
-                }
-                return;
-            }
             KeyCode::Char('g') if !editing => {
                 self.pending_prefix = Some(('g', Instant::now()));
                 return;
@@ -7090,6 +7111,69 @@ mod tests {
         }))
         .expect("a running turn the server could have sent");
         ThreadState::from_snapshot(snapshot)
+    }
+
+    /// A thread sitting on a question, in the shape the server sends one.
+    fn awaiting_question() -> ThreadState {
+        let snapshot: ThreadDetailSnapshot = serde_json::from_value(serde_json::json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p", "title": "Test",
+                "modelSelection": {"instanceId": "instance", "model": "a-model"},
+                "runtimeMode": "full-access", "latestTurn": null, "session": null,
+                "messages": [{"id": "m1", "role": "assistant", "text": "the answer"}],
+                "activities": [{
+                    "id": "a1", "kind": "user-input.requested",
+                    "payload": {
+                        "requestId": "r1",
+                        "questions": [{
+                            "id": "q1", "question": "Which one?",
+                            "options": [{"label": "this one"}, {"label": "that one"}]
+                        }]
+                    }
+                }]
+            }
+        }))
+        .expect("a question the server could have sent");
+        ThreadState::from_snapshot(snapshot)
+    }
+
+    /// The question panel is a panel over a thread, not a room with the door shut. The
+    /// `g` motions that go and look at the thread still work while it is up, so an
+    /// answer can be checked against what was said before it is given.
+    #[test]
+    fn the_question_panel_lets_the_g_motions_past() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(awaiting_question());
+        app.begin_answering();
+        assert_eq!(app.mode, Mode::Question);
+
+        typed(&mut app, "g");
+        assert_eq!(app.waiting_prefix(), Some('g'), "`g` waits for its motion");
+        typed(&mut app, "y");
+        assert_eq!(app.mode, Mode::Question, "yanking leaves the panel up");
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|(t, _, _)| t.contains("yanked")),
+            "gy yanked the last assistant message"
+        );
+
+        // A motion that opens something else takes the panel down, the way it does from
+        // normal mode, and `ga` brings it back.
+        typed(&mut app, "gT");
+        assert_eq!(app.mode, Mode::Tasks);
+
+        // The panel's own letters are still its own: `y` on its own is not a yank.
+        app.mode = Mode::Question;
+        typed(&mut app, "j");
+        assert_eq!(
+            app.question.as_ref().expect("a draft").highlight,
+            1,
+            "j still moves the highlight"
+        );
     }
 
     fn awaiting_approval() -> ThreadState {
