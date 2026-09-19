@@ -77,7 +77,7 @@ impl vt100::Callbacks for Answers {
 const ZERO_WIDTH_JOINER: char = '\u{200D}';
 
 /// One of the two letters a flag is spelled with, alone in a cell.
-fn is_regional(text: &str) -> bool {
+pub fn is_regional(text: &str) -> bool {
     let mut chars = text.chars();
     matches!(
         (chars.next(), chars.next()),

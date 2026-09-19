@@ -173,31 +173,52 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         _ => {}
     }
 
-    pin_emoji_widths(frame.buffer_mut());
+    pin_symbol_widths(frame.buffer_mut());
 }
 
-/// Tell the diff how wide an emoji presentation sequence really is.
+/// How many columns the terminal gives a symbol, where that is not what
+/// `unicode-width` measures.
 ///
-/// A symbol carrying U+FE0F is two columns wide, and by default the diff hedges: it
-/// writes the emoji and then a blank over the column the emoji covers, in case the
-/// terminal drew the sequence one column wide. A terminal that gives the sequence the two
-/// columns Unicode asks for has already moved its cursor past both, so that blank lands
-/// on the column *after* the emoji and every cell printed after it in the same run slides
-/// one column right. The line reads as mangled until something forces a full repaint.
+/// A regional indicator on its own is half a flag: two of them side by side are one
+/// flag two columns wide, and `unicode-width` measures one of them at a single column
+/// on the way there. Terminals draw the lone letter in a box, two columns wide, so a
+/// line with an odd number of them in it is a line the two disagree about.
 ///
-/// Pinning the width takes the hedge off: the emoji is then diffed like any other wide
-/// symbol, the way a CJK glyph already is, and the next cell printed comes with a cursor
-/// move of its own.
-fn pin_emoji_widths(buffer: &mut Buffer) {
+/// Only the diff is told. The layout still measures the lone letter at a column, so its
+/// box is drawn over whatever follows it — which is a smaller wrong than a line that has
+/// slid sideways, and the only one available without a width table of tria's own.
+fn drawn_width(symbol: &str) -> usize {
+    match crate::term::is_regional(symbol) {
+        true => 2,
+        false => symbol.width(),
+    }
+}
+
+/// Tell the diff how wide every symbol on the screen really is.
+///
+/// Drawing a frame means writing runs of neighbouring cells with one cursor move in
+/// front of each run, which is right only while tria and the terminal agree about how
+/// many columns each symbol takes. Two things break that agreement, and both are told
+/// the same way — by pinning the width on the cell, which leaves the diff stepping over
+/// the symbol the way it steps over a CJK glyph, and the cell after it reached by a
+/// cursor move of its own.
+///
+/// The first is a symbol carrying U+FE0F. Left alone the diff hedges on those: it writes
+/// the emoji and then a blank over the second of the two columns, in case the terminal
+/// drew the sequence one column wide. A terminal that gives it both columns has already
+/// moved its cursor past them, so the blank lands on the column after the emoji instead.
+///
+/// The second is a symbol [`drawn_width`] knows better than `unicode-width` does.
+///
+/// Either way the rest of the line slides a column, and stays slid: the next frame has
+/// no reason to touch cells it believes are already right, so the marks sit there until
+/// something paints the whole screen again.
+fn pin_symbol_widths(buffer: &mut Buffer) {
     for cell in &mut buffer.content {
         if cell.diff_option != CellDiffOption::None {
             continue;
         }
-        let symbol = cell.symbol();
-        if !symbol.contains('\u{FE0F}') {
-            continue;
-        }
-        if let Some(width) = NonZeroU16::new(symbol.width() as u16)
+        if let Some(width) = NonZeroU16::new(drawn_width(cell.symbol()) as u16)
             && width.get() > 1
         {
             cell.diff_option = CellDiffOption::ForcedWidth(width);
@@ -4171,7 +4192,7 @@ mod tests {
         let [before, after] = [before, after].map(|text| {
             let mut buffer = Buffer::empty(area);
             buffer.set_string(0, 0, text, Style::default());
-            pin_emoji_widths(&mut buffer);
+            pin_symbol_widths(&mut buffer);
             buffer
         });
         let mut written = Vec::new();
@@ -4254,8 +4275,20 @@ mod redraw {
         out
     }
 
-    /// A terminal that gives every cluster the columns `unicode-width` asks for, which
-    /// is what the ones people use do — the client's own width probe said so.
+    /// What a terminal does, held apart from what the client assumes it does: every
+    /// cluster gets the columns `unicode-width` asks for, except a regional indicator
+    /// on its own, which is drawn as a letter in a box and takes two. Written out again
+    /// here rather than read from [`drawn_width`], so that the test is an account of
+    /// the terminal the width probe measured and not a restatement of the client.
+    fn measured_width(cluster: &str) -> usize {
+        let mut chars = cluster.chars();
+        match (chars.next(), chars.next()) {
+            (Some('\u{1F1E6}'..='\u{1F1FF}'), None) => 2,
+            _ => cluster.width(),
+        }
+    }
+
+    /// A terminal that draws every cluster at its [`measured_width`].
     struct Screen {
         grid: Vec<Vec<String>>,
         row: usize,
@@ -4314,7 +4347,7 @@ mod redraw {
 
         fn print(&mut self, text: &str) {
             for cluster in clusters(text) {
-                let width = cluster.width().max(1);
+                let width = measured_width(&cluster).max(1);
                 if self.row >= self.grid.len() || self.col + width > self.width {
                     continue;
                 }
@@ -4337,7 +4370,7 @@ mod redraw {
             while lead > 0 && self.grid[row][lead].is_empty() {
                 lead -= 1;
             }
-            let width = self.grid[row][lead].width().max(1);
+            let width = measured_width(&self.grid[row][lead]).max(1);
             for column in lead..(lead + width).min(self.width) {
                 self.grid[row][column] = " ".to_string();
             }
