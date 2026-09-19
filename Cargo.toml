@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "A terminal chat client for T3 Code"
 license = "MIT"
+repository = "https://github.com/Pajn/tria"
+readme = "README.md"
+keywords = ["tui", "terminal", "chat", "ratatui", "t3code"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
