@@ -2967,6 +2967,9 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  mouse drag              select chat text; released, it is copied"),
         Line::from("  Ctrl-c                  interrupt the running turn, or the background work"),
         Line::from("                          left without one; anywhere else, it is Esc"),
+        Line::from(
+            "  Ctrl-l                  paint the screen again, if anything else wrote on it",
+        ),
         // The setting as it stands rather than as it ships: somebody reading this to
         // find out how long the pair holds together wants the answer, not the default.
         Line::from("  g  z                    shown on the status bar while they wait"),
@@ -3434,7 +3437,7 @@ mod tests {
     }
 
     /// The same thread, with the agent doing the talking: markdown, and so pictures.
-    fn thread_answering(text: &str) -> crate::state::ThreadState {
+    pub(super) fn thread_answering(text: &str) -> crate::state::ThreadState {
         let snapshot: crate::model::ThreadDetailSnapshot = serde_json::from_value(json!({
             "snapshotSequence": 1,
             "thread": {
@@ -4201,5 +4204,240 @@ mod tests {
         let cjk = emitted(filler, "and \u{30B3}in the mid");
         assert_eq!(cursor_moves(&emoji), cursor_moves(&cjk));
         assert_eq!(cursor_moves(&emoji), ["1;2", "1;7"]);
+    }
+}
+
+/// Drawing a frame means telling the terminal only what changed since the last one, so
+/// a frame is only ever as right as the last one was. These tests replay what the
+/// backend writes through a terminal of their own and hold the result against a frame
+/// painted from nothing: the two have to agree, or the screen drifts a little further
+/// from the truth with every redraw.
+#[cfg(test)]
+mod redraw {
+    use std::io::Write;
+
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::{Terminal, TerminalOptions, Viewport};
+    use unicode_width::UnicodeWidthStr;
+
+    use super::*;
+    use crate::app::App;
+
+    const WIDTH: u16 = 100;
+    const HEIGHT: u16 = 20;
+
+    /// Split into something close enough to grapheme clusters for emoji: a joiner or a
+    /// presentation selector belongs to what came before it, and so does the second of
+    /// a pair of regional indicators.
+    fn clusters(text: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for c in text.chars() {
+            let extend = match out.last() {
+                None => false,
+                Some(last) => {
+                    c == '\u{FE0F}'
+                        || c == '\u{200D}'
+                        || last.ends_with('\u{200D}')
+                        || (('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
+                            && last.chars().count() == 1
+                            && last
+                                .chars()
+                                .next()
+                                .is_some_and(|f| ('\u{1F1E6}'..='\u{1F1FF}').contains(&f)))
+                }
+            };
+            match (extend, out.last_mut()) {
+                (true, Some(last)) => last.push(c),
+                _ => out.push(c.to_string()),
+            }
+        }
+        out
+    }
+
+    /// A terminal that gives every cluster the columns `unicode-width` asks for, which
+    /// is what the ones people use do — the client's own width probe said so.
+    struct Screen {
+        grid: Vec<Vec<String>>,
+        row: usize,
+        col: usize,
+        width: usize,
+    }
+
+    impl Screen {
+        fn new(width: usize, height: usize) -> Self {
+            Self {
+                grid: vec![vec![" ".to_string(); width]; height],
+                row: 0,
+                col: 0,
+                width,
+            }
+        }
+
+        fn feed(&mut self, stream: &str) {
+            let mut rest = stream;
+            while !rest.is_empty() {
+                match rest.find('\u{1b}') {
+                    None => {
+                        self.print(rest);
+                        break;
+                    }
+                    Some(at) => {
+                        let (text, escape) = rest.split_at(at);
+                        self.print(text);
+                        rest = self.escape(&escape[1..]);
+                    }
+                }
+            }
+        }
+
+        /// Act on one escape sequence and return what is left of the stream. Only the
+        /// cursor moves matter here; colour and the rest are read past.
+        fn escape<'a>(&mut self, rest: &'a str) -> &'a str {
+            let Some(body) = rest.strip_prefix('[') else {
+                return &rest[rest.char_indices().nth(1).map_or(rest.len(), |(i, _)| i)..];
+            };
+            let Some((at, final_byte)) = body
+                .char_indices()
+                .find(|(_, c)| c.is_ascii_alphabetic() || *c == '@' || *c == '`')
+            else {
+                return "";
+            };
+            if final_byte == 'H' {
+                let mut parts = body[..at].split(';');
+                let row: usize = parts.next().unwrap_or("1").parse().unwrap_or(1);
+                let col: usize = parts.next().unwrap_or("1").parse().unwrap_or(1);
+                self.row = row.saturating_sub(1);
+                self.col = col.saturating_sub(1);
+            }
+            &body[at + final_byte.len_utf8()..]
+        }
+
+        fn print(&mut self, text: &str) {
+            for cluster in clusters(text) {
+                let width = cluster.width().max(1);
+                if self.row >= self.grid.len() || self.col + width > self.width {
+                    continue;
+                }
+                // Writing over any part of a wide cluster takes the whole of it away.
+                for column in self.col..self.col + width {
+                    self.blank(column);
+                }
+                self.grid[self.row][self.col] = cluster;
+                for filler in 1..width {
+                    self.grid[self.row][self.col + filler] = String::new();
+                }
+                self.col += width;
+            }
+        }
+
+        /// Blank a column, and with it the rest of whatever cluster it is part of.
+        fn blank(&mut self, column: usize) {
+            let row = self.row;
+            let mut lead = column;
+            while lead > 0 && self.grid[row][lead].is_empty() {
+                lead -= 1;
+            }
+            let width = self.grid[row][lead].width().max(1);
+            for column in lead..(lead + width).min(self.width) {
+                self.grid[row][column] = " ".to_string();
+            }
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.grid.iter().map(|row| row.concat()).collect()
+        }
+    }
+
+    /// Lines that share no column with the line above, so a scroll changes every cell
+    /// of every row and the diff walks each row as one long run — which is where a
+    /// column written in the wrong place carries into the rest of the line. Every kind
+    /// of symbol wider than the column it starts in gets a turn: an emoji built out of
+    /// a joiner and two presentation selectors, one with a selector and no joiner, one
+    /// with neither, a pair of regional indicators, one on its own, and an arrow.
+    fn message() -> String {
+        const WIDE: [&str; 8] = [
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{26A7}\u{FE0F}",
+            "\u{26A7}\u{FE0F}",
+            "\u{1F308}",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            "\u{1F1F8}\u{1F1EA}",
+            "\u{1F1F8}",
+            "\u{2190}",
+            "\u{26A0}\u{FE0F}",
+        ];
+        const WORDS: [&str; 8] = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ];
+        (1..=40)
+            .map(|n| {
+                let words: Vec<&str> = (0..5).map(|w| WORDS[(n * 3 + w * 5) % 8]).collect();
+                let (before, after) = words.split_at(2);
+                format!(
+                    "- {} {} {} {} {n}",
+                    before.join(" "),
+                    WIDE[n % 8],
+                    after.join(" "),
+                    WIDE[(n * 5 + 3) % 8],
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Everything the backend writes while drawing `frames` frames, scrolling the chat
+    /// up a line between them.
+    fn scrolled(app: &mut App, frames: usize) -> Vec<u8> {
+        let mut stream: Vec<u8> = Vec::new();
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(&mut stream),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, WIDTH, HEIGHT)),
+            },
+        )
+        .unwrap();
+        for frame in 0..frames {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            if frame + 1 < frames {
+                app.on_key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('y'),
+                    crossterm::event::KeyModifiers::CONTROL,
+                ));
+                // The chat is drawn from a cache the thread's revision keys, and only a
+                // change to the thread bumps it. A scroll is not one.
+                if let Some(thread) = app.thread.as_mut() {
+                    thread.revision += 1;
+                }
+            }
+        }
+        terminal.backend_mut().flush().unwrap();
+        drop(terminal);
+        stream
+    }
+
+    /// A screen scrolled to where it is has to look like a screen painted there. An
+    /// emoji that the diff walked past by the wrong number of columns pulls the rest of
+    /// its line along with it, and the line stays wrong until something paints the whole
+    /// screen again — which is why a resize used to put it right and the next scroll
+    /// broke it once more.
+    #[tokio::test]
+    async fn a_scrolled_screen_reads_the_same_as_a_painted_one() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(tests::thread_answering(&message()));
+
+        let stream = scrolled(&mut app, 6);
+        let mut screen = Screen::new(WIDTH as usize, HEIGHT as usize);
+        screen.feed(&String::from_utf8_lossy(&stream));
+
+        // The same state again, on a terminal that has never been written to.
+        let fresh = scrolled(&mut app, 1);
+        let mut clean = Screen::new(WIDTH as usize, HEIGHT as usize);
+        clean.feed(&String::from_utf8_lossy(&fresh));
+
+        let (scrolled, clean) = (screen.lines(), clean.lines());
+        for (row, (a, b)) in scrolled.iter().zip(clean.iter()).enumerate() {
+            assert_eq!(a, b, "row {row} drifted");
+        }
     }
 }

@@ -469,6 +469,9 @@ pub struct App {
     pub spinner: usize,
     /// The `g` or `z` waiting for the key that completes it, and when it was pressed.
     pub(crate) pending_prefix: Option<(char, Instant)>,
+    /// Set by Ctrl-l: the next frame is painted over a cleared screen rather than
+    /// diffed against the last one.
+    pub repaint: bool,
     /// Filled by the renderer each frame so key handling can page correctly.
     pub chat_viewport: (usize, usize),
     /// First visible sidebar row; the renderer reads and clamps it.
@@ -636,6 +639,7 @@ impl App {
             toast: None,
             spinner: 0,
             pending_prefix: None,
+            repaint: false,
             chat_viewport: (0, 0),
             sidebar_offset: 0,
             sidebar_reveal: false,
@@ -4425,7 +4429,7 @@ impl App {
 
     // ── Key handling ───────────────────────────────────────────────────
 
-    fn on_key(&mut self, key: KeyEvent) {
+    pub(crate) fn on_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return;
         }
@@ -4442,11 +4446,11 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        // Ctrl-c, the one global chord. In vim it is Esc under another name: it leaves
-        // what is being typed. So it does here, whatever is being typed — a message, a
-        // command, a search, a list — rather than reaching past the thing in front of
-        // you to the turn behind it. Normal mode is where there is nothing to leave,
-        // and that is where it stops the turn.
+        // Ctrl-c, the first of the two global chords. In vim it is Esc under another
+        // name: it leaves what is being typed. So it does here, whatever is being
+        // typed — a message, a command, a search, a list — rather than reaching past
+        // the thing in front of you to the turn behind it. Normal mode is where there
+        // is nothing to leave, and that is where it stops the turn.
         if ctrl && key.code == KeyCode::Char('c') {
             if self.mode != Mode::Normal {
                 return self.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -4457,6 +4461,15 @@ impl App {
             } else {
                 self.toast("nothing running · :q to quit", false);
             }
+            return;
+        }
+        // Ctrl-l, the second. tria draws the screen by telling the terminal
+        // what changed since the last one, which is only ever right while nothing else
+        // writes there. Something that did — a stray line from another program, a
+        // terminal that took a character a different number of columns wide — leaves
+        // marks the next frame has no reason to touch. This paints the lot again.
+        if ctrl && key.code == KeyCode::Char('l') {
+            self.repaint = true;
             return;
         }
         match self.mode {
@@ -5912,6 +5925,11 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     let mut tick = tokio::time::interval(TICK);
 
     let result: Result<()> = loop {
+        if std::mem::take(&mut app.repaint)
+            && let Err(err) = terminal.clear()
+        {
+            break Err(err.into());
+        }
         if let Err(err) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
             break Err(err.into());
         }
