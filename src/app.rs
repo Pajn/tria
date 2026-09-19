@@ -527,7 +527,7 @@ pub struct App {
     /// How that checkout stands against its upstream.
     pub vcs_remote: Option<crate::model::VcsRemote>,
     /// The directory the watch is on, so it only resubscribes when the thread moves.
-    vcs_cwd: Option<String>,
+    pub(crate) vcs_cwd: Option<String>,
     /// Set between asking for a thread and hearing whether it was made.
     pending_create: Option<PendingCreate>,
     /// Set when the open thread stopped receiving updates, until they come back.
@@ -3173,12 +3173,25 @@ impl App {
 
     fn thread_directory(&self) -> Option<String> {
         let shell = self.thread.as_ref().map(|t| &t.detail.shell)?;
+        self.directory_of(shell)
+    }
+
+    /// Where a thread works: the worktree it was given one, and otherwise the project's
+    /// own checkout, which every thread without a worktree of its own shares.
+    fn directory_of(&self, shell: &crate::model::ThreadShell) -> Option<String> {
         shell.worktree_path.clone().or_else(|| {
             self.shell
                 .projects
                 .get(&shell.project_id)
                 .map(|p| p.workspace_root.clone())
         })
+    }
+
+    /// Whether a thread works in the checkout tria is watching. One is watched at a
+    /// time and it is the open thread's, but a checkout is not a thread's to itself:
+    /// what is known of this one is true of every thread that works in it.
+    pub fn shares_watched_checkout(&self, thread: &crate::model::ThreadShell) -> bool {
+        self.vcs_cwd.is_some() && self.directory_of(thread) == self.vcs_cwd
     }
 
     /// `gD` and `:reveal`: show the thread's directory in whatever this machine browses

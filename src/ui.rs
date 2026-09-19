@@ -748,12 +748,15 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     // text stops short of it whether or not this project has one.
                     let title_width = width.saturating_sub(ICON_COLUMN + 4);
                     let title = fit(&t.title, title_width);
-                    // What the thread is working in: its own branch, the checkout tria
-                    // is watching when this is the thread whose checkout that is, and
-                    // failing both the project it belongs to, which is the one thing
-                    // about it that is always known.
+                    // Threads that were not given a worktree work in the project's own
+                    // checkout, so the one tria watches is several threads' at once and
+                    // what it knows is true of each of them.
+                    let watched = app.shares_watched_checkout(t);
+                    // What the thread is working in: its own branch, the branch of the
+                    // checkout it shares with the watched one, and failing both the
+                    // project it belongs to, which is always known.
                     let mut under = t.branch.clone().or_else(|| {
-                        is_current
+                        watched
                             .then(|| app.vcs.as_ref().and_then(|vcs| vcs.ref_name.clone()))
                             .flatten()
                     });
@@ -763,7 +766,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     // Where the checkout stands goes on the right of the branch it is
                     // the state of. It needs room of its own, and the branch is what
                     // the line is for, so it is left off rather than squeezed in.
-                    let mut marks = match is_current {
+                    let mut marks = match watched {
                         true => git_marks(app),
                         false => Vec::new(),
                     };
@@ -3946,18 +3949,30 @@ mod tests {
         assert_eq!(nx, stop + 2);
     }
 
-    /// The open thread's row says where its checkout stands, on the right of the branch
-    /// the state belongs to. Only that row: the checkout being watched is the open
-    /// thread's, and the numbers mean nothing under anybody else's branch.
+    /// Every row working in the watched checkout says where it stands, on the right of
+    /// the branch the state belongs to. Rows on a checkout of their own say nothing:
+    /// the numbers would be a lie under somebody else's branch.
     #[test]
-    fn the_open_threads_row_says_where_its_checkout_stands() {
+    fn the_rows_on_the_watched_checkout_say_where_it_stands() {
         picture::draw_in_halfblocks();
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         app.sidebar_layout = SidebarLayout::TwoLine;
         with_threads(&mut app);
+        // A second thread in the project's checkout, which is the one being watched.
+        app.shell.apply(crate::model::ShellItem::ThreadUpserted {
+            sequence: 2,
+            thread: serde_json::from_value(json!({
+                "id": "t4", "projectId": "p1",
+                "title": "Teach the picker",
+                "modelSelection": {"instanceId": "i", "model": "m"},
+                "createdAt": "2026-01-01T00:00:04Z"
+            }))
+            .unwrap(),
+        });
         app.current_thread_id = Some("t1".into());
+        app.vcs_cwd = Some("/src/tria".into());
         app.vcs = Some(
             serde_json::from_value(json!({
                 "isRepo": true,
@@ -3976,22 +3991,28 @@ mod tests {
                 .position(|line| line.contains(needle))
                 .unwrap_or_else(|| panic!("{needle} should be listed"))
         };
-        let open = &lines[row("Can we add a way to sto") + 1];
         let marks = "● +252 −316  ↑1";
-        let at = open
-            .find(marks)
-            .unwrap_or_else(|| panic!("the checkout's state is on the row · {open}"));
-        // Hard against the column the branch stops short of for the project's icon,
-        // rather than trailing the branch wherever that happens to end.
-        let text_end = 3 + (SIDEBAR_WIDTH as usize - 1 - ICON_COLUMN - 4);
-        assert_eq!(
-            open[..at].chars().count() + marks.chars().count(),
-            text_end,
-            "{open}"
-        );
-        assert!(open.contains("main"), "the branch is still named · {open}");
+        for title in ["Can we add a way to sto", "Teach the picker"] {
+            let line = &lines[row(title) + 1];
+            let at = line
+                .find(marks)
+                .unwrap_or_else(|| panic!("the checkout's state is on the row · {line}"));
+            // Hard against the column the branch stops short of for the project's icon,
+            // rather than trailing the branch wherever that happens to end.
+            let text_end = 3 + (SIDEBAR_WIDTH as usize - 1 - ICON_COLUMN - 4);
+            assert_eq!(
+                line[..at].chars().count() + marks.chars().count(),
+                text_end,
+                "{line}"
+            );
+            assert!(line.contains("main"), "the branch is still named · {line}");
+        }
 
-        let other = &lines[row("Nx cache invalidation") + 1];
+        // Its own worktree, so the watched checkout says nothing about it.
+        let elsewhere = &lines[row("Nx cache invalidation") + 1];
+        assert!(!elsewhere.contains('●'), "{elsewhere}");
+        // Another project altogether.
+        let other = &lines[row("What do I need to do") + 1];
         assert!(!other.contains('●'), "{other}");
     }
 
@@ -4006,6 +4027,7 @@ mod tests {
         app.sidebar_layout = SidebarLayout::TwoLine;
         with_threads(&mut app);
         app.current_thread_id = Some("t2".into());
+        app.vcs_cwd = Some("/worktrees/t3code-afa6757e".into());
         app.vcs = Some(
             serde_json::from_value(json!({
                 "isRepo": true,
