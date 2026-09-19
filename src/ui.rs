@@ -1049,7 +1049,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             match &app.status {
                 Status::Connecting => "connecting…",
                 Status::Reconnecting { .. } => "reconnecting…",
-                Status::Failed(_) => "connection failed",
+                Status::Failed(_) => "not connected",
                 Status::Connected => "loading threads…",
             }
         } else {
@@ -1646,7 +1646,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Yellow),
             format!(" reconnecting #{attempt}"),
         ),
-        Status::Failed(_) => ("●", Style::default().fg(Color::Red), " auth failed".into()),
+        // What went wrong is a sentence, and it goes on the line under the header where
+        // there is room for one. Here it is the dot that matters.
+        Status::Failed(_) => (
+            "●",
+            Style::default().fg(Color::Red),
+            " not connected".into(),
+        ),
     };
     spans.push(Span::styled(dot, dot_style));
     spans.push(Span::styled(
@@ -2693,7 +2699,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :approve [n]  :stop  :stop! (the session)  :older  :answer  :dismiss  :sidebar  :q",
+            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :approve [n]  :stop  :stop! (the session)  :older  :answer  :dismiss  :reconnect  :sidebar  :q",
         ),
     ]);
     let width = 72.min(area.width);

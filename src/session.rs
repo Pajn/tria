@@ -49,6 +49,10 @@ pub enum Request {
     },
     /// Re-read the watched checkout, for when something outside the server changed it.
     RefreshVcs,
+    /// Throw away the connection and make another. What `:reconnect` sends: the way
+    /// out of a connection that has settled into refusing, and a way to start again
+    /// with one that is up but has stopped being any use.
+    Reconnect,
     /// Any other RPC, for the calls that are not orchestration commands.
     Call {
         tag: String,
@@ -122,6 +126,11 @@ impl Handle {
 
     pub fn close_thread(&self) {
         let _ = self.tx.send(Request::CloseThread);
+    }
+
+    /// Drop the connection and make a new one, whatever state the old one was in.
+    pub fn reconnect(&self) {
+        let _ = self.tx.send(Request::Reconnect);
     }
 
     pub fn load_older(&self, before_cursor: &str) {
@@ -221,25 +230,33 @@ async fn run(
         if attempt == 0 {
             let _ = updates.send(Update::Status(Status::Connecting));
         }
+        let mut forced = false;
         let client = match connect(&origin, &token).await {
             Ok(client) => client,
             Err(err) => {
-                let message = err.to_string();
-                if message.contains("401") || message.contains("rejected") {
-                    let _ = updates.send(Update::Status(Status::Failed(message)));
-                    // Auth failures do not resolve by retrying. Keep serving dispatch
-                    // requests with an error so the UI can report it.
-                    while let Some(request) = requests.recv().await {
-                        if let Request::Dispatch { reply, .. } = request {
-                            let _ = reply.send(Err(anyhow!("not connected")));
-                        }
+                // Told apart by the status the server sent rather than by what the
+                // message happens to read like: a 503 from a server coming up used to
+                // be read as a refused token, and the client gave up on a server that
+                // was seconds from answering.
+                let settled = err
+                    .downcast_ref::<auth::HttpStatus>()
+                    .filter(|refusal| refusal.is_settled());
+                if let Some(refusal) = settled {
+                    let _ = updates.send(Update::Status(Status::Failed(refusal.report())));
+                    // Nothing here resolves by asking again, so wait to be told to.
+                    // Requests still get an answer, because a UI left with none of them
+                    // coming back is a UI that has stopped rather than one that is
+                    // saying what is wrong.
+                    if wait_for_reconnect(&mut requests, &mut open).await {
+                        attempt = 0;
+                        continue;
                     }
                     return;
                 }
                 attempt += 1;
                 let _ = updates.send(Update::Status(Status::Reconnecting {
                     attempt,
-                    error: message,
+                    error: err.to_string(),
                 }));
                 tokio::time::sleep(backoff(attempt)).await;
                 continue;
@@ -353,6 +370,10 @@ async fn run(
                             open = Some(OpenThread { id, last_sequence: None, subscription, attempts: 0 });
                         }
                         Request::CloseThread => open = None,
+                        Request::Reconnect => {
+                            forced = true;
+                            break;
+                        }
                         Request::Attach { thread_id, terminal_id, cwd, cols, rows } => {
                             let payload = json!({
                                 "threadId": thread_id,
@@ -545,19 +566,59 @@ async fn run(
             }
         }
 
-        attempt += 1;
-        let _ = updates.send(Update::Status(Status::Reconnecting {
-            attempt,
-            error: "connection lost".into(),
-        }));
         if let Some(o) = open.as_mut() {
             o.subscription = None;
             // A new connection is a fresh start: what the old one could not keep up says
             // nothing about what this one will manage.
             o.attempts = 0;
         }
+        // A connection thrown away on purpose is not a connection that failed: it is
+        // asked for again at once, and nothing reports trouble that nobody had.
+        if forced {
+            attempt = 0;
+            continue;
+        }
+        attempt += 1;
+        let _ = updates.send(Update::Status(Status::Reconnecting {
+            attempt,
+            error: "connection lost".into(),
+        }));
         tokio::time::sleep(backoff(attempt)).await;
     }
+}
+
+/// Sit out a connection the server has settled into refusing, until something asks for
+/// another try. `false` means the UI has gone and there is nothing left to serve.
+///
+/// Requests are still answered while waiting — with a refusal, but answered. The thread
+/// being opened is remembered too, so that a connection which does come back comes back
+/// to the thread on the screen rather than to the one that was open when it broke.
+async fn wait_for_reconnect(
+    requests: &mut mpsc::UnboundedReceiver<Request>,
+    open: &mut Option<OpenThread>,
+) -> bool {
+    while let Some(request) = requests.recv().await {
+        match request {
+            Request::Reconnect => return true,
+            Request::OpenThread(id) => {
+                *open = Some(OpenThread {
+                    id,
+                    last_sequence: None,
+                    subscription: None,
+                    attempts: 0,
+                })
+            }
+            Request::CloseThread => *open = None,
+            Request::Dispatch { reply, .. } => {
+                let _ = reply.send(Err(anyhow!("not connected")));
+            }
+            Request::Call { reply, .. } => {
+                let _ = reply.send(Err(anyhow!("not connected")));
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn forward_thread_item(

@@ -165,7 +165,8 @@ Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [l
 `archive`, `delete!`, `approve [n]`, `stop`, `stop!`,
 `older`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
 `reveal`,
-`worktree`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`, `usage`, `help`, `q`.
+`worktree`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`, `usage`,
+`reconnect`, `help`, `q`.
 
 ## Approvals
 
@@ -320,6 +321,20 @@ interrupt sent with no turn to name — `Ctrl-c`, `:stop`, or `s` in the list, w
 what the desktop app's `Monitoring · Stop` sends. `S` or `:stop!` is the harder one: it
 ends the provider session, and every process it started goes with it. Either way the
 conversation stays, and the next message starts a session again.
+
+## When the connection goes
+
+A connection that drops is asked for again with a backoff, and the streams resume from
+where they got to, so a server restarting under you costs a moment and nothing else.
+
+A server that refuses tria is the other case: a token that has been revoked or has
+expired is not going to be accepted by asking again every few seconds. That stops the
+asking, and the line under the header says what the server said and what to do about
+it: mint another credential, `tria pair <credential>` again, then `:reconnect`. Only the
+server actually refusing this client counts as that — a 500 or a 503 is a server having
+a bad minute and is asked again as anything else is.
+
+`:reconnect` throws the connection away and makes another, whatever state it was in.
 
 ## When the updates stop
 

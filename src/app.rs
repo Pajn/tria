@@ -1626,6 +1626,12 @@ impl App {
     /// the trouble that is still true a minute later, where the screen otherwise looks
     /// like everything is fine and simply quiet.
     pub fn trouble(&self) -> Option<String> {
+        // The connection first: a thread that has stopped updating is what a connection
+        // that has stopped being one looks like from the thread's end, and only one of
+        // the two is worth telling somebody about.
+        if let Status::Failed(why) = &self.status {
+            return Some(why.clone());
+        }
         let lost = self.lost_stream.as_ref()?;
         if self.current_thread_id.as_deref() != Some(lost.thread_id.as_str()) {
             return None;
@@ -3234,6 +3240,15 @@ impl App {
             "stop" | "interrupt" => self.interrupt(),
             // The harder one, for when the interrupt does not take: the session itself.
             "stop!" => self.stop_session(),
+            // The way back from a connection that has settled into refusing, and a way
+            // to start again with one that is up but has stopped being any use.
+            "reconnect" | "connect" => {
+                self.handle.reconnect();
+                if let Some(lost) = self.lost_stream.as_mut() {
+                    lost.retry_at = Instant::now();
+                }
+                self.toast("connecting again…", false);
+            }
             "sidebar" => self.sidebar_visible = !self.sidebar_visible,
             "pr" | "pull" => self.open_pull_request(true),
             "tmux" => self.switch_tmux_session(),
@@ -5832,6 +5847,42 @@ mod tests {
             item: crate::model::ThreadItem::Synchronized,
         });
         assert!(app.trouble().is_none());
+    }
+
+    /// A connection the server has settled into refusing used to be two words in the
+    /// header — "auth failed" — with the reason thrown away and no way back. The reason
+    /// is the only part of it anybody can act on.
+    #[test]
+    fn a_connection_that_will_not_come_back_says_why_and_how_to_try_again() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.current_thread_id = Some("t1".into());
+        // A thread that has stopped hearing anything, which is what a refused
+        // connection looks like from the thread's end.
+        app.on_update(Update::ThreadStreamError {
+            thread_id: "t1".into(),
+            error: "connection closed".into(),
+        });
+
+        app.on_update(Update::Status(crate::session::Status::Failed(
+            "the server would not accept the stored token (401) · run `tria pair \
+             <credential>` again, then `:reconnect`"
+                .into(),
+        )));
+        let said = app.trouble().expect("the line under the header");
+        assert!(said.contains("tria pair"), "{said}");
+        assert!(
+            !said.contains("stopped updating"),
+            "the connection outranks the thread: {said}"
+        );
+
+        // And there is a way to ask again without quitting the whole client.
+        app.run_command("reconnect");
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(crate::session::Request::Reconnect)
+        ));
     }
 
     /// The trouble belongs to the thread it happened to. One left in the meantime is not
