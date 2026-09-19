@@ -34,6 +34,10 @@ const MARK: usize = 3;
 /// the picture, which is two rows tall and so needs four columns to come out square, and
 /// one to stand it off the text.
 const ICON_COLUMN: usize = 5;
+/// The fewest columns of branch worth keeping on the second line of a two-line row.
+/// Under that there is no branch left to read, and the git state it was annotating is
+/// annotating nothing, so neither is drawn.
+const LEAST_BRANCH: usize = 4;
 /// What a selected row is tinted with: the foreground at about a third, which is a mark
 /// the eye finds without it being a block. Faint on purpose — half the list is written in
 /// grey, and a fill dark enough to read black text on is a fill grey text disappears
@@ -582,6 +586,45 @@ fn apply_selection(frame: &mut Frame, app: &App, chat: Rect) {
     }
 }
 
+/// How the checkout tria is watching stands: a dot for work that is not committed
+/// yet, the lines that work adds and takes away, and how far the branch has drifted
+/// from its upstream.
+///
+/// Only the open thread has one, because the checkout being watched is the open
+/// thread's. Saying nothing about the other rows is better than putting one thread's
+/// numbers under another thread's branch.
+fn git_marks(app: &App) -> Vec<Span<'static>> {
+    let mut marks = Vec::new();
+    if let Some(vcs) = &app.vcs
+        && vcs.has_working_tree_changes
+    {
+        let tree = &vcs.working_tree;
+        let counts = match tree.insertions + tree.deletions {
+            0 => String::new(),
+            _ => format!(" +{} −{}", tree.insertions, tree.deletions),
+        };
+        marks.push(Span::styled(
+            format!(" ●{counts}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if let Some(remote) = &app.vcs_remote {
+        if remote.ahead_count > 0 {
+            marks.push(Span::styled(
+                format!("  ↑{}", remote.ahead_count),
+                Style::default().fg(Color::Green),
+            ));
+        }
+        if remote.behind_count > 0 {
+            marks.push(Span::styled(
+                format!("  ↓{}", remote.behind_count),
+                Style::default().fg(Color::Red),
+            ));
+        }
+    }
+    marks
+}
+
 pub fn status_style(status: ThreadStatus) -> Style {
     match status {
         ThreadStatus::Approval | ThreadStatus::Question => Style::default().fg(Color::Yellow),
@@ -717,10 +760,26 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     if under.is_none() {
                         under = Some(app.shell.project_title(&t.project_id).to_string());
                     }
-                    let mut under = fit(&under.unwrap_or_default(), title_width);
-                    if holds_worktree {
-                        under = fit(&format!("⌂ {under}"), title_width);
+                    // Where the checkout stands goes on the right of the branch it is
+                    // the state of. It needs room of its own, and the branch is what
+                    // the line is for, so it is left off rather than squeezed in.
+                    let mut marks = match is_current {
+                        true => git_marks(app),
+                        false => Vec::new(),
+                    };
+                    let mut taken: usize = marks.iter().map(|s| s.content.chars().count()).sum();
+                    if title_width.saturating_sub(taken) < LEAST_BRANCH {
+                        marks.clear();
+                        taken = 0;
                     }
+                    let room = title_width - taken;
+                    let mut under = fit(&under.unwrap_or_default(), room);
+                    if holds_worktree {
+                        under = fit(&format!("⌂ {under}"), room);
+                    }
+                    let gap = " ".repeat(room.saturating_sub(under.chars().count()));
+                    let mut second = vec![Span::styled(format!("   {under}{gap}"), dim)];
+                    second.extend(marks);
                     // The mark is the status column over both lines: a bar beside the
                     // thread, which says which row is selected without covering the two
                     // lines it is made of.
@@ -729,7 +788,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                             Span::styled(format!(" {glyph} "), glyph_style),
                             Span::styled(title, title_style),
                         ]),
-                        Line::from(Span::styled(format!("   {under}"), dim)),
+                        Line::from(second),
                     ]);
                 }
                 // The glyph carries the status; the right column always names the project.
@@ -973,34 +1032,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             ));
         }
-        if let Some(vcs) = &app.vcs
-            && vcs.has_working_tree_changes
-        {
-            let tree = &vcs.working_tree;
-            let counts = if tree.insertions + tree.deletions > 0 {
-                format!(" +{} −{}", tree.insertions, tree.deletions)
-            } else {
-                String::new()
-            };
-            spans.push(Span::styled(
-                format!(" ●{counts}"),
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-        if let Some(remote) = &app.vcs_remote {
-            if remote.ahead_count > 0 {
-                spans.push(Span::styled(
-                    format!("  ↑{}", remote.ahead_count),
-                    Style::default().fg(Color::Green),
-                ));
-            }
-            if remote.behind_count > 0 {
-                spans.push(Span::styled(
-                    format!("  ↓{}", remote.behind_count),
-                    Style::default().fg(Color::Red),
-                ));
-            }
-        }
+        spans.extend(git_marks(app));
         // Only worth naming when the thread has a checkout of its own.
         if let Some(worktree) = shell.worktree_path.as_deref().and_then(worktree_name) {
             spans.push(Span::styled(
@@ -3912,6 +3944,87 @@ mod tests {
         assert!(lines[stop + 1].trim() == "tria", "{}", lines[stop + 1]);
         // And the rows that follow start two lines apart, not one.
         assert_eq!(nx, stop + 2);
+    }
+
+    /// The open thread's row says where its checkout stands, on the right of the branch
+    /// the state belongs to. Only that row: the checkout being watched is the open
+    /// thread's, and the numbers mean nothing under anybody else's branch.
+    #[test]
+    fn the_open_threads_row_says_where_its_checkout_stands() {
+        picture::draw_in_halfblocks();
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.sidebar_layout = SidebarLayout::TwoLine;
+        with_threads(&mut app);
+        app.current_thread_id = Some("t1".into());
+        app.vcs = Some(
+            serde_json::from_value(json!({
+                "isRepo": true,
+                "refName": "main",
+                "hasWorkingTreeChanges": true,
+                "workingTree": {"insertions": 252, "deletions": 316}
+            }))
+            .unwrap(),
+        );
+        app.vcs_remote = Some(serde_json::from_value(json!({"aheadCount": 1})).unwrap());
+
+        let lines: Vec<String> = sidebar_text(&mut app).lines().map(str::to_string).collect();
+        let row = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} should be listed"))
+        };
+        let open = &lines[row("Can we add a way to sto") + 1];
+        let marks = "● +252 −316  ↑1";
+        let at = open
+            .find(marks)
+            .unwrap_or_else(|| panic!("the checkout's state is on the row · {open}"));
+        // Hard against the column the branch stops short of for the project's icon,
+        // rather than trailing the branch wherever that happens to end.
+        let text_end = 3 + (SIDEBAR_WIDTH as usize - 1 - ICON_COLUMN - 4);
+        assert_eq!(
+            open[..at].chars().count() + marks.chars().count(),
+            text_end,
+            "{open}"
+        );
+        assert!(open.contains("main"), "the branch is still named · {open}");
+
+        let other = &lines[row("Nx cache invalidation") + 1];
+        assert!(!other.contains('●'), "{other}");
+    }
+
+    /// The branch is what the second line is for. Where there is no room for both, the
+    /// annotation goes rather than the thing it annotates.
+    #[test]
+    fn a_row_with_no_room_for_both_keeps_the_branch() {
+        picture::draw_in_halfblocks();
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.sidebar_layout = SidebarLayout::TwoLine;
+        with_threads(&mut app);
+        app.current_thread_id = Some("t2".into());
+        app.vcs = Some(
+            serde_json::from_value(json!({
+                "isRepo": true,
+                "hasWorkingTreeChanges": true,
+                "workingTree": {"insertions": 999_999, "deletions": 999_999}
+            }))
+            .unwrap(),
+        );
+        app.vcs_remote =
+            Some(serde_json::from_value(json!({"aheadCount": 99, "behindCount": 99})).unwrap());
+
+        let lines: Vec<String> = sidebar_text(&mut app).lines().map(str::to_string).collect();
+        let at = lines
+            .iter()
+            .position(|line| line.contains("Nx cache invalidation"))
+            .expect("the thread is listed");
+        let under = &lines[at + 1];
+        assert!(!under.contains('●'), "{under}");
+        assert!(under.contains("t3code/"), "{under}");
     }
 
     /// The project's icon is drawn over the right of both the thread's lines, which is
