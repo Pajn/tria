@@ -166,6 +166,7 @@ const COMMANDS: &[&str] = &[
     "usage",
     "view",
     "wake",
+    "window",
     "worktree",
     "worktrees",
 ];
@@ -3210,15 +3211,35 @@ impl App {
         };
         // Tria's own pane, rather than whichever one tmux last called the active one.
         let pane = std::env::var("TMUX_PANE").ok();
-        let args = split_args(&dir, pane.as_deref());
-        match std::process::Command::new("tmux").args(&args).output() {
+        self.run_tmux(&split_args(&dir, pane.as_deref()), "split-window");
+    }
+
+    /// Run a tmux command that is expected to say nothing, and pass on what it said if
+    /// it failed. tmux writes the reason to its standard error and nowhere else, so
+    /// without this a key that did nothing would look like a key that does nothing.
+    fn run_tmux(&mut self, args: &[String], what: &str) {
+        match std::process::Command::new("tmux").args(args).output() {
             Ok(out) if out.status.success() => {}
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                self.toast(format!("tmux split-window failed: {err}"), true);
+                self.toast(format!("tmux {what} failed: {err}"), true);
             }
             Err(err) => self.toast(format!("could not run tmux: {err}"), true),
         }
+    }
+
+    /// `gN` and `:window`: open a tmux window in this session, in the thread's directory
+    /// — the tab at the bottom of the screen, which is what `prefix c` makes, opened
+    /// where the thread works rather than wherever the session was started.
+    ///
+    /// Which session that is comes from the environment tria was started in, so it is
+    /// the one on screen. tmux moves to a window it has just made, and says nothing
+    /// afterwards for the same reason the split does not: it is already there.
+    fn new_tmux_window(&mut self) {
+        let Some(dir) = self.tmux_directory() else {
+            return;
+        };
+        self.run_tmux(&window_args(&dir), "new-window");
     }
 
     /// `gt` and `:tmux`: switch the tmux client to the session named after the thread's
@@ -3757,6 +3778,7 @@ impl App {
             "pr" | "pull" => self.open_pull_request(true),
             "tmux" => self.switch_tmux_session(),
             "split" => self.split_tmux_pane(),
+            "window" | "tab" => self.new_tmux_window(),
             "reveal" | "dir" => self.reveal_directory(),
             // `:git` is what the `l` binding has always been called, whatever is on it.
             "git" | "lazygit" => self.open_program('l'),
@@ -4027,6 +4049,7 @@ impl App {
             KeyCode::Char('x') if prefix == Some('g') => self.open_under_cursor(false),
             KeyCode::Char('t') if prefix == Some('g') => self.switch_tmux_session(),
             KeyCode::Char('P') if prefix == Some('g') => self.split_tmux_pane(),
+            KeyCode::Char('N') if prefix == Some('g') => self.new_tmux_window(),
             KeyCode::Char('D') if prefix == Some('g') => self.reveal_directory(),
             KeyCode::Char('y') if prefix == Some('g') => self.yank_last_assistant(),
             KeyCode::Char('s') if prefix == Some('g') => {
@@ -4579,6 +4602,7 @@ impl App {
             KeyCode::Char('x') if prefix == Some('g') => return self.open_under_cursor(false),
             KeyCode::Char('t') if prefix == Some('g') => return self.switch_tmux_session(),
             KeyCode::Char('P') if prefix == Some('g') => return self.split_tmux_pane(),
+            KeyCode::Char('N') if prefix == Some('g') => return self.new_tmux_window(),
             KeyCode::Char('y') if prefix == Some('g') => return self.yank_last_assistant(),
             KeyCode::Char('s') if prefix == Some('g') => {
                 let id = self.current_thread_id.clone();
@@ -5613,6 +5637,16 @@ fn split_args(dir: &str, pane: Option<&str>) -> Vec<String> {
         args.push(pane.to_string());
     }
     args
+}
+
+/// The tmux command that opens the window, as its arguments.
+///
+/// No target: tria was started inside the session it is in, so that is the one tmux
+/// resolves from the environment. No position either, so the window lands where this
+/// session puts a new one — the point is that it is `prefix c` with a directory, and
+/// anything else would be tria having an opinion about somebody's window numbering.
+fn window_args(dir: &str) -> Vec<String> {
+    vec!["new-window".to_string(), "-c".to_string(), dir.to_string()]
 }
 
 /// tmux session name for a directory: its last path component, with the characters tmux
@@ -7717,7 +7751,7 @@ mod tests {
         assert_eq!(app.shell.projects["p"].title, "p");
     }
 
-    use super::{split_args, tmux_session_name};
+    use super::{split_args, tmux_session_name, window_args};
 
     #[test]
     fn search_matching_is_smartcase() {
@@ -7752,6 +7786,16 @@ mod tests {
         assert_eq!(
             split_args("/home/me/work/app", None),
             ["split-window", "-h", "-c", "/home/me/work/app"]
+        );
+    }
+
+    /// The window is `prefix c` with a directory: no target, since the session is the
+    /// one tria was started in, and no position, since that is the session's to decide.
+    #[test]
+    fn the_window_is_a_new_one_in_this_session() {
+        assert_eq!(
+            window_args("/home/me/work/app"),
+            ["new-window", "-c", "/home/me/work/app"]
         );
     }
 }
