@@ -32,6 +32,11 @@ const MARK: usize = 3;
 /// the picture, which is two rows tall and so needs four columns to come out square, and
 /// one to stand it off the text.
 const ICON_COLUMN: usize = 5;
+/// What a selected row is tinted with: the foreground at about a third, which is a mark
+/// the eye finds without it being a block. Faint on purpose — half the list is written in
+/// grey, and a fill dark enough to read black text on is a fill grey text disappears
+/// into, so the tint is the same on every row whatever colour the row is written in.
+const SELECTED: Color = Color::Indexed(238);
 /// The largest a drawn icon is made, however much room it was given. Past this it is a
 /// line drawing with more pixels than the lines have detail.
 const MOST_ICON_PIXELS: u32 = 64;
@@ -547,17 +552,12 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             |row| matches!(row, SidebarRow::Thread { id, .. } if Some(id) == app.current_thread_id.as_ref()),
         )
     };
-    let highlight = if focused {
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM)
-    };
+    // Which list has the keys is the border's to say, so the mark is the same either
+    // way: it is answering which row, not which pane.
+    let highlight = Style::default().bg(SELECTED);
     let items: Vec<ListItem> = rows
         .iter()
-        .enumerate()
-        .map(|(index, row)| match row {
+        .map(|row| match row {
             SidebarRow::Header {
                 section,
                 count,
@@ -650,17 +650,12 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     // The mark is the status column over both lines: a bar beside the
                     // thread, which says which row is selected without covering the two
                     // lines it is made of.
-                    let (status, rest) = if Some(index) == selected {
-                        (glyph_style.patch(highlight), highlight)
-                    } else {
-                        (glyph_style, Style::default())
-                    };
                     return ListItem::new(vec![
                         Line::from(vec![
-                            Span::styled(format!(" {glyph} "), status),
+                            Span::styled(format!(" {glyph} "), glyph_style),
                             Span::styled(title, title_style),
                         ]),
-                        Line::from(vec![Span::styled("   ", rest), Span::styled(under, dim)]),
+                        Line::from(Span::styled(format!("   {under}"), dim)),
                     ]);
                 }
                 // The glyph carries the status; the right column always names the project.
@@ -685,14 +680,9 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let items: Vec<ListItem> = items
         .into_iter()
-        .zip(rows.iter())
         .enumerate()
-        .map(|(i, (item, row))| {
-            // A two-line thread has taken the mark into its status column already; the
-            // same block over two lines and the whole width is a lot of paint to say
-            // one row is selected.
-            let marks_itself = two_line && matches!(row, SidebarRow::Thread { .. });
-            if Some(i) == selected && !marks_itself {
+        .map(|(i, item)| {
+            if Some(i) == selected {
                 item.style(highlight)
             } else {
                 item
@@ -3422,11 +3412,10 @@ mod tests {
         );
     }
 
-    /// Selecting a thread marks its status column down both lines: the whole of two
-    /// lines in a block is more paint than a selection needs, and a bar beside them
-    /// still says the two are one row.
+    /// Selecting a thread marks the whole of it, both lines and whatever colour each of
+    /// them is written in.
     #[test]
-    fn selecting_a_two_line_thread_marks_its_status_column() {
+    fn selecting_a_two_line_thread_marks_both_of_its_lines() {
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
@@ -3437,11 +3426,10 @@ mod tests {
         app.sidebar_selected = 1;
         let buffer = screen(100, &mut app);
 
-        let marked = |y: u16| {
-            (0..SIDEBAR_WIDTH - 1)
-                .filter(|x| buffer[(*x, y)].style().bg == Some(Color::DarkGray))
-                .collect::<Vec<_>>()
-        };
+        // Up to the icon, which is a picture and paints over the row it is on, and short
+        // of the border, which is not the list's to mark.
+        let text = SIDEBAR_WIDTH - 1 - ICON_COLUMN as u16;
+        let marked = |y: u16| (0..text).all(|x| buffer[(x, y)].style().bg == Some(SELECTED));
         let titled = (0..buffer.area.height)
             .find(|y| {
                 (0..SIDEBAR_WIDTH)
@@ -3450,10 +3438,14 @@ mod tests {
                     .contains("Can we add a way")
             })
             .unwrap();
-        // The status column, and none of the title or the line under it.
-        assert_eq!(marked(titled), vec![0, 1, 2], "the title's line");
-        assert_eq!(marked(titled + 1), vec![0, 1, 2], "the branch's line");
-        assert!(marked(titled + 2).is_empty(), "and nothing else is marked");
+        assert!(marked(titled), "the title's line is marked");
+        assert!(marked(titled + 1), "and so is the branch's");
+        assert!(!marked(titled + 2), "and nothing else is");
+        // The row is tinted, not filled: what is written on it keeps its own colours.
+        let branch = (0..text)
+            .map(|x| buffer[(x, titled + 1)].style().fg)
+            .find(|fg| fg.is_some());
+        assert_eq!(branch, Some(Some(Color::DarkGray)));
     }
 
     /// A project the server found an icon for is drawn with it, in room the label left;
