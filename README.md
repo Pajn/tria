@@ -9,7 +9,9 @@ web, or mobile app for those.
 
 - A T3 Code server, either the desktop app or `npx t3@latest`, on the same machine or reachable
   over the network. It need not already be running: see [Starting the server](#starting-the-server).
-- Rust 1.88 or newer, to build it yourself. The prebuilt binaries need nothing.
+- A Rust toolchain, to build it yourself. `rust-toolchain.toml` names the version this is
+  built and checked with, and rustup installs that one for you. Older ones may work and
+  nothing checks. The prebuilt binaries need none of this.
 
 ## Setup
 

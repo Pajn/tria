@@ -25,9 +25,9 @@ jobs:
         os: [ubuntu-24.04, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      # No toolchain is named here. rustup reads rust-toolchain.toml and installs what
+      # it says, so CI and a working copy cannot be checking different Rusts.
+      - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings

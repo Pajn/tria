@@ -9,9 +9,10 @@ readme = "README.md"
 keywords = ["tui", "terminal", "chat", "ratatui", "t3code"]
 categories = ["command-line-utilities", "development-tools"]
 # Repository furniture rather than part of the program: the design notes stay where
-# somebody reading the protocol wants them, and the workflows only mean anything to
-# GitHub. Neither belongs in everybody's registry cache.
-exclude = ["PLAN.md", ".github"]
+# somebody reading the protocol wants them, the workflows only mean anything to GitHub,
+# and the pinned toolchain is what this is developed with, not a version anybody
+# installing it has to have. None of it belongs in everybody's registry cache.
+exclude = ["PLAN.md", ".github", "rust-toolchain.toml"]
 
 [dependencies]
 anyhow = "1"

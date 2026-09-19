@@ -31,9 +31,10 @@ jobs:
             runner: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # rustup reads rust-toolchain.toml, here and for the target, which it adds to the
+      # toolchain that file names rather than to whatever the runner had as its default.
+      - run: rustup show active-toolchain
+      - run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}

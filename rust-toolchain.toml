@@ -1,0 +1,7 @@
+# The toolchain this is built and checked with, so that what CI says and what a
+# working copy says are the same thing. rustup installs it on the first cargo
+# command run in here.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
