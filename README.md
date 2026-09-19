@@ -99,7 +99,7 @@ Press `?` inside the app for the full list.
 | `ga` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `gy` | copy the last assistant message (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
-| `gT` | list the agent's background tasks that are still running; `s` stops them, `S` the session |
+| `gT` | list the agent's background tasks that are still running; `s` stops them, `S` the session, after asking |
 | `gA` | list the subagents the thread has run; `Enter` reads one's transcript (`r` re-reads a running one), `y` yanks its report |
 | `gS` | list the thread's terminals; attach to one, or close, restart, open a new one |
 | `gW` | list the worktrees threads are holding; remove the ones that are done with |
@@ -386,6 +386,11 @@ interrupt sent with no turn to name — `Ctrl-c`, `:stop`, or `s` in the list, w
 what the desktop app's `Monitoring · Stop` sends. `S` or `:stop!` is the harder one: it
 ends the provider session, and every process it started goes with it. Either way the
 conversation stays, and the next message starts a session again.
+
+`S` asks before it does it. It is `s` with a finger on shift, it takes down work the list
+is not showing, and nothing takes it back: `S` again or `y` agrees, and any other key —
+`Esc` included — leaves the session running and the list where it was. `:stop!` carries
+its answer in the `!`, as `:delete!` does, so it goes straight through.
 
 ## When the connection goes
 

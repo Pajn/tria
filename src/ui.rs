@@ -2553,14 +2553,27 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  s stops it, as Ctrl-c does · S stops the whole session",
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(Span::styled(
-        "  Esc to close",
-        Style::default().fg(Color::DarkGray),
-    )));
+    if app.confirm_stop_session {
+        lines.push(Line::from(Span::styled(
+            "  stop the session, and every process the agent started?",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  S again or y · anything else leaves it running",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  s stops it, as Ctrl-c does · S stops the whole session, after asking",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Esc to close",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     let text = Text::from(lines);
     let width = 76.min(area.width);
     let height = (text.lines.len() as u16 + 2).min(area.height);
@@ -2817,6 +2830,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  g!                      a shell in the pane; exiting it closes the popup"),
         Line::from("  gT                      background tasks still running in this thread:"),
         Line::from("                          s stops it as Ctrl-c does, S stops the session"),
+        Line::from("                          after asking, since nothing undoes that one"),
         Line::from("  gA                      subagents this thread has run: Enter reads one's"),
         Line::from("                          transcript (r re-reads a running one), y yanks its"),
         Line::from("                          report"),

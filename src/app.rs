@@ -464,6 +464,10 @@ pub struct App {
     pub literal_next: bool,
     /// Set while a forced removal is waiting to be agreed to.
     pub worktree_confirm: Option<WorktreeConfirm>,
+    /// Set while `S` in the task list is waiting to be agreed to. Stopping the session
+    /// is not stopping a task: everything the agent has running goes with it, and it
+    /// sits one shifted keystroke away from the `s` that stops the one task.
+    pub confirm_stop_session: bool,
     pub worktree_selected: usize,
     /// The worktrees that are still on the disk, so the sidebar can mark the threads
     /// holding one without asking the disk about every row it draws.
@@ -585,6 +589,7 @@ impl App {
             statuses: HashMap::new(),
             literal_next: false,
             worktree_confirm: None,
+            confirm_stop_session: false,
             worktree_selected: 0,
             live_worktrees: HashSet::new(),
             worktrees_checked: None,
@@ -2461,6 +2466,7 @@ impl App {
             return;
         }
         self.mode = Mode::Tasks;
+        self.confirm_stop_session = false;
     }
 
     /// What the server says the session is still running after the turn settled:
@@ -2510,13 +2516,27 @@ impl App {
 
     /// The task list is a list to read; what there is to do from it is stop the work it
     /// shows. It stays open afterwards, because the rows clearing is the confirmation.
+    ///
+    /// `S` asks first. It ends the provider session and every process the agent started
+    /// with it, it cannot be taken back, and it is `s` with a finger on shift — which is
+    /// too near for something that big to happen on the first press.
     fn on_tasks_key(&mut self, key: KeyEvent) {
+        if self.confirm_stop_session {
+            // Anything that is not the answer is a no, including Esc: the question is
+            // in front of the list until it has one, so no key meant for the list can
+            // be read as agreeing to this.
+            self.confirm_stop_session = false;
+            if matches!(key.code, KeyCode::Char('S') | KeyCode::Char('y')) {
+                self.stop_session();
+            }
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('T') => {
                 self.mode = Mode::Normal
             }
             KeyCode::Char('s') => self.interrupt(),
-            KeyCode::Char('S') => self.stop_session(),
+            KeyCode::Char('S') => self.confirm_stop_session = true,
             _ => {}
         }
     }
@@ -5972,6 +5992,48 @@ mod tests {
             .iter()
             .any(|command| command["type"] == "thread.session.stop" && command["threadId"] == "t1");
         assert!(stopped, "the session was never stopped");
+    }
+
+    /// `S` in the task list is `s` with shift held, and it ends the whole session
+    /// rather than the one task. It asks before it does, and only the answer answers.
+    #[tokio::test]
+    async fn stopping_the_session_from_the_list_is_asked_about_first() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        watched(&mut app, Some("monitoring"), "idle");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT));
+        app.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        tokio::task::yield_now().await;
+        assert!(app.confirm_stop_session, "it asks");
+        assert_eq!(app.mode, Mode::Tasks, "and stays on the list to ask on it");
+        assert!(
+            !stopped(&mut requests),
+            "the session is still running until it is answered"
+        );
+
+        // Anything but the answer is a no, and leaves the list as it was.
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        tokio::task::yield_now().await;
+        assert!(!app.confirm_stop_session);
+        assert_eq!(app.mode, Mode::Tasks);
+        assert!(!stopped(&mut requests), "a stray key does not stop it");
+
+        // Pressing it again is the answer.
+        app.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        app.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        tokio::task::yield_now().await;
+        assert!(!app.confirm_stop_session);
+        assert!(stopped(&mut requests), "the session was never stopped");
+    }
+
+    /// Whether a session stop went out.
+    fn stopped(requests: &mut mpsc::UnboundedReceiver<crate::session::Request>) -> bool {
+        dispatched(requests)
+            .iter()
+            .any(|command| command["type"] == "thread.session.stop")
     }
 
     /// A thread as the list has it, on a given turn in a given state.
