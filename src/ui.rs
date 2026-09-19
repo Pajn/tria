@@ -173,52 +173,52 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         _ => {}
     }
 
-    pin_symbol_widths(frame.buffer_mut());
+    settle_symbol_widths(frame.buffer_mut());
 }
 
-/// How many columns the terminal gives a symbol, where that is not what
-/// `unicode-width` measures.
+/// The Latin letter a regional indicator stands for, when the symbol is one on its own.
 ///
-/// A regional indicator on its own is half a flag: two of them side by side are one
-/// flag two columns wide, and `unicode-width` measures one of them at a single column
-/// on the way there. Terminals draw the lone letter in a box, two columns wide, so a
-/// line with an odd number of them in it is a line the two disagree about.
-///
-/// Only the diff is told. The layout still measures the lone letter at a column, so its
-/// box is drawn over whatever follows it — which is a smaller wrong than a line that has
-/// slid sideways, and the only one available without a width table of tria's own.
-fn drawn_width(symbol: &str) -> usize {
-    match crate::term::is_regional(symbol) {
-        true => 2,
-        false => symbol.width(),
+/// Two regional indicators side by side are a flag, two columns wide, and everything
+/// agrees about that. One on its own is half a flag, and half a flag is not a flag: the
+/// terminal draws it as the letter it is named for, in a box two columns wide, where
+/// `unicode-width` measures it at one.
+fn lone_flag_letter(symbol: &str) -> Option<char> {
+    if !crate::term::is_regional(symbol) {
+        return None;
     }
+    let letter = symbol.chars().next()? as u32 - '\u{1F1E6}' as u32;
+    char::from_u32(letter + u32::from(b'A'))
 }
 
-/// Tell the diff how wide every symbol on the screen really is.
+/// Leave the screen with nothing on it that tria and the terminal measure differently.
 ///
 /// Drawing a frame means writing runs of neighbouring cells with one cursor move in
-/// front of each run, which is right only while tria and the terminal agree about how
-/// many columns each symbol takes. Two things break that agreement, and both are told
-/// the same way — by pinning the width on the cell, which leaves the diff stepping over
-/// the symbol the way it steps over a CJK glyph, and the cell after it reached by a
-/// cursor move of its own.
+/// front of each run, which is right only while the two agree about how many columns
+/// each symbol takes. Where they disagree the rest of the line slides a column, and
+/// stays slid: the next frame has no reason to touch cells it believes are already
+/// right, so the marks sit there until something paints the whole screen again.
 ///
-/// The first is a symbol carrying U+FE0F. Left alone the diff hedges on those: it writes
+/// Two things break the agreement. A regional indicator on its own is one, and the
+/// answer is to write the letter instead — one column, the same letter, and nothing
+/// left to disagree about.
+///
+/// The other is a symbol carrying U+FE0F. Left alone the diff hedges on those: it writes
 /// the emoji and then a blank over the second of the two columns, in case the terminal
 /// drew the sequence one column wide. A terminal that gives it both columns has already
 /// moved its cursor past them, so the blank lands on the column after the emoji instead.
-///
-/// The second is a symbol [`drawn_width`] knows better than `unicode-width` does.
-///
-/// Either way the rest of the line slides a column, and stays slid: the next frame has
-/// no reason to touch cells it believes are already right, so the marks sit there until
-/// something paints the whole screen again.
-fn pin_symbol_widths(buffer: &mut Buffer) {
+/// Pinning the width takes the hedge off, and leaves the diff stepping over the emoji
+/// the way it steps over a CJK glyph, with the cell after it reached by a cursor move of
+/// its own.
+fn settle_symbol_widths(buffer: &mut Buffer) {
     for cell in &mut buffer.content {
         if cell.diff_option != CellDiffOption::None {
             continue;
         }
-        if let Some(width) = NonZeroU16::new(drawn_width(cell.symbol()) as u16)
+        if let Some(letter) = lone_flag_letter(cell.symbol()) {
+            cell.set_symbol(letter.encode_utf8(&mut [0; 4]));
+            continue;
+        }
+        if let Some(width) = NonZeroU16::new(cell.symbol().width() as u16)
             && width.get() > 1
         {
             cell.diff_option = CellDiffOption::ForcedWidth(width);
@@ -4192,7 +4192,7 @@ mod tests {
         let [before, after] = [before, after].map(|text| {
             let mut buffer = Buffer::empty(area);
             buffer.set_string(0, 0, text, Style::default());
-            pin_symbol_widths(&mut buffer);
+            settle_symbol_widths(&mut buffer);
             buffer
         });
         let mut written = Vec::new();
