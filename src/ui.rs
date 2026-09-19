@@ -2847,6 +2847,17 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         )),
         Line::from("                          set by prefix_timeout_ms, 0 for no limit"),
         Line::from(""),
+        Line::from(Span::styled("Notifications", Style::default().bold())),
+        Line::from(format!(
+            "  a thread stops working  {}",
+            match app.notify {
+                crate::notify::When::Never => "not announced · notify in the config file",
+                crate::notify::When::Always => "always announced · notify in the config",
+                crate::notify::When::Unfocused => "announced unless this terminal has the focus",
+            }
+        )),
+        Line::from("                          notify = unfocused | always | never"),
+        Line::from(""),
         Line::from(Span::styled("Insert", Style::default().bold())),
         Line::from("  Enter send · Alt-Enter / Ctrl-j newline · Esc or Ctrl-c normal"),
         Line::from("  Ctrl-v or Ctrl-q        the next key as a character: Ctrl-v Enter is a"),

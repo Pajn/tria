@@ -378,6 +378,31 @@ So it says so, on a line under the header, for as long as it lasts — `⚠ this
 stopped updating` — and keeps asking every ten seconds until the thread speaks again.
 Opening the thread again, or the next reconnection, also starts a new stream.
 
+## Notifications
+
+A turn takes minutes, which is the whole reason not to sit and watch one. When a thread
+stops working — finished, failed, waiting on an approval or a question, or holding a plan
+— the terminal is asked to say so, and it turns that into whatever this desktop calls a
+notification. Which thread it was does not come into it: the open one finishing while you
+are in another window is the case this is for.
+
+By default it only speaks up when the terminal does not have the focus, since a
+notification for something already on the screen in front of you is an interruption to
+tell you what you are looking at. The config file says otherwise:
+
+```toml
+notify = "always"   # or "unfocused", the default, or "never"
+```
+
+Two things this leans on the terminal for. The notification itself is OSC 9, which most
+terminals understand and some do not. The focus is the terminal reporting it, which fewer
+do — and inside tmux it arrives only with `focus-events on`, as the notification itself
+arrives only with `allow-passthrough on`. A terminal that never mentions focus is treated
+as one that does not have it, so notifications arrive rather than not: an interruption you
+did not need is something you can see and turn off, and one that never came looks like a
+feature that does not work. `notify = "never"` turns them off, and `"always"` is the
+setting for a terminal that will not report focus but will notify.
+
 ## Usage limits
 
 `:usage` shows what each signed-in account has left of its subscription: a bar per

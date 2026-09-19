@@ -7,6 +7,7 @@ mod discovery;
 mod kitty;
 mod lucide;
 mod model;
+mod notify;
 mod picture;
 mod question;
 mod rpc;
@@ -87,6 +88,8 @@ async fn main() -> Result<()> {
             let (programs, mut refused) = cfg.programs();
             let (sidebar_layout, refused_layout) = cfg.sidebar_layout();
             refused.extend(refused_layout);
+            let (notify, refused_notify) = cfg.notify();
+            refused.extend(refused_notify);
             let launch = app::Launch {
                 started_server: started,
                 programs,
@@ -95,6 +98,7 @@ async fn main() -> Result<()> {
                 editor: cfg.editor(),
                 model: cfg.model.clone(),
                 prefix_timeout: cfg.prefix_timeout(),
+                notify,
             };
             app::run(origin, token, launch).await
         }

@@ -436,6 +436,12 @@ pub struct App {
     /// How long `g` and `z` wait for the key that completes them. `None` waits for as
     /// long as it takes, which is what the config asks for with `0`.
     pub prefix_timeout: Option<Duration>,
+    /// When a thread that has stopped working is announced to the desktop.
+    pub notify: crate::notify::When,
+    /// Whether the terminal has the focus, as far as it has said so.
+    pub terminal_focus: crate::notify::Focus,
+    /// What each thread was last doing, so that a change can be told from a repeat.
+    statuses: HashMap<Id, crate::model::ThreadStatus>,
     /// Set by `Ctrl-v` in insert mode: the next key goes in as a character.
     pub literal_next: bool,
     /// Set while a forced removal is waiting to be agreed to.
@@ -546,6 +552,9 @@ impl App {
             lost_stream: None,
             worktrees: Vec::new(),
             prefix_timeout: Some(crate::config::DEFAULT_PREFIX_TIMEOUT),
+            notify: crate::notify::When::default(),
+            terminal_focus: crate::notify::Focus::default(),
+            statuses: HashMap::new(),
             literal_next: false,
             worktree_confirm: None,
             worktree_selected: 0,
@@ -915,6 +924,28 @@ impl App {
         {
             self.unseen.insert(thread.id.clone());
         }
+        self.note_status(thread);
+    }
+
+    /// Say out loud that a thread has stopped working, to somebody who is not looking
+    /// at it. Which thread it is does not come into it — the open one finishing while
+    /// you are in another window is the case this is for — but the change does: a
+    /// thread already finished when tria first heard of it has nothing to announce, and
+    /// a status that has not moved is the same thread saying the same thing again.
+    fn note_status(&mut self, thread: &crate::model::ThreadShell) {
+        let status = thread.status();
+        let Some(was) = self.statuses.insert(thread.id.clone(), status) else {
+            // First sight. Every thread would announce itself on the way in.
+            return;
+        };
+        let stopped_working = was == crate::model::ThreadStatus::Working
+            && status != crate::model::ThreadStatus::Working;
+        if !stopped_working || !self.notify.wants(self.terminal_focus) {
+            return;
+        }
+        let title: String = thread.title.chars().take(60).collect();
+        let title = if title.is_empty() { "a thread" } else { &title };
+        crate::notify::send(&format!("{title} · {}", status.notice()));
     }
 
     fn first_usable_model(&self) -> Option<ModelSelection> {
@@ -4697,11 +4728,13 @@ impl App {
                     ShellItem::Snapshot { snapshot } => {
                         for thread in &snapshot.threads {
                             self.marks.insert(thread.id.clone(), mark_of(thread));
+                            self.statuses.insert(thread.id.clone(), thread.status());
                         }
                     }
                     ShellItem::ThreadUpserted { thread, .. } => self.note_thread(thread),
                     ShellItem::ThreadRemoved { thread_id, .. } => {
                         self.marks.remove(thread_id);
+                        self.statuses.remove(thread_id);
                         self.unseen.remove(thread_id);
                     }
                     _ => {}
@@ -5068,7 +5101,8 @@ fn run_external(terminal: &mut ratatui::DefaultTerminal, external: &ExternalComm
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableFocusChange
     );
     ratatui::restore();
     // crossterm's reader thread may be blocked waiting for input on our behalf and would
@@ -5087,7 +5121,11 @@ fn run_external(terminal: &mut ratatui::DefaultTerminal, external: &ExternalComm
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableBracketedPaste,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        // Whether the terminal has the focus, which is what decides whether a thread
+        // finishing is worth a notification. A terminal that does not answer this
+        // leaves it unheard, and unheard errs towards saying something.
+        crossterm::event::EnableFocusChange
     );
     // Whatever the terminal was holding for us went out with the other program's screen.
     picture::forget();
@@ -5179,6 +5217,8 @@ pub struct Launch {
     pub started_server: bool,
     /// How long `g` and `z` wait for the key after them; `None` is indefinitely.
     pub prefix_timeout: Option<Duration>,
+    /// When a thread that has stopped working is announced to the desktop.
+    pub notify: crate::notify::When,
 }
 
 /// Ask where a project's icon is and fetch it. `sourcePath` is the server saying it found
@@ -5258,6 +5298,12 @@ fn apply(app: &mut App, event: AppEvent) {
                 app.command_line.push_str(text.trim());
             }
         }
+        AppEvent::Terminal(Event::FocusGained) => {
+            app.terminal_focus = crate::notify::Focus::Focused
+        }
+        AppEvent::Terminal(Event::FocusLost) => {
+            app.terminal_focus = crate::notify::Focus::Unfocused
+        }
         AppEvent::Terminal(_) => {}
         AppEvent::Tick => {
             app.spinner = app.spinner.wrapping_add(1);
@@ -5310,6 +5356,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     }
     app.editor = launch.editor;
     app.prefix_timeout = launch.prefix_timeout;
+    app.notify = launch.notify;
     app.new_thread_model = launch.model;
     if launch.started_server {
         // Said again here because the line printed before the screen was taken over is
@@ -5324,7 +5371,11 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableBracketedPaste,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        // Whether the terminal has the focus, which is what decides whether a thread
+        // finishing is worth a notification. A terminal that does not answer this
+        // leaves it unheard, and unheard errs towards saying something.
+        crossterm::event::EnableFocusChange
     );
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
@@ -5378,7 +5429,8 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableFocusChange
     );
     ratatui::restore();
     result
@@ -5710,6 +5762,14 @@ mod tests {
         })
     }
 
+    /// The same, with a title of its own and, when it has stopped, what it stopped for.
+    fn titled(id: &str, title: &str, state: &str, approval: bool) -> serde_json::Value {
+        let mut thread = listed(id, Some(("turn", state)));
+        thread["title"] = json!(title);
+        thread["hasPendingApprovals"] = json!(approval);
+        thread
+    }
+
     /// The same, with background work still alive after the turn.
     fn watching(id: &str, liveness: &str) -> serde_json::Value {
         let mut thread = listed(id, Some(("t1", "completed")));
@@ -5934,6 +5994,122 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         // Something that is not a picture is not written out at all.
         assert_eq!(write_picture("bm90IGEgcGljdHVyZQ=="), None);
+    }
+
+    /// A turn takes minutes and the whole point of the client is not having to watch it.
+    /// What is announced is a thread that has stopped working, whichever thread it is —
+    /// the open one finishing while you are in another window is the case this is for.
+    #[test]
+    fn a_thread_that_stops_working_says_so() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.terminal_focus = crate::notify::Focus::Unfocused;
+
+        // First sight is not news: every thread would announce itself on the way in.
+        upsert(
+            &mut app,
+            titled("t1", "Fix the auth redirect", "running", false),
+        );
+        assert!(crate::notify::sent().is_empty());
+
+        // Working to anything else is.
+        upsert(
+            &mut app,
+            titled("t1", "Fix the auth redirect", "completed", false),
+        );
+        assert_eq!(
+            crate::notify::sent(),
+            vec!["Fix the auth redirect · finished"]
+        );
+
+        // The same status again is the same thread saying the same thing.
+        upsert(
+            &mut app,
+            titled("t1", "Fix the auth redirect", "completed", false),
+        );
+        assert!(crate::notify::sent().is_empty());
+
+        // What it stopped for is what it says.
+        upsert(
+            &mut app,
+            titled("t1", "Fix the auth redirect", "running", false),
+        );
+        upsert(
+            &mut app,
+            titled("t1", "Fix the auth redirect", "running", true),
+        );
+        assert_eq!(
+            crate::notify::sent(),
+            vec!["Fix the auth redirect · needs approval"]
+        );
+    }
+
+    /// The default is not to talk over something already on the screen in front of you.
+    #[test]
+    fn nothing_is_announced_while_the_terminal_has_the_focus() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+
+        for (focus, expected) in [
+            (crate::notify::Focus::Focused, 0),
+            (crate::notify::Focus::Unfocused, 1),
+            // A terminal that never mentions focus is told anyway, since the other way
+            // round is the feature silently not working.
+            (crate::notify::Focus::Unheard, 1),
+        ] {
+            app.statuses.clear();
+            app.terminal_focus = focus;
+            upsert(&mut app, titled("t1", "a thread", "running", false));
+            upsert(&mut app, titled("t1", "a thread", "completed", false));
+            assert_eq!(crate::notify::sent().len(), expected, "{focus:?}");
+        }
+
+        // And `never` is never, focus or no focus.
+        app.notify = crate::notify::When::Never;
+        for focus in [
+            crate::notify::Focus::Focused,
+            crate::notify::Focus::Unfocused,
+            crate::notify::Focus::Unheard,
+        ] {
+            app.statuses.clear();
+            app.terminal_focus = focus;
+            upsert(&mut app, titled("t1", "a thread", "running", false));
+            upsert(&mut app, titled("t1", "a thread", "completed", false));
+            assert!(crate::notify::sent().is_empty(), "{focus:?}");
+        }
+    }
+
+    /// The list that arrives on connecting is what is already there, and a reconnection
+    /// brings it again. Neither is a pile of threads finishing.
+    #[test]
+    fn the_list_arriving_announces_nothing() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.terminal_focus = crate::notify::Focus::Unfocused;
+
+        let snapshot = |threads: serde_json::Value| {
+            Update::Shell(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "snapshot",
+                    "snapshot": {
+                        "snapshotSequence": 1, "projects": [], "threads": threads
+                    }
+                }))
+                .expect("a shell snapshot the server could have sent"),
+            )
+        };
+        app.on_update(snapshot(serde_json::json!([
+            titled("t1", "one", "running", false),
+            titled("t2", "two", "completed", false),
+        ])));
+        assert!(crate::notify::sent().is_empty(), "nothing on the way in");
+
+        // The running one finishing after that is news.
+        upsert(&mut app, titled("t1", "one", "completed", false));
+        assert_eq!(crate::notify::sent(), vec!["one · finished"]);
     }
 
     /// `g` waits for the key that finishes it, and how long is the config's to say —

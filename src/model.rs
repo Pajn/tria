@@ -432,6 +432,21 @@ pub enum ThreadStatus {
 }
 
 impl ThreadStatus {
+    /// How a thread in this state asks to be come back to, for a notification, where
+    /// the thread is the subject: "Fix the auth redirect · needs approval".
+    pub fn notice(self) -> &'static str {
+        match self {
+            Self::Approval => "needs approval",
+            Self::Question => "asks a question",
+            Self::Working => "is working",
+            Self::Failed => "failed",
+            Self::Monitoring => "finished, still watching",
+            Self::PlanReady => "has a plan ready",
+            Self::Done => "finished",
+            Self::Idle => "stopped",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Approval => "approval",

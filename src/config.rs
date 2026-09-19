@@ -31,6 +31,10 @@ pub struct Config {
     /// The last model picked, used for the next new thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<crate::model::ModelSelection>,
+    /// When a thread that has stopped working is announced to the desktop:
+    /// `unfocused`, `always`, or `never`. Unset is `unfocused`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<String>,
     /// How long `g` and `z` wait for the key that completes them, in milliseconds.
     /// Zero waits for as long as it takes. Unset is `DEFAULT_PREFIX_TIMEOUT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +181,11 @@ impl Config {
         }
         programs.sort_by_key(|program| program.key);
         (programs, refused)
+    }
+
+    /// When a finished thread is announced, and the reason a setting was not taken.
+    pub fn notify(&self) -> (crate::notify::When, Option<String>) {
+        crate::notify::When::parse(self.notify.as_deref())
     }
 
     /// How long `g` and `z` wait for the key that completes them. `None` is for as long
