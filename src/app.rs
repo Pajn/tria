@@ -4991,6 +4991,12 @@ impl App {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.composer.leave_insert();
+                // Insert mode types into the composer wherever the focus happens to
+                // have been left — a click in the chat, a model picked from the thread
+                // list. Leaving it is leaving the message, so it lands where the
+                // message was being written rather than at the chat or the list.
+                self.focus = Focus::Composer;
+                self.chat_visual = None;
             }
             KeyCode::Enter if alt || shift || ctrl => self.composer.newline(),
             KeyCode::Char('j') if ctrl => self.composer.newline(),
@@ -7019,6 +7025,31 @@ mod tests {
             asked(&mut requests).await,
             Some(crate::session::Request::Dispatch { .. })
         ));
+    }
+
+    /// The focus can be somewhere else while a message is being typed — a click in the
+    /// chat leaves it there, a model picked from the thread list never moves it — and
+    /// the keys still go to the composer. Leaving insert mode brings the focus back with
+    /// it, so the same two keys always land in the same place.
+    #[tokio::test]
+    async fn leaving_insert_mode_lands_at_the_composer_wherever_the_focus_was() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+
+        for leave in [plain(KeyCode::Esc), ctrl('c')] {
+            for focus in [Focus::Chat, Focus::Sidebar] {
+                app.mode = Mode::Insert;
+                app.focus = focus;
+                app.composer.set_text("half a message");
+
+                app.on_key(leave);
+                assert_eq!(app.mode, Mode::Normal, "{focus:?}");
+                assert_eq!(app.focus, Focus::Composer, "{focus:?}");
+                assert_eq!(app.composer.text(), "half a message", "{focus:?}");
+            }
+        }
     }
 
     /// Everything else being typed leaves the same way, rather than the picker staying
