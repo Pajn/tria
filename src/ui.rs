@@ -232,7 +232,13 @@ fn settle_symbol_widths(buffer: &mut Buffer) {
 
 /// Highlight the chat cursor and the visual selection when the chat has focus.
 fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
-    if app.focus != Focus::Chat || app.thread.is_none() || chat.height == 0 {
+    // Insert mode always types into the composer, even if a chat click left the
+    // navigation focus there. Do not paint a second cursor on the old chat row.
+    if app.mode == Mode::Insert
+        || app.focus != Focus::Chat
+        || app.thread.is_none()
+        || chat.height == 0
+    {
         return;
     }
     let offset = app.chat_offset();
@@ -3770,6 +3776,36 @@ mod tests {
         assert_eq!(
             chat_span((start + 1, 4), (start + 1, 7)),
             Some("two".into())
+        );
+    }
+
+    #[test]
+    fn insert_mode_does_not_leave_a_second_cursor_in_the_chat() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_saying("read this"));
+        app.focus = Focus::Chat;
+        app.mode = Mode::Insert;
+        app.scroll = Scroll::Offset(0);
+        chat(50, &mut app);
+        app.chat_cursor = app.message_starts[0] + 1;
+        let buffer = screen(50, &mut app);
+        let y = app.chat_area.y + (app.chat_cursor - app.chat_offset()) as u16;
+        for x in app.chat_area.x..app.chat_area.right() {
+            assert_ne!(buffer[(x, y)].style().bg, Some(Color::Indexed(236)));
+            assert!(
+                !buffer[(x, y)]
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::REVERSED)
+            );
+        }
+        app.mode = Mode::Normal;
+        let buffer = screen(50, &mut app);
+        assert_eq!(
+            buffer[(app.chat_area.x, y)].style().bg,
+            Some(Color::Indexed(236))
         );
     }
 

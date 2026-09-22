@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::Result;
+use crossterm::SynchronizedUpdate;
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -6098,12 +6099,17 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     let mut tick = tokio::time::interval(TICK);
 
     let result: Result<()> = loop {
-        if std::mem::take(&mut app.repaint)
-            && let Err(err) = terminal.clear()
-        {
-            break Err(err.into());
-        }
-        if let Err(err) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
+        // Drawing moves the hardware cursor through changed cells before restoring
+        // it to the input field. Publish the frame only after that restoration, so
+        // idle ticks and image repaints cannot expose those intermediate positions.
+        // sync_update also ends the synchronized region when drawing returns an error.
+        let drawn = std::io::stdout().sync_update(|_| -> std::io::Result<()> {
+            if std::mem::take(&mut app.repaint) {
+                terminal.clear()?;
+            }
+            terminal.draw(|frame| ui::draw(frame, &mut app)).map(|_| ())
+        });
+        if let Err(err) = drawn.and_then(|result| result) {
             break Err(err.into());
         }
         app.flush_clipboard();
