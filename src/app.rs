@@ -336,6 +336,11 @@ pub enum Scroll {
 }
 
 pub enum AppEvent {
+    ToolRecovery {
+        request: String,
+        thread_id: Id,
+        recovered: HashMap<String, crate::recovery::Recovery>,
+    },
     Terminal(Event),
     Tick,
     Update(Box<Update>),
@@ -564,6 +569,7 @@ pub struct App {
     worktrees_checked: Option<Instant>,
     /// Whether the server's disk is this one.
     pub local_disk: bool,
+    tool_recovery_request: Option<String>,
     /// Whether the open thread was running at the last update, to notice it finishing.
     was_running: bool,
     /// When the checkout was last re-read.
@@ -683,6 +689,7 @@ impl App {
             live_worktrees: HashSet::new(),
             worktrees_checked: None,
             local_disk: false,
+            tool_recovery_request: None,
             was_running: false,
             vcs_refreshed: Instant::now(),
             new_thread_model: None,
@@ -928,6 +935,7 @@ impl App {
         // A transcript belongs to the thread that ran the subagent; it does not follow.
         self.transcript = None;
         self.transcript_loading = None;
+        self.tool_recovery_request = None;
         self.current_thread_id = Some(thread_id.to_string());
         self.lost_stream = None;
         self.unseen.remove(thread_id);
@@ -4139,9 +4147,9 @@ impl App {
             KeyCode::Char('z') => self.pending_prefix = Some(('z', Instant::now())),
             KeyCode::Char('a') if prefix == Some('z') => self.fold_at(cursor, true),
             KeyCode::Enter | KeyCode::Char(' ') => self.fold_at(cursor, false),
-            KeyCode::Char('R') if prefix == Some('z') => self.open_levels = MOST_OPEN_LEVELS,
+            KeyCode::Char('R') if prefix == Some('z') => self.open_work_level(true),
             KeyCode::Char('r') if prefix == Some('z') => {
-                self.open_levels = (self.open_levels + 1).min(MOST_OPEN_LEVELS);
+                self.open_work_level(false);
             }
             KeyCode::Char('m') if prefix == Some('z') => {
                 self.open_levels = self.open_levels.saturating_sub(1);
@@ -4429,7 +4437,18 @@ impl App {
     fn fold_at(&mut self, line: usize, quiet: bool) {
         match self.region_at(line) {
             Some((key, true)) => self.toggle_expanded(key),
-            Some((_, false)) => self.toast("the server kept nothing more for this row", false),
+            Some((key, false)) => {
+                if self.local_disk
+                    && key
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|id| id.starts_with("toolu_"))
+                {
+                    self.toggle_expanded(key);
+                } else {
+                    self.toast("the server kept nothing more for this row", false);
+                }
+            }
             None if !quiet => self.toast("nothing to fold here", false),
             None => {}
         }
@@ -4438,7 +4457,97 @@ impl App {
     fn toggle_expanded(&mut self, key: String) {
         if !self.expanded.remove(&key) {
             self.expanded.insert(key);
+            self.recover_tools();
         }
+    }
+
+    /// Read in a blocking worker: large transcripts must not stop terminal input.
+    /// Reopening retries missing results and refreshes background output files.
+    fn recover_tools(&mut self) {
+        if !self.local_disk || self.transcript.is_some() || self.tool_recovery_request.is_some() {
+            return;
+        }
+        let Some(cwd) = self.thread_directory() else {
+            return;
+        };
+        let Some(thread) = self.thread.as_mut() else {
+            return;
+        };
+        let ids: HashSet<String> = thread
+            .detail
+            .activities
+            .iter()
+            .filter_map(crate::recovery::tool_id)
+            .map(str::to_string)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        for id in &ids {
+            thread
+                .recovered_tools
+                .entry(id.clone())
+                .or_insert(crate::recovery::Recovery::Loading);
+        }
+        thread.revision += 1;
+        let thread_id = thread.id().to_string();
+        let request = uuid::Uuid::new_v4().to_string();
+        self.tool_recovery_request = Some(request.clone());
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let fallback = ids.clone();
+            let recovered =
+                tokio::task::spawn_blocking(move || crate::recovery::recover(&cwd, &ids))
+                    .await
+                    .unwrap_or_else(|_| {
+                        fallback
+                            .into_iter()
+                            .map(|id| (id, crate::recovery::Recovery::Unavailable))
+                            .collect()
+                    });
+            let _ = events.send(AppEvent::ToolRecovery {
+                request,
+                thread_id,
+                recovered,
+            });
+        });
+    }
+
+    fn on_tool_recovery(
+        &mut self,
+        request: String,
+        thread_id: Id,
+        recovered: HashMap<String, crate::recovery::Recovery>,
+    ) {
+        if self.tool_recovery_request.as_deref() != Some(&request) {
+            return;
+        }
+        self.tool_recovery_request = None;
+        let Some(thread) = self.thread.as_mut().filter(|t| t.id() == thread_id) else {
+            return;
+        };
+        for (id, payload) in recovered {
+            // Keep already recovered content if a temporary file disappeared later.
+            if matches!(payload, crate::recovery::Recovery::Unavailable)
+                && matches!(
+                    thread.recovered_tools.get(&id),
+                    Some(crate::recovery::Recovery::Found { .. })
+                )
+            {
+                continue;
+            }
+            thread.recovered_tools.insert(id, payload);
+        }
+        thread.revision += 1;
+    }
+
+    fn open_work_level(&mut self, all: bool) {
+        self.open_levels = if all {
+            MOST_OPEN_LEVELS
+        } else {
+            (self.open_levels + 1).min(MOST_OPEN_LEVELS)
+        };
+        self.recover_tools();
     }
 
     fn toggle_work_group(&mut self) {
@@ -4709,10 +4818,10 @@ impl App {
             }
             KeyCode::Char('a') if prefix == Some('z') => return self.toggle_work_group(),
             KeyCode::Char('R') if prefix == Some('z') => {
-                return self.open_levels = MOST_OPEN_LEVELS;
+                return self.open_work_level(true);
             }
             KeyCode::Char('r') if prefix == Some('z') => {
-                return self.open_levels = (self.open_levels + 1).min(MOST_OPEN_LEVELS);
+                return self.open_work_level(false);
             }
             KeyCode::Char('m') if prefix == Some('z') => {
                 return self.open_levels = self.open_levels.saturating_sub(1);
@@ -5927,6 +6036,11 @@ fn apply(app: &mut App, event: AppEvent) {
             Ok(()) => app.toast(ok, false),
             Err(error) => app.toast(error, true),
         },
+        AppEvent::ToolRecovery {
+            request,
+            thread_id,
+            recovered,
+        } => app.on_tool_recovery(request, thread_id, recovered),
         AppEvent::Transcript { agent_id, result } => app.on_transcript(agent_id, result),
         AppEvent::Favicon { project, bytes } => app.on_favicon(project, bytes),
     }
@@ -6040,6 +6154,51 @@ mod tests {
 
     use super::*;
     use crate::model::{Project, VcsLocal, VcsWorkingTree};
+
+    #[test]
+    fn tool_recovery_is_local_and_late_answers_cannot_replace_a_new_request() {
+        use crate::recovery::Recovery;
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        project(&mut app);
+        app.thread = Some(running_thread());
+        app.thread.as_mut().unwrap().detail.activities.push(
+            serde_json::from_value(json!({
+                "id":"a", "kind":"tool.completed", "tone":"info", "summary":"Read",
+                "createdAt":"1", "payload":{"toolCallId":"toolu_test"}
+            }))
+            .unwrap(),
+        );
+        // No runtime is needed: a remote connection must never launch local I/O.
+        app.recover_tools();
+        assert!(app.tool_recovery_request.is_none());
+        assert!(app.thread.as_ref().unwrap().recovered_tools.is_empty());
+        app.tool_recovery_request = Some("new".into());
+        let recovered = HashMap::from([(
+            "toolu_test".into(),
+            Recovery::Found {
+                input: Some("full input".into()),
+                output: Some("full output".into()),
+            },
+        )]);
+        app.on_tool_recovery("old".into(), "t1".into(), recovered.clone());
+        assert!(app.thread.as_ref().unwrap().recovered_tools.is_empty());
+        assert_eq!(app.tool_recovery_request.as_deref(), Some("new"));
+        let revision = app.thread.as_ref().unwrap().revision;
+        app.on_tool_recovery("new".into(), "t1".into(), recovered);
+        assert!(app.thread.as_ref().unwrap().revision > revision);
+        app.tool_recovery_request = Some("retry".into());
+        app.on_tool_recovery(
+            "retry".into(),
+            "t1".into(),
+            HashMap::from([("toolu_test".into(), Recovery::Unavailable)]),
+        );
+        assert!(matches!(
+            app.thread.as_ref().unwrap().recovered_tools["toolu_test"],
+            Recovery::Found { .. }
+        ));
+    }
 
     fn selection() -> ModelSelection {
         ModelSelection {

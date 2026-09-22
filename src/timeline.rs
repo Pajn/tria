@@ -179,6 +179,31 @@ pub fn build(
         // Providers do not always emit a completion for every parallel call. Once the
         // turn that owned an entry is over, "in progress" can only be stale.
         for entry in pending.iter_mut() {
+            if let Some(recovered) = thread.recovered_tools.get(&entry.key) {
+                let note = match recovered {
+                    crate::recovery::Recovery::Loading => "[Loading saved tool content…]",
+                    crate::recovery::Recovery::Unavailable => {
+                        "[Full content unavailable in the local Claude transcript; showing server summary]"
+                    }
+                    crate::recovery::Recovery::Found { input, output } => {
+                        if let Some(input) = input {
+                            entry.input = Some(input.clone());
+                        }
+                        if let Some(output) = output {
+                            entry.output = Some(output.clone());
+                        }
+                        if output.is_some() {
+                            "[Recovered from local Claude transcript]"
+                        } else {
+                            "[Saved input recovered; full result unavailable — reopen to retry]"
+                        }
+                    }
+                };
+                entry.output = Some(match entry.output.take() {
+                    Some(output) => format!("{output}\n\n{note}"),
+                    None => note.to_string(),
+                });
+            }
             if entry.status == "inProgress" && entry.turn_id.as_deref() != active_turn {
                 entry.status = "completed".to_string();
             }
@@ -1290,6 +1315,48 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn recovered_payloads_reach_expanded_rows_and_exports_without_changing_server_data() {
+        let text = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_test","name":"Read","input":{"file_path":"/cut…"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_test","content":"first line"}]}}"#;
+        let (mut thread, _) = crate::transcript::parse(text, "thread", "test").unwrap();
+        thread.recovered_tools.insert(
+            "toolu_test".into(),
+            crate::recovery::Recovery::Found {
+                input: Some("complete input".into()),
+                output: Some("first line\nlast line".into()),
+            },
+        );
+        let blocks = build(&thread, &HashSet::new(), 2, 100, 30);
+        let rendered = blocks
+            .iter()
+            .map(|b| b.text.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("complete input"));
+        assert!(rendered.contains("last line"));
+        assert!(
+            blocks
+                .iter()
+                .flat_map(|b| &b.exports)
+                .any(|(_, text)| text.contains("last line"))
+        );
+        assert_eq!(
+            thread.detail.activities[0].payload["data"]["result"]["content"],
+            "first line"
+        );
+        thread
+            .recovered_tools
+            .insert("toolu_test".into(), crate::recovery::Recovery::Unavailable);
+        let rendered = build(&thread, &HashSet::new(), 2, 100, 30)
+            .iter()
+            .map(|b| b.text.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("first line"));
+        assert!(rendered.contains("Full content unavailable"));
+    }
 
     fn activity(kind: &str, payload: serde_json::Value) -> Activity {
         serde_json::from_value(json!({

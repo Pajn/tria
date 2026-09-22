@@ -10,6 +10,7 @@ mod model;
 mod notify;
 mod picture;
 mod question;
+mod recovery;
 mod rpc;
 mod server;
 mod session;

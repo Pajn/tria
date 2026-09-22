@@ -639,12 +639,20 @@ open and shut a level across the whole conversation, so `zr zr` is every call an
 in it, which `zR` does in one. `zM` shuts them all, and is the one key that also lets go of
 the folds opened by hand.
 
-Expanding a tool row shows what the server sends: the command or tool input, the first line
-of the output or a line count, changed files, and the status. The server projects tool
-payloads to that summary before they go on the wire, so the full output is not available to
-any client through the orchestration API. Rows without anything beyond their summary have no
-fold marker. A subagent's tool calls are the exception: those come from a file rather than the
-wire, and keep what they sent and what they got back.
+Expanding a tool row starts with what the server sends: the command or tool input, an
+output summary, changed files, and the status. When connected to a local server, opening
+folds also looks for the full Claude tool inputs and results in the checkout's saved
+transcripts under `~/.claude/projects` (or `CLAUDE_CONFIG_DIR/projects`). Calls are matched
+by their tool-use IDs. Recovered content appears in expanded rows, searches, yanks, and
+editor exports; the server's records are unchanged. Reading happens in the background.
+
+For a background Bash command, recovery also reads the output file referenced by its saved
+result, labelled as current background output. These file previews are limited to 2 MiB
+and explicitly marked if cut off. Reopening folds retries recovery and refreshes that
+output. Missing transcripts or results are labelled, with the server summary kept as a
+fallback. This recovery currently supports Claude and local servers only; it does not
+resume a session or rerun a command. A subagent's tool calls already come from its transcript
+file and keep what they sent and what they got back.
 
 An image the agent read is drawn rather than named: unfolding the row puts the picture under
 the line, as wide as the chat and at most half as tall, scrolling with the conversation like

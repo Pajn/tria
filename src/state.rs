@@ -285,6 +285,8 @@ pub struct PlanStep {
 
 #[derive(Debug)]
 pub struct ThreadState {
+    /// Local payloads are an overlay; server events remain authoritative.
+    pub recovered_tools: HashMap<String, crate::recovery::Recovery>,
     pub detail: ThreadDetail,
     pub last_sequence: u64,
     pub synchronized: bool,
@@ -319,6 +321,7 @@ impl ThreadState {
         };
         Self {
             detail: snapshot.thread,
+            recovered_tools: HashMap::new(),
             last_sequence: snapshot.snapshot_sequence,
             synchronized: false,
             has_more,
