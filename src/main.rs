@@ -18,6 +18,7 @@ mod state;
 mod subagent;
 mod term;
 mod timeline;
+mod tool_text;
 mod transcript;
 mod ui;
 mod vim;

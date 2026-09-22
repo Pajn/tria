@@ -644,7 +644,9 @@ output summary, changed files, and the status. When connected to a local server,
 folds also looks for the full Claude tool inputs and results in the checkout's saved
 transcripts under `~/.claude/projects` (or `CLAUDE_CONFIG_DIR/projects`). Calls are matched
 by their tool-use IDs. Recovered content appears in expanded rows, searches, yanks, and
-editor exports; the server's records are unchanged. Reading happens in the background.
+editor exports; the server's records are unchanged. Reading happens in the background. JSON inputs and outputs are syntax highlighted; unified
+diffs use green additions, red deletions, and cyan headers. Copying and exports retain the
+original text.
 
 For a background Bash command, recovery also reads the output file referenced by its saved
 result, labelled as current background output. These file previews are limited to 2 MiB

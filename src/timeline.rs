@@ -919,19 +919,23 @@ fn render_work(
         lines.push(Line::from(spans));
         if open {
             if let Some(input) = &entry.input {
-                for line in input.lines() {
-                    lines.push(Line::from(vec![
-                        Span::raw("      "),
-                        Span::styled(line.to_string(), Style::default().fg(Color::Gray)),
-                    ]));
+                for mut spans in
+                    crate::tool_text::highlight(input, Style::default().fg(Color::Gray))
+                {
+                    spans.insert(0, Span::raw("      "));
+                    lines.push(Line::from(spans));
                 }
             }
             if let Some(output) = &entry.output {
-                for (i, line) in output.lines().enumerate() {
-                    lines.push(Line::from(vec![
+                for (i, mut spans) in crate::tool_text::highlight(output, Style::default())
+                    .into_iter()
+                    .enumerate()
+                {
+                    spans.insert(
+                        0,
                         Span::styled(if i == 0 { "      → " } else { "        " }, dim),
-                        Span::styled(line.to_string(), Style::default()),
-                    ]));
+                    );
+                    lines.push(Line::from(spans));
                 }
             }
             for file in &entry.files {
