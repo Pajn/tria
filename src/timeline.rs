@@ -27,6 +27,7 @@ pub enum BlockKey {
     Work(String),
     Plan(String),
     Working,
+    TurnEnd(String),
 }
 
 pub struct Block {
@@ -117,6 +118,7 @@ enum Item<'a> {
     Message(&'a crate::model::Message),
     Activity(&'a Activity),
     Plan(&'a crate::model::ProposedPlan),
+    TurnEnd(&'a crate::turn_time::Finished),
 }
 
 fn item_time<'a>(item: &'a Item<'a>) -> &'a str {
@@ -124,6 +126,7 @@ fn item_time<'a>(item: &'a Item<'a>) -> &'a str {
         Item::Message(m) => &m.created_at,
         Item::Activity(a) => &a.created_at,
         Item::Plan(p) => &p.created_at,
+        Item::TurnEnd(turn) => &turn.completed_at,
     }
 }
 
@@ -150,6 +153,8 @@ pub fn build(
             .map(Item::Activity),
     );
     items.extend(detail.proposed_plans.iter().map(Item::Plan));
+    let finished = crate::turn_time::finished(thread);
+    items.extend(finished.iter().map(Item::TurnEnd));
     items.sort_by(|a, b| item_time(a).cmp(item_time(b)));
 
     let active_turn: Option<&str> = if thread.is_running() {
@@ -236,6 +241,26 @@ pub fn build(
 
     for item in items {
         match item {
+            Item::TurnEnd(turn) => {
+                flush_work(
+                    &mut blocks,
+                    &mut pending_work,
+                    &mut work_anchor,
+                    &mut work_group_index,
+                );
+                blocks.push(Block {
+                    key: BlockKey::TurnEnd(turn.id.clone()),
+                    text: Text::from(Line::from(Span::styled(
+                        format!("  ◷ {}", turn.label),
+                        Style::default().fg(Color::DarkGray),
+                    ))),
+                    rows: Vec::new(),
+                    exports: vec![(format!("turn:{}", turn.id), format!("{}\n", turn.label))],
+                    images: Vec::new(),
+                    pictures: Vec::new(),
+                });
+            }
+
             Item::Message(message) => {
                 flush_work(
                     &mut blocks,

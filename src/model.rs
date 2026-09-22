@@ -617,6 +617,14 @@ pub struct ProposedPlan {
     pub created_at: String,
 }
 
+/// The completion timestamp retained for each historical turn.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Checkpoint {
+    pub turn_id: Id,
+    pub completed_at: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadDetail {
@@ -628,6 +636,8 @@ pub struct ThreadDetail {
     pub activities: Vec<Activity>,
     #[serde(default)]
     pub proposed_plans: Vec<ProposedPlan>,
+    #[serde(default)]
+    pub checkpoints: Vec<Checkpoint>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

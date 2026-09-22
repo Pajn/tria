@@ -632,6 +632,12 @@ else's directory here.
 
 ## Tool output
 
+Completed turns end with a dim `◷ Worked for 2m 3s` row, using elapsed wall time
+(including tool execution and waits). Interrupted and failed turns say so on that row.
+Historical turns whose start time is not retained use the preceding prompt as an estimate,
+marked `~`; a turn with missing or invalid timing has no duration row. Loading older turns
+also loads their completion timestamps.
+
 Tool calls fold in two levels. A run of them collapses to one line saying how many there are
 and what the last one was; opening that gives a line per call; opening a call gives what the
 server kept of it. `za` works on whatever is under the cursor, a group or a row. `zr` and `zm`

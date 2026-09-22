@@ -20,6 +20,7 @@ mod term;
 mod timeline;
 mod tool_text;
 mod transcript;
+mod turn_time;
 mod ui;
 mod vim;
 mod wire;

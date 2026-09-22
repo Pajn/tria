@@ -5545,6 +5545,16 @@ fn prepend_page(thread: &mut ThreadState, snapshot: ThreadDetailSnapshot) {
     activities.retain(|a| !thread.detail.activities.iter().any(|e| e.id == a.id));
     activities.append(&mut thread.detail.activities);
     thread.detail.activities = activities;
+    for checkpoint in older.checkpoints {
+        if !thread
+            .detail
+            .checkpoints
+            .iter()
+            .any(|c| c.turn_id == checkpoint.turn_id)
+        {
+            thread.detail.checkpoints.push(checkpoint);
+        }
+    }
     for plan in older.proposed_plans {
         if !thread.detail.proposed_plans.iter().any(|p| p.id == plan.id) {
             thread.detail.proposed_plans.insert(0, plan);
@@ -6154,6 +6164,26 @@ mod tests {
 
     use super::*;
     use crate::model::{Project, VcsLocal, VcsWorkingTree};
+
+    #[test]
+    fn older_pages_keep_turn_completions_without_duplicates() {
+        let mut thread = running_thread();
+        let page = || {
+            serde_json::from_value::<ThreadDetailSnapshot>(json!({
+                "snapshotSequence":1,
+                "thread":{
+                    "id":"t1", "projectId":"p", "title":"Test",
+                    "modelSelection":{"instanceId":"instance","model":"a-model"},
+                    "checkpoints":[{"turnId":"old", "completedAt":"2026-09-22T12:00:00Z"}]
+                }
+            }))
+            .unwrap()
+        };
+        prepend_page(&mut thread, page());
+        prepend_page(&mut thread, page());
+        assert_eq!(thread.detail.checkpoints.len(), 1);
+        assert_eq!(thread.detail.checkpoints[0].turn_id, "old");
+    }
 
     #[test]
     fn tool_recovery_is_local_and_late_answers_cannot_replace_a_new_request() {

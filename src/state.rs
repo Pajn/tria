@@ -287,6 +287,8 @@ pub struct PlanStep {
 pub struct ThreadState {
     /// Local payloads are an overlay; server events remain authoritative.
     pub recovered_tools: HashMap<String, crate::recovery::Recovery>,
+    /// Exact turn timing seen on the shell stream, retained as the next turn starts.
+    pub turn_timings: HashMap<String, crate::model::LatestTurn>,
     pub detail: ThreadDetail,
     pub last_sequence: u64,
     pub synchronized: bool,
@@ -320,6 +322,13 @@ impl ThreadState {
             None => (false, None),
         };
         Self {
+            turn_timings: snapshot
+                .thread
+                .shell
+                .latest_turn
+                .iter()
+                .map(|turn| (turn.turn_id.clone(), turn.clone()))
+                .collect(),
             detail: snapshot.thread,
             recovered_tools: HashMap::new(),
             last_sequence: snapshot.snapshot_sequence,
@@ -340,7 +349,13 @@ impl ThreadState {
             ThreadItem::Synchronized => self.synchronized = true,
             ThreadItem::Snapshot { snapshot } => {
                 let synchronized = self.synchronized;
+                let timings = std::mem::take(&mut self.turn_timings);
                 *self = Self::from_snapshot(snapshot);
+                for (id, timing) in timings {
+                    if self.detail.checkpoints.iter().any(|c| c.turn_id == id) {
+                        self.turn_timings.entry(id).or_insert(timing);
+                    }
+                }
                 self.synchronized = synchronized;
             }
             ThreadItem::Event { event } => self.apply_event(event),
@@ -396,6 +411,22 @@ impl ThreadState {
                     None => self.detail.proposed_plans.push(plan),
                 }
             }
+            "thread.turn-diff-completed" => {
+                let Ok(checkpoint) =
+                    serde_json::from_value::<crate::model::Checkpoint>(event.payload)
+                else {
+                    return;
+                };
+                match self
+                    .detail
+                    .checkpoints
+                    .iter_mut()
+                    .find(|c| c.turn_id == checkpoint.turn_id)
+                {
+                    Some(existing) => *existing = checkpoint,
+                    None => self.detail.checkpoints.push(checkpoint),
+                }
+            }
             "thread.reverted" => self.needs_snapshot = true,
             _ => return,
         }
@@ -434,6 +465,9 @@ impl ThreadState {
 
     /// Update list-level fields from the shell stream (title, model, latest turn).
     pub fn sync_shell(&mut self, shell: &ThreadShell) {
+        if let Some(turn) = &shell.latest_turn {
+            self.turn_timings.insert(turn.turn_id.clone(), turn.clone());
+        }
         let mine = &mut self.detail.shell;
         mine.title = shell.title.clone();
         mine.model_selection = shell.model_selection.clone();
