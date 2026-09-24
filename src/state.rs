@@ -671,6 +671,15 @@ impl ThreadState {
         pending
     }
 
+    /// The plan waiting to be built: the latest one, while nothing has built it yet.
+    pub fn actionable_plan(&self) -> Option<&crate::model::ProposedPlan> {
+        self.detail
+            .proposed_plans
+            .iter()
+            .max_by(|a, b| a.created_at.cmp(&b.created_at))
+            .filter(|plan| plan.implemented_at.is_none())
+    }
+
     /// What rewinding to before one of your messages would do. The turn the message
     /// belongs to goes, and every turn after it; what comes back is everything you sent
     /// that turn, the prompt and the messages that steered it, since a steer is part of

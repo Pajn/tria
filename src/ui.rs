@@ -1663,6 +1663,13 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
     });
     let placeholder = match resume.as_deref() {
         Some(resume) => resume,
+        None if app
+            .thread
+            .as_ref()
+            .is_some_and(|t| !t.is_running() && t.actionable_plan().is_some()) =>
+        {
+            "plan ready · :implement builds it here, :implement new in a thread of its own"
+        }
         None if insert && app.thread.as_ref().is_some_and(|t| t.is_running()) => {
             "Enter steers the running turn · Ctrl-s queues for after it · Esc normal"
         }
@@ -3139,7 +3146,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
-            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :approve [n]  :stop  :stop! (the session)  :older  :answer  :dismiss  :reconnect  :sidebar  :worktrees  :split  :window  :q",
+            "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :approve [n]  :stop  :stop! (the session)  :implement [new]  :rewind  :older  :answer  :dismiss  :reconnect  :sidebar  :worktrees  :split  :window  :q",
         ),
         Line::from("  the line takes the editing keys above, Up/Down for the commands"),
         Line::from("  run this session, and Tab to complete a name or a listed argument"),

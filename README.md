@@ -244,11 +244,16 @@ newline.
 
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `project rename <name>`,
-`archive`, `delete!`, `approve [n]`, `stop`, `stop!`,
+`archive`, `delete!`, `approve [n]`, `stop`, `stop!`, `implement [new]`,
 `older`, `rewind`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
 `reveal`,
 `worktree`, `worktrees`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`,
 `usage`, `split`, `window`, `reconnect`, `help`, `q`.
+
+`implement` builds the plan a thread in plan mode has proposed: it sends the plan back as the
+next turn, out of plan mode, and the server marks the plan built. `implement new` does it in a
+thread of its own that works on the same branch and checkout, and tria moves there once the
+server has made it. The composer says when a plan is waiting.
 
 The line is the same one-line editor as the rest of the client, so it takes the same keys:
 `Ctrl-w` rubs out a word and `Ctrl-u` the line, `Ctrl-a` and `Ctrl-e` go to the ends, and

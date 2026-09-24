@@ -23,6 +23,10 @@ pub struct NewThread<'a> {
     /// Set to start the thread in a fresh worktree branched off `base_branch`; the
     /// server creates it and points the thread at it.
     pub worktree: Option<Worktree<'a>>,
+    /// The branch and checkout of a thread this one carries on from, to work where it
+    /// did. Without them the thread works in the project's own checkout.
+    pub branch: Option<&'a str>,
+    pub worktree_path: Option<&'a str>,
 }
 
 /// Where a worktree for a new thread comes from, and what it is called.
@@ -79,8 +83,8 @@ pub fn turn_start(
                 "modelSelection": new_thread.model_selection,
                 "runtimeMode": new_thread.runtime_mode,
                 "interactionMode": new_thread.interaction_mode,
-                "branch": null,
-                "worktreePath": null,
+                "branch": new_thread.branch,
+                "worktreePath": new_thread.worktree_path,
                 "createdAt": created_at,
             }
         });
@@ -94,6 +98,17 @@ pub fn turn_start(
             });
         }
     }
+    command
+}
+
+/// What a turn that builds a proposed plan says. The desktop's words, so that a plan
+/// implemented from either reads the same in the thread.
+pub const PLAN_PROMPT_PREFIX: &str = "PLEASE IMPLEMENT THIS PLAN:\n";
+
+/// Mark a turn as building a plan, which is what has the server record the plan as
+/// implemented.
+pub fn implementing(mut command: Value, thread_id: &str, plan_id: &str) -> Value {
+    command["sourceProposedPlan"] = json!({ "threadId": thread_id, "planId": plan_id });
     command
 }
 
@@ -301,6 +316,8 @@ mod tests {
                     branch: "tria/12345678",
                     start_from_origin: true,
                 }),
+                branch: None,
+                worktree_path: None,
             }),
         );
         let bootstrap = &command["bootstrap"];
@@ -341,6 +358,8 @@ mod tests {
                 runtime_mode: "full-access",
                 interaction_mode: "default",
                 worktree: None,
+                branch: None,
+                worktree_path: None,
             }),
         );
         assert!(command["bootstrap"]["prepareWorktree"].is_null());

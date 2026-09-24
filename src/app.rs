@@ -142,11 +142,11 @@ const COMMANDS: &[&str] = &[
     "effort",
     "git",
     "help",
+    "implement",
     "mode",
     "model",
     "new",
     "older",
-    "rewind",
     "perm",
     "pr",
     "project",
@@ -154,6 +154,7 @@ const COMMANDS: &[&str] = &[
     "reconnect",
     "rename",
     "reveal",
+    "rewind",
     "settle",
     "settled",
     "shell",
@@ -319,6 +320,16 @@ const REWIND_FAILED: &str = "checkpoint.revert.failed";
 
 const REWIND_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// What a plan calls itself: its first heading.
+fn plan_title(markdown: &str) -> Option<&str> {
+    markdown
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('#'))
+        .map(|line| line.trim_start_matches('#').trim())
+        .filter(|title| !title.is_empty())
+}
+
 /// The last two parts of a path, which is what tells one worktree from another.
 fn short_path(path: &str) -> String {
     let parts: Vec<&str> = path.rsplit('/').take(2).collect();
@@ -408,6 +419,8 @@ pub enum AppEvent {
         text: String,
         error: String,
     },
+    /// A thread made to build a plan exists now, and is where to look.
+    PlanThreadCreated(Id),
     /// The server would not take a rewind at all.
     RewindRefused {
         thread_id: Id,
@@ -1372,6 +1385,8 @@ impl App {
                         branch: &worktree_branch,
                         start_from_origin: self.config.settings.new_worktrees_start_from_origin,
                     }),
+                    branch: None,
+                    worktree_path: None,
                 }),
             );
             // The view moves to the new thread now, and reads as loading until the
@@ -1521,6 +1536,93 @@ impl App {
                 self.on_send_refused(thread.id.clone(), queued.text, why.into());
             }
         }
+    }
+
+    /// `:implement`: build the thread's plan here, leaving plan mode for it; with
+    /// `new`, in a thread of its own that works where this one does. Either way the
+    /// server is told which plan it is, and marks it built.
+    fn implement_plan(&mut self, arg: &str) {
+        if !matches!(arg, "" | "new") {
+            self.toast(
+                "implement takes nothing, or new for a thread of its own",
+                true,
+            );
+            return;
+        }
+        let Some(thread) = &self.thread else {
+            self.toast("no thread open", true);
+            return;
+        };
+        if thread.is_running() {
+            self.toast(
+                "the thread is still working; implement once it is done",
+                true,
+            );
+            return;
+        }
+        let Some(plan) = thread.actionable_plan() else {
+            self.toast("no plan waiting to be built", true);
+            return;
+        };
+        let text = format!(
+            "{}{}",
+            commands::PLAN_PROMPT_PREFIX,
+            plan.plan_markdown.trim()
+        );
+        let shell = &thread.detail.shell;
+        let (source, plan_id) = (thread.id().to_string(), plan.id.clone());
+        if arg.is_empty() {
+            let command = commands::turn_start(
+                &source,
+                &text,
+                &shell.model_selection,
+                &shell.runtime_mode,
+                "default",
+                None,
+            );
+            self.leave_transcript();
+            self.dispatch(commands::implementing(command, &source, &plan_id));
+            self.scroll = Scroll::Follow;
+            return;
+        }
+        let title: String = plan_title(&plan.plan_markdown)
+            .map_or_else(
+                || "Implement plan".into(),
+                |title| format!("Implement {title}"),
+            )
+            .chars()
+            .take(60)
+            .collect();
+        let thread_id = commands::new_id();
+        let command = commands::turn_start(
+            &thread_id,
+            &text,
+            &shell.model_selection,
+            &shell.runtime_mode,
+            "default",
+            Some(commands::NewThread {
+                project_id: &shell.project_id,
+                title: title.trim(),
+                model_selection: &shell.model_selection,
+                runtime_mode: &shell.runtime_mode,
+                interaction_mode: "default",
+                worktree: None,
+                branch: shell.branch.as_deref(),
+                worktree_path: shell.worktree_path.as_deref(),
+            }),
+        );
+        let command = commands::implementing(command, &source, &plan_id);
+        // The view stays on the plan until the thread building it exists: moving first
+        // would be looking at a thread that may never be made.
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let _ = events.send(match handle.dispatch(command).await {
+                Ok(_) => AppEvent::PlanThreadCreated(thread_id),
+                Err(error) => AppEvent::Dispatched(Err(error.to_string())),
+            });
+        });
+        self.toast("starting a thread for the plan…", false);
     }
 
     /// `gr`: rewind to before the message under the chat cursor.
@@ -4274,6 +4376,7 @@ impl App {
             }
             "older" => self.load_older(),
             "rewind" => self.ask_rewind(None),
+            "implement" => self.implement_plan(arg),
             "dismiss" => self.dismiss_question(),
             "answer" | "a" => {
                 if !self.begin_answering() {
@@ -5684,6 +5787,7 @@ impl App {
             "mode" => &["plan", "default"],
             "perm" | "permissions" => RUNTIME_MODES,
             "project" => &["rename"],
+            "implement" => &["new"],
             // The efforts are the model's own, and a model that has none offers none.
             "effort" | "e" => {
                 return self
@@ -6450,6 +6554,7 @@ fn apply(app: &mut App, event: AppEvent) {
         AppEvent::Update(update) => app.on_update(*update),
         AppEvent::ThreadCreated(thread_id) => app.on_thread_created(thread_id),
         AppEvent::RewindRefused { thread_id, error } => app.on_rewind_refused(thread_id, error),
+        AppEvent::PlanThreadCreated(thread_id) => app.open_thread(&thread_id),
         AppEvent::CreateRefused { thread_id, error } => app.on_create_refused(thread_id, error),
         AppEvent::SendRefused {
             thread_id,
@@ -8201,6 +8306,119 @@ mod tests {
             .expect("sent straight away");
         assert_eq!(command["message"]["text"], "now");
         assert_eq!(app.queued_message(), None);
+    }
+
+    /// A thread in plan mode on a worktree, with a plan waiting and an older one built.
+    fn planned_thread() -> ThreadState {
+        let snapshot: ThreadDetailSnapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p", "title": "Test",
+                "modelSelection": {"instanceId": "instance", "model": "a-model"},
+                "runtimeMode": "full-access", "interactionMode": "plan",
+                "branch": "tria/abc", "worktreePath": "/worktrees/p-1",
+                "latestTurn": {"turnId": "turn", "state": "completed"},
+                "hasActionableProposedPlan": true,
+                "messages": [], "activities": [],
+                "proposedPlans": [
+                    {"id": "old", "planMarkdown": "# Old", "implementedAt": "2026-01-01T09:00:00Z",
+                        "createdAt": "2026-01-01T08:00:00Z"},
+                    {"id": "plan", "planMarkdown": "\n# Add a queue\n\n1. do it\n",
+                        "createdAt": "2026-01-01T10:00:00Z"},
+                ]
+            }
+        }))
+        .expect("a plan the server could have sent");
+        ThreadState::from_snapshot(snapshot)
+    }
+
+    /// `:implement` sends the plan back out of plan mode, naming it, so the server can
+    /// mark it built.
+    #[tokio::test]
+    async fn implement_builds_the_waiting_plan_here() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(planned_thread());
+        app.current_thread_id = Some("t1".into());
+
+        app.run_command("implement");
+        let command = sent_command(&mut requests)
+            .await
+            .expect("the plan was sent");
+        assert_eq!(command["type"], "thread.turn.start");
+        assert_eq!(command["threadId"], "t1");
+        assert_eq!(command["interactionMode"], "default");
+        assert_eq!(
+            command["message"]["text"],
+            "PLEASE IMPLEMENT THIS PLAN:\n# Add a queue\n\n1. do it"
+        );
+        assert_eq!(
+            command["sourceProposedPlan"],
+            json!({"threadId": "t1", "planId": "plan"})
+        );
+    }
+
+    /// `:implement new` makes a thread where this one works, named for the plan, and
+    /// moves there only once the server has made it.
+    #[tokio::test]
+    async fn implement_new_builds_it_in_a_thread_of_its_own() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(planned_thread());
+        app.current_thread_id = Some("t1".into());
+
+        app.run_command("implement new");
+        let command = loop {
+            match asked(&mut requests).await.expect("the plan was sent") {
+                crate::session::Request::Dispatch { command, reply } => {
+                    let _ = reply.send(Ok(1));
+                    break command;
+                }
+                _ => continue,
+            }
+        };
+        let created = &command["bootstrap"]["createThread"];
+        assert_eq!(created["title"], "Implement Add a queue");
+        assert_eq!(created["interactionMode"], "default");
+        assert_eq!(created["branch"], "tria/abc");
+        assert_eq!(created["worktreePath"], "/worktrees/p-1");
+        assert_eq!(command["sourceProposedPlan"]["planId"], "plan");
+        assert_ne!(command["threadId"], "t1");
+        assert_eq!(
+            app.current_thread_id.as_deref(),
+            Some("t1"),
+            "moved before it exists"
+        );
+
+        let made = tokio::time::timeout(Duration::from_millis(500), sent.recv())
+            .await
+            .ok()
+            .flatten();
+        let Some(event @ AppEvent::PlanThreadCreated(_)) = made else {
+            panic!("no word the thread was made");
+        };
+        apply(&mut app, event);
+        assert_eq!(
+            app.current_thread_id.as_deref(),
+            command["threadId"].as_str(),
+            "not moved to the new thread"
+        );
+    }
+
+    /// A built plan is not built again.
+    #[test]
+    fn implement_wants_a_plan_nobody_has_built() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let mut thread = planned_thread();
+        thread.detail.proposed_plans.retain(|p| p.id == "old");
+        app.thread = Some(thread);
+        app.current_thread_id = Some("t1".into());
+        app.run_command("implement");
+        assert!(app.toast.as_ref().unwrap().0.contains("no plan"));
     }
 
     /// Three finished turns, the second of them steered: `u3` arrived while it ran.
