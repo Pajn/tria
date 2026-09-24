@@ -283,6 +283,17 @@ struct PendingCreate {
     text: String,
 }
 
+/// A message written during a turn and held back until that turn is over, where
+/// `Enter` would have steered the turn with it. It is tria's, not the server's: the
+/// protocol has no queue, and a message the server has been given cannot be taken
+/// back, so this is the only kind that can be.
+struct Queued {
+    text: String,
+    /// The turn that was running when it was queued. A list entry about any other
+    /// turn is older than the one it waits for, and says nothing about it.
+    after_turn: Option<Id>,
+}
+
 /// The last two parts of a path, which is what tells one worktree from another.
 fn short_path(path: &str) -> String {
     let parts: Vec<&str> = path.rsplit('/').take(2).collect();
@@ -511,6 +522,9 @@ pub struct App {
     /// Unsent composer text per thread, keyed by thread id, so switching threads keeps a
     /// half-written message where it belongs. New-thread drafts use `NEW_THREAD_DRAFT_KEY`.
     drafts: HashMap<String, String>,
+    /// Messages waiting for their thread's turn to end, one per thread: a second one
+    /// queued behind the first joins it, as one message is what the turn gets next.
+    queued: HashMap<Id, Queued>,
     /// Every terminal session the server knows about, across threads.
     pub terminals: Vec<crate::model::TerminalSummary>,
     /// Selection in the terminal panel.
@@ -697,6 +711,7 @@ impl App {
             draft_worktree: None,
             links: Vec::new(),
             drafts: HashMap::new(),
+            queued: HashMap::new(),
             programs: vec![crate::config::Program {
                 key: 'l',
                 command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
@@ -1102,6 +1117,7 @@ impl App {
             self.unseen.insert(thread.id.clone());
         }
         self.note_status(thread);
+        self.release_queued(thread);
     }
 
     /// Say out loud that a thread has stopped working, to somebody who is not looking
@@ -1358,6 +1374,113 @@ impl App {
             self.drafts.remove(&key);
         }
         self.scroll = Scroll::Follow;
+    }
+
+    /// Hold the message until the running turn is over, instead of steering the turn
+    /// with it as `Enter` does. With no turn running there is nothing to wait for, and
+    /// it is sent.
+    fn queue_message(&mut self) {
+        let text = self.composer.text().trim_end().to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+        let running = self
+            .thread
+            .as_ref()
+            .filter(|thread| self.draft.is_none() && thread.is_running());
+        let Some(thread) = running else {
+            return self.send_message();
+        };
+        let thread_id = thread.id().to_string();
+        let after_turn = thread
+            .detail
+            .shell
+            .latest_turn
+            .as_ref()
+            .filter(|turn| turn.state == "running")
+            .map(|turn| turn.turn_id.clone());
+        self.leave_transcript();
+        let queued = self.queued.entry(thread_id.clone()).or_insert(Queued {
+            text: String::new(),
+            after_turn: None,
+        });
+        if !queued.text.is_empty() {
+            queued.text.push_str("\n\n");
+        }
+        queued.text.push_str(&text);
+        queued.after_turn = after_turn;
+        self.composer.push_history(text);
+        self.composer.clear();
+        self.drafts.remove(&thread_id);
+        self.scroll = Scroll::Follow;
+    }
+
+    /// What the open thread has queued, for the composer to show.
+    pub fn queued_message(&self) -> Option<&str> {
+        let thread_id = self.current_thread_id.as_ref()?;
+        self.queued
+            .get(thread_id)
+            .map(|queued| queued.text.as_str())
+    }
+
+    /// Take the open thread's queued message back into an empty composer, to be
+    /// edited or thrown away. Nothing is sent for it until it is sent again.
+    fn recall_queued(&mut self) -> bool {
+        if !self.composer.is_empty() {
+            return false;
+        }
+        let Some(queued) = self
+            .current_thread_id
+            .as_ref()
+            .and_then(|thread_id| self.queued.remove(thread_id))
+        else {
+            return false;
+        };
+        self.composer.set_text(&queued.text);
+        true
+    }
+
+    /// Send what a thread has queued once its turn is over. A turn that completed is
+    /// what it was waiting for. One that was interrupted or failed is not: the message
+    /// was written for a turn that did not get where it was going, so it comes back to
+    /// be read again rather than going out on its own.
+    fn release_queued(&mut self, thread: &crate::model::ThreadShell) {
+        let Some(queued) = self.queued.get(&thread.id) else {
+            return;
+        };
+        let turn = thread.latest_turn.as_ref();
+        if thread.is_running()
+            || queued
+                .after_turn
+                .as_ref()
+                .is_some_and(|waited| turn.map(|t| &t.turn_id) != Some(waited))
+        {
+            return;
+        }
+        let Some(queued) = self.queued.remove(&thread.id) else {
+            return;
+        };
+        match turn.map(|t| t.state.as_str()) {
+            Some("completed") => {
+                let command = commands::turn_start(
+                    &thread.id,
+                    &queued.text,
+                    &thread.model_selection,
+                    &thread.runtime_mode,
+                    &thread.interaction_mode,
+                    None,
+                );
+                self.dispatch_message(command, thread.id.clone(), queued.text);
+            }
+            state => {
+                let why = match state {
+                    Some("interrupted") => "the turn was interrupted",
+                    Some("error") => "the turn failed",
+                    _ => "the turn did not finish",
+                };
+                self.on_send_refused(thread.id.clone(), queued.text, why.into());
+            }
+        }
     }
 
     /// Stop what the session is doing. Usually that is the turn, and the turn is named.
@@ -5140,8 +5263,9 @@ impl App {
             KeyCode::Enter if alt || shift || ctrl => self.composer.newline(),
             KeyCode::Char('j') if ctrl => self.composer.newline(),
             KeyCode::Enter => self.send_message(),
+            KeyCode::Char('s') if ctrl => self.queue_message(),
             KeyCode::Up => {
-                if !self.composer.up() {
+                if !self.composer.up() && !self.recall_queued() {
                     self.composer.history_prev();
                 }
             }
@@ -5152,7 +5276,11 @@ impl App {
             }
             KeyCode::PageUp => self.scroll_by(-(self.chat_viewport.0 as isize)),
             KeyCode::PageDown => self.scroll_by(self.chat_viewport.0 as isize),
-            KeyCode::Char('p') if ctrl => self.composer.history_prev(),
+            KeyCode::Char('p') if ctrl => {
+                if !self.recall_queued() {
+                    self.composer.history_prev();
+                }
+            }
             KeyCode::Char('n') if ctrl => self.composer.history_next(),
             KeyCode::Tab => self.composer.insert_str("    "),
             _ => {
@@ -5421,10 +5549,13 @@ impl App {
                         for thread in &snapshot.threads {
                             self.marks.insert(thread.id.clone(), mark_of(thread));
                             self.statuses.insert(thread.id.clone(), thread.status());
+                            // A turn can end while tria is not connected to hear it.
+                            self.release_queued(thread);
                         }
                     }
                     ShellItem::ThreadUpserted { thread, .. } => self.note_thread(thread),
                     ShellItem::ThreadRemoved { thread_id, .. } => {
+                        self.queued.remove(thread_id);
                         self.marks.remove(thread_id);
                         self.statuses.remove(thread_id);
                         self.unseen.remove(thread_id);
@@ -7696,6 +7827,118 @@ mod tests {
         assert_eq!(app.focus, Focus::Composer);
         let said = app.toast.as_ref().expect("it says why").0.clone();
         assert!(said.starts_with("not sent:"), "{said}");
+    }
+
+    /// `Enter` steers a running turn; `Ctrl-s` holds the message until the turn has
+    /// finished, and only then is it sent — as the next turn, not into this one.
+    #[tokio::test]
+    async fn a_queued_message_waits_for_the_turn_to_finish() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+        app.current_thread_id = Some("t1".into());
+        app.mode = Mode::Insert;
+        app.focus = Focus::Composer;
+
+        app.composer.set_text("first");
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.composer.set_text("second");
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.composer.is_empty());
+        assert_eq!(app.queued_message(), Some("first\n\nsecond"));
+        assert!(
+            sent_no_command(&mut requests).await,
+            "sent into the running turn"
+        );
+
+        // A list entry from before the turn began says nothing about this one.
+        upsert(
+            &mut app,
+            listed("t1", Some(("an-earlier-turn", "completed"))),
+        );
+        upsert(&mut app, listed("t1", Some(("turn", "running"))));
+        assert!(
+            sent_no_command(&mut requests).await,
+            "sent before the turn ended"
+        );
+
+        upsert(&mut app, listed("t1", Some(("turn", "completed"))));
+        let command = sent_command(&mut requests)
+            .await
+            .expect("sent once it ended");
+        assert_eq!(command["type"], "thread.turn.start");
+        assert_eq!(command["message"]["text"], "first\n\nsecond");
+        assert_eq!(app.queued_message(), None);
+    }
+
+    /// A queued message is still tria's, so it can be taken back to change or drop.
+    #[tokio::test]
+    async fn up_takes_a_queued_message_back() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+        app.current_thread_id = Some("t1".into());
+        app.mode = Mode::Insert;
+        app.focus = Focus::Composer;
+
+        app.composer.set_text("not yet");
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.composer.text(), "not yet");
+        assert_eq!(app.queued_message(), None);
+
+        upsert(&mut app, listed("t1", Some(("turn", "completed"))));
+        assert!(
+            sent_no_command(&mut requests).await,
+            "a recalled message went out"
+        );
+    }
+
+    /// A turn stopped part way is not the one the message was written to follow, so the
+    /// message comes back rather than going out behind it.
+    #[tokio::test]
+    async fn a_queued_message_comes_back_when_the_turn_is_interrupted() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+        app.current_thread_id = Some("t1".into());
+        app.mode = Mode::Insert;
+        app.focus = Focus::Composer;
+
+        app.composer.set_text("after that");
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        upsert(&mut app, listed("t1", Some(("turn", "interrupted"))));
+
+        assert!(sent_no_command(&mut requests).await);
+        assert_eq!(app.composer.text(), "after that");
+        assert_eq!(app.queued_message(), None);
+        assert!(app.toast.as_ref().unwrap().0.contains("interrupted"));
+    }
+
+    /// With no turn running there is nothing to wait for.
+    #[tokio::test]
+    async fn queueing_with_nothing_running_sends() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let mut thread = running_thread();
+        thread.detail.shell.session = None;
+        thread.detail.shell.latest_turn.as_mut().unwrap().state = "completed".into();
+        app.thread = Some(thread);
+        app.current_thread_id = Some("t1".into());
+        app.mode = Mode::Insert;
+        app.focus = Focus::Composer;
+
+        app.composer.set_text("now");
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let command = sent_command(&mut requests)
+            .await
+            .expect("sent straight away");
+        assert_eq!(command["message"]["text"], "now");
+        assert_eq!(app.queued_message(), None);
     }
 
     /// Where the composer is not free, putting the message back would write over

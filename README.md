@@ -194,10 +194,11 @@ still waiting.
 
 | Insert mode | |
 | --- | --- |
-| `Enter` | send |
+| `Enter` | send; while a turn runs, steer it |
+| `Ctrl-s` | while a turn runs, queue the message until it ends |
 | `Alt-Enter` or `Ctrl-j` | newline |
 | `Ctrl-v` or `Ctrl-q` | the next key as the character it stands for: `Ctrl-v` `Enter` is a newline, `Ctrl-v` `Tab` a tab |
-| `Up` `Down` or `Ctrl-p` `Ctrl-n` | prompt history |
+| `Up` `Down` or `Ctrl-p` `Ctrl-n` | prompt history; on an empty composer, `Up` takes a queued message back first |
 | `←` `→` `Home` `End`, `Ctrl-a` `Ctrl-e` | move the cursor; `Alt` with an arrow, or `Alt-b` `Alt-f`, moves by word |
 | `Backspace` `Delete`, `Ctrl-w` `Ctrl-k` `Ctrl-u` | delete a character, the word before the cursor, to the end, to the start |
 | `Esc` or `Ctrl-c` | back to normal mode |
@@ -208,6 +209,13 @@ to find by accident. `Ctrl-v` and `Ctrl-q` mean in insert mode what they mean in
 which is why neither is a quit: the next key goes in as the character it stands for.
 `Alt-Enter` is the usual way to write a newline where `Enter` sends, but a terminal has to
 be willing to send it; `Ctrl-v` `Enter` needs nothing of the terminal and always works.
+
+A message sent while a turn runs goes straight to the agent and joins the turn it is on:
+that is steering, and the server has no way to take such a message back. `Ctrl-s` keeps the message in tria instead, shown on the
+composer's lower border, and sends it as the next turn once the running one completes.
+Queuing another joins it to the first. Until then `Up` on an empty composer takes it back
+to edit or drop. A turn that is interrupted or fails does not send it; it comes back to the
+composer to be looked at again.
 
 The custom answer typed after `ga` then `c` is edited with those same keys, less the ones
 that only mean something in a message: it is one line, so there is no newline to write. A

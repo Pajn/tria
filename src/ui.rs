@@ -1625,9 +1625,26 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         title_spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
     }
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_style(border_style)
         .title(Line::from(title_spans));
+    // What is waiting for the turn to end, on the border of the box it came out of and
+    // goes back into. The first line is enough to know which message it is.
+    if let Some(queued) = app.queued_message() {
+        let first = queued.lines().next().unwrap_or_default();
+        let room = (area.width as usize).saturating_sub(34).max(8);
+        let mut preview: String = first.chars().take(room).collect();
+        if preview.len() < first.len() || queued.contains('\n') {
+            preview.push('…');
+        }
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                format!(" queued: {preview} · ↑ takes it back "),
+                Style::default().fg(Color::Yellow),
+            ))
+            .right_aligned(),
+        );
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let text_area = Rect {
@@ -1646,6 +1663,9 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
     });
     let placeholder = match resume.as_deref() {
         Some(resume) => resume,
+        None if insert && app.thread.as_ref().is_some_and(|t| t.is_running()) => {
+            "Enter steers the running turn · Ctrl-s queues for after it · Esc normal"
+        }
         None if insert => "type a message · Enter sends · Ctrl-v Enter newline · Esc normal",
         None => "i or a click to write · d c y w b f t motions edit",
     };
@@ -3070,7 +3090,10 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  Enter send · Alt-Enter / Ctrl-j newline · Esc or Ctrl-c normal"),
         Line::from("  Ctrl-v or Ctrl-q        the next key as a character: Ctrl-v Enter is a"),
         Line::from("                          newline where Enter would send"),
-        Line::from("  Up/Down or Ctrl-p/n     prompt history"),
+        Line::from("  Ctrl-s                  queue the message until the running turn ends,"),
+        Line::from("                          where Enter would steer the turn with it"),
+        Line::from("  Up/Down or Ctrl-p/n     prompt history; Up on an empty composer takes"),
+        Line::from("                          a queued message back first"),
         Line::from("  ← → Home End Ctrl-a/e  move · Alt-arrow or Alt-b/f by word"),
         Line::from("  Ctrl-w Ctrl-k Ctrl-u    kill word / to end / to start"),
         Line::from("  the same keys edit every other line in the client: a custom answer"),
