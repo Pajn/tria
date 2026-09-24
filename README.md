@@ -100,7 +100,7 @@ Press `?` inside the app for the full list.
 | --- | --- |
 | `Ctrl-d` `Ctrl-u` `Ctrl-f` `Ctrl-b` `Ctrl-e` `Ctrl-y` | scroll the conversation: half page, page, line |
 | `J` `K` | next / previous thread |
-| `/` | fuzzy thread picker |
+| `/` | fuzzy thread picker, which also searches what the threads said |
 | `Tab` / `Shift-Tab` | cycle focus: composer, chat, thread list. `Esc` returns to the composer |
 | `s` `S` | toggle the sidebar / the settled shelf |
 | `n` | new thread (pick a project; `^R` renames the one under the cursor) |
@@ -162,6 +162,14 @@ chat has focus. Queries are case-insensitive unless they contain an uppercase le
 chat, `?` searches; help is `?` from the composer or `:help`.
 
 In the thread list, `j`/`k` move, `Enter` opens a thread or folds a section.
+
+The `/` thread picker filters titles as you type. Once you pause, it also asks the server
+which threads said what you typed, and lists them under the titles with the words in place:
+yours marked `you:`, the agent's `agent:`. The server matches the query as written, ignoring
+case, in your messages and each turn's final answer, and names each thread once, by its best
+match. `Enter` on one opens the thread at that message, loading older turns until it is there,
+and leaves the query as the chat's search, so `n` and `N` go on to the rest. Archived threads
+are not searched.
 
 With the composer focused, normal mode edits it with Vim semantics. Motions: `h j k l w b e
 W B E 0 ^ $ gg G f F t T ; ,`, all taking counts. Operators `d c y` combine with a motion or a

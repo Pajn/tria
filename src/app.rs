@@ -220,9 +220,58 @@ pub struct Picker {
     pub items: Vec<PickerItem>,
     /// The project being renamed, while one is: the query line is its new title.
     pub renaming: Option<Id>,
+    /// What the server found in the threads' messages, for the thread list.
+    pub content: ContentSearch,
+}
+
+/// The thread list's search of what was said, which the server does: titles are
+/// filtered here as they are typed, messages are asked for once the typing pauses.
+#[derive(Debug, Default)]
+pub struct ContentSearch {
+    /// Threads whose messages hold the query, as rows and where in them.
+    pub hits: Vec<(PickerItem, ContentHit)>,
+    /// The query the hits are for.
+    pub found_for: String,
+    /// The query last asked about, answered or not.
+    asked: String,
+    /// The query as it stood at the last tick, and since when, to tell a pause.
+    seen: String,
+    seen_at: Option<Instant>,
+}
+
+impl ContentSearch {
+    pub fn searching(&self) -> bool {
+        !self.asked.is_empty() && self.asked != self.found_for
+    }
+}
+
+/// Where a thread's messages match: the message's time, which is how it is found
+/// again once the thread is open, and whose words they were.
+#[derive(Debug, Clone)]
+pub struct ContentHit {
+    pub thread_id: Id,
+    pub created_at: Option<String>,
 }
 
 impl Picker {
+    /// The rows the list shows: titles that match, then threads whose messages do.
+    pub fn rows(&self) -> Vec<&PickerItem> {
+        let mut rows = self.filtered();
+        if self.content.found_for == self.query.text().trim() {
+            rows.extend(self.content.hits.iter().map(|(item, _)| item));
+        }
+        rows
+    }
+
+    /// The message match a row stands for, when it stands for one.
+    pub fn hit(&self, row: usize) -> Option<&ContentHit> {
+        let titles = self.filtered().len();
+        let index = row.checked_sub(titles)?;
+        (self.content.found_for == self.query.text().trim())
+            .then(|| self.content.hits.get(index).map(|(_, hit)| hit))
+            .flatten()
+    }
+
     pub fn filtered(&self) -> Vec<&PickerItem> {
         // While a name is being typed the list is not being searched, and a list that
         // reshuffled under the row being renamed would be reshuffling for nothing.
@@ -319,6 +368,19 @@ struct PendingRewind {
 const REWIND_FAILED: &str = "checkpoint.revert.failed";
 
 const REWIND_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A message to go to, from a search of what threads said.
+struct Jump {
+    thread_id: Id,
+    created_at: Option<String>,
+    query: String,
+    /// The older page last asked for while looking for it, so it is asked for once.
+    asked_before: Option<String>,
+}
+
+/// How long the thread list waits after the last key before asking the server what
+/// the threads said. Titles need no wait; they are filtered here.
+const CONTENT_SEARCH_PAUSE: Duration = Duration::from_millis(250);
 
 /// The list under a `/` or `$` being typed, and the row it is on.
 pub struct CompletionMenu {
@@ -428,6 +490,11 @@ pub enum AppEvent {
     },
     /// A thread made to build a plan exists now, and is where to look.
     PlanThreadCreated(Id),
+    /// What the server found in the threads' messages, for the query it was asked.
+    ThreadSearch {
+        query: String,
+        result: Result<Value, String>,
+    },
     /// The server would not take a rewind at all.
     RewindRefused {
         thread_id: Id,
@@ -575,6 +642,8 @@ pub struct App {
     /// Messages waiting for their thread's turn to end, one per thread: a second one
     /// queued behind the first joins it, as one message is what the turn gets next.
     queued: HashMap<Id, Queued>,
+    /// A message a search found, to go to once its thread is open and drawn.
+    jump: Option<Jump>,
     /// What the word being typed could be finished as, while there is anything.
     pub completion: Option<CompletionMenu>,
     /// The word `Esc` put the list away for, which it stays away for until the word
@@ -770,6 +839,7 @@ impl App {
             links: Vec::new(),
             drafts: HashMap::new(),
             queued: HashMap::new(),
+            jump: None,
             completion: None,
             completion_dismissed: None,
             rewind_ask: None,
@@ -1550,6 +1620,163 @@ impl App {
                 self.on_send_refused(thread.id.clone(), queued.text, why.into());
             }
         }
+    }
+
+    /// Ask the server what the threads said, once the thread list's query has held
+    /// still for a moment. Two characters is the least it will search for.
+    fn search_thread_contents(&mut self) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        if picker.kind != PickerKind::Thread || picker.renaming.is_some() {
+            return;
+        }
+        let query = picker.query.text().trim().to_string();
+        let content = &mut picker.content;
+        if query != content.seen {
+            content.seen = query;
+            content.seen_at = Some(Instant::now());
+            return;
+        }
+        let paused = content
+            .seen_at
+            .is_some_and(|at| at.elapsed() >= CONTENT_SEARCH_PAUSE);
+        if !paused || query == content.asked {
+            return;
+        }
+        content.asked = query.clone();
+        if query.chars().count() < 2 {
+            content.hits.clear();
+            content.found_for = query;
+            return;
+        }
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result = handle
+                .call(
+                    "orchestration.searchThreads",
+                    json!({ "query": query, "limit": 50 }),
+                )
+                .await
+                .map_err(|e| e.to_string());
+            let _ = events.send(AppEvent::ThreadSearch { query, result });
+        });
+    }
+
+    /// Take the server's matches into the list, if the list is still asking that.
+    fn on_thread_search(&mut self, query: String, result: Result<Value, String>) {
+        let Some(picker) = self
+            .picker
+            .as_mut()
+            .filter(|p| p.kind == PickerKind::Thread && p.content.asked == query)
+        else {
+            return;
+        };
+        let matches = match result {
+            Ok(value) => value
+                .get("matches")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            Err(error) => {
+                picker.content.found_for = query;
+                picker.content.hits.clear();
+                self.toast(format!("could not search messages: {error}"), true);
+                return;
+            }
+        };
+        let threads = &self.shell.threads;
+        picker.content.hits = matches
+            .iter()
+            .filter_map(|hit| {
+                let thread_id = hit.get("threadId")?.as_str()?;
+                let thread = threads.get(thread_id)?;
+                let whose = match hit.get("source").and_then(Value::as_str) {
+                    Some("user") => "you",
+                    _ => "agent",
+                };
+                let snippet = hit
+                    .get("snippet")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Some((
+                    PickerItem {
+                        label: thread.title.clone(),
+                        detail: format!("{whose}: {snippet}"),
+                        key: thread_id.to_string(),
+                    },
+                    ContentHit {
+                        thread_id: thread_id.to_string(),
+                        created_at: hit
+                            .get("messageCreatedAt")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    },
+                ))
+            })
+            .collect();
+        picker.content.found_for = query;
+    }
+
+    /// Go to the message a search found, once its thread is open and drawn: the line
+    /// in it that matches, with the query left as the chat's search so `n` and `N`
+    /// go on to the rest. A message older than what is loaded has the older turns
+    /// asked for until it turns up or there are none left.
+    pub fn settle_jump(&mut self) {
+        let Some(jump) = self.jump.as_mut() else {
+            return;
+        };
+        if self.current_thread_id.as_ref() != Some(&jump.thread_id) {
+            self.jump = None;
+            return;
+        }
+        let Some(thread) = &self.thread else {
+            return;
+        };
+        let query = jump.query.to_lowercase();
+        let found = thread.detail.messages.iter().find(|m| {
+            jump.created_at
+                .as_ref()
+                .is_none_or(|at| &m.created_at == at)
+                && m.text.to_lowercase().contains(&query)
+        });
+        let Some(message) = found else {
+            match (&thread.before_cursor, thread.has_more) {
+                (Some(cursor), true) if jump.asked_before.as_ref() != Some(cursor) => {
+                    jump.asked_before = Some(cursor.clone());
+                    self.handle.load_older(cursor);
+                }
+                (_, true) => {}
+                _ => {
+                    self.jump = None;
+                    self.toast("the match is no longer in the thread", true);
+                }
+            }
+            return;
+        };
+        let key = format!("msg:{}", message.id);
+        let Some(&(start, end, _)) = self.block_ranges.iter().find(|(_, _, k)| *k == key) else {
+            // Not drawn yet; the next frame will have it.
+            return;
+        };
+        let Some(jump) = self.jump.take() else {
+            return;
+        };
+        // Lower case, so the chat's search is as blind to case as the server's was
+        // and finds what it found.
+        let search = Search {
+            query: jump.query.to_lowercase(),
+            backward: false,
+        };
+        let line = self
+            .find_match(&search, start.saturating_sub(1))
+            .filter(|(line, _)| (start..end).contains(line))
+            .map_or(start, |(line, _)| line);
+        self.search = Some(search);
+        self.composer.vim_cancel();
+        self.focus = Focus::Chat;
+        self.set_chat_cursor(line);
     }
 
     /// `:implement`: build the thread's plan here, leaving plan mode for it; with
@@ -4121,6 +4348,7 @@ impl App {
             selected: 0,
             items,
             renaming: None,
+            content: ContentSearch::default(),
         });
         self.mode = Mode::Picker;
     }
@@ -4181,11 +4409,21 @@ impl App {
             self.rename_project(&project, picker.query.text().trim());
             return;
         }
-        let Some(item) = picker.filtered().get(picker.selected).map(|i| (*i).clone()) else {
+        let Some(item) = picker.rows().get(picker.selected).map(|i| (*i).clone()) else {
             self.mode = Mode::Normal;
             return;
         };
         self.mode = Mode::Normal;
+        if let Some(hit) = picker.hit(picker.selected) {
+            self.jump = Some(Jump {
+                thread_id: hit.thread_id.clone(),
+                created_at: hit.created_at.clone(),
+                query: picker.query.text().trim().to_string(),
+                asked_before: None,
+            });
+            self.open_thread(&hit.thread_id);
+            return;
+        }
         match picker.kind {
             PickerKind::Thread => self.open_thread(&item.key),
             PickerKind::PullRequest => self.open_url(&item.key),
@@ -5913,7 +6151,7 @@ impl App {
             self.mode = Mode::Normal;
             return;
         };
-        let count = picker.filtered().len();
+        let count = picker.rows().len();
         match key.code {
             KeyCode::Esc if picker.renaming.is_some() => {
                 picker.renaming = None;
@@ -6648,6 +6886,7 @@ fn apply(app: &mut App, event: AppEvent) {
             app.poll_popup();
             app.retry_lost_stream();
             app.check_rewind();
+            app.search_thread_contents();
             app.refresh_vcs_periodically();
             app.refresh_worktrees_periodically();
             if app
@@ -6662,6 +6901,7 @@ fn apply(app: &mut App, event: AppEvent) {
         AppEvent::ThreadCreated(thread_id) => app.on_thread_created(thread_id),
         AppEvent::RewindRefused { thread_id, error } => app.on_rewind_refused(thread_id, error),
         AppEvent::PlanThreadCreated(thread_id) => app.open_thread(&thread_id),
+        AppEvent::ThreadSearch { query, result } => app.on_thread_search(query, result),
         AppEvent::CreateRefused { thread_id, error } => app.on_create_refused(thread_id, error),
         AppEvent::SendRefused {
             thread_id,
@@ -6746,6 +6986,9 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
             }
             terminal.draw(|frame| ui::draw(frame, &mut app)).map(|_| ())
         });
+        // Where a search said to go is a line of the chat, and there are only lines
+        // once the chat has been drawn.
+        app.settle_jump();
         if let Err(err) = drawn.and_then(|result| result) {
             break Err(err.into());
         }
@@ -8413,6 +8656,144 @@ mod tests {
             .expect("sent straight away");
         assert_eq!(command["message"]["text"], "now");
         assert_eq!(app.queued_message(), None);
+    }
+
+    /// Titles filter as they are typed; what was said is asked of the server once the
+    /// typing pauses, and only then.
+    #[tokio::test]
+    async fn the_thread_list_asks_what_was_said_once_the_typing_pauses() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        upsert(&mut app, listed("t1", None));
+        app.open_picker(PickerKind::Thread);
+        typing(&mut app, "backoff");
+
+        app.search_thread_contents();
+        assert!(
+            asked_nothing(&mut requests).await,
+            "asked while still typing"
+        );
+        tokio::time::sleep(CONTENT_SEARCH_PAUSE + Duration::from_millis(20)).await;
+        app.search_thread_contents();
+        let asked = loop {
+            match asked(&mut requests).await.expect("the server was asked") {
+                crate::session::Request::Call { tag, payload, .. } => break (tag, payload),
+                _ => continue,
+            }
+        };
+        assert_eq!(asked.0, "orchestration.searchThreads");
+        assert_eq!(asked.1["query"], "backoff");
+        assert!(app.picker.as_ref().unwrap().content.searching());
+
+        // Asked once for the one query, however many ticks go by.
+        app.search_thread_contents();
+        assert!(asked_nothing(&mut requests).await);
+    }
+
+    /// The matches come under the titles, each one where in its thread it was, and an
+    /// answer to a query since typed over is not shown for the new one.
+    #[test]
+    fn what_was_said_is_listed_under_the_titles() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        for id in ["backoff notes", "t2"] {
+            app.shell
+                .threads
+                .insert(id.into(), serde_json::from_value(listed(id, None)).unwrap());
+        }
+        app.open_picker(PickerKind::Thread);
+        typing(&mut app, "backoff");
+        app.picker.as_mut().unwrap().content.asked = "backoff".into();
+
+        let found = json!({"matches": [{
+            "threadId": "t2", "projectId": "p", "source": "user",
+            "snippet": "add a retry backoff", "messageCreatedAt": "2026-01-01T10:00:00Z"
+        }]});
+        app.on_thread_search("back".into(), Ok(found.clone()));
+        assert_eq!(
+            app.picker.as_ref().unwrap().rows().len(),
+            1,
+            "a stale answer was shown"
+        );
+
+        app.on_thread_search("backoff".into(), Ok(found));
+        let picker = app.picker.as_ref().unwrap();
+        let rows: Vec<_> = picker
+            .rows()
+            .iter()
+            .map(|r| (r.label.clone(), r.detail.clone()))
+            .collect();
+        assert_eq!(rows[0].0, "backoff notes", "the title match comes first");
+        assert_eq!(rows[1], ("t2".into(), "you: add a retry backoff".into()));
+        assert!(picker.hit(0).is_none());
+        assert_eq!(picker.hit(1).map(|h| h.thread_id.as_str()), Some("t2"));
+    }
+
+    /// Opening a match goes to the line that has it, and leaves the query as the chat's
+    /// search for `n` to go on with.
+    #[test]
+    fn a_match_opens_where_it_was_said() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(rewindable_thread());
+        app.current_thread_id = Some("t1".into());
+        app.chat_viewport = (10, 40);
+        app.block_ranges = (0..8)
+            .map(|i| {
+                (
+                    i * 5,
+                    i * 5 + 5,
+                    format!(
+                        "msg:{}",
+                        ["u1", "a1", "u2", "a2", "u3", "a3", "u4", "a4"][i]
+                    ),
+                )
+            })
+            .collect();
+        // `u3` says "u3" and was sent at 10:05.
+        app.jump = Some(Jump {
+            thread_id: "t1".into(),
+            created_at: Some("2026-01-01T10:05:00Z".into()),
+            query: "U3".into(),
+            asked_before: None,
+        });
+        app.settle_jump();
+        assert!(app.jump.is_none());
+        assert_eq!(app.chat_cursor, 20);
+        assert_eq!(app.focus, Focus::Chat);
+        assert_eq!(app.search.as_ref().map(|s| s.query.as_str()), Some("u3"));
+    }
+
+    /// A match older than what is loaded has the older turns asked for, once.
+    #[tokio::test]
+    async fn a_match_further_back_loads_the_turns_before() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let mut thread = rewindable_thread();
+        thread.has_more = true;
+        thread.before_cursor = Some("page-1".into());
+        app.thread = Some(thread);
+        app.current_thread_id = Some("t1".into());
+        app.jump = Some(Jump {
+            thread_id: "t1".into(),
+            created_at: Some("2025-12-01T10:00:00Z".into()),
+            query: "long ago".into(),
+            asked_before: None,
+        });
+        app.settle_jump();
+        app.settle_jump();
+        let mut pages = 0;
+        while let Some(request) = asked(&mut requests).await {
+            if matches!(request, crate::session::Request::LoadOlder { .. }) {
+                pages += 1;
+            }
+        }
+        assert_eq!(pages, 1);
+        assert!(app.jump.is_some(), "still looking");
     }
 
     fn typing(app: &mut App, text: &str) {

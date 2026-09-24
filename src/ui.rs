@@ -1751,6 +1751,30 @@ fn draw_completion(frame: &mut Frame, app: &App, bounds: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// Text with every case-blind occurrence of `query` picked out. Only ASCII is folded,
+/// which keeps every byte where it was and so every slice on a character boundary.
+fn highlighted(text: &str, query: &str) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let folded = text.to_ascii_lowercase();
+    let needle = query.to_ascii_lowercase();
+    let mut spans = Vec::new();
+    let mut at = 0;
+    if !needle.is_empty() {
+        while let Some(found) = folded[at..].find(&needle) {
+            let start = at + found;
+            let end = start + needle.len();
+            spans.push(Span::styled(text[at..start].to_string(), dim));
+            spans.push(Span::styled(
+                text[start..end].to_string(),
+                Style::default().fg(Color::Yellow).bold(),
+            ));
+            at = end;
+        }
+    }
+    spans.push(Span::styled(text[at..].to_string(), dim));
+    spans
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     // The question takes the next key, so it takes the row that says what keys do.
     if let Some(ask) = &app.rewind_ask {
@@ -2044,15 +2068,22 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Clear, popup);
     let title = match picker.kind {
         _ if picker.renaming.is_some() => " rename project · Enter renames · Esc keeps it ",
+        PickerKind::Thread if picker.content.searching() => " threads · searching messages… ",
         PickerKind::Thread => " threads ",
         PickerKind::Model => " models ",
         PickerKind::Project => " new thread in project · ^R renames ",
         PickerKind::Effort => " effort ",
         PickerKind::PullRequest => " pull requests ",
     };
-    let block = Block::bordered()
+    let found = picker.rows().len() - picker.filtered().len();
+    let mut block = Block::bordered()
         .border_style(Style::default().fg(Color::Magenta))
         .title(title);
+    if picker.kind == PickerKind::Thread && found > 0 {
+        block = block.title_bottom(
+            Line::from(format!(" {found} found in messages, below the titles ")).right_aligned(),
+        );
+    }
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let [query_area, list_area] =
@@ -2071,7 +2102,9 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.set_cursor_position((query_area.x + 2 + cursor as u16, query_area.y));
 
-    let items = picker.filtered();
+    let items = picker.rows();
+    let titles = picker.filtered().len();
+    let query = picker.query.text();
     // A project is drawn with what it is known by, in room kept at the front of the row:
     // the emoji it was given, or failing that the icon its checkout carries.
     let icons = picker.kind == PickerKind::Project;
@@ -2079,7 +2112,8 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     let label_width = (list_area.width as usize).saturating_sub(4 + gutter);
     let list_items: Vec<ListItem> = items
         .iter()
-        .map(|item| {
+        .enumerate()
+        .map(|(row, item)| {
             let label_len = item.label.chars().count().min(label_width * 2 / 3);
             let mark = match icons.then(|| app.project_emoji(&item.key)).flatten() {
                 // Emoji are drawn at whatever width the terminal gives them, so the room
@@ -2092,13 +2126,15 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
             };
             let label = format!("{mark}{}", fit(&item.label, label_len.max(1)));
             let remaining = label_width.saturating_sub(label.chars().count() + 2);
-            ListItem::new(Line::from(vec![
-                Span::raw(label),
-                Span::styled(
-                    format!("  {}", fit(&item.detail, remaining)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]))
+            let detail = fit(&item.detail, remaining);
+            let mut spans = vec![Span::raw(label), Span::raw("  ")];
+            if row >= titles {
+                // A match in what was said shows where, with the words themselves lit.
+                spans.extend(highlighted(&detail, query.trim()));
+            } else {
+                spans.push(Span::styled(detail, Style::default().fg(Color::DarkGray)));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let mut state = ListState::default();
@@ -3084,7 +3120,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(Span::styled("Normal", Style::default().bold())),
         Line::from("  Tab / Shift-Tab         cycle focus: composer → chat → threads · Esc back"),
         Line::from("  J/K                     next / previous thread"),
-        Line::from("  /                       fuzzy thread picker"),
+        Line::from("  /                       fuzzy thread picker; after a pause it also lists"),
+        Line::from("                          threads whose messages say it, opened at the match"),
         Line::from(""),
         Line::from("  chat (focused):"),
         Line::from("  j k  { }  gg G  Ctrl-d/u/f/b/e/y   move the cursor / by message / scroll"),
@@ -3788,6 +3825,66 @@ mod tests {
         crate::state::ThreadState::from_snapshot(snapshot)
     }
 
+    /// Matches in what was said are listed under the titles, with the words lit and a
+    /// count saying they are there.
+    #[test]
+    fn the_thread_picker_lists_what_was_said_under_the_titles() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let mut query = crate::composer::Composer::new();
+        query.set_text("backoff");
+        let row = |label: &str, detail: &str| crate::app::PickerItem {
+            label: label.into(),
+            detail: detail.into(),
+            key: label.into(),
+        };
+        let mut content = crate::app::ContentSearch::default();
+        content.found_for = "backoff".into();
+        content.hits = vec![(
+            row("Fix the uploader", "you: add a retry Backoff to the upload"),
+            crate::app::ContentHit {
+                thread_id: "t2".into(),
+                created_at: None,
+            },
+        )];
+        app.picker = Some(crate::app::Picker {
+            kind: PickerKind::Thread,
+            query,
+            selected: 0,
+            items: vec![row("backoff notes", "tria · done")],
+            renaming: None,
+            content,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal
+            .draw(|frame| draw_picker(frame, &app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let titles = lines
+            .iter()
+            .position(|l| l.contains("backoff notes"))
+            .unwrap();
+        let said = lines
+            .iter()
+            .position(|l| l.contains("Fix the uploader"))
+            .unwrap();
+        assert!(said > titles, "the match is not under the titles");
+        assert!(lines[said].contains("you: add a retry Backoff"));
+        assert!(lines.iter().any(|l| l.contains("1 found in messages")));
+        // The words themselves are lit, whatever their case.
+        let x = lines[said].find("Backoff").unwrap();
+        let x = lines[said][..x].chars().count() as u16;
+        assert_eq!(buffer[(x, said as u16)].fg, Color::Yellow);
+    }
+
     /// The list sits over the chat just above the composer, with what each row is.
     #[test]
     fn the_completion_list_is_drawn_above_the_composer() {
@@ -4468,6 +4565,7 @@ mod tests {
                 },
             ],
             renaming: None,
+            content: Default::default(),
         });
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(picture::test_png(64, 64))
@@ -4539,6 +4637,7 @@ mod tests {
                 key: "p1".into(),
             }],
             renaming: None,
+            content: Default::default(),
         });
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(picture::test_png(64, 64))
