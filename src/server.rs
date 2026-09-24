@@ -53,6 +53,16 @@ pub fn is_local(origin: &str) -> bool {
 /// runtime file. `None` means even the runtime file was missing, which is itself a sign
 /// that no server has run.
 pub async fn ensure(origin: Option<String>, command: &str) -> Result<(String, bool)> {
+    let running = crate::discovery::local_origin().ok();
+    ensure_among(origin, running, command).await
+}
+
+/// `ensure`, given the origin the runtime file names, if there is one.
+async fn ensure_among(
+    origin: Option<String>,
+    running: Option<String>,
+    command: &str,
+) -> Result<(String, bool)> {
     if let Some(origin) = &origin
         && is_listening(origin).await
     {
@@ -62,6 +72,20 @@ pub async fn ensure(origin: Option<String>, command: &str) -> Result<(String, bo
         && !is_local(origin)
     {
         bail!("no server answering at {origin}");
+    }
+    // The stored origin can be out of date while a server is up somewhere else: the
+    // desktop app, say, on a port of its own. Two servers on one T3 home share its
+    // database without knowing about each other, and each acts on what the other writes,
+    // so a message sent to one gets answered by both. The one already running is the
+    // one to use.
+    if let Some(running) = running
+        && origin.as_ref() != Some(&running)
+        && is_listening(&running).await
+    {
+        if let Some(origin) = &origin {
+            println!("Nothing answers at {origin}. Using the T3 Code server at {running}.");
+        }
+        return Ok((running, false));
     }
     if command.trim().is_empty() {
         bail!(
@@ -184,13 +208,13 @@ mod tests {
     async fn a_server_that_answers_is_used_as_it_is() {
         let (_listener, origin) = listener().await;
         // Even with starting one turned off: nothing needs starting.
-        let (used, started) = ensure(Some(origin.clone()), "").await.unwrap();
+        let (used, started) = ensure_among(Some(origin.clone()), None, "").await.unwrap();
         assert_eq!((used, started), (origin, false));
     }
 
     #[tokio::test]
     async fn another_host_is_not_ours_to_start() {
-        let err = ensure(Some("http://nowhere.invalid:3773".into()), "t3 serve")
+        let err = ensure_among(Some("http://nowhere.invalid:3773".into()), None, "t3 serve")
             .await
             .unwrap_err()
             .to_string();
@@ -199,7 +223,36 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_command_turns_starting_one_off() {
-        let err = ensure(None, "  ").await.unwrap_err().to_string();
+        let err = ensure_among(None, None, "  ")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("turned off"), "{err}");
+    }
+
+    /// A stored origin nothing answers at, with a server running elsewhere on this
+    /// machine: that server is used, and a second one is not started beside it.
+    #[tokio::test]
+    async fn a_server_running_elsewhere_is_used_rather_than_starting_another() {
+        let (_running, running) = listener().await;
+        let (gone, stored) = listener().await;
+        drop(gone);
+        // Starting one is turned off, so reaching the start would be an error.
+        let (used, started) = ensure_among(Some(stored), Some(running.clone()), "")
+            .await
+            .unwrap();
+        assert_eq!((used, started), (running, false));
+    }
+
+    /// A runtime file left behind by a server that has gone names nothing to use.
+    #[tokio::test]
+    async fn a_runtime_file_nothing_answers_at_is_passed_over() {
+        let (gone, left_behind) = listener().await;
+        drop(gone);
+        let err = ensure_among(None, Some(left_behind), "")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("turned off"), "{err}");
     }
 }
