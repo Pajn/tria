@@ -280,6 +280,13 @@ async fn run(
             }
         };
 
+        // Commands go out one after another, in the order they were asked for — a turn
+        // on a thread follows the command that made it — but not from this loop: a
+        // command the server takes its time over would hold every stream here still
+        // until it answered. The worker ends with the connection, once this sender
+        // is dropped and what it was given has gone out.
+        let dispatches = dispatcher(&client);
+
         // Config first: it tells us whether pagination and completion markers are supported.
         match client
             .call::<ServerConfig>("server.getConfig", json!({}))
@@ -436,15 +443,18 @@ async fn run(
                                 }
                             }
                         }
+                        // Answered off this loop: a call can take as long as the work
+                        // behind it — removing a worktree is deleting a directory — and
+                        // the streams have to keep moving while it does. Calls do not
+                        // depend on one another, so they go out side by side.
                         Request::Call { tag, payload, reply } => {
-                            let _ = reply.send(client.call::<Value>(&tag, payload).await);
+                            let client = client.clone();
+                            tokio::spawn(async move {
+                                let _ = reply.send(client.call::<Value>(&tag, payload).await);
+                            });
                         }
                         Request::Dispatch { command, reply } => {
-                            let result = client
-                                .call::<Value>("orchestration.dispatchCommand", command)
-                                .await
-                                .map(|v| v.get("sequence").and_then(Value::as_u64).unwrap_or(0));
-                            let _ = reply.send(result);
+                            let _ = dispatches.send((command, reply));
                         }
                     }
                 }
@@ -732,6 +742,26 @@ async fn subscribe_vcs(client: &RpcClient, cwd: &str) -> Option<Subscription> {
     }
 }
 
+/// A command and where its answer goes.
+type Dispatched = (Value, oneshot::Sender<Result<u64>>);
+
+/// Send commands to the server one at a time, in the order they arrive, each once the
+/// one before it has been answered.
+fn dispatcher(client: &RpcClient) -> mpsc::UnboundedSender<Dispatched> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Dispatched>();
+    let client = client.clone();
+    tokio::spawn(async move {
+        while let Some((command, reply)) = rx.recv().await {
+            let result = client
+                .call::<Value>("orchestration.dispatchCommand", command)
+                .await
+                .map(|v| v.get("sequence").and_then(Value::as_u64).unwrap_or(0));
+            let _ = reply.send(result);
+        }
+    });
+    tx
+}
+
 fn refresh_vcs(client: &RpcClient, cwd: String) {
     let client = client.clone();
     tokio::spawn(async move {
@@ -761,4 +791,81 @@ async fn subscribe_thread(
 fn backoff(attempt: u32) -> Duration {
     let secs = 2u64.saturating_pow(attempt.min(5));
     Duration::from_secs(secs).min(MAX_BACKOFF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// A server that hands each request it reads to the test, and sends back whatever
+    /// the test gives it to.
+    async fn fake_server() -> (
+        String,
+        mpsc::UnboundedReceiver<Value>,
+        mpsc::UnboundedSender<Value>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (heard, requests) = mpsc::unbounded_channel();
+        let (answers, mut answer_rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            loop {
+                tokio::select! {
+                    frame = socket.next() => {
+                        let Some(Ok(Message::Text(text))) = frame else { break };
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["_tag"] == "Request" {
+                            let _ = heard.send(frame);
+                        }
+                    }
+                    answer = answer_rx.recv() => {
+                        let Some(answer) = answer else { break };
+                        socket.send(Message::Text(answer.to_string().into())).await.unwrap();
+                    }
+                }
+            }
+        });
+        (origin, requests, answers)
+    }
+
+    fn answer(request: &Value, sequence: u64) -> Value {
+        json!({
+            "_tag": "Exit",
+            "requestId": request["id"],
+            "exit": {"_tag": "Success", "value": {"sequence": sequence}},
+        })
+    }
+
+    /// Commands leave in the order they were given, each once the one before it has
+    /// been answered — a turn must not reach the server ahead of the thread it is on.
+    #[tokio::test]
+    async fn commands_go_out_one_after_another() {
+        let (origin, mut requests, answers) = fake_server().await;
+        let client = RpcClient::connect(&origin, "ticket").await.unwrap();
+        let dispatches = dispatcher(&client);
+        let (first, first_answer) = oneshot::channel();
+        let (second, second_answer) = oneshot::channel();
+        dispatches.send((json!({"n": 1}), first)).unwrap();
+        dispatches.send((json!({"n": 2}), second)).unwrap();
+
+        let one = requests.recv().await.unwrap();
+        assert_eq!(one["tag"], "orchestration.dispatchCommand");
+        assert_eq!(one["payload"]["n"], 1);
+        let early = tokio::time::timeout(Duration::from_millis(100), requests.recv()).await;
+        assert!(
+            early.is_err(),
+            "the second went out before the first was answered"
+        );
+
+        answers.send(answer(&one, 7)).unwrap();
+        assert_eq!(first_answer.await.unwrap().unwrap(), 7);
+        let two = requests.recv().await.unwrap();
+        assert_eq!(two["payload"]["n"], 2);
+        answers.send(answer(&two, 8)).unwrap();
+        assert_eq!(second_answer.await.unwrap().unwrap(), 8);
+    }
 }
