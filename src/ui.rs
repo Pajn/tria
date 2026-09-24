@@ -1678,6 +1678,31 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+    // The question takes the next key, so it takes the row that says what keys do.
+    if let Some(ask) = &app.rewind_ask {
+        let rewind = &ask.rewind;
+        let what = match rewind.later_turns {
+            0 => "the last turn".to_string(),
+            later => format!("{} turns", later + 1),
+        };
+        let back = match rewind.message_ids.len() {
+            1 => "your message comes back to edit".to_string(),
+            n => format!("its {n} messages of yours come back to edit"),
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" rewind {what}? "),
+                Style::default().fg(Color::Yellow).bold(),
+            ),
+            Span::raw(format!("{back} · ")),
+            Span::styled("Enter", Style::default().bold()),
+            Span::raw(" keeps the files · "),
+            Span::styled("f", Style::default().bold()),
+            Span::raw(" puts them back too · any other key cancels"),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     if app.mode == Mode::Command {
         // The line scrolls inside the row rather than wrapping, as the custom answer
         // field does: the status bar is one row and there is no second one to take.
@@ -1846,7 +1871,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         if shell.interaction_mode == "plan" {
             spans.push(Span::styled("  plan", Style::default().fg(Color::Blue)));
         }
-        if thread.is_running() {
+        if app.is_rewinding() {
+            spans.push(Span::styled(
+                format!("  {} rewinding", app.spinner_frame()),
+                Style::default().fg(Color::Cyan),
+            ));
+        } else if thread.is_running() {
             // Compacting is a turn like any other on the wire, and says nothing while it
             // runs; a thread that looks like it is answering and is not is worth naming.
             let doing = if thread.is_compacting() {
@@ -3025,6 +3055,10 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
             "  ge                      composer: edit the draft · chat: view the block under the cursor",
         ),
         Line::from("  gE                      view the whole conversation in your editor"),
+        Line::from("  gr                      chat: rewind to before the message of yours under"),
+        Line::from(
+            "                          the cursor, and write it again · :rewind, the last turn",
+        ),
         Line::from("  Ctrl-e Ctrl-y Ctrl-d Ctrl-u  scroll the conversation by line / half page"),
         Line::from(""),
         Line::from("  composer (focused, Vim):"),

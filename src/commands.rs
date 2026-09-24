@@ -110,6 +110,20 @@ pub fn turn_interrupt(thread_id: &str, turn_id: Option<&str>) -> Value {
     command
 }
 
+/// Drop the thread's turns after the first `turn_count`, from the conversation and, with
+/// `restore_files`, from the checkout too, by putting back the files as that turn left
+/// them. Two commands rather than a flag, so that a server which does not know the
+/// history-only one refuses it instead of restoring files nobody asked it to.
+pub fn thread_revert(thread_id: &str, turn_count: u32, restore_files: bool) -> Value {
+    json!({
+        "type": if restore_files { "thread.checkpoint.revert" } else { "thread.conversation.revert" },
+        "commandId": new_id(),
+        "threadId": thread_id,
+        "turnCount": turn_count,
+        "createdAt": now_iso(),
+    })
+}
+
 /// Stop the thread's provider session. The protocol has no stop for one background task,
 /// and monitors and backgrounded commands are the session's own processes, so this is
 /// what ends them. The conversation is untouched: the next message starts a session again.

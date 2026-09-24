@@ -623,6 +623,10 @@ pub struct ProposedPlan {
 pub struct Checkpoint {
     pub turn_id: Id,
     pub completed_at: String,
+    /// How many turns the thread had once this one was done: the number a revert is
+    /// asked for by. Absent from servers that predate it, which cannot revert either.
+    #[serde(default)]
+    pub checkpoint_turn_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -829,6 +833,10 @@ pub struct Provider {
     /// at all. An API key or a cloud endpoint has no quota to report and carries none.
     #[serde(default)]
     pub usage_limits: Option<UsageLimits>,
+    /// Whether the provider can drop turns from its own history. Only a `false` says it
+    /// cannot: the server leaves the field out for the ones that can.
+    #[serde(default)]
+    pub supports_conversation_rollback: Option<bool>,
 }
 
 impl Provider {

@@ -146,6 +146,7 @@ const COMMANDS: &[&str] = &[
     "model",
     "new",
     "older",
+    "rewind",
     "perm",
     "pr",
     "project",
@@ -294,6 +295,30 @@ struct Queued {
     after_turn: Option<Id>,
 }
 
+/// A rewind worked out and waiting on `Enter` or `f`, for the thread it was asked in.
+pub struct RewindAsk {
+    pub thread_id: Id,
+    pub rewind: crate::state::Rewind,
+}
+
+/// A rewind the server has been asked for. The command is taken before the work is
+/// done, so what says it happened is the messages going, and what says it did not is a
+/// failure the server writes into the thread.
+struct PendingRewind {
+    thread_id: Id,
+    rewind: crate::state::Rewind,
+    /// Failures already in the thread when it was asked for, which are not this one's.
+    failures_seen: HashSet<Id>,
+    deadline: Instant,
+}
+
+/// How long a rewind is waited for before its messages are given back anyway. A
+/// Claude rewind reads and forks the session's history, which is not instant.
+/// The activity the server writes into a thread when a rewind did not happen.
+const REWIND_FAILED: &str = "checkpoint.revert.failed";
+
+const REWIND_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The last two parts of a path, which is what tells one worktree from another.
 fn short_path(path: &str) -> String {
     let parts: Vec<&str> = path.rsplit('/').take(2).collect();
@@ -381,6 +406,11 @@ pub enum AppEvent {
     SendRefused {
         thread_id: Id,
         text: String,
+        error: String,
+    },
+    /// The server would not take a rewind at all.
+    RewindRefused {
+        thread_id: Id,
         error: String,
     },
     /// The config was read again for the usage window, or was not.
@@ -525,6 +555,9 @@ pub struct App {
     /// Messages waiting for their thread's turn to end, one per thread: a second one
     /// queued behind the first joins it, as one message is what the turn gets next.
     queued: HashMap<Id, Queued>,
+    /// A rewind asked about and not yet answered, which takes the next key.
+    pub rewind_ask: Option<RewindAsk>,
+    rewinding: Option<PendingRewind>,
     /// Every terminal session the server knows about, across threads.
     pub terminals: Vec<crate::model::TerminalSummary>,
     /// Selection in the terminal panel.
@@ -712,6 +745,8 @@ impl App {
             links: Vec::new(),
             drafts: HashMap::new(),
             queued: HashMap::new(),
+            rewind_ask: None,
+            rewinding: None,
             programs: vec![crate::config::Program {
                 key: 'l',
                 command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
@@ -1294,6 +1329,11 @@ impl App {
         if text.trim().is_empty() {
             return;
         }
+        // It would land in the turns the rewind is about to drop.
+        if self.is_rewinding() {
+            self.toast("wait for the rewind to finish", true);
+            return;
+        }
         // The message joins the conversation, so that is what to be looking at.
         self.leave_transcript();
         // Read the slot before sending: starting a new thread moves the view to it, and the
@@ -1480,6 +1520,213 @@ impl App {
                 };
                 self.on_send_refused(thread.id.clone(), queued.text, why.into());
             }
+        }
+    }
+
+    /// `gr`: rewind to before the message under the chat cursor.
+    fn rewind_at_cursor(&mut self) {
+        if self.transcript.is_some() {
+            self.toast("a subagent's transcript is read, not rewound", true);
+            return;
+        }
+        let line = self.chat_cursor;
+        let id = self
+            .block_ranges
+            .iter()
+            .find(|(start, end, _)| *start <= line && line < *end)
+            .and_then(|(_, _, key)| key.strip_prefix("msg:"))
+            .map(str::to_string);
+        match id {
+            Some(id) => self.ask_rewind(Some(&id)),
+            None => self.toast("put the cursor on a message of yours to rewind to it", true),
+        }
+    }
+
+    /// Work out what a rewind would drop and ask before doing it: to before the given
+    /// message, or with none, to before the last turn. Nothing is asked while a turn
+    /// runs — the server would drop turns from under it — or where the provider cannot
+    /// drop turns from its own history.
+    fn ask_rewind(&mut self, message_id: Option<&str>) {
+        if self.rewinding.is_some() {
+            self.toast("a rewind is already on its way", true);
+            return;
+        }
+        let Some(thread) = &self.thread else {
+            self.toast("no thread open", true);
+            return;
+        };
+        if thread.is_running() {
+            self.toast("interrupt the turn first (Ctrl-c), then rewind", true);
+            return;
+        }
+        let instance = &thread.detail.shell.model_selection.instance_id;
+        let unsupported = self.config.providers.iter().any(|provider| {
+            &provider.instance_id == instance
+                && provider.supports_conversation_rollback == Some(false)
+        });
+        if unsupported {
+            self.toast(
+                "this provider cannot rewind its history; start a new thread instead",
+                true,
+            );
+            return;
+        }
+        let rewind = match message_id {
+            Some(id) => thread.rewind_before(id),
+            None => thread.rewind_last(),
+        };
+        match rewind {
+            Ok(rewind) => {
+                self.rewind_ask = Some(RewindAsk {
+                    thread_id: thread.id().to_string(),
+                    rewind,
+                })
+            }
+            Err(why) => self.toast(why, true),
+        }
+    }
+
+    /// The key after the question: `Enter` rewinds the conversation and leaves the files
+    /// as they are, `f` puts the files back as well, and anything else asks no more.
+    fn on_rewind_key(&mut self, key: KeyEvent) {
+        let Some(ask) = self.rewind_ask.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Enter => self.rewind(ask, false),
+            KeyCode::Char('f') => self.rewind(ask, true),
+            _ => self.toast("not rewound", false),
+        }
+    }
+
+    fn rewind(&mut self, ask: RewindAsk, restore_files: bool) {
+        let Some(thread) = self.thread.as_ref().filter(|t| t.id() == ask.thread_id) else {
+            self.toast("the thread is no longer open; not rewound", true);
+            return;
+        };
+        if thread.is_running() {
+            self.toast("a turn started meanwhile; interrupt it first", true);
+            return;
+        }
+        let failures_seen = thread
+            .detail
+            .activities
+            .iter()
+            .filter(|a| a.kind == REWIND_FAILED)
+            .map(|a| a.id.clone())
+            .collect();
+        let command = commands::thread_revert(&ask.thread_id, ask.rewind.turn_count, restore_files);
+        tracing::info!(
+            thread = %ask.thread_id,
+            turn_count = ask.rewind.turn_count,
+            restore_files,
+            "rewinding"
+        );
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        let thread_id = ask.thread_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle.dispatch(command).await {
+                let _ = events.send(AppEvent::RewindRefused {
+                    thread_id,
+                    error: error.to_string(),
+                });
+            }
+        });
+        self.rewinding = Some(PendingRewind {
+            thread_id: ask.thread_id,
+            rewind: ask.rewind,
+            failures_seen,
+            deadline: Instant::now() + REWIND_TIMEOUT,
+        });
+        self.toast("rewinding…", false);
+    }
+
+    /// Whether the open thread has a rewind on its way.
+    pub fn is_rewinding(&self) -> bool {
+        self.rewinding
+            .as_ref()
+            .is_some_and(|r| self.current_thread_id.as_ref() == Some(&r.thread_id))
+    }
+
+    fn on_rewind_refused(&mut self, thread_id: Id, error: String) {
+        if self
+            .rewinding
+            .as_ref()
+            .is_some_and(|r| r.thread_id == thread_id)
+        {
+            self.rewinding = None;
+            self.toast(format!("not rewound: {error}"), true);
+        }
+    }
+
+    /// See whether the rewind on its way has been through. The messages it drops going
+    /// is what it looks like when it has, and they come back to the composer to be
+    /// written again; a failure the server wrote into the thread since is what it looks
+    /// like when it has not. With neither by the deadline the messages are given back
+    /// anyway: a copy too many is better than none.
+    fn check_rewind(&mut self) {
+        let Some(pending) = &self.rewinding else {
+            return;
+        };
+        if Instant::now() >= pending.deadline {
+            if let Some(pending) = self.rewinding.take() {
+                self.give_back(pending.thread_id, pending.rewind.text);
+                self.toast(
+                    "no word of the rewind from the server · what you sent is back in the composer",
+                    true,
+                );
+            }
+            return;
+        }
+        let Some(thread) = self.thread.as_ref().filter(|t| t.id() == pending.thread_id) else {
+            return;
+        };
+        let failure = thread
+            .detail
+            .activities
+            .iter()
+            .rev()
+            .find(|a| a.kind == REWIND_FAILED && !pending.failures_seen.contains(&a.id))
+            .map(|a| a.str("detail").unwrap_or(&a.summary).to_string());
+        if let Some(detail) = failure {
+            self.rewinding = None;
+            self.toast(format!("not rewound: {detail}"), true);
+            return;
+        }
+        let gone = pending
+            .rewind
+            .message_ids
+            .iter()
+            .all(|id| !thread.detail.messages.iter().any(|m| &m.id == id));
+        if gone && let Some(pending) = self.rewinding.take() {
+            self.give_back(pending.thread_id, pending.rewind.text);
+            self.toast("rewound · what you sent that turn is back to edit", false);
+        }
+    }
+
+    /// Put text a rewind took out of the thread back where it can be written again,
+    /// after whatever is already there: the composer when the thread is open, its
+    /// parked draft when it is not.
+    fn give_back(&mut self, thread_id: Id, text: String) {
+        let join = |existing: &str| {
+            if existing.trim().is_empty() {
+                text.clone()
+            } else {
+                format!("{}\n\n{text}", existing.trim_end())
+            }
+        };
+        if self.current_thread_id.as_deref() == Some(thread_id.as_str()) {
+            let joined = join(&self.composer.text());
+            self.composer.set_text(&joined);
+            if matches!(self.mode, Mode::Normal | Mode::Insert) {
+                self.composer.checkpoint();
+                self.focus = Focus::Composer;
+                self.mode = Mode::Insert;
+            }
+        } else {
+            let joined = join(self.drafts.get(&thread_id).map_or("", String::as_str));
+            self.drafts.insert(thread_id, joined);
         }
     }
 
@@ -4026,6 +4273,7 @@ impl App {
                 }
             }
             "older" => self.load_older(),
+            "rewind" => self.ask_rewind(None),
             "dismiss" => self.dismiss_question(),
             "answer" | "a" => {
                 if !self.begin_answering() {
@@ -4266,6 +4514,7 @@ impl App {
                 }
             }
             KeyCode::Char('e') if prefix == Some('g') => self.view_at_cursor(),
+            KeyCode::Char('r') if prefix == Some('g') => self.rewind_at_cursor(),
             KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
             KeyCode::Char('G') => {
                 self.chat_count = None;
@@ -4741,6 +4990,9 @@ impl App {
         if self.mode == Mode::TerminalPane {
             self.on_pane_key(key);
             return;
+        }
+        if self.rewind_ask.is_some() {
+            return self.on_rewind_key(key);
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Ctrl-c, the first of the two global chords. In vim it is Esc under another
@@ -5607,6 +5859,14 @@ impl App {
                     (Some(thread), item) => thread.apply(item),
                     (None, _) => {}
                 }
+                // A revert drops turns and the event says only how many are left, so
+                // what is left is asked for whole.
+                if let Some(thread) = self.thread.as_mut()
+                    && std::mem::take(&mut thread.needs_snapshot)
+                {
+                    self.handle.refresh_thread(&thread_id);
+                }
+                self.check_rewind();
                 self.reconcile_question();
                 self.sync_vcs_watch();
                 // A finished turn has usually changed the checkout, and the server's
@@ -6176,6 +6436,7 @@ fn apply(app: &mut App, event: AppEvent) {
             app.spinner = app.spinner.wrapping_add(1);
             app.poll_popup();
             app.retry_lost_stream();
+            app.check_rewind();
             app.refresh_vcs_periodically();
             app.refresh_worktrees_periodically();
             if app
@@ -6188,6 +6449,7 @@ fn apply(app: &mut App, event: AppEvent) {
         }
         AppEvent::Update(update) => app.on_update(*update),
         AppEvent::ThreadCreated(thread_id) => app.on_thread_created(thread_id),
+        AppEvent::RewindRefused { thread_id, error } => app.on_rewind_refused(thread_id, error),
         AppEvent::CreateRefused { thread_id, error } => app.on_create_refused(thread_id, error),
         AppEvent::SendRefused {
             thread_id,
@@ -7939,6 +8201,214 @@ mod tests {
             .expect("sent straight away");
         assert_eq!(command["message"]["text"], "now");
         assert_eq!(app.queued_message(), None);
+    }
+
+    /// Three finished turns, the second of them steered: `u3` arrived while it ran.
+    fn rewindable_thread() -> ThreadState {
+        let message = |id: &str, role: &str, turn: Option<&str>, at: &str| {
+            json!({"id": id, "role": role, "text": id, "turnId": turn,
+                "createdAt": format!("2026-01-01T10:{at}:00Z")})
+        };
+        let checkpoint = |turn: &str, count: u32, at: &str| {
+            json!({"turnId": turn, "checkpointTurnCount": count,
+                "completedAt": format!("2026-01-01T10:{at}:00Z")})
+        };
+        let snapshot: ThreadDetailSnapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p", "title": "Test",
+                "modelSelection": {"instanceId": "instance", "model": "a-model"},
+                "latestTurn": {"turnId": "three", "state": "completed"},
+                "messages": [
+                    message("u1", "user", None, "00"),
+                    message("a1", "assistant", Some("one"), "01"),
+                    message("u2", "user", None, "03"),
+                    message("a2", "assistant", Some("two"), "04"),
+                    message("u3", "user", None, "05"),
+                    message("a3", "assistant", Some("two"), "06"),
+                    message("u4", "user", None, "08"),
+                    message("a4", "assistant", Some("three"), "09"),
+                ],
+                "checkpoints": [
+                    checkpoint("one", 1, "02"),
+                    checkpoint("two", 2, "07"),
+                    checkpoint("three", 3, "10"),
+                ],
+                "activities": []
+            }
+        }))
+        .expect("a thread the server could have sent");
+        ThreadState::from_snapshot(snapshot)
+    }
+
+    /// A steer is part of the turn it joined, so rewinding to it or to the prompt it
+    /// followed drops the same turn, and gives back both.
+    #[test]
+    fn a_rewind_drops_the_whole_turn_a_message_is_in() {
+        let thread = rewindable_thread();
+        let expected = crate::state::Rewind {
+            turn_count: 1,
+            text: "u2\n\nu3".into(),
+            message_ids: vec!["u2".into(), "u3".into()],
+            later_turns: 1,
+        };
+        assert_eq!(thread.rewind_before("u3"), Ok(expected.clone()));
+        assert_eq!(thread.rewind_before("u2"), Ok(expected));
+        assert_eq!(thread.rewind_before("u1").map(|r| r.turn_count), Ok(0));
+        assert_eq!(
+            thread
+                .rewind_last()
+                .map(|r| (r.turn_count, r.text, r.later_turns)),
+            Ok((2, "u4".into(), 0))
+        );
+        assert!(
+            thread.rewind_before("a1").is_err(),
+            "not a message of yours"
+        );
+    }
+
+    /// Asked, sent, and once the messages are gone they are back in the composer, after
+    /// what was already being written there.
+    #[tokio::test]
+    async fn a_rewind_gives_back_what_was_sent_once_it_is_through() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(rewindable_thread());
+        app.current_thread_id = Some("t1".into());
+        app.composer.set_text("half written");
+
+        app.ask_rewind(Some("u3"));
+        assert!(app.rewind_ask.is_some(), "it asks first");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let command = sent_command(&mut requests)
+            .await
+            .expect("a rewind was sent");
+        assert_eq!(command["type"], "thread.conversation.revert");
+        assert_eq!(command["turnCount"], 1);
+        assert!(app.is_rewinding());
+
+        // Nothing goes into the turns that are about to go.
+        app.mode = Mode::Insert;
+        app.send_message();
+        assert!(sent_no_command(&mut requests).await);
+
+        app.thread
+            .as_mut()
+            .unwrap()
+            .detail
+            .messages
+            .retain(|m| m.id == "u1" || m.id == "a1");
+        app.check_rewind();
+        assert!(!app.is_rewinding());
+        assert_eq!(app.composer.text(), "half written\n\nu2\n\nu3");
+        assert_eq!(app.mode, Mode::Insert);
+    }
+
+    /// `f` puts the files back as well; any other key asks no more and sends nothing.
+    #[tokio::test]
+    async fn f_restores_the_files_and_anything_else_cancels() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(rewindable_thread());
+        app.current_thread_id = Some("t1".into());
+
+        app.ask_rewind(None);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.rewind_ask.is_none());
+        assert!(sent_no_command(&mut requests).await);
+
+        app.ask_rewind(None);
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        let command = sent_command(&mut requests)
+            .await
+            .expect("a rewind was sent");
+        assert_eq!(command["type"], "thread.checkpoint.revert");
+        assert_eq!(command["turnCount"], 2);
+    }
+
+    /// The server takes the command before it does the work, and says it could not
+    /// in the thread. That is where the reason is read from.
+    #[tokio::test]
+    async fn a_rewind_the_server_could_not_do_says_why() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(rewindable_thread());
+        app.current_thread_id = Some("t1".into());
+        app.ask_rewind(None);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let failed: crate::model::Event = serde_json::from_value(json!({
+            "sequence": 2, "type": "thread.activity-appended",
+            "payload": {"threadId": "t1", "activity": {"id": "f1", "kind": "checkpoint.revert.failed",
+                "summary": "Checkpoint revert failed", "payload": {"detail": "no checkpoint"},
+                "turnId": null, "createdAt": ""}}
+        }))
+        .unwrap();
+        app.on_update(crate::session::Update::Thread {
+            thread_id: "t1".into(),
+            item: ThreadItem::Event { event: failed },
+        });
+        assert!(!app.is_rewinding());
+        assert_eq!(app.toast.as_ref().unwrap().0, "not rewound: no checkpoint");
+        assert!(
+            app.composer.is_empty(),
+            "nothing went, so nothing comes back"
+        );
+    }
+
+    /// Not while a turn runs, and not where the provider cannot drop turns.
+    #[test]
+    fn a_rewind_is_not_asked_where_it_cannot_happen() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+        app.current_thread_id = Some("t1".into());
+        app.ask_rewind(None);
+        assert!(app.rewind_ask.is_none());
+        assert!(app.toast.as_ref().unwrap().0.contains("interrupt"));
+
+        app.thread = Some(rewindable_thread());
+        app.config.providers = vec![
+            serde_json::from_value(json!({
+                "instanceId": "instance", "supportsConversationRollback": false
+            }))
+            .unwrap(),
+        ];
+        app.ask_rewind(None);
+        assert!(app.rewind_ask.is_none());
+        assert!(app.toast.as_ref().unwrap().0.contains("cannot rewind"));
+    }
+
+    /// A revert from anywhere — here, the desktop — drops turns the stream only counts,
+    /// so the thread is asked for whole again.
+    #[tokio::test]
+    async fn a_revert_asks_for_the_thread_again() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(rewindable_thread());
+        app.current_thread_id = Some("t1".into());
+        let reverted: crate::model::Event = serde_json::from_value(json!({
+            "sequence": 2, "type": "thread.reverted",
+            "payload": {"threadId": "t1", "turnCount": 1}
+        }))
+        .unwrap();
+        app.on_update(crate::session::Update::Thread {
+            thread_id: "t1".into(),
+            item: ThreadItem::Event { event: reverted },
+        });
+        let mut refreshed = false;
+        while let Some(request) = asked(&mut requests).await {
+            if matches!(&request, crate::session::Request::RefreshThread(id) if id == "t1") {
+                refreshed = true;
+                break;
+            }
+        }
+        assert!(refreshed, "the thread was not asked for again");
     }
 
     /// Where the composer is not free, putting the message back would write over

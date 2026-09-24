@@ -122,6 +122,7 @@ Press `?` inside the app for the full list.
 | `g!` | a shell in the popup, in the thread's directory |
 | `ge` | composer focused: edit the draft in your editor, read back on exit. Chat focused: view the message, plan, tool row, or tool group under the cursor |
 | `gE` | view the whole conversation in your editor |
+| `gr` | chat focused: rewind to before the message of yours under the cursor (`:rewind` for the last turn) |
 | `gx` | open the link on the cursor's line, else the picture under the cursor, else the thread's pull request |
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
 | `gP` | split a tmux pane beside tria, in the thread's directory (`:split`) |
@@ -210,6 +211,14 @@ which is why neither is a quit: the next key goes in as the character it stands 
 `Alt-Enter` is the usual way to write a newline where `Enter` sends, but a terminal has to
 be willing to send it; `Ctrl-v` `Enter` needs nothing of the terminal and always works.
 
+`gr` on one of your messages in the chat rewinds the thread to before it, and `:rewind` does
+the same for the last turn. The turn goes, with every turn after it, and what you sent in that
+turn comes back to the composer to be written again: the prompt and anything that steered it,
+since a steer is part of the turn it joined. The status bar asks first. `Enter` rewinds the
+conversation and leaves the files as they are; `f` also puts the files back as the turn before
+left them, from the checkpoint the server keeps of each turn. A running turn has to be
+interrupted first, and a provider that cannot drop turns from its history cannot rewind.
+
 A message sent while a turn runs goes straight to the agent and joins the turn it is on:
 that is steering, and the server has no way to take such a message back. `Ctrl-s` keeps the message in tria instead, shown on the
 composer's lower border, and sends it as the next turn once the running one completes.
@@ -236,7 +245,7 @@ newline.
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `project rename <name>`,
 `archive`, `delete!`, `approve [n]`, `stop`, `stop!`,
-`older`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
+`older`, `rewind`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
 `reveal`,
 `worktree`, `worktrees`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`,
 `usage`, `split`, `window`, `reconnect`, `help`, `q`.

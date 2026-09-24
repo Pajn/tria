@@ -174,6 +174,19 @@ pub struct PendingApproval {
     pub options: Vec<ApprovalOption>,
 }
 
+/// A rewind worked out, before anything is sent for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rewind {
+    /// How many turns the thread keeps.
+    pub turn_count: u32,
+    /// What you sent in the turn that goes, to write again.
+    pub text: String,
+    /// Those messages, which are gone once the rewind has been through.
+    pub message_ids: Vec<Id>,
+    /// Finished turns after that one, which go with it.
+    pub later_turns: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalOption {
     pub decision: String,
@@ -656,6 +669,75 @@ impl ThreadState {
             }
         }
         pending
+    }
+
+    /// What rewinding to before one of your messages would do. The turn the message
+    /// belongs to goes, and every turn after it; what comes back is everything you sent
+    /// that turn, the prompt and the messages that steered it, since a steer is part of
+    /// the turn it joined and cannot be kept without it.
+    ///
+    /// A user message carries no turn of its own, so it is placed by time: it belongs
+    /// to the first turn that finished after it was sent. That holds for a steer, which
+    /// arrives mid-turn, and for a turn that ended before it said anything.
+    pub fn rewind_before(&self, message_id: &str) -> Result<Rewind, &'static str> {
+        let message = self
+            .detail
+            .messages
+            .iter()
+            .find(|m| m.id == message_id && m.role == "user")
+            .ok_or("that is not a message of yours")?;
+        let turns = self.counted_turns();
+        let at = turns
+            .iter()
+            .position(|(_, completed)| *completed >= message.created_at.as_str())
+            .ok_or("that message's turn has not finished")?;
+        self.rewind_to(&turns, at)
+    }
+
+    /// The same, for the last turn that finished.
+    pub fn rewind_last(&self) -> Result<Rewind, &'static str> {
+        let turns = self.counted_turns();
+        if turns.is_empty() {
+            return Err("no finished turn to rewind");
+        }
+        self.rewind_to(&turns, turns.len() - 1)
+    }
+
+    /// Finished turns in order, by their count and when they finished.
+    fn counted_turns(&self) -> Vec<(u32, &str)> {
+        let mut turns: Vec<(u32, &str)> = self
+            .detail
+            .checkpoints
+            .iter()
+            .filter_map(|c| Some((c.checkpoint_turn_count?, c.completed_at.as_str())))
+            .collect();
+        turns.sort();
+        turns
+    }
+
+    fn rewind_to(&self, turns: &[(u32, &str)], at: usize) -> Result<Rewind, &'static str> {
+        let (count, completed) = turns[at];
+        let after = at.checked_sub(1).map(|before| turns[before].1);
+        let (message_ids, texts): (Vec<Id>, Vec<&str>) = self
+            .detail
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.created_at.as_str() <= completed
+                    && after.is_none_or(|after| m.created_at.as_str() > after)
+            })
+            .map(|m| (m.id.clone(), m.text.as_str()))
+            .unzip();
+        if message_ids.is_empty() {
+            return Err("the messages of that turn are not loaded");
+        }
+        Ok(Rewind {
+            turn_count: count.saturating_sub(1),
+            text: texts.join("\n\n"),
+            message_ids,
+            later_turns: turns.len() - at - 1,
+        })
     }
 
     pub fn pending_user_input(&self) -> Option<PendingUserInput> {
