@@ -200,7 +200,12 @@ fn fit(store: &mut Store, key: &str, offered: Size, image: image::DynamicImage) 
     let protocol =
         SlicedProtocol::new_with_resize(picker, image, within, Resize::Fit(None)).ok()?;
     let size = protocol.size();
-    store.ready.retain(|ready| ready.key != key);
+    // Only this size is replaced. The same icon is drawn at one size in the sidebar and
+    // another in the picker, and dropping the other size here would have each re-encode
+    // the other's on every frame — a new image for the terminal each time, and a flicker.
+    store
+        .ready
+        .retain(|ready| ready.key != key || ready.offered != offered);
     store.ready.push_front(Ready {
         key: key.to_string(),
         offered,
@@ -213,6 +218,8 @@ fn fit(store: &mut Store, key: &str, offered: Size, image: image::DynamicImage) 
 
 /// Draw a placed image at `position` within `area`, clipped to it. The position may sit
 /// above or below the area: a chat line scrolls, and half an image is still the image.
+/// Where the key is ready at more than one size, the one drawn is the one last placed,
+/// since placing moves it to the front.
 pub fn draw(frame: &mut Frame, key: &str, area: Rect, position: SignedPosition) {
     STORE.with(|store| {
         let store = store.borrow();
@@ -269,6 +276,27 @@ mod tests {
         assert_eq!(
             place("wide", Source::Data(&data), Size::new(40, 10)),
             Some(size)
+        );
+    }
+
+    /// The sidebar and the project picker draw the same icon at two sizes in one frame.
+    /// Each has to find its own still there, or the terminal is sent both again on every
+    /// frame and they flicker.
+    #[test]
+    fn one_image_at_two_sizes_keeps_both() {
+        draw_in_halfblocks();
+        let data = test_png(64, 64);
+        let big = place("icon", Source::Data(&data), Size::new(4, 2)).unwrap();
+        let small = place("icon", Source::Data(&data), Size::new(2, 1)).unwrap();
+        assert_ne!(big, small);
+        // Not an image, so this only answers if the first size was kept.
+        assert_eq!(
+            place("icon", Source::Data("bm90IGFuIGltYWdl"), Size::new(4, 2)),
+            Some(big)
+        );
+        assert_eq!(
+            place("icon", Source::Data("bm90IGFuIGltYWdl"), Size::new(2, 1)),
+            Some(small)
         );
     }
 
