@@ -829,6 +829,11 @@ pub struct Provider {
     pub models: Vec<Model>,
     #[serde(default)]
     pub slash_commands: Vec<SlashCommand>,
+    #[serde(default)]
+    pub skills: Vec<Skill>,
+    /// The same, as they stand in particular directories.
+    #[serde(default)]
+    pub workspace_snapshots: Vec<WorkspaceSnapshot>,
     /// What the subscription behind this account has left, when the provider reports it
     /// at all. An API key or a cloud endpoint has no quota to report and carries none.
     #[serde(default)]
@@ -842,6 +847,19 @@ pub struct Provider {
 impl Provider {
     pub fn label(&self) -> &str {
         self.display_name.as_deref().unwrap_or(&self.instance_id)
+    }
+
+    /// The commands and skills to offer in `cwd`: what the provider found there when
+    /// it looked, and otherwise what it has everywhere.
+    pub fn commands_in(&self, cwd: Option<&str>) -> (&[SlashCommand], &[Skill]) {
+        match self
+            .workspace_snapshots
+            .iter()
+            .find(|snapshot| Some(snapshot.cwd.as_str()) == cwd)
+        {
+            Some(snapshot) => (&snapshot.slash_commands, &snapshot.skills),
+            None => (&self.slash_commands, &self.skills),
+        }
     }
 
     pub fn is_usable(&self) -> bool {
@@ -968,10 +986,57 @@ pub struct OptionChoice {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SlashCommand {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// What the command takes after its name, when it takes anything.
+    #[serde(default)]
+    pub input: Option<SlashCommandInput>,
+    /// `false` for one only the agent starts, which is not the user's to offer.
+    #[serde(default)]
+    pub user_invocable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashCommandInput {
+    pub hint: String,
+}
+
+/// A skill the provider can run, named in a message as `$name`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Skill {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub short_description: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    /// `false` for one only the agent starts, as for a command.
+    #[serde(default)]
+    pub user_invocable: Option<bool>,
+}
+
+impl Skill {
+    pub fn offered(&self) -> bool {
+        self.enabled && self.user_invocable != Some(false)
+    }
+}
+
+/// The commands and skills a provider has in one directory, which the project's own
+/// `.claude` or `.agents` adds to.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSnapshot {
+    pub cwd: String,
+    #[serde(default)]
+    pub slash_commands: Vec<SlashCommand>,
+    #[serde(default)]
+    pub skills: Vec<Skill>,
 }
 
 #[cfg(test)]

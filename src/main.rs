@@ -1,6 +1,7 @@
 mod app;
 mod auth;
 mod commands;
+mod completion;
 mod composer;
 mod config;
 mod discovery;

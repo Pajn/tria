@@ -9,6 +9,25 @@ use ratatui::{
 
 const MAX_HISTORY: usize = 200;
 
+/// A word being typed that a list can finish, and where it starts on the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trigger {
+    pub kind: TriggerKind,
+    /// What has been typed after the `/` or `$`.
+    pub query: String,
+    /// Column of the `/` or `$`.
+    pub start: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerKind {
+    /// A `/` opening a line. The provider's own commands only mean anything as the
+    /// first thing in a message, so they are offered only on its first line.
+    Command { at_prompt_start: bool },
+    /// A `$` word: a skill, named anywhere in a message.
+    Skill,
+}
+
 #[derive(Debug, Default)]
 pub struct Composer {
     pub(crate) lines: Vec<String>,
@@ -112,6 +131,55 @@ impl Composer {
             .nth(col)
             .map(|(i, _)| i)
             .unwrap_or(line.len())
+    }
+
+    /// What the word before the cursor is asking to be finished as, if anything. A
+    /// line that starts with `/` and has no space yet is a command; a word that starts
+    /// with `$` is a skill, wherever it is. The same rules as the desktop's composer,
+    /// so a message means the same whichever one wrote it.
+    pub fn completion_trigger(&self) -> Option<Trigger> {
+        let line = self.line();
+        let before: String = line.chars().take(self.col).collect();
+        if let Some(query) = before.strip_prefix('/')
+            && !query.contains(char::is_whitespace)
+        {
+            return Some(Trigger {
+                kind: TriggerKind::Command {
+                    at_prompt_start: self.row == 0,
+                },
+                query: query.to_string(),
+                start: 0,
+            });
+        }
+        let chars: Vec<char> = before.chars().collect();
+        let start = chars
+            .iter()
+            .rposition(|c| c.is_whitespace())
+            .map_or(0, |i| i + 1);
+        let word: String = before.chars().skip(start).collect();
+        let query = word.strip_prefix('$')?;
+        Some(Trigger {
+            kind: TriggerKind::Skill,
+            query: query.to_string(),
+            start,
+        })
+    }
+
+    /// Replace the cursor's line from column `start` up to the cursor, leaving the
+    /// cursor after what went in. A space already after the cursor is used rather than
+    /// doubled.
+    pub fn replace_before_cursor(&mut self, start: usize, replacement: &str) {
+        let line = self.line().to_string();
+        let from = Self::byte_index(&line, start);
+        let to = Self::byte_index(&line, self.col);
+        let rest = &line[to..];
+        // A space already after the cursor is the one the replacement would add.
+        let (replacement, step) = match replacement.strip_suffix(' ') {
+            Some(bare) if rest.starts_with(' ') => (bare, 1),
+            _ => (replacement, 0),
+        };
+        self.lines[self.row] = format!("{}{replacement}{rest}", &line[..from]);
+        self.col = start + char_len(replacement) + step;
     }
 
     pub fn insert_char(&mut self, ch: char) {

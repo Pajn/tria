@@ -320,6 +320,13 @@ const REWIND_FAILED: &str = "checkpoint.revert.failed";
 
 const REWIND_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The list under a `/` or `$` being typed, and the row it is on.
+pub struct CompletionMenu {
+    pub trigger: crate::composer::Trigger,
+    pub items: Vec<crate::completion::Item>,
+    pub selected: usize,
+}
+
 /// What a plan calls itself: its first heading.
 fn plan_title(markdown: &str) -> Option<&str> {
     markdown
@@ -568,6 +575,11 @@ pub struct App {
     /// Messages waiting for their thread's turn to end, one per thread: a second one
     /// queued behind the first joins it, as one message is what the turn gets next.
     queued: HashMap<Id, Queued>,
+    /// What the word being typed could be finished as, while there is anything.
+    pub completion: Option<CompletionMenu>,
+    /// The word `Esc` put the list away for, which it stays away for until the word
+    /// changes.
+    completion_dismissed: Option<crate::composer::Trigger>,
     /// A rewind asked about and not yet answered, which takes the next key.
     pub rewind_ask: Option<RewindAsk>,
     rewinding: Option<PendingRewind>,
@@ -758,6 +770,8 @@ impl App {
             links: Vec::new(),
             drafts: HashMap::new(),
             queued: HashMap::new(),
+            completion: None,
+            completion_dismissed: None,
             rewind_ask: None,
             rewinding: None,
             programs: vec![crate::config::Program {
@@ -5594,11 +5608,104 @@ impl App {
 
     fn on_insert_key(&mut self, key: KeyEvent) {
         if std::mem::take(&mut self.literal_next) {
-            return self.insert_literal(key);
+            self.insert_literal(key);
+            return self.refresh_completion();
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if self.completion.is_some() && self.on_completion_key(key, ctrl) {
+            return;
+        }
+        self.insert_key(key, ctrl, alt, shift);
+        self.refresh_completion();
+    }
+
+    /// The keys an open list takes for itself: `Tab` to take the row, the arrows and
+    /// `Ctrl-p`/`Ctrl-n` to move, `Esc` to put the list away without leaving insert
+    /// mode. `Enter` is not one of them: it sends, list or no list.
+    fn on_completion_key(&mut self, key: KeyEvent, ctrl: bool) -> bool {
+        let Some(menu) = self.completion.as_mut() else {
+            return false;
+        };
+        let len = menu.items.len();
+        match key.code {
+            KeyCode::Tab => {
+                let item = menu.items[menu.selected].insert.clone();
+                let start = menu.trigger.start;
+                self.completion = None;
+                self.composer.replace_before_cursor(start, &item);
+                self.refresh_completion();
+            }
+            KeyCode::Up => menu.selected = (menu.selected + len - 1) % len,
+            KeyCode::Char('p') if ctrl => menu.selected = (menu.selected + len - 1) % len,
+            KeyCode::Down => menu.selected = (menu.selected + 1) % len,
+            KeyCode::Char('n') if ctrl => menu.selected = (menu.selected + 1) % len,
+            KeyCode::Esc => {
+                self.completion_dismissed = self.completion.take().map(|menu| menu.trigger);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Work out the list again for what is now before the cursor.
+    fn refresh_completion(&mut self) {
+        let trigger = (self.mode == Mode::Insert)
+            .then(|| self.composer.completion_trigger())
+            .flatten();
+        let Some(trigger) = trigger else {
+            self.completion = None;
+            self.completion_dismissed = None;
+            return;
+        };
+        if self.completion_dismissed.as_ref() == Some(&trigger) {
+            return;
+        }
+        self.completion_dismissed = None;
+        let instance = self
+            .draft
+            .as_ref()
+            .map(|d| &d.model_selection)
+            .or_else(|| {
+                self.thread
+                    .as_ref()
+                    .map(|t| &t.detail.shell.model_selection)
+            })
+            .map(|selection| selection.instance_id.clone());
+        let cwd = self.watch_directory();
+        let items = self
+            .config
+            .providers
+            .iter()
+            .find(|provider| Some(&provider.instance_id) == instance.as_ref())
+            .map(|provider| {
+                let (commands, skills) = provider.commands_in(cwd.as_deref());
+                crate::completion::items(&trigger, commands, skills)
+            })
+            .unwrap_or_default();
+        if items.is_empty() {
+            self.completion = None;
+            return;
+        }
+        // The row stays put while the word it was chosen for is still being typed.
+        let selected = self
+            .completion
+            .as_ref()
+            .filter(|menu| menu.trigger.start == trigger.start)
+            .and_then(|menu| {
+                let chosen = &menu.items[menu.selected].insert;
+                items.iter().position(|item| &item.insert == chosen)
+            })
+            .unwrap_or(0);
+        self.completion = Some(CompletionMenu {
+            trigger,
+            items,
+            selected,
+        });
+    }
+
+    fn insert_key(&mut self, key: KeyEvent, ctrl: bool, alt: bool, shift: bool) {
         match key.code {
             // As in vim, where `Ctrl-q` is `Ctrl-v` under another name: the next key
             // goes in as the character it stands for rather than as the key it is.
@@ -8306,6 +8413,75 @@ mod tests {
             .expect("sent straight away");
         assert_eq!(command["message"]["text"], "now");
         assert_eq!(app.queued_message(), None);
+    }
+
+    fn typing(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    fn with_commands(app: &mut App) {
+        app.config.providers = vec![
+            serde_json::from_value(json!({
+                "instanceId": "instance",
+                "slashCommands": [{"name": "compact", "description": "Summarise"}],
+                "skills": [{"name": "deploy", "enabled": true}],
+            }))
+            .unwrap(),
+        ];
+        app.thread = Some(rewindable_thread());
+        app.current_thread_id = Some("t1".into());
+        app.mode = Mode::Insert;
+        app.focus = Focus::Composer;
+    }
+
+    /// `/` opens the provider's list, typing narrows it, and `Tab` writes the row in.
+    #[test]
+    fn a_slash_offers_what_the_provider_can_run() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        with_commands(&mut app);
+
+        typing(&mut app, "/");
+        let offered: Vec<_> = app
+            .completion
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
+        assert_eq!(offered, ["$deploy", "/compact"]);
+
+        typing(&mut app, "co");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.composer.text(), "/compact ");
+        assert!(app.completion.is_none());
+
+        // A skill is named anywhere, and goes in as the server reads one.
+        typing(&mut app, "then $d");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.composer.text(), "/compact then $deploy ");
+    }
+
+    /// `Esc` puts the list away and leaves you writing; the next word brings it back.
+    #[test]
+    fn esc_hides_the_list_for_that_word_only() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        with_commands(&mut app);
+
+        typing(&mut app, "$");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.completion.is_none());
+        assert_eq!(app.mode, Mode::Insert, "Esc left insert mode");
+        // Tab is itself again while the list is away.
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        typing(&mut app, "$de");
+        assert!(app.completion.is_some());
     }
 
     /// A thread in plan mode on a worktree, with a plan waiting and an older one built.

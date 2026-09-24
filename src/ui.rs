@@ -158,6 +158,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_question(frame, app, question, questions);
     }
     draw_composer(frame, app, composer);
+    draw_completion(frame, app, main_area);
     draw_status(frame, app, status);
     let chat_inner = app.chat_area;
     apply_links(frame, app, chat_inner);
@@ -1684,6 +1685,72 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// The list under a `/` or `$` being typed, over the chat just above the composer and
+/// lined up with the word it would finish.
+fn draw_completion(frame: &mut Frame, app: &App, bounds: Rect) {
+    let Some(menu) = &app.completion else {
+        return;
+    };
+    let composer = app.composer_area;
+    let shown = menu.items.len().min(crate::completion::VISIBLE);
+    // Scrolled only as far as keeps the chosen row in sight.
+    let first = menu.selected.saturating_sub(shown - 1);
+    let rows = &menu.items[first..first + shown];
+    let label_width = rows
+        .iter()
+        .map(|item| item.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let width = bounds.width.saturating_sub(2).min(72);
+    let height = shown as u16 + 2;
+    // Above the composer's top border, where the chat is.
+    let top = composer.y.saturating_sub(1 + height).max(bounds.y);
+    let left = (composer.x + menu.trigger.start as u16)
+        .saturating_sub(1)
+        .min(bounds.x + bounds.width.saturating_sub(width));
+    let area = Rect {
+        x: left,
+        y: top,
+        width,
+        height: height.min(composer.y.saturating_sub(bounds.y)),
+    };
+    let inner_width = width.saturating_sub(2) as usize;
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let style = if first + i == menu.selected {
+                Style::default().bg(Color::Yellow).fg(Color::Black)
+            } else {
+                Style::default()
+            };
+            let label = format!(" {:label_width$}  ", item.label);
+            let room = inner_width.saturating_sub(label.chars().count());
+            Line::from(vec![
+                Span::styled(label, style.bold()),
+                Span::styled(
+                    fit(&item.detail, room),
+                    style.fg(if first + i == menu.selected {
+                        Color::Black
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+            ])
+        })
+        .collect();
+    let more = if menu.items.len() > shown {
+        format!(" · {}/{}", menu.selected + 1, menu.items.len())
+    } else {
+        String::new()
+    };
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title_bottom(Line::from(format!(" Tab takes it · Esc hides{more} ")).right_aligned());
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     // The question takes the next key, so it takes the row that says what keys do.
     if let Some(ask) = &app.rewind_ask {
@@ -3131,6 +3198,9 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  Enter send · Alt-Enter / Ctrl-j newline · Esc or Ctrl-c normal"),
         Line::from("  Ctrl-v or Ctrl-q        the next key as a character: Ctrl-v Enter is a"),
         Line::from("                          newline where Enter would send"),
+        Line::from("  / or $                  a line opening / lists the provider's commands"),
+        Line::from("                          and skills, a $ word its skills · Tab takes the"),
+        Line::from("                          row, Up/Down move, Esc hides the list"),
         Line::from("  Ctrl-s                  queue the message until the running turn ends,"),
         Line::from("                          where Enter would steer the turn with it"),
         Line::from("  Up/Down or Ctrl-p/n     prompt history; Up on an empty composer takes"),
@@ -3716,6 +3786,41 @@ mod tests {
         }))
         .unwrap();
         crate::state::ThreadState::from_snapshot(snapshot)
+    }
+
+    /// The list sits over the chat just above the composer, with what each row is.
+    #[test]
+    fn the_completion_list_is_drawn_above_the_composer() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_carrying(0));
+        app.mode = crate::app::Mode::Insert;
+        app.composer.set_text("/");
+        let item = |label: &str, detail: &str| crate::completion::Item {
+            insert: format!("{label} "),
+            label: label.into(),
+            detail: detail.into(),
+        };
+        app.completion = Some(crate::app::CompletionMenu {
+            trigger: app.composer.completion_trigger().unwrap(),
+            items: vec![
+                item("/compact", "Summarise the conversation"),
+                item("$deploy", "Ship it"),
+            ],
+            selected: 1,
+        });
+        let drawn = chat(80, &mut app);
+        let lines: Vec<&str> = drawn.lines().collect();
+        let compact = lines
+            .iter()
+            .position(|l| l.contains("/compact"))
+            .expect("no list");
+        assert!(lines[compact].contains("Summarise the conversation"));
+        assert!(lines[compact + 1].contains("$deploy"));
+        assert!(lines[compact + 2].contains("Tab takes it"));
+        // And the composer is still under it.
+        assert!(lines[compact + 3..].iter().any(|l| l.contains("insert")));
     }
 
     /// The composer is where somebody about to write is already looking, so that is

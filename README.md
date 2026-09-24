@@ -197,6 +197,7 @@ still waiting.
 | --- | --- |
 | `Enter` | send; while a turn runs, steer it |
 | `Ctrl-s` | while a turn runs, queue the message until it ends |
+| `/` at the start of a line, or `$` | list the provider's commands and skills; `Tab` takes the row, `Up` `Down` move, `Esc` hides the list |
 | `Alt-Enter` or `Ctrl-j` | newline |
 | `Ctrl-v` or `Ctrl-q` | the next key as the character it stands for: `Ctrl-v` `Enter` is a newline, `Ctrl-v` `Tab` a tab |
 | `Up` `Down` or `Ctrl-p` `Ctrl-n` | prompt history; on an empty composer, `Up` takes a queued message back first |
@@ -210,6 +211,14 @@ to find by accident. `Ctrl-v` and `Ctrl-q` mean in insert mode what they mean in
 which is why neither is a quit: the next key goes in as the character it stands for.
 `Alt-Enter` is the usual way to write a newline where `Enter` sends, but a terminal has to
 be willing to send it; `Ctrl-v` `Enter` needs nothing of the terminal and always works.
+
+A line that starts with `/` lists what the provider can run: its commands, which only mean
+anything as the first line of a message, and its skills. A word that starts with `$` lists the
+skills alone, anywhere in the message. Typing narrows the list and `Tab` writes the row in. A
+skill always goes in as `$name`, however it was found, since that is how the server knows to
+run one; a command goes in as `/name`. `Enter` still sends with the list up. The lists are the
+ones the provider found for the thread's directory, so a project's own commands and skills are
+there with the rest.
 
 `gr` on one of your messages in the chat rewinds the thread to before it, and `:rewind` does
 the same for the last turn. The turn goes, with every turn after it, and what you sent in that
