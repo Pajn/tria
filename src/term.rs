@@ -94,6 +94,9 @@ pub struct Pane {
     /// A command being started in place of the shell: the pane shows a notice instead of
     /// the shell's prompt until the command is actually running.
     pub starting: Option<String>,
+    /// Why the terminal is not running, shown in place of its screen until the pane is
+    /// closed. Nothing typed goes anywhere while it is set.
+    pub failed: Option<String>,
     parser: vt100::Parser<Answers>,
     size: (u16, u16),
     graphics: crate::kitty::Graphics,
@@ -117,6 +120,7 @@ impl Pane {
             thread_id,
             exited: None,
             starting: None,
+            failed: None,
             graphics: crate::kitty::Graphics::new(&terminal_id),
             terminal_id,
             label,

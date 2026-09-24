@@ -1848,6 +1848,21 @@ impl App {
             Event::Snapshot { snapshot } | Event::Restarted { snapshot } => {
                 pane.label = snapshot.label;
                 pane.reset(&snapshot.history);
+                // A terminal the server could not start has no shell to type into. The
+                // server does publish why, but its attach stream drops that event as
+                // older than this snapshot, so the snapshot's status is all there is.
+                if snapshot.status == "error" {
+                    pane.starting = None;
+                    pane.failed.get_or_insert_with(|| {
+                        format!(
+                            "The server could not start a shell in {} and did not say why.",
+                            snapshot.cwd
+                        )
+                    });
+                    self.pending_pane_command = None;
+                    return;
+                }
+                pane.failed = None;
                 let terminal_id = pane.terminal_id.clone();
                 // Only type the queued command into a shell that is sitting idle: an
                 // existing session already running it should be left alone.
@@ -1895,6 +1910,13 @@ impl App {
                     pane.starting = None;
                 }
             }
+            // Before anything is running, an error is why nothing will: it takes the
+            // place of the notice. Later ones leave the program on screen.
+            Event::Error { message } if pane.starting.is_some() || pane.failed.is_some() => {
+                pane.starting = None;
+                pane.failed = Some(message);
+                self.pending_pane_command = None;
+            }
             Event::Error { message } => self.toast(message, true),
             Event::Unknown => {}
         }
@@ -1912,6 +1934,13 @@ impl App {
             self.mode = Mode::Normal;
             return;
         };
+        // With no shell behind the pane, Esc is free to close it.
+        if pane.failed.is_some() {
+            if key.code == KeyCode::Esc {
+                self.detach_terminal();
+            }
+            return;
+        }
         // Typing returns to the live screen, the way a terminal behaves.
         if pane.scrollback() > 0 {
             pane.scroll(isize::MIN / 2);
@@ -6417,6 +6446,52 @@ mod tests {
         press(&mut app, 'g');
         press(&mut app, 'q');
         assert_eq!(app.pending_pane_command, None);
+    }
+
+    /// A terminal the server could not start says so in the pane, instead of waiting on
+    /// a program that will never come up, and Esc closes it.
+    #[tokio::test]
+    async fn a_terminal_that_did_not_start_says_so_until_esc() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.pane = Some(crate::term::Pane::new(
+            "t1".into(),
+            "tria-gl".into(),
+            "lazygit".into(),
+            80,
+            24,
+        ));
+        app.pane.as_mut().unwrap().starting = Some("lazygit".into());
+        app.pending_pane_command = Some("exec lazygit\r".into());
+        app.mode = Mode::TerminalPane;
+
+        let snapshot = serde_json::from_value(json!({
+            "type": "snapshot",
+            "snapshot": {
+                "threadId": "t1", "terminalId": "tria-gl", "cwd": "/repo",
+                "status": "error", "pid": null, "history": "", "label": "tria-gl"
+            }
+        }))
+        .unwrap();
+        app.apply_terminal_stream(snapshot);
+        let pane = app.pane.as_ref().unwrap();
+        assert_eq!(pane.starting, None);
+        assert!(pane.failed.as_deref().unwrap().contains("/repo"));
+        assert_eq!(app.pending_pane_command, None, "nothing to type it into");
+
+        // Should the server's reason reach the stream, it replaces the guess.
+        app.apply_terminal_stream(crate::model::TerminalStreamEvent::Error {
+            message: "posix_spawnp failed".into(),
+        });
+        let pane = app.pane.as_ref().unwrap();
+        assert_eq!(pane.failed.as_deref(), Some("posix_spawnp failed"));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::TerminalPane);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.pane.is_none());
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     /// The figures on the config are as old as the connection that fetched them, so

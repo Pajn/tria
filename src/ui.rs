@@ -2034,7 +2034,10 @@ fn draw_terminal_pane(frame: &mut Frame, app: &mut App, area: Rect) {
         },
         None => " terminal ".into(),
     };
-    let hint = if scrollback > 0 {
+    let failed = app.pane.as_ref().is_some_and(|p| p.failed.is_some());
+    let hint = if failed {
+        " Esc closes ".into()
+    } else if scrollback > 0 {
         format!(" scrollback {scrollback} · Ctrl-\\ detaches ")
     } else {
         " Ctrl-\\ detaches ".into()
@@ -2050,6 +2053,25 @@ fn draw_terminal_pane(frame: &mut Frame, app: &mut App, area: Rect) {
     app.pane_area = inner;
     app.sync_pane_size(inner.width, inner.height);
     let Some(pane) = &app.pane else { return };
+    if let Some(failed) = &pane.failed {
+        let text = vec![
+            Line::from(Span::styled(
+                format!("{} did not start", pane.label),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::default(),
+            Line::from(failed.as_str()),
+        ];
+        let paragraph = Paragraph::new(text).centered().wrap(Wrap { trim: false });
+        let height = (paragraph.line_count(inner.width) as u16).min(inner.height);
+        let area = Rect {
+            y: inner.y + (inner.height - height) / 2,
+            height,
+            ..inner
+        };
+        frame.render_widget(paragraph, area);
+        return;
+    }
     // Until the command has taken over the shell, show a notice rather than the prompt
     // it is about to replace.
     if let Some(starting) = &pane.starting {
@@ -3777,6 +3799,22 @@ mod tests {
             chat_span((start + 1, 4), (start + 1, 7)),
             Some("two".into())
         );
+    }
+
+    #[tokio::test]
+    async fn a_pane_that_did_not_start_shows_why_and_how_to_close_it() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let mut pane =
+            crate::term::Pane::new("t1".into(), "tria-gl".into(), "lazygit".into(), 60, 12);
+        pane.failed = Some("posix_spawnp failed".into());
+        app.pane = Some(pane);
+        app.mode = Mode::TerminalPane;
+        let text = chat(70, &mut app);
+        assert!(text.contains("lazygit did not start"), "{text}");
+        assert!(text.contains("posix_spawnp failed"), "{text}");
+        assert!(text.contains("Esc closes"), "{text}");
     }
 
     #[test]
