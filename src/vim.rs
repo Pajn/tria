@@ -794,6 +794,19 @@ impl Composer {
     }
 
     fn move_to_target(&mut self, motion: Motion, count: usize) {
+        // Moving goes by the rows as drawn, the way `gj` and `gk` do, so a line that
+        // wraps is walked through rather than jumped over. An operator still takes
+        // whole lines: `dj` is two of them however they wrap.
+        let by = match motion {
+            Motion::Up => Some(-(count as isize)),
+            Motion::Down => Some(count as isize),
+            _ => None,
+        };
+        if let Some(by) = by {
+            self.move_rows(by, |line| line.chars().count().saturating_sub(1));
+            self.clamp_normal();
+            return;
+        }
         if let Some((target, _)) = self.motion_target(motion, count) {
             self.row = target.0;
             self.col = target.1;
@@ -1577,6 +1590,33 @@ mod tests {
         assert_eq!((c.row, c.col), (0, 15));
         keys(&mut c, "0");
         assert_eq!((c.row, c.col), (0, 0));
+    }
+
+    /// A line that wraps is walked through a row at a time, keeping the place along the
+    /// row, while an operator on the same keys still takes whole lines.
+    #[test]
+    fn j_and_k_move_by_rows_as_drawn() {
+        let mut c = composer("0123456789abcdefghij0123\nshort\nlast");
+        // Drawn ten wide: the first line is three rows, the last of them four long.
+        c.render(ratatui::layout::Rect::new(0, 0, 10, 5), "");
+        c.col = 5;
+        keys(&mut c, "j");
+        assert_eq!((c.row, c.col), (0, 15));
+        keys(&mut c, "j");
+        assert_eq!((c.row, c.col), (0, 23), "held to the end of the short row");
+        keys(&mut c, "j");
+        assert_eq!((c.row, c.col), (1, 3));
+        keys(&mut c, "3k");
+        assert_eq!((c.row, c.col), (0, 3));
+        keys(&mut c, "k");
+        assert_eq!((c.row, c.col), (0, 3), "nothing above the first row");
+        keys(&mut c, "9j");
+        assert_eq!((c.row, c.col), (2, 3), "as far as there is to go");
+
+        c.row = 0;
+        c.col = 3;
+        keys(&mut c, "dj");
+        assert_eq!(c.text(), "last");
     }
 
     #[test]

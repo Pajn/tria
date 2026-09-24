@@ -16,6 +16,9 @@ pub struct Composer {
     /// Cursor column in characters.
     pub(crate) col: usize,
     pub(crate) vim: crate::vim::VimState,
+    /// The width the composer was last drawn at, which is where its lines wrap. Zero
+    /// until it has been drawn, and then every line is one row.
+    width: usize,
     history: Vec<String>,
     history_index: Option<usize>,
     draft: String,
@@ -179,22 +182,39 @@ impl Composer {
         }
     }
 
-    /// Returns false when already on the first row so callers can reuse the key.
+    /// Up a row as drawn, which is a line up unless the line wraps. Returns false when
+    /// already on the first row so callers can reuse the key.
     pub fn up(&mut self) -> bool {
-        if self.row == 0 {
-            return false;
-        }
-        self.row -= 1;
-        self.col = self.col.min(char_len(self.line()));
-        true
+        self.move_rows(-1, char_len)
     }
 
     pub fn down(&mut self) -> bool {
-        if self.row + 1 >= self.lines.len() {
+        self.move_rows(1, char_len)
+    }
+
+    /// Move `by` rows as drawn, keeping the cursor's place along the row. `end` is the
+    /// furthest the cursor may sit on a line: past its last character while typing, on
+    /// it otherwise. Returns false when there is no row that way to go to.
+    pub(crate) fn move_rows(&mut self, by: isize, end: fn(&str) -> usize) -> bool {
+        let width = if self.width == 0 {
+            usize::MAX
+        } else {
+            self.width
+        };
+        let rows = self.wrapped(width);
+        let (along, at) = self.cursor_row(&rows);
+        let target = (at as isize + by).clamp(0, rows.len() as isize - 1) as usize;
+        if target == at as usize {
             return false;
         }
-        self.row += 1;
-        self.col = self.col.min(char_len(self.line()));
+        let row = &rows[target];
+        let last = if row.last {
+            end(&self.lines[row.line]).max(row.start)
+        } else {
+            row.end - 1
+        };
+        self.row = row.line;
+        self.col = (row.start + along as usize).min(last);
         true
     }
 
@@ -357,9 +377,11 @@ impl Composer {
         self.vim_cancel();
     }
 
-    /// Wrapped lines plus the cursor position relative to `area`, scrolled so the cursor is visible.
-    pub fn render(&self, area: Rect, placeholder: &str) -> (Vec<Line<'static>>, (u16, u16)) {
+    /// Wrapped lines plus the cursor position relative to `area`, scrolled so the cursor
+    /// is visible. The width is kept, so moving by rows moves by these ones.
+    pub fn render(&mut self, area: Rect, placeholder: &str) -> (Vec<Line<'static>>, (u16, u16)) {
         let width = area.width.max(1) as usize;
+        self.width = width;
         let cursor = self.cursor_row(&self.wrapped(width));
         let mut rows: Vec<Line<'static>> = Vec::new();
         for (index, line) in self.lines.iter().enumerate() {
@@ -444,6 +466,26 @@ fn char_len(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The arrows go by the rows as drawn too, and while typing the end of a line is a
+    /// place of its own, past the last character. Off the top is left to the caller.
+    #[test]
+    fn the_arrows_move_by_the_rows_as_drawn() {
+        let mut c = Composer::new();
+        c.set_text("0123456789abc\nxy");
+        c.render(Rect::new(0, 0, 10, 4), "");
+        c.row = 0;
+        c.col = 8;
+        assert!(c.down());
+        assert_eq!((c.row, c.col), (0, 13), "the end of the short row");
+        assert!(c.down());
+        assert_eq!((c.row, c.col), (1, 2));
+        assert!(!c.down());
+        assert!(c.up());
+        assert!(c.up());
+        assert_eq!((c.row, c.col), (0, 2));
+        assert!(!c.up());
+    }
 
     /// A click is a character, and the two have to agree about wrapping and scrolling
     /// or the cursor lands somewhere the text is not.
