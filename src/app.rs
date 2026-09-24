@@ -706,6 +706,9 @@ pub struct App {
     /// The worktrees that are still on the disk, so the sidebar can mark the threads
     /// holding one without asking the disk about every row it draws.
     live_worktrees: HashSet<String>,
+    /// Worktrees the server has been asked to remove and has not answered about yet.
+    /// Git deletes the whole directory before it answers, which can take a while.
+    pub removing: HashSet<String>,
     /// `None` until the first look, so the sidebar is marked as soon as there is a
     /// thread list to mark rather than a minute later.
     worktrees_checked: Option<Instant>,
@@ -829,6 +832,7 @@ impl App {
             confirm_stop_session: false,
             worktree_selected: 0,
             live_worktrees: HashSet::new(),
+            removing: HashSet::new(),
             worktrees_checked: None,
             local_disk: false,
             tool_recovery_request: None,
@@ -3220,6 +3224,9 @@ impl App {
 
     /// Why a worktree is not tria's to remove, whatever git thinks of it.
     fn worktree_held(&self, worktree: &ThreadWorktree) -> Option<&'static str> {
+        if self.removing.contains(&worktree.path) {
+            return Some("it is already being removed");
+        }
         if worktree.running {
             return Some("that thread is still running");
         }
@@ -3259,6 +3266,7 @@ impl App {
         let events = self.events.clone();
         let payload = json!({ "cwd": worktree.project_cwd, "path": path, "force": force });
         self.toast(format!("removing {}", short_path(&path)), false);
+        self.removing.insert(path.clone());
         tokio::spawn(async move {
             let result = handle
                 .call("vcs.removeWorktree", payload)
@@ -3289,6 +3297,7 @@ impl App {
     }
 
     fn on_worktree_removed(&mut self, path: String, result: Result<(), String>) {
+        self.removing.remove(&path);
         match result {
             Ok(()) => {
                 self.worktrees.retain(|w| w.path != path);
@@ -9390,6 +9399,40 @@ mod tests {
         app.worktree_selected = 0;
         app.mode = Mode::Worktrees;
         path
+    }
+
+    /// A worktree on its way out says so until the server answers, whichever way, and
+    /// is not asked to go twice.
+    #[tokio::test]
+    async fn a_worktree_being_removed_is_marked_until_the_server_answers() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let path = holding(&mut app, Some(false));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.removing.contains(&path));
+        let mut calls = 0;
+        while let Some(request) = asked(&mut requests).await {
+            if matches!(&request, crate::session::Request::Call { tag, .. } if tag == "vcs.removeWorktree")
+            {
+                calls += 1;
+            }
+        }
+        assert_eq!(calls, 1);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(
+            app.toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("already being removed")
+        );
+
+        // Refused, it is a worktree like any other again.
+        app.on_worktree_removed(path.clone(), Err("busy".into()));
+        assert!(!app.removing.contains(&path));
     }
 
     /// `X` is one shift away from `x` in a list moved through with `j` and `k`, and it

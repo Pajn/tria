@@ -2358,8 +2358,11 @@ fn draw_worktrees(frame: &mut Frame, app: &App, area: Rect) {
     }
     for (index, worktree) in worktrees.iter().enumerate().skip(first).take(room) {
         let selected = index == selection;
+        let removing = app.removing.contains(&worktree.path);
         // What it is waiting for, which is what says whether it can go.
-        let (glyph, glyph_style) = if worktree.running {
+        let (glyph, glyph_style) = if removing {
+            (app.spinner_frame(), Style::default().fg(Color::Red))
+        } else if worktree.running {
             (app.spinner_frame(), Style::default().fg(Color::Cyan))
         } else if worktree.settled {
             ("✓", Style::default().fg(Color::Green))
@@ -2389,6 +2392,10 @@ fn draw_worktrees(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ];
         match worktree.changes {
+            // Git is deleting it; what it held is no longer the news.
+            _ if removing => {
+                detail.push(Span::styled("  removing…", Style::default().fg(Color::Red)))
+            }
             None => detail.push(Span::styled("  reading…", dim)),
             Some(true) => detail.push(Span::styled(
                 "  uncommitted work",
@@ -3372,6 +3379,29 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The row being removed says so, in place of what it holds.
+    #[test]
+    fn a_worktree_being_removed_says_so() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.worktrees = vec![worktree(1), worktree(2)];
+        app.removing.insert(worktree(1).path);
+        let drawn = drawn(88, 20, &app);
+        let lines: Vec<&str> = drawn.lines().collect();
+        let first = lines
+            .iter()
+            .position(|l| l.contains("thread number 1"))
+            .unwrap();
+        let second = lines
+            .iter()
+            .position(|l| l.contains("thread number 2"))
+            .unwrap();
+        assert!(lines[first + 1].contains("removing…"));
+        assert!(!lines[first + 1].contains("clean"));
+        assert!(lines[second + 1].contains("clean"));
     }
 
     fn dirty(app: &mut App, files: &[(&str, u32, u32)]) {
