@@ -5066,7 +5066,7 @@ impl App {
         ui::chat_span(spot(from, 0), spot(to, 1))
     }
 
-    /// Called by the event loop once the frame that resolved a selection has been drawn.
+    /// Called by the event loop as it starts the frame after a selection resolved.
     pub fn flush_clipboard(&mut self) {
         if let Some(text) = self.clipboard_pending.take() {
             if text.trim().is_empty() {
@@ -6103,7 +6103,10 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
         // it to the input field. Publish the frame only after that restoration, so
         // idle ticks and image repaints cannot expose those intermediate positions.
         // sync_update also ends the synchronized region when drawing returns an error.
+        // A pending copy goes out inside the region too: tmux keeps an OSC 52 that
+        // directly follows the end of one, but does not pass it on to the terminal.
         let drawn = std::io::stdout().sync_update(|_| -> std::io::Result<()> {
+            app.flush_clipboard();
             if std::mem::take(&mut app.repaint) {
                 terminal.clear()?;
             }
@@ -6112,7 +6115,6 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
         if let Err(err) = drawn.and_then(|result| result) {
             break Err(err.into());
         }
-        app.flush_clipboard();
         let event = tokio::select! {
             ev = input.next() => match ev {
                 Some(Ok(ev)) => AppEvent::Terminal(ev),
