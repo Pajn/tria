@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    model::ThreadDetailSnapshot,
+    model::{PullRequestRef, ThreadDetailSnapshot},
     state::ThreadState,
     timeline::{Block, BlockKey, Region},
 };
@@ -184,30 +184,70 @@ pub fn state(detail: &Detail, revision: u64) -> Result<ThreadState> {
     Ok(state)
 }
 
-/// The view's blocks: where it stands, its checks, and what it says. `images` is what
-/// has come back for the pictures the description points at, by their links.
-///
-/// `activity` is the review history, `None` while it is on its way. A reviewer's row is
-/// open by default when theirs is the latest review, so `za` there shuts it rather than
-/// opening it.
-pub fn blocks(
-    detail: &Detail,
-    activity: Option<&Result<Activity, String>>,
-    expanded: &HashSet<String>,
-    open_levels: u8,
-    size: (u16, u16),
-    images: &HashMap<String, Option<String>>,
-    now: &str,
-) -> Vec<Block> {
+/// Everything besides the detail that the view is drawn from.
+pub struct Context<'a> {
+    /// The review history, `None` while it is on its way.
+    pub activity: Option<&'a Result<Activity, String>>,
+    /// The stack it is a layer of, bottom to top, and which layer it is.
+    pub stack: Option<(&'a [PullRequestRef], usize)>,
+    /// The folds opened by hand, and how many levels are open everywhere.
+    pub expanded: &'a HashSet<String>,
+    pub open_levels: u8,
+    pub size: (u16, u16),
+    /// What has come back for the pictures the description and reviews point at.
+    pub images: &'a HashMap<String, Option<String>>,
+    pub now: &'a str,
+}
+
+/// The view's blocks: where it stands, its checks, its reviews, and what it says. A
+/// reviewer's row is open by default when theirs is the latest review, so `za` there shuts
+/// it rather than opening it.
+pub fn blocks(detail: &Detail, context: &Context<'_>) -> Vec<Block> {
+    let Context {
+        activity,
+        stack,
+        expanded,
+        open_levels,
+        size,
+        images,
+        now,
+    } = *context;
     let open = |key: &str| open_levels > 0 || expanded.contains(key);
     let flipped =
         |key: &str, by_default: bool| open_levels > 0 || expanded.contains(key) != by_default;
     vec![
-        summary(detail),
+        summary(detail, stack),
         checks(detail, &open),
         reviews(detail, activity, &flipped, now, size, images),
         body(detail, &open, &flipped, size, images),
     ]
+}
+
+/// The stack across the top: each layer by number, bottom to top, in the colour of where it
+/// stands, with the one being read picked out.
+fn stack_strip(layers: &[PullRequestRef], at: usize) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("stack {}/{}  ", at + 1, layers.len()),
+        dim(),
+    )];
+    for (index, layer) in layers.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" › ", dim()));
+        }
+        let (glyph, color) = match layer.state.as_deref() {
+            Some("merged") => ("◆", Color::Magenta),
+            Some("closed") => ("✗", Color::Red),
+            _ if layer.is_draft => ("◌", Color::Gray),
+            _ => ("●", Color::Green),
+        };
+        let mut style = Style::default().fg(color);
+        if index == at {
+            style = style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        }
+        spans.push(Span::styled(format!("{glyph} #{}", layer.number), style));
+    }
+    spans.push(Span::styled("   [ ] move through it", dim()));
+    Line::from(spans)
 }
 
 /// The link a region of the view stands for, for `gx`: a check's page, or the review a
@@ -877,11 +917,15 @@ fn heading(text: &str) -> Span<'static> {
     )
 }
 
-fn summary(detail: &Detail) -> Block {
-    let mut lines = vec![Line::from(Span::styled(
+fn summary(detail: &Detail, stack: Option<(&[PullRequestRef], usize)>) -> Block {
+    let mut lines = Vec::new();
+    if let Some((layers, at)) = stack {
+        lines.push(stack_strip(layers, at));
+    }
+    lines.push(Line::from(Span::styled(
         format!("#{} {}", detail.number, detail.title),
         Style::default().add_modifier(Modifier::BOLD),
-    ))];
+    )));
 
     let (state, color) = match detail.state.as_str() {
         "merged" => ("merged", Color::Magenta),
@@ -1242,9 +1286,42 @@ mod tests {
         assert_eq!((fold.first, fold.end), (2, 5));
     }
 
+    /// A layer of a stack says where it sits: every layer by number, bottom to top, in the
+    /// colour of where it stands, and the one being read picked out.
+    #[test]
+    fn a_stack_is_drawn_across_the_top() {
+        let layers: Vec<serde_json::Value> = [1u64, 2, 3]
+            .into_iter()
+            .map(|n| {
+                json!({
+                    "host": "github.com", "repository": "o/r", "number": n,
+                    "url": format!("https://github.com/o/r/pull/{n}"), "source": "agent",
+                    "linkedAt": "", "snapshot": {
+                        "state": if n == 1 { "merged" } else { "open" }, "isDraft": n == 3,
+                        "title": "t", "headBranch": format!("b{n}"),
+                        "baseBranch": if n == 1 { "main".to_string() } else { format!("b{}", n - 1) },
+                    }
+                })
+            })
+            .collect();
+        let shell: crate::model::ThreadShell = serde_json::from_value(json!({
+            "id": "t", "projectId": "p", "title": "T",
+            "modelSelection": {"instanceId": "c", "model": "m"},
+            "pullRequests": layers,
+        }))
+        .unwrap();
+        let chains = shell.pull_request_chains();
+        let lines = text(&summary(&detail(json!([])), Some((&chains[0].layers, 1))));
+        assert_eq!(
+            lines[0],
+            "stack 2/3  ◆ #1 › ● #2 › ◌ #3   [ ] move through it"
+        );
+        assert_eq!(lines[1], "#42 Add the thing");
+    }
+
     #[test]
     fn the_summary_says_what_stands_in_the_way() {
-        let lines = text(&summary(&detail(json!([]))));
+        let lines = text(&summary(&detail(json!([])), None));
         assert_eq!(lines[0], "#42 Add the thing");
         assert_eq!(lines[1], "open · @someone · b → a");
         assert!(lines.contains(&"⚠ conflicts with a".to_string()));

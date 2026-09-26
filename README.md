@@ -417,6 +417,11 @@ yanking, and `q` or `Esc` to go back to the conversation where it was. It is fet
 `pullRequests.detail`, which the server answers by asking the host, so the host's CLI has to be
 installed and signed in where the server runs.
 
+A pull request that is a layer of a stack says so across the top: every layer by number, bottom
+to top, in the colour of where it stands — merged, open, draft, closed — with the one being read
+picked out. `[` and `]` read the layer below and above. The strip is the thread list's, so it
+changes as soon as a layer lands or another is linked.
+
 The top says where it stands: state, author, the branch and the one it merges into, the size of
 the change, the labels in the host's colours, and whatever stands between it and landing — a
 conflict with its base, commits it is behind by, workflow runs waiting for approval — and

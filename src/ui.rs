@@ -1191,6 +1191,8 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
 
+    // Owned, and read before the drawing below takes hold of the app.
+    let stack = app.pull_request_stack();
     let expanded_hash = hash_set(&app.expanded);
     let key = (
         thread.id().to_string(),
@@ -1221,12 +1223,15 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             let blocks = match app.transcript.as_ref().and_then(|t| t.pull_request()) {
                 Some(detail) => crate::pull_request::blocks(
                     detail,
-                    app.pull_request_activity.get(&detail.url),
-                    &app.expanded,
-                    app.open_levels,
-                    (inner.width, inner.height),
-                    &app.pull_request_images,
-                    &crate::commands::now_iso(),
+                    &crate::pull_request::Context {
+                        activity: app.pull_request_activity.get(&detail.url),
+                        stack: stack.as_ref().map(|(layers, at)| (layers.as_slice(), *at)),
+                        expanded: &app.expanded,
+                        open_levels: app.open_levels,
+                        size: (inner.width, inner.height),
+                        images: &app.pull_request_images,
+                        now: &crate::commands::now_iso(),
+                    },
                 ),
                 None => timeline::build(
                     thread,

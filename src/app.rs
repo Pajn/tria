@@ -756,6 +756,8 @@ pub struct App {
     /// The open pull request's link as the thread list last had it, to notice the server's
     /// sync bringing news of it.
     pull_request_synced: Option<String>,
+    /// The stack the open pull request is in, as last drawn.
+    pull_request_stack_seen: Option<String>,
     /// Each pull request's review history as last read, by its link, or why it could not be.
     pub pull_request_activity: HashMap<String, Result<crate::pull_request::Activity, String>>,
     /// Pictures asked for, whether or not they have come back.
@@ -924,6 +926,7 @@ impl App {
             pull_request_quiet: false,
             pull_request_revision: None,
             pull_request_synced: None,
+            pull_request_stack_seen: None,
             pull_request_images_asked: HashSet::new(),
             gh_tokens: Default::default(),
             pane: None,
@@ -4553,12 +4556,50 @@ impl App {
         else {
             return;
         };
+        // The strip across the top is the thread list's, so a layer landing or linked
+        // redraws it, without reading anything.
+        let stack = format!("{:?}", self.pull_request_stack());
+        if self.pull_request_stack_seen.as_ref() != Some(&stack) {
+            self.pull_request_stack_seen = Some(stack);
+            if let Some(open) = self.transcript.as_mut() {
+                self.pull_request_reads += 1;
+                open.state.revision = self.pull_request_reads;
+            }
+        }
         let synced = self.synced_link(&url);
         if synced.is_some() && synced != self.pull_request_synced {
             let had = std::mem::replace(&mut self.pull_request_synced, synced);
             if had.is_some() {
                 self.refresh_open_pull_request();
             }
+        }
+    }
+
+    /// The stack the pull request being read is a layer of, bottom to top, and which layer
+    /// it is. Only a stack of more than one: a pull request on its own is not in one.
+    pub fn pull_request_stack(&self) -> Option<(Vec<crate::model::PullRequestRef>, usize)> {
+        let url = &self.transcript.as_ref()?.pull_request()?.url;
+        let shell = &self.thread.as_ref()?.detail.shell;
+        shell
+            .pull_request_chains()
+            .into_iter()
+            .filter(|chain| chain.layers.len() > 1)
+            .find_map(|chain| {
+                let at = chain.layers.iter().position(|layer| &layer.url == url)?;
+                Some((chain.layers, at))
+            })
+    }
+
+    /// `[` and `]`: read the layer below or above in the stack.
+    fn move_through_stack(&mut self, by: isize) {
+        let Some((layers, at)) = self.pull_request_stack() else {
+            self.toast("this pull request is not in a stack", false);
+            return;
+        };
+        match at.checked_add_signed(by).and_then(|next| layers.get(next)) {
+            Some(layer) => self.read_pull_request(&layer.url.clone()),
+            None if by < 0 => self.toast("already the bottom of the stack", false),
+            None => self.toast("already the top of the stack", false),
         }
     }
 
@@ -5365,6 +5406,10 @@ impl App {
         // which conversation is in front.
         if self.transcript.is_some() && prefix.is_none() {
             let idle = self.chat_visual.is_none() && self.chat_count.is_none();
+            let reading_pull_request = self
+                .transcript
+                .as_ref()
+                .is_some_and(|t| t.pull_request().is_some());
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc if idle => {
                     let from_roster = self
@@ -5378,6 +5423,14 @@ impl App {
                     return;
                 }
                 KeyCode::Tab | KeyCode::BackTab => self.leave_transcript(),
+                KeyCode::Char('[') if idle && reading_pull_request => {
+                    self.move_through_stack(-1);
+                    return;
+                }
+                KeyCode::Char(']') if idle && reading_pull_request => {
+                    self.move_through_stack(1);
+                    return;
+                }
                 // The file grows while the agent works, and a pull request moves on while it
                 // is read; nothing pushes either to us.
                 KeyCode::Char('r') if idle => {
@@ -9522,6 +9575,37 @@ mod tests {
             Ok(open_detail("late")),
         );
         assert!(app.transcript.is_none(), "put away, it stays away");
+    }
+
+    /// `]` reads the layer above, and the bottom of a stack says so rather than moving.
+    #[tokio::test]
+    async fn brackets_move_through_a_stack() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        reading_a_pull_request(&mut app);
+        let _ = calls(&mut requests, 2).await;
+        assert_eq!(
+            app.pull_request_stack()
+                .map(|(layers, at)| (layers.len(), at)),
+            Some((2, 0))
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        assert!(asked_nothing(&mut requests).await);
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.0.as_str()),
+            Some("already the bottom of the stack")
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        let asked = calls(&mut requests, 2).await;
+        assert!(
+            asked
+                .iter()
+                .any(|(tag, payload)| tag == "pullRequests.detail" && payload["number"] == 2),
+            "{asked:?}"
+        );
     }
 
     #[tokio::test]
