@@ -3,7 +3,7 @@
 //! default, and open string unions stay `String`.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -181,11 +181,47 @@ fn default_interaction_mode() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PullRequest {
+    /// The host the repository is on; with the repository and number, the link's identity.
+    #[serde(default)]
+    pub host: String,
     pub repository: String,
     pub number: u64,
     pub url: String,
+    /// manual | created | agent | stack | stack-dismissed
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub linked_at: String,
     #[serde(default)]
     pub snapshot: Option<PullRequestSnapshot>,
+    /// The stack the host itself keeps the pull request in, where it has such a thing.
+    #[serde(default)]
+    pub stack: Option<PullRequestStack>,
+}
+
+impl PullRequest {
+    /// A layer taken out of a host's stack by hand stays linked, so the stack does not
+    /// bring it back, and is not shown.
+    fn is_visible(&self) -> bool {
+        self.source != "stack-dismissed"
+    }
+
+    /// The repository as an identity: hosts and repositories compare without case.
+    fn repository_key(&self) -> String {
+        format!(
+            "{}/{}",
+            self.host.trim().to_lowercase(),
+            self.repository.trim().to_lowercase()
+        )
+    }
+
+    fn head_branch(&self) -> Option<&str> {
+        self.snapshot.as_ref()?.head_branch.as_deref()
+    }
+
+    fn base_branch(&self) -> Option<&str> {
+        self.snapshot.as_ref()?.base_branch.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -200,6 +236,35 @@ pub struct PullRequestSnapshot {
     pub checks_state: Option<String>,
     #[serde(default)]
     pub review_decision: Option<String>,
+    #[serde(default)]
+    pub head_branch: Option<String>,
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// A stack as the host keeps it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestStack {
+    pub id: String,
+    /// Bottom to top.
+    #[serde(default)]
+    pub layers: Vec<PullRequestStackLayer>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestStackLayer {
+    pub number: u64,
+}
+
+/// Pull requests that build on each other, each on the branch of the one below.
+#[derive(Debug, Clone)]
+pub struct PullRequestChain {
+    /// Bottom to top.
+    pub layers: Vec<PullRequestRef>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -213,22 +278,30 @@ pub struct BranchPullRequest {
 /// What the UI shows for a thread's pull request.
 #[derive(Debug, Clone)]
 pub struct PullRequestRef {
+    pub host: String,
     pub repository: String,
     pub number: u64,
     pub url: String,
+    pub head_branch: Option<String>,
     pub title: Option<String>,
     pub state: Option<String>,
     pub is_draft: bool,
     pub checks_state: Option<String>,
     pub review_decision: Option<String>,
+    linked_at: String,
+    updated_at: Option<String>,
 }
 
 impl PullRequestRef {
     fn from_linked(pr: &PullRequest) -> Self {
         Self {
+            host: pr.host.clone(),
             repository: pr.repository.clone(),
             number: pr.number,
             url: pr.url.clone(),
+            head_branch: pr.head_branch().map(str::to_string),
+            linked_at: pr.linked_at.clone(),
+            updated_at: pr.snapshot.as_ref().and_then(|s| s.updated_at.clone()),
             title: pr.snapshot.as_ref().map(|s| s.title.clone()),
             state: pr.snapshot.as_ref().map(|s| s.state.clone()),
             is_draft: pr.snapshot.as_ref().is_some_and(|s| s.is_draft),
@@ -258,9 +331,9 @@ impl PullRequestRef {
             Some("pending") => facts.push("○ checks pending".into()),
             _ => {}
         }
-        // GitHub's words for it, `CHANGES_REQUESTED` and the like, read as words.
+        // The server's words for it, `changes-requested` and the like, read as words.
         if let Some(review) = self.review_decision.as_deref().filter(|r| !r.is_empty()) {
-            facts.push(review.to_lowercase().replace('_', " "));
+            facts.push(review.replace('-', " "));
         }
         if with_repository {
             facts.push(self.repository.clone());
@@ -516,40 +589,182 @@ impl ThreadShell {
         )
     }
 
-    /// The pull request to surface: the one on the thread's branch, else the first open
-    /// linked one, else the most recently linked.
-    pub fn primary_pull_request(&self) -> Option<PullRequestRef> {
-        if let Some(branch_pr) = &self.branch_pull_request {
-            return Some(
-                self.pull_requests
-                    .iter()
-                    .find(|pr| {
-                        pr.number == branch_pr.number && pr.repository == branch_pr.repository
-                    })
+    fn visible_pull_requests(&self) -> impl Iterator<Item = &PullRequest> {
+        self.pull_requests.iter().filter(|pr| pr.is_visible())
+    }
+
+    /// The linked pull requests grouped into stacks, as the desktop app groups them. A
+    /// stack the host keeps comes first, in the host's order; the rest are chained by one
+    /// pull request's base branch being another's head branch in the same repository. One
+    /// that chains to nothing is a stack of one.
+    pub fn pull_request_chains(&self) -> Vec<PullRequestChain> {
+        let visible: Vec<&PullRequest> = self.visible_pull_requests().collect();
+        let mut chains: Vec<PullRequestChain> = Vec::new();
+
+        let mut native: Vec<(String, Vec<&PullRequest>)> = Vec::new();
+        for pr in &visible {
+            let Some(stack) = &pr.stack else { continue };
+            let key = format!("{}#{}", pr.repository_key(), stack.id);
+            match native.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, members)) => members.push(pr),
+                None => native.push((key, vec![pr])),
+            }
+        }
+        for (_, mut members) in native {
+            let order: Vec<u64> = members[0]
+                .stack
+                .as_ref()
+                .map(|stack| stack.layers.iter().map(|layer| layer.number).collect())
+                .unwrap_or_default();
+            members.sort_by_key(|pr| order.iter().position(|n| *n == pr.number).unwrap_or(0));
+            chains.push(PullRequestChain {
+                layers: members
+                    .into_iter()
                     .map(PullRequestRef::from_linked)
-                    .unwrap_or(PullRequestRef {
+                    .collect(),
+            });
+        }
+
+        let remaining: Vec<&PullRequest> = visible
+            .into_iter()
+            .filter(|pr| pr.stack.is_none())
+            .collect();
+        let branch_key =
+            |pr: &PullRequest, branch: &str| format!("{}:{branch}", pr.repository_key());
+        // A head branch two of them share says nothing about which one is the parent.
+        let mut by_head: HashMap<String, Option<usize>> = HashMap::new();
+        for (index, pr) in remaining.iter().enumerate() {
+            if let Some(head) = pr.head_branch() {
+                by_head
+                    .entry(branch_key(pr, head))
+                    .and_modify(|found| *found = None)
+                    .or_insert(Some(index));
+            }
+        }
+        let parent_of = |index: usize| {
+            let pr = remaining[index];
+            pr.base_branch()
+                .and_then(|base| by_head.get(&branch_key(pr, base)).copied().flatten())
+                .filter(|parent| *parent != index)
+        };
+        let has_child: HashSet<usize> = (0..remaining.len()).filter_map(parent_of).collect();
+        let mut placed = vec![false; remaining.len()];
+        // Down from each top, which is one nothing builds on.
+        for top in (0..remaining.len()).filter(|index| !has_child.contains(index)) {
+            let mut layers = Vec::new();
+            let mut cursor = Some(top);
+            while let Some(index) = cursor.filter(|index| !placed[*index]) {
+                placed[index] = true;
+                layers.insert(0, PullRequestRef::from_linked(remaining[index]));
+                cursor = parent_of(index);
+            }
+            if !layers.is_empty() {
+                chains.push(PullRequestChain { layers });
+            }
+        }
+        // A cycle has no top. Its members are still shown, without an order made up for them.
+        for (index, pr) in remaining.iter().enumerate() {
+            if !placed[index] {
+                chains.push(PullRequestChain {
+                    layers: vec![PullRequestRef::from_linked(pr)],
+                });
+            }
+        }
+        chains
+    }
+
+    /// The pull request a one-slot surface shows. First the one on the branch checked out
+    /// where the thread works, so moving between the layers of a stack moves with it;
+    /// then the one the server knows to be on the thread's branch; then as the desktop app
+    /// chooses: the only open one, else the highest open layer of the stack linked most
+    /// recently, else the top of a finished stack, else the one updated last.
+    pub fn current_pull_request(&self, checked_out: Option<&str>) -> Option<PullRequestRef> {
+        let visible: Vec<PullRequestRef> = self
+            .visible_pull_requests()
+            .map(PullRequestRef::from_linked)
+            .collect();
+        if let Some(branch) = checked_out {
+            let on_branch: Vec<&PullRequestRef> = visible
+                .iter()
+                .filter(|pr| pr.head_branch.as_deref() == Some(branch))
+                .collect();
+            if let Some(pr) = on_branch
+                .iter()
+                .find(|pr| pr.is_open())
+                .or(on_branch.last())
+            {
+                return Some((*pr).clone());
+            }
+        }
+        if let Some(branch_pr) = &self.branch_pull_request {
+            let linked = self
+                .pull_requests
+                .iter()
+                .find(|pr| pr.number == branch_pr.number && pr.repository == branch_pr.repository);
+            match linked {
+                Some(pr) if pr.is_visible() => return Some(PullRequestRef::from_linked(pr)),
+                Some(_) => {}
+                None => {
+                    return Some(PullRequestRef {
+                        host: String::new(),
                         repository: branch_pr.repository.clone(),
                         number: branch_pr.number,
                         url: branch_pr.url.clone(),
+                        head_branch: None,
                         title: None,
                         state: None,
                         is_draft: false,
                         checks_state: None,
                         review_decision: None,
-                    }),
-            );
+                        linked_at: String::new(),
+                        updated_at: None,
+                    });
+                }
+            }
         }
-        self.pull_requests
-            .iter()
-            .find(|pr| pr.snapshot.as_ref().is_some_and(|s| s.state == "open"))
-            .or(self.pull_requests.last())
-            .map(PullRequestRef::from_linked)
+        let open: Vec<&PullRequestRef> = visible.iter().filter(|pr| pr.is_open()).collect();
+        if let [only] = open.as_slice() {
+            return Some((*only).clone());
+        }
+        let chains = self.pull_request_chains();
+        if open.len() > 1 {
+            // Timestamps are the server's own ISO strings, which sort as they read.
+            let mut best: Option<(&str, &PullRequestRef)> = None;
+            for chain in &chains {
+                let Some(top) = chain.layers.iter().rev().find(|pr| pr.is_open()) else {
+                    continue;
+                };
+                let latest = chain
+                    .layers
+                    .iter()
+                    .filter(|pr| pr.is_open())
+                    .map(|pr| pr.linked_at.as_str())
+                    .max()
+                    .unwrap_or_default();
+                if best.is_none_or(|(seen, _)| latest > seen) {
+                    best = Some((latest, top));
+                }
+            }
+            return best.map(|(_, pr)| pr.clone());
+        }
+        if let [chain] = chains.as_slice() {
+            return chain.layers.last().cloned();
+        }
+        let mut latest: Option<&PullRequestRef> = None;
+        for pr in &visible {
+            let at = |pr: &PullRequestRef| pr.updated_at.clone().unwrap_or(pr.linked_at.clone());
+            if latest.is_none_or(|seen| at(pr) > at(seen)) {
+                latest = Some(pr);
+            }
+        }
+        latest.cloned()
     }
 
-    /// Every linked pull request, primary first, without duplicates.
-    pub fn all_pull_requests(&self) -> Vec<PullRequestRef> {
-        let mut out: Vec<PullRequestRef> = self.primary_pull_request().into_iter().collect();
-        for pr in &self.pull_requests {
+    /// Every pull request to show, the current one first, without duplicates.
+    pub fn all_pull_requests(&self, checked_out: Option<&str>) -> Vec<PullRequestRef> {
+        let mut out: Vec<PullRequestRef> =
+            self.current_pull_request(checked_out).into_iter().collect();
+        for pr in self.visible_pull_requests() {
             if !out.iter().any(|p| p.url == pr.url) {
                 out.push(PullRequestRef::from_linked(pr));
             }
@@ -1125,9 +1340,26 @@ mod tests {
     }
 
     fn linked(number: u64, state: &str, checks: Option<&str>) -> serde_json::Value {
-        serde_json::json!({"repository":"o/r","number":number,
+        serde_json::json!({"host":"github.com","repository":"o/r","number":number,
             "url":format!("https://github.com/o/r/pull/{number}"),
+            "source":"agent","linkedAt":"2026-01-01T00:00:00.000Z",
             "snapshot":{"state":state,"title":format!("pr {number}"),"checksState":checks}})
+    }
+
+    /// A linked pull request on `head`, asking to merge into `base`.
+    fn on(number: u64, head: &str, base: &str, linked_at: &str) -> serde_json::Value {
+        let mut pr = linked(number, "open", None);
+        pr["linkedAt"] = linked_at.into();
+        pr["snapshot"]["headBranch"] = head.into();
+        pr["snapshot"]["baseBranch"] = base.into();
+        pr
+    }
+
+    fn numbers(chains: &[PullRequestChain]) -> Vec<Vec<u64>> {
+        chains
+            .iter()
+            .map(|chain| chain.layers.iter().map(|pr| pr.number).collect())
+            .collect()
     }
 
     /// A failing pull request anywhere in the thread is the one to see; a merged one
@@ -1139,7 +1371,7 @@ mod tests {
             linked(2, "open", Some("passing")),
             linked(3, "open", Some("pending")),
         ]));
-        let prs = shell.all_pull_requests();
+        let prs = shell.all_pull_requests(None);
         assert_eq!(ThreadShell::worst_checks(&prs), Some("pending"));
         assert_eq!(ThreadShell::worst_checks(&prs[..1]), Some("passing"));
         assert_eq!(ThreadShell::worst_checks(&[]), None);
@@ -1147,11 +1379,11 @@ mod tests {
 
     #[test]
     fn facts_read_as_words() {
-        let shell = shell_with_prs(serde_json::json!([{"repository":"o/r","number":4,
-            "url":"https://github.com/o/r/pull/4",
-            "snapshot":{"state":"open","title":"t","isDraft":true,"checksState":"failing",
-                "reviewDecision":"CHANGES_REQUESTED"}}]));
-        let pr = &shell.all_pull_requests()[0];
+        let mut pr = linked(4, "open", Some("failing"));
+        pr["snapshot"]["isDraft"] = true.into();
+        pr["snapshot"]["reviewDecision"] = "changes-requested".into();
+        let shell = shell_with_prs(serde_json::json!([pr]));
+        let pr = &shell.all_pull_requests(None)[0];
         assert_eq!(
             pr.facts(false),
             "draft · ✗ checks failing · changes requested"
@@ -1159,6 +1391,119 @@ mod tests {
         assert_eq!(
             pr.facts(true),
             "draft · ✗ checks failing · changes requested · o/r"
+        );
+    }
+
+    /// A layer taken out of a stack by hand stays linked so the stack does not bring it
+    /// back; it is not one of the thread's pull requests to show.
+    #[test]
+    fn a_dismissed_layer_is_not_shown() {
+        let mut dismissed = linked(2, "open", None);
+        dismissed["source"] = "stack-dismissed".into();
+        let shell = shell_with_prs(serde_json::json!([linked(1, "open", None), dismissed]));
+        let shown: Vec<u64> = shell
+            .all_pull_requests(None)
+            .iter()
+            .map(|pr| pr.number)
+            .collect();
+        assert_eq!(shown, vec![1]);
+        assert_eq!(numbers(&shell.pull_request_chains()), vec![vec![1]]);
+    }
+
+    /// Linked in any order, the layers come out bottom to top, and one that builds on
+    /// none of them is a stack of its own.
+    #[test]
+    fn pull_requests_chain_base_to_head() {
+        let shell = shell_with_prs(serde_json::json!([
+            on(3, "c", "b", "2026-01-03T00:00:00.000Z"),
+            on(1, "a", "main", "2026-01-01T00:00:00.000Z"),
+            on(9, "x", "main", "2026-01-04T00:00:00.000Z"),
+            on(2, "b", "a", "2026-01-02T00:00:00.000Z"),
+        ]));
+        assert_eq!(
+            numbers(&shell.pull_request_chains()),
+            vec![vec![1, 2, 3], vec![9]]
+        );
+    }
+
+    /// Two pull requests from one head branch cannot say which is the parent, so neither
+    /// is; and a cycle has no top to start from, so its members stand alone.
+    #[test]
+    fn ambiguous_parents_and_cycles_are_not_chained() {
+        let shared = shell_with_prs(serde_json::json!([
+            on(1, "a", "main", ""),
+            on(2, "a", "main", ""),
+            on(3, "b", "a", ""),
+        ]));
+        assert_eq!(
+            numbers(&shared.pull_request_chains()),
+            vec![vec![1], vec![2], vec![3]]
+        );
+        let cycle = shell_with_prs(serde_json::json!([
+            on(1, "a", "b", ""),
+            on(2, "b", "a", "")
+        ]));
+        assert_eq!(
+            numbers(&cycle.pull_request_chains()),
+            vec![vec![1], vec![2]]
+        );
+    }
+
+    /// A stack the host keeps is taken in the host's order, whatever the branches say.
+    #[test]
+    fn a_host_stack_keeps_its_own_order() {
+        let stack = serde_json::json!({"kind":"native","id":"s1","number":1,"url":"u","base":"main",
+            "layers":[{"number":5,"headBranch":"p","state":"open"},
+                      {"number":4,"headBranch":"q","state":"open"}]});
+        let mut top = on(4, "q", "main", "");
+        top["stack"] = stack.clone();
+        let mut bottom = on(5, "p", "main", "");
+        bottom["stack"] = stack;
+        let shell = shell_with_prs(serde_json::json!([top, bottom, on(6, "r", "q", "")]));
+        assert_eq!(
+            numbers(&shell.pull_request_chains()),
+            vec![vec![5, 4], vec![6]]
+        );
+    }
+
+    /// The layer checked out is the one shown, so moving through a stack moves with it;
+    /// without one, it is the highest open layer of the stack linked last.
+    #[test]
+    fn the_current_pull_request_follows_the_checkout() {
+        let mut merged = on(1, "a", "main", "2026-01-01T00:00:00.000Z");
+        merged["snapshot"]["state"] = "merged".into();
+        let shell = shell_with_prs(serde_json::json!([
+            merged,
+            on(2, "b", "a", "2026-01-02T00:00:00.000Z"),
+            on(3, "c", "b", "2026-01-03T00:00:00.000Z"),
+            on(7, "x", "main", "2026-01-01T00:00:00.000Z"),
+            on(8, "y", "x", "2026-01-01T12:00:00.000Z"),
+        ]));
+        let current = |branch| shell.current_pull_request(branch).map(|pr| pr.number);
+        assert_eq!(current(Some("b")), Some(2));
+        assert_eq!(
+            current(Some("a")),
+            Some(1),
+            "a merged layer is still the one checked out"
+        );
+        assert_eq!(current(Some("main")), Some(3));
+        assert_eq!(current(None), Some(3));
+    }
+
+    /// When everything has landed, a single stack is shown by its top.
+    #[test]
+    fn a_finished_stack_is_shown_by_its_top() {
+        let mut prs = vec![
+            on(1, "a", "main", "2026-01-02T00:00:00.000Z"),
+            on(2, "b", "a", "2026-01-01T00:00:00.000Z"),
+        ];
+        for pr in &mut prs {
+            pr["snapshot"]["state"] = "merged".into();
+        }
+        let shell = shell_with_prs(serde_json::json!(prs));
+        assert_eq!(
+            shell.current_pull_request(None).map(|pr| pr.number),
+            Some(2)
         );
     }
 }

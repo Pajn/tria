@@ -220,6 +220,8 @@ pub struct Picker {
     pub items: Vec<PickerItem>,
     /// The project being renamed, while one is: the query line is its new title.
     pub renaming: Option<Id>,
+    /// The pull request asked about being unlinked, by its link, until it is answered.
+    pub unlinking: Option<String>,
     /// What the server found in the threads' messages, for the thread list.
     pub content: ContentSearch,
 }
@@ -4041,6 +4043,12 @@ impl App {
         self.checkout().map(|c| &c.local)
     }
 
+    /// The branch checked out where the open thread works, which says which layer of a
+    /// stack it is on.
+    pub fn checked_out_branch(&self) -> Option<&str> {
+        self.vcs()?.ref_name.as_deref()
+    }
+
     /// What is known of it, which is nothing until the first status arrives.
     pub fn checkout(&self) -> Option<&Checkout> {
         self.checkouts.get(self.vcs_cwd.as_deref()?)
@@ -4243,12 +4251,37 @@ impl App {
             self.toast("no thread open", true);
             return;
         };
-        let prs = shell.all_pull_requests();
+        let prs = shell.all_pull_requests(self.checked_out_branch());
         match prs.as_slice() {
             [] => self.toast("no pull request linked to this thread", true),
             [_] => self.open_url(&prs[0].url.clone()),
             _ if pick => self.open_picker(PickerKind::PullRequest),
             _ => self.open_url(&prs[0].url.clone()),
+        }
+    }
+
+    /// Take the pull request with this link off the open thread, and out of the picker
+    /// showing it.
+    fn unlink_pull_request(&mut self, url: &str) {
+        let Some(shell) = self.thread.as_ref().map(|t| &t.detail.shell) else {
+            return;
+        };
+        let Some(pr) = shell.pull_requests.iter().find(|pr| pr.url == url) else {
+            self.toast("that pull request is not linked to this thread", true);
+            return;
+        };
+        let command = commands::pull_request_unlink(&shell.id, &pr.host, &pr.repository, pr.number);
+        let number = pr.number;
+        self.dispatch(command);
+        self.toast(format!("unlinked #{number}"), false);
+        if let Some(picker) = self.picker.as_mut() {
+            picker.items.retain(|item| item.key != url);
+            if picker.items.is_empty() {
+                self.picker = None;
+                self.mode = Mode::Normal;
+            } else {
+                picker.selected = picker.selected.min(picker.rows().len().saturating_sub(1));
+            }
         }
     }
 
@@ -4379,24 +4412,48 @@ impl App {
                 })
                 .collect(),
             PickerKind::PullRequest => {
-                let prs = self
-                    .thread
-                    .as_ref()
-                    .map(|t| t.detail.shell.all_pull_requests())
-                    .unwrap_or_default();
-                // The repository only tells rows apart when they are not all from one.
-                let repositories = prs
+                let Some(shell) = self.thread.as_ref().map(|t| &t.detail.shell) else {
+                    return;
+                };
+                let current = shell.current_pull_request(self.checked_out_branch());
+                let mut chains = shell.pull_request_chains();
+                // The stack the header speaks for goes first, as it does there; a pull
+                // request on the thread's branch that was never linked is a stack of one.
+                let url = current.as_ref().map(|pr| pr.url.clone());
+                match chains
                     .iter()
+                    .position(|chain| chain.layers.iter().any(|pr| Some(&pr.url) == url.as_ref()))
+                {
+                    Some(index) => {
+                        let chain = chains.remove(index);
+                        chains.insert(0, chain);
+                    }
+                    None => chains.extend(
+                        current.map(|pr| crate::model::PullRequestChain { layers: vec![pr] }),
+                    ),
+                }
+                // The repository only tells rows apart when they are not all from one.
+                let repositories = chains
+                    .iter()
+                    .flat_map(|chain| &chain.layers)
                     .map(|pr| pr.repository.as_str())
                     .collect::<HashSet<_>>()
                     .len();
-                prs.iter()
-                    .map(|pr| PickerItem {
-                        label: pr.label(),
-                        detail: pr.facts(repositories > 1),
-                        key: pr.url.clone(),
-                    })
-                    .collect()
+                let mut items = Vec::new();
+                for chain in &chains {
+                    for (layer, pr) in chain.layers.iter().enumerate() {
+                        items.push(PickerItem {
+                            label: if layer > 0 {
+                                format!("↳ {}", pr.label())
+                            } else {
+                                pr.label()
+                            },
+                            detail: pr.facts(repositories > 1),
+                            key: pr.url.clone(),
+                        });
+                    }
+                }
+                items
             }
             PickerKind::Effort => {
                 let Some(descriptor) = self.effort_descriptor() else {
@@ -4435,6 +4492,7 @@ impl App {
             selected: 0,
             items,
             renaming: None,
+            unlinking: None,
             content: ContentSearch::default(),
         });
         self.mode = Mode::Picker;
@@ -6241,6 +6299,14 @@ impl App {
             self.mode = Mode::Normal;
             return;
         };
+        // Anything that is not the answer is a no: the question stands in the title until
+        // it has one, so no key meant for the search can be read as agreeing to it.
+        if let Some(url) = picker.unlinking.take() {
+            if matches!(key.code, KeyCode::Char('y')) || (ctrl && key.code == KeyCode::Char('d')) {
+                self.unlink_pull_request(&url);
+            }
+            return;
+        }
         let count = picker.rows().len();
         match key.code {
             KeyCode::Esc if picker.renaming.is_some() => {
@@ -6272,6 +6338,18 @@ impl App {
                         picker.query.set_text(&title);
                     }
                     None => self.toast("no project under the cursor", true),
+                }
+            }
+            // Asked first: it takes the pull request off the thread for every client, and
+            // tria has no way to put it back.
+            KeyCode::Char('d') if ctrl && picker.kind == PickerKind::PullRequest => {
+                match picker
+                    .filtered()
+                    .get(picker.selected)
+                    .map(|item| item.key.clone())
+                {
+                    Some(url) => picker.unlinking = Some(url),
+                    None => self.toast("no pull request under the cursor", true),
                 }
             }
             // Ctrl-y for the same reason as Ctrl-r: the letters are the search.
@@ -8688,6 +8766,81 @@ mod tests {
         );
         assert!(app.transcript.is_none(), "still reading the transcript");
         assert!(app.composer.is_empty());
+    }
+
+    fn stacked_thread() -> ThreadState {
+        let mut thread = running_thread();
+        let pr = |number: u64, head: &str, base: &str| {
+            json!({"host":"github.com","repository":"o/r","number":number,
+                "url":format!("https://github.com/o/r/pull/{number}"),"source":"agent",
+                "linkedAt":"2026-01-01T00:00:00.000Z",
+                "snapshot":{"state":"open","title":format!("layer {number}"),
+                    "headBranch":head,"baseBranch":base}})
+        };
+        thread.detail.shell.pull_requests =
+            serde_json::from_value(json!([pr(2, "b", "a"), pr(1, "a", "main")])).unwrap();
+        thread
+    }
+
+    /// The picker lists a stack bottom to top, each layer above the first marked as
+    /// building on the one before.
+    #[tokio::test]
+    async fn the_pull_request_picker_lists_a_stack_in_order() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(stacked_thread());
+        app.current_thread_id = Some("t1".into());
+        app.open_picker(PickerKind::PullRequest);
+        let rows: Vec<(String, String)> = app
+            .picker
+            .as_ref()
+            .expect("a picker")
+            .items
+            .iter()
+            .map(|item| (item.label.clone(), item.detail.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("#1 layer 1".to_string(), "open".to_string()),
+                ("↳ #2 layer 2".to_string(), "open".to_string()),
+            ]
+        );
+    }
+
+    /// Unlinking asks first, and only the answer sends it.
+    #[tokio::test]
+    async fn unlinking_a_pull_request_asks_first() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(stacked_thread());
+        app.current_thread_id = Some("t1".into());
+        app.open_picker(PickerKind::PullRequest);
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        app.on_key(ctrl_d);
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(
+            sent_no_command(&mut requests).await,
+            "unlinked without an answer"
+        );
+        let picker = app.picker.as_ref().expect("still open");
+        assert_eq!(picker.items.len(), 2);
+        assert!(
+            picker.query.text().is_empty(),
+            "the no went into the search"
+        );
+
+        app.on_key(ctrl_d);
+        app.on_key(ctrl_d);
+        let command = sent_command(&mut requests).await.expect("unlinked");
+        assert_eq!(command["type"], "thread.pull-request.unlink");
+        assert_eq!(command["host"], "github.com");
+        assert_eq!(command["repository"], "o/r");
+        assert_eq!(command["number"], 1);
+        assert_eq!(app.picker.as_ref().map(|p| p.items.len()), Some(1));
     }
 
     /// Anything but the answer is a no, and the message and the transcript stay put.

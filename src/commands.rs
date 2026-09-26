@@ -151,6 +151,19 @@ pub fn session_stop(thread_id: &str) -> Value {
     })
 }
 
+/// Take a pull request off a thread. It is named as the link names it: host, repository,
+/// and number.
+pub fn pull_request_unlink(thread_id: &str, host: &str, repository: &str, number: u64) -> Value {
+    json!({
+        "type": "thread.pull-request.unlink",
+        "commandId": new_id(),
+        "threadId": thread_id,
+        "host": host,
+        "repository": repository,
+        "number": number,
+    })
+}
+
 pub fn approval_respond(thread_id: &str, request_id: &str, decision: &str) -> Value {
     json!({
         "type": "thread.approval.respond",

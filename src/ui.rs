@@ -1048,7 +1048,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             ));
         }
-        let prs = shell.all_pull_requests();
+        let prs = shell.all_pull_requests(app.checked_out_branch());
         if let Some((pr, others)) = prs.split_first() {
             let state_style = match pr.state.as_deref() {
                 Some("merged") => Style::default().fg(Color::Magenta),
@@ -1090,11 +1090,24 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(color),
                 ));
             }
-            // The rest are counted, with the worst of their checks: one failing further
-            // down a stack holds up the one shown.
+            // The rest are counted, with the worst of their checks: one failing elsewhere in
+            // a stack holds up the one shown. When they are all one stack, where the one
+            // shown sits in it says more than how many others there are.
             if !others.is_empty() {
+                let chains = shell.pull_request_chains();
+                let layer = match chains.as_slice() {
+                    [chain] if chain.layers.len() == prs.len() => chain
+                        .layers
+                        .iter()
+                        .position(|layer| layer.url == pr.url)
+                        .map(|at| (at + 1, chain.layers.len())),
+                    _ => None,
+                };
                 spans.push(Span::styled(
-                    format!("  +{}", others.len()),
+                    match layer {
+                        Some((at, of)) => format!("  stack {at}/{of}"),
+                        None => format!("  +{}", others.len()),
+                    },
                     Style::default().fg(Color::Gray),
                 ));
                 let worst = crate::model::ThreadShell::worst_checks(others);
@@ -2115,12 +2128,27 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         PickerKind::Model => " models ",
         PickerKind::Project => " new thread in project · ^R renames ",
         PickerKind::Effort => " effort ",
-        PickerKind::PullRequest => " pull requests · ^Y copies the link ",
+        PickerKind::PullRequest => " pull requests · ^Y copies the link · ^D unlinks ",
     };
+    // The question stands where the keys are listed until it has its answer.
+    let asking = picker.unlinking.as_ref().map(|url| {
+        let number = picker
+            .items
+            .iter()
+            .find(|item| &item.key == url)
+            .and_then(|item| item.label.trim_start_matches("↳ ").split(' ').next())
+            .unwrap_or("it");
+        Line::from(Span::styled(
+            format!(" unlink {number} from this thread? ^D again or y · anything else keeps it "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    });
     let found = picker.rows().len() - picker.filtered().len();
     let mut block = Block::bordered()
         .border_style(Style::default().fg(Color::Magenta))
-        .title(title);
+        .title(asking.unwrap_or_else(|| Line::from(title)));
     if picker.kind == PickerKind::Thread && found > 0 {
         block = block.title_bottom(
             Line::from(format!(" {found} found in messages, below the titles ")).right_aligned(),
@@ -3926,6 +3954,7 @@ mod tests {
             selected: 0,
             items: vec![row("backoff notes", "tria · done")],
             renaming: None,
+            unlinking: None,
             content,
         });
         let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
@@ -4637,6 +4666,7 @@ mod tests {
                 },
             ],
             renaming: None,
+            unlinking: None,
             content: Default::default(),
         });
         let bytes = base64::engine::general_purpose::STANDARD
@@ -4709,6 +4739,7 @@ mod tests {
                 key: "p1".into(),
             }],
             renaming: None,
+            unlinking: None,
             content: Default::default(),
         });
         let bytes = base64::engine::general_purpose::STANDARD

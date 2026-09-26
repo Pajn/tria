@@ -382,15 +382,31 @@ share it.
 
 The server caches its git status and does not report every edit, so tria asks it to re-read the
 checkout when the thread opens, when a turn finishes, when you leave the terminal popup, and
-every twenty seconds otherwise. The pull request on the thread's branch wins; otherwise the first open linked one.
-`gx` opens it in the browser through the platform's URL opener. `:pr` does the same, and
-offers a picker when several pull requests are linked.
+every twenty seconds otherwise.
 
-A thread can have several pull requests linked, as a stack or side by side. The header shows
-one and counts the rest after it, `+2`, with the worst checks among the ones still open: a
-failure lower in a stack holds up the one shown, so it is not left to be found. The `:pr`
-picker lists every one with its state, checks, and review decision, and its repository when
-they are not all from one; `Ctrl-y` copies the link under the cursor.
+`gx` opens the thread's pull request in the browser through the platform's URL opener. `:pr`
+does the same, and offers a picker when several pull requests are linked.
+
+A thread can have several pull requests linked, as a stack or side by side. They are grouped
+into stacks the way the desktop app groups them: a stack the host keeps is taken in the host's
+order, and the rest are chained where one pull request's base branch is another's head branch
+in the same repository. Two pull requests from the same head branch say nothing about which is
+the parent, so neither is chained to it. A layer taken out of a stack in the desktop app stays
+linked so the stack does not bring it back, and tria does not show it.
+
+The header shows one of them: the one on the branch checked out where the thread works, so
+moving through the layers of a stack moves the header with it; else the one the server finds on
+the thread's branch; else the only open one, the highest open layer of the stack linked last,
+once everything has landed, the top of the stack, or the one updated last. When they are all one stack, the header
+says where the one shown sits in it, `stack 2/3`; otherwise it counts the rest, `+2`. Either way
+it adds the worst checks among the others still open, since a failure elsewhere in a stack holds
+up the one shown.
+
+The `:pr` picker lists them stack by stack, the header's first, each stack bottom to top with
+`↳` on the layers that build on another. Each row has its
+state, checks, and review decision, and its repository when they are not all from one.
+`Ctrl-y` copies the link under the cursor, and `Ctrl-d` unlinks it from the thread, after
+asking.
 
 ## Programs
 
