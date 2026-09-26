@@ -10,6 +10,7 @@ mod lucide;
 mod model;
 mod notify;
 mod picture;
+mod pull_request;
 mod question;
 mod recovery;
 mod rpc;

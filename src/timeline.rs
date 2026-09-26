@@ -1,7 +1,7 @@
 //! Derives renderable blocks from a thread: user and assistant messages,
 //! collapsed tool groups, plan cards, and error lines, in chronological order.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::{
     layout::Size,
@@ -28,6 +28,9 @@ pub enum BlockKey {
     Plan(String),
     Working,
     TurnEnd(String),
+    /// A section of something read in place of the conversation, drawn by its own module:
+    /// its regions fold and open like a work group's rows, but the section itself does not.
+    Section(String),
 }
 
 pub struct Block {
@@ -288,6 +291,7 @@ pub fn build(
                             &mut text,
                             width,
                             height,
+                            None,
                         );
                         text
                     }
@@ -1055,12 +1059,17 @@ fn image_room(width: u16, height: u16, indent: u16) -> Size {
 /// The regions are the lines each picture answers for, so the picture under the cursor
 /// can be opened where the terminal draws it small or not at all. They fold nothing: a
 /// message has no rows to fold.
-fn place_message_images(
+///
+/// `remote` holds what came back for pictures on the web, base64 or `None` where the
+/// fetch failed, for a caller that fetches them; one not in it yet is on its way. Without
+/// it a picture on the web is only its caption, as it is in the chat.
+pub fn place_message_images(
     id: &str,
     source: &str,
     rendered: &mut Text<'static>,
     width: u16,
     height: u16,
+    remote: Option<&HashMap<String, Option<String>>>,
 ) -> (Vec<Placed>, Vec<Region>, Vec<(String, Picture)>) {
     let mut placed = Vec::new();
     let mut regions = Vec::new();
@@ -1090,12 +1099,31 @@ fn place_message_images(
             let Some(source) = sources.next() else { break };
             let key = format!("msg:{id}/{taken}");
             taken += 1;
+            // A message sits against the left edge, so its pictures do too.
+            let room = image_room(width, height, 0);
             let Some(path) = image_file(&source) else {
+                let Some(remote) = remote.filter(|_| is_web(&source)) else {
+                    continue;
+                };
+                // Known by where it came from, since that is what the bytes are.
+                let key = format!("img:{source}");
+                match remote.get(&source) {
+                    Some(Some(data)) => {
+                        pictures.push((key.clone(), Picture::Data(data.clone())));
+                        match picture::place(&key, picture::Source::Data(data), room) {
+                            Some(size) => {
+                                shown.push(mark);
+                                here.push((key, size.height));
+                            }
+                            None => here.push((key, 0)),
+                        }
+                    }
+                    Some(None) => note = note.or(Some("could not be fetched")),
+                    None => note = note.or(Some("loading…")),
+                }
                 continue;
             };
             pictures.push((key.clone(), Picture::File(path.clone())));
-            // A message sits against the left edge, so its pictures do too.
-            let room = image_room(width, height, 0);
             match picture::place(&key, picture::Source::File(&path), room) {
                 Some(size) => {
                     // The marker says there is a picture that cannot be shown. It is
@@ -1177,6 +1205,21 @@ fn image_sources(text: &str) -> Vec<String> {
 /// picture has just written it somewhere and names it in full; a relative source has no
 /// directory here to be relative to, and one over the web is not something the timeline
 /// goes and fetches.
+/// The pictures on the web a piece of markdown points at, for a caller to fetch.
+pub fn web_images(text: &str) -> Vec<String> {
+    if !text.contains("![") {
+        return Vec::new();
+    }
+    image_sources(text)
+        .into_iter()
+        .filter(|source| is_web(source))
+        .collect()
+}
+
+fn is_web(source: &str) -> bool {
+    source.starts_with("https://") || source.starts_with("http://")
+}
+
 fn image_file(source: &str) -> Option<String> {
     let path = source.strip_prefix("file://").unwrap_or(source);
     path.starts_with('/').then(|| path.to_string())
@@ -1736,7 +1779,8 @@ mod tests {
         let path = path.to_str().unwrap().to_string();
         let source = format!("Here it is.\n\n![the viewer serving a run]({path})\n");
         let mut text = render_assistant(&source, false);
-        let (images, regions, pictures) = place_message_images("m1", &source, &mut text, 80, 24);
+        let (images, regions, pictures) =
+            place_message_images("m1", &source, &mut text, 80, 24, None);
 
         assert_eq!(images.len(), 1, "the picture took its room");
         assert_eq!(
@@ -1777,7 +1821,8 @@ mod tests {
         picture::draw_in_halfblocks();
         let source = "![a run](/tmp/tria-no-such-message-picture.png)".to_string();
         let mut text = render_assistant(&source, false);
-        let (images, regions, pictures) = place_message_images("m2", &source, &mut text, 80, 24);
+        let (images, regions, pictures) =
+            place_message_images("m2", &source, &mut text, 80, 24, None);
         assert!(images.is_empty(), "nothing was drawn");
         assert_eq!(regions.len(), 1, "the caption is still the picture's line");
         assert_eq!(pictures.len(), 1);
@@ -1803,7 +1848,7 @@ mod tests {
                       ![three](relative.png) and ![four](https://example.com/four.png)"
             .to_string();
         let mut text = render_assistant(&source, false);
-        let (_, _, pictures) = place_message_images("m3", &source, &mut text, 80, 24);
+        let (_, _, pictures) = place_message_images("m3", &source, &mut text, 80, 24, None);
         assert_eq!(
             pictures,
             [
@@ -1828,7 +1873,8 @@ mod tests {
         let source = "A paragraph with `code` and a [link](http://example.com).".to_string();
         let before = render_assistant(&source, false);
         let mut text = render_assistant(&source, false);
-        let (images, regions, pictures) = place_message_images("m4", &source, &mut text, 80, 24);
+        let (images, regions, pictures) =
+            place_message_images("m4", &source, &mut text, 80, 24, None);
         assert!(images.is_empty() && regions.is_empty() && pictures.is_empty());
         assert_eq!(text.lines.len(), before.lines.len());
     }

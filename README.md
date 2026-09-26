@@ -124,6 +124,7 @@ Press `?` inside the app for the full list.
 | `gE` | view the whole conversation in your editor |
 | `gr` | chat focused: rewind to before the message of yours under the cursor (`:rewind` for the last turn) |
 | `gx` | open the link on the cursor's line, else the picture under the cursor, else the thread's pull request |
+| `gp` | read the thread's pull request in place of the chat (`:pr`) |
 | `gt` | switch to the tmux session named after the thread's directory, creating it if needed |
 | `gP` | split a tmux pane beside tria, in the thread's directory (`:split`) |
 | `gN` | open a tmux window in this session, in the thread's directory (`:window`) |
@@ -384,8 +385,8 @@ The server caches its git status and does not report every edit, so tria asks it
 checkout when the thread opens, when a turn finishes, when you leave the terminal popup, and
 every twenty seconds otherwise.
 
-`gx` opens the thread's pull request in the browser through the platform's URL opener. `:pr`
-does the same, and offers a picker when several pull requests are linked.
+`gx` opens the thread's pull request in the browser through the platform's URL opener. `gp`
+reads it in tria instead, and `:pr` does too, offering a picker when several are linked.
 
 A thread can have several pull requests linked, as a stack or side by side. They are grouped
 into stacks the way the desktop app groups them: a stack the host keeps is taken in the host's
@@ -405,8 +406,39 @@ up the one shown.
 The `:pr` picker lists them stack by stack, the header's first, each stack bottom to top with
 `↳` on the layers that build on another. Each row has its
 state, checks, and review decision, and its repository when they are not all from one.
-`Ctrl-y` copies the link under the cursor, and `Ctrl-d` unlinks it from the thread, after
-asking.
+`Enter` reads the one under the cursor, `Ctrl-y` copies its link, and `Ctrl-d` unlinks it from
+the thread, after asking.
+
+## Reading a pull request
+
+`Enter` in the `:pr` picker, or `gp`, reads a pull request in place of the conversation, as a
+subagent's transcript is read: the same view with the same keys for scrolling, search, and
+yanking, and `q` or `Esc` to go back to the conversation where it was. It is fetched with
+`pullRequests.detail`, which the server answers by asking the host, so the host's CLI has to be
+installed and signed in where the server runs.
+
+The top says where it stands: state, author, the branch and the one it merges into, the size of
+the change, the labels in the host's colours, and whatever stands between it and landing — a
+conflict with its base, commits it is behind by, workflow runs waiting for approval — and
+whether auto-merge is on.
+
+Then the checks, counted by state, with every one that is failing, needs action, or is still
+running listed on its own row and the ones that passed or were skipped folded into a count;
+`za` on the count lists them. `gx` on a check's row opens that check; anywhere else it opens
+the pull request. Then the description, rendered like a message and folded to its opening
+lines when it is long.
+
+Pictures in the description are drawn under their captions, as they are in a message, and `gx`
+on one opens it. That covers the `<img>` tags GitHub writes when a picture is dropped into a
+pull request as well as markdown images. They are fetched by tria itself, since the server has
+no way to hand them over; the caption says `loading…` until one arrives. A picture on the pull
+request's own host is fetched with the token `gh auth token` gives for that host, which is what
+a private repository's uploads need, so `gh` has to be installed and signed in where tria runs
+for those.
+
+Nothing pushes changes to it: `r` reads it again, keeping the place. A message written while it
+is open goes to the main agent, after asking, starting with `Sent looking at pull request
+<repository>#<number> (<link>):`.
 
 ## Programs
 

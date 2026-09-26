@@ -973,7 +973,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
         spans.push(Span::styled(
-            if transcript.live {
+            if transcript.pull_request().is_some() {
+                "  r re-reads · gx opens · q back"
+            } else if transcript.live {
                 "  r re-reads · q back"
             } else {
                 "  q back"
@@ -1159,8 +1161,8 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         height: area.height,
     };
     app.chat_area = inner;
-    // A subagent's transcript is read in place of the conversation, through the same
-    // renderer: it is a conversation too, only one held out of sight.
+    // A subagent's transcript, or a pull request, is read in place of the conversation,
+    // through the same chat: scrolled, searched, and yanked like it.
     let open = app
         .transcript
         .as_ref()
@@ -1214,13 +1216,24 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             None => true,
         };
         if needs_rebuild {
-            let blocks = timeline::build(
-                thread,
-                &app.expanded,
-                app.open_levels,
-                inner.width,
-                inner.height,
-            );
+            // A pull request is drawn by its own module, already styled; everything after
+            // this treats its blocks like any others.
+            let blocks = match app.transcript.as_ref().and_then(|t| t.pull_request()) {
+                Some(detail) => crate::pull_request::blocks(
+                    detail,
+                    &app.expanded,
+                    app.open_levels,
+                    (inner.width, inner.height),
+                    &app.pull_request_images,
+                ),
+                None => timeline::build(
+                    thread,
+                    &app.expanded,
+                    app.open_levels,
+                    inner.width,
+                    inner.height,
+                ),
+            };
             let mut total = 0usize;
             let blocks: Vec<CachedBlock> = blocks
                 .into_iter()
@@ -1302,7 +1315,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             let start = y;
             let end = y + cached.height();
             y = end;
-            if matches!(block.key, BlockKey::Message(_)) {
+            if matches!(block.key, BlockKey::Message(_) | BlockKey::Section(_)) {
                 app.message_starts.push(start);
             }
             if let Some((key, _)) = exports.first() {
@@ -1311,6 +1324,14 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             app.chat_pictures.extend(block.pictures.iter().cloned());
             if matches!(block.key, BlockKey::Message(_)) {
                 app.picture_ranges
+                    .extend(rows.iter().map(|region| timeline::Region {
+                        first: start + region.first,
+                        end: start + region.end,
+                        ..region.clone()
+                    }));
+            }
+            if let BlockKey::Section(_) = &block.key {
+                app.work_ranges
                     .extend(rows.iter().map(|region| timeline::Region {
                         first: start + region.first,
                         end: start + region.end,
@@ -1692,9 +1713,14 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
             crate::app::TranscriptSend::Now => "Enter",
             crate::app::TranscriptSend::Queued => "Ctrl-s",
         };
+        let noun = app
+            .transcript
+            .as_ref()
+            .map(|t| t.noun())
+            .unwrap_or("what is open");
         block = block.title_bottom(Line::from(Span::styled(
             format!(
-                " this goes to the main agent, with context about the subagent · {key} or y sends · anything else keeps writing "
+                " this goes to the main agent, with context about {noun} · {key} or y sends · anything else keeps writing "
             ),
             Style::default()
                 .fg(Color::Yellow)
@@ -3272,6 +3298,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(
             "  gx                      open the link, picture, or pull request under the cursor",
         ),
+        Line::from("  gp                      read the thread's pull request in place of the chat"),
         Line::from("  click a link            open it in the browser"),
         Line::from(
             "  gt                      switch to the tmux session for the thread's directory",
