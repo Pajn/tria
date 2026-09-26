@@ -51,6 +51,8 @@ const TICK: Duration = Duration::from_millis(120);
 /// enough that a stream which never stops still gets drawn.
 const BATCH: usize = 512;
 const TOAST_TTL: Duration = Duration::from_secs(6);
+/// How often a running agent's open transcript is read again when nothing it did said so.
+const TRANSCRIPT_POLL: Duration = Duration::from_secs(5);
 
 /// How often to look for worktrees that have gone from the disk. They only go when
 /// something removes one, which is rare and is usually this.
@@ -690,6 +692,13 @@ pub struct App {
     keep_sidebar_focus: Option<String>,
     /// Whether the transcript open was opened from the subagent list, which `q` goes back to.
     transcript_from_roster: bool,
+    /// Whether the transcript read on its way was one nobody asked for, bringing a running
+    /// agent's up to date: it says nothing, and moves nobody.
+    transcript_quiet: bool,
+    /// When the open transcript was last read, and the running agent as it stood then, to
+    /// tell when it is worth reading again.
+    transcript_read_at: Option<Instant>,
+    transcript_seen: Option<String>,
     /// First visible line of the help, which is taller than most terminals.
     pub help_offset: usize,
     /// Rows the help fits and rows it has, filled by the renderer each frame.
@@ -927,6 +936,9 @@ impl App {
             sidebar_unlinking: None,
             keep_sidebar_focus: None,
             transcript_from_roster: false,
+            transcript_quiet: false,
+            transcript_read_at: None,
+            transcript_seen: None,
             help_offset: 0,
             help_viewport: (0, 0),
             show_settled: false,
@@ -3888,23 +3900,35 @@ impl App {
     /// is the provider's own, outside any workspace, which is what `projects.readFile`
     /// takes an absolute path for.
     fn read_transcript(&mut self) {
+        self.read_transcript_as(false);
+    }
+
+    /// Read the selected subagent's transcript, `quiet`ly to bring an open one up to date.
+    fn read_transcript_as(&mut self, quiet: bool) {
         let agents = self.subagents();
         let Some(agent) = agents.get(self.agent_selected) else {
-            self.toast("no subagent selected", true);
+            if !quiet {
+                self.toast("no subagent selected", true);
+            }
             return;
         };
         let Some(path) = self.transcript_path(agent) else {
-            self.toast("no transcript for this subagent yet", false);
+            if !quiet {
+                self.toast("no transcript for this subagent yet", false);
+            }
             return;
         };
         if self.transcript_loading.is_some() {
             return;
         }
         let Some(cwd) = self.thread_directory() else {
-            self.toast("thread has no directory", true);
+            if !quiet {
+                self.toast("thread has no directory", true);
+            }
             return;
         };
         self.transcript_loading = Some(agent.id.clone());
+        self.transcript_quiet = quiet;
         let agent_id = agent.id.clone();
         let handle = self.handle.clone();
         let events = self.events.clone();
@@ -3934,9 +3958,23 @@ impl App {
             return;
         }
         self.transcript_loading = None;
+        self.transcript_read_at = Some(Instant::now());
+        let quiet = std::mem::take(&mut self.transcript_quiet);
+        // A read nobody asked for only brings up to date what is still open.
+        let open = self
+            .transcript
+            .as_ref()
+            .is_some_and(|t| t.agent_id() == Some(agent_id.as_str()));
+        if quiet && !open {
+            return;
+        }
         let agent_id_read = agent_id.clone();
         let file = match result {
             Ok(file) => file,
+            Err(error) if quiet => {
+                tracing::info!(%error, "bringing the transcript up to date");
+                return;
+            }
             Err(error) => return self.toast(format!("reading the transcript: {error}"), true),
         };
         let agents = self.subagents();
@@ -3946,6 +3984,10 @@ impl App {
         let (mut state, summary) =
             match crate::transcript::parse(&file.contents, &agent.id, &agent.title) {
                 Ok(parsed) => parsed,
+                Err(error) if quiet => {
+                    tracing::info!(%error, "bringing the transcript up to date");
+                    return;
+                }
                 Err(error) => return self.toast(format!("{error}"), true),
             };
         self.reads += 1;
@@ -3972,6 +4014,9 @@ impl App {
             None => (self.scroll, self.chat_cursor, self.focus),
         };
         let live = !agent.status.is_terminal();
+        if !reread {
+            self.transcript_seen = Some(format!("{} {:?}", agent.updated_at, agent.status));
+        }
         self.transcript = Some(Transcript {
             source: Reading::Subagent(agent_id),
             title: agent.title.clone(),
@@ -3985,6 +4030,11 @@ impl App {
         // is done and the conversation's own place is kept for the way back. A re-read
         // of a run still going lands at the end, which is the part that is new. One asked
         // for from the sidebar leaves the keys there, for the next.
+        // Brought up to date under somebody, it leaves them where they were: reading
+        // further up stays put, and reading at the end follows what is new.
+        if quiet {
+            return;
+        }
         self.mode = Mode::Normal;
         if self.keep_sidebar_focus.take().as_deref() != Some(agent_id_read.as_str()) {
             self.focus = Focus::Chat;
@@ -3997,6 +4047,42 @@ impl App {
         }
         self.chat_visual = None;
         self.search = None;
+    }
+
+    /// Keep a running agent's transcript up to date while it is open. The server has no
+    /// way to say a file changed, but the thread says when the agent does something, and
+    /// that is when its transcript grows; between those, a stretch of writing is caught by
+    /// reading again every few seconds. Once the agent has finished, one last read shows
+    /// how it ended, and that is the end of it.
+    fn follow_transcript(&mut self) {
+        let Some(id) = self
+            .transcript
+            .as_ref()
+            .filter(|t| t.live)
+            .and_then(|t| t.agent_id())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        if self.transcript_loading.is_some() {
+            return;
+        }
+        let agents = self.subagents();
+        let Some(index) = agents.iter().position(|agent| agent.id == id) else {
+            return;
+        };
+        let agent = &agents[index];
+        let seen = format!("{} {:?}", agent.updated_at, agent.status);
+        let moved = self.transcript_seen.as_ref() != Some(&seen);
+        let due = self
+            .transcript_read_at
+            .is_none_or(|at| at.elapsed() >= TRANSCRIPT_POLL);
+        if !moved && !due {
+            return;
+        }
+        self.transcript_seen = Some(seen);
+        self.agent_selected = index;
+        self.read_transcript_as(true);
     }
 
     /// Read the open transcript again: an agent still working has written more since.
@@ -7313,9 +7399,13 @@ impl App {
 
     fn on_update(&mut self, update: Update) {
         let may_sync = matches!(update, Update::Shell(_) | Update::Thread { .. });
+        let may_move = matches!(update, Update::Thread { .. });
         self.apply_update(update);
         if may_sync {
             self.notice_pull_request_sync();
+        }
+        if may_move {
+            self.follow_transcript();
         }
     }
 
@@ -8094,6 +8184,7 @@ fn apply(app: &mut App, event: AppEvent) {
             app.search_thread_contents();
             app.refresh_vcs_periodically();
             app.refresh_worktrees_periodically();
+            app.follow_transcript();
             if app
                 .toast
                 .as_ref()
@@ -9830,6 +9921,169 @@ mod tests {
         }))
         .map(ThreadState::from_snapshot)
         .unwrap()
+    }
+
+    /// A thread whose subagent `a1` is still working, beside a finished one whose output
+    /// file says where `a1`'s is being written.
+    fn thread_with_a_followable_agent() -> ThreadState {
+        let activity = |id: &str, kind: &str, at: &str, payload: Value| {
+            json!({"id": id, "kind": kind, "tone": "info", "summary": "", "createdAt": at,
+                "payload": payload})
+        };
+        let started = |task: &str, at: &str| {
+            json!({"taskId": task, "agentKind": "agent", "taskType": "local_agent",
+                "title": format!("Look into {task}"), "startedAt": at})
+        };
+        let mut thread = serde_json::from_value::<crate::model::ThreadDetailSnapshot>(json!({
+            "snapshotSequence": 0,
+            "thread": {"id": "t1", "projectId": "p", "title": "A thread",
+                "modelSelection": {"instanceId": "c", "model": "m"},
+                "session": {"status": "running"},
+                "messages": [], "proposedPlans": [], "activities": [
+                    activity("s0", "task.started", "2026-01-01T00:00:00Z", started("a0", "2026-01-01T00:00:00Z")),
+                    activity("c0", "task.completed", "2026-01-01T00:00:01Z",
+                        json!({"taskId": "a0", "status": "completed", "outputFile": "/tmp/tasks/a0.output"})),
+                    activity("s1", "task.started", "2026-01-01T00:00:02Z", started("a1", "2026-01-01T00:00:02Z")),
+                ]},
+        }))
+        .map(ThreadState::from_snapshot)
+        .unwrap();
+        thread.detail.shell.worktree_path = Some("/tmp".into());
+        thread
+    }
+
+    /// The agent does something: a progress activity arrives on the thread.
+    fn agent_progresses(app: &mut App, at: &str) {
+        let progress: crate::model::Activity = serde_json::from_value(json!({
+            "id": format!("p-{at}"), "kind": "task.progress", "tone": "info", "summary": "",
+            "createdAt": at, "payload": {"taskId": "a1", "detail": "Reading ws.ts", "lastToolName": "Read"},
+        }))
+        .unwrap();
+        app.thread
+            .as_mut()
+            .unwrap()
+            .detail
+            .activities
+            .push(progress);
+    }
+
+    /// The next transcript read asked for, answered with these replies.
+    async fn answer_the_read(
+        app: &mut App,
+        requests: &mut mpsc::UnboundedReceiver<crate::session::Request>,
+        sent: &mut mpsc::UnboundedReceiver<AppEvent>,
+        replies: &[&str],
+    ) -> Value {
+        let (payload, reply) = loop {
+            match asked(requests).await.expect("the transcript is read") {
+                crate::session::Request::Call {
+                    tag,
+                    payload,
+                    reply,
+                } if tag == "projects.readFile" => {
+                    break (payload, reply);
+                }
+                _ => continue,
+            }
+        };
+        let file = transcript_saying(replies);
+        let _ = reply.send(Ok(json!({"contents": file.contents, "truncated": false})));
+        let event = tokio::time::timeout(Duration::from_millis(500), sent.recv())
+            .await
+            .expect("it comes back")
+            .expect("an event");
+        apply(app, event);
+        payload
+    }
+
+    /// A running agent's transcript reads itself again when the agent does something, and
+    /// shows what was written without moving whoever is reading it.
+    #[tokio::test]
+    async fn a_running_agents_transcript_follows_what_it_does() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_with_a_followable_agent());
+        app.current_thread_id = Some("t1".into());
+        app.transcript_loading = Some("a1".into());
+        app.on_transcript("a1".into(), Ok(transcript_saying(&["Looking now."])));
+        app.transcript_read_at = Some(Instant::now());
+        app.mode = Mode::Insert;
+        app.focus = Focus::Composer;
+
+        app.follow_transcript();
+        assert!(
+            asked_nothing(&mut requests).await,
+            "nothing has happened, and it is not due"
+        );
+
+        agent_progresses(&mut app, "2026-01-01T00:00:05Z");
+        app.follow_transcript();
+        let payload = answer_the_read(
+            &mut app,
+            &mut requests,
+            &mut sent,
+            &["Looking now.", "Found it."],
+        )
+        .await;
+        assert_eq!(payload["relativePath"], "/tmp/tasks/a1.output");
+        assert!(drawn(&mut app).contains("Found it."));
+        assert_eq!(
+            app.mode,
+            Mode::Insert,
+            "whoever was writing is still writing"
+        );
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(app.toast.is_none());
+
+        // A stretch of writing says nothing on the thread; the clock catches it.
+        app.transcript_read_at = Instant::now().checked_sub(TRANSCRIPT_POLL * 2);
+        app.follow_transcript();
+        let more = ["Looking now.", "Found it.", "Still writing."];
+        answer_the_read(&mut app, &mut requests, &mut sent, &more).await;
+        assert!(drawn(&mut app).contains("Still writing."));
+
+        // Finished, it is read once more for how it ended, and then left alone.
+        let done: crate::model::Activity = serde_json::from_value(json!({
+            "id": "done", "kind": "task.completed", "tone": "info", "summary": "",
+            "createdAt": "2026-01-01T00:00:09Z",
+            "payload": {"taskId": "a1", "status": "completed", "summary": "Found it in ws.ts"},
+        }))
+        .unwrap();
+        app.thread.as_mut().unwrap().detail.activities.push(done);
+        app.follow_transcript();
+        let last = ["Looking now.", "Found it.", "Done."];
+        answer_the_read(&mut app, &mut requests, &mut sent, &last).await;
+        assert!(!app.transcript.as_ref().unwrap().live);
+        app.transcript_read_at = Instant::now().checked_sub(TRANSCRIPT_POLL * 2);
+        app.follow_transcript();
+        assert!(
+            asked_nothing(&mut requests).await,
+            "a finished run is not read again"
+        );
+    }
+
+    /// Put away, a transcript is not brought back by a read that was already on its way.
+    #[tokio::test]
+    async fn a_put_away_transcript_stays_away() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_with_a_followable_agent());
+        app.current_thread_id = Some("t1".into());
+        app.transcript_loading = Some("a1".into());
+        app.on_transcript("a1".into(), Ok(transcript_saying(&["Looking now."])));
+        agent_progresses(&mut app, "2026-01-01T00:00:05Z");
+        app.follow_transcript();
+        app.leave_transcript();
+        answer_the_read(
+            &mut app,
+            &mut requests,
+            &mut sent,
+            &["Looking now.", "Found it."],
+        )
+        .await;
+        assert!(app.transcript.is_none());
     }
 
     fn transcript_saying(replies: &[&str]) -> TranscriptFile {

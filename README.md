@@ -659,9 +659,13 @@ tail is missing.
 A subagent that is still working can be read as far as it has got: the provider writes the
 file from the moment the agent starts, but it only reports the path once the task is over, so
 the path is taken from another task in the same thread — they are written side by side in one
-directory, each named after its task. The header says the run is still going, and `r` reads it
-again for whatever has been written since. In a thread where no task has finished yet there is
-nothing to take the directory from, and the row says it has no transcript.
+directory, each named after its task. The header says the run is still going, and the
+transcript keeps itself up to date while it is open: the server has no way to say a file
+changed, so it is read again whenever the thread says the agent did something, and every five
+seconds between those, for a stretch of writing that says nothing. Reading further up stays
+put; reading at the end follows what is new. Once the agent has finished it is read one last
+time and left alone. `r` reads it again by hand. In a thread where no task has finished yet
+there is nothing to take the directory from, and the row says it has no transcript.
 
 Unlike the tool rows in the thread, these are not projected down to a summary on the way out:
 the file has the whole input and the whole output, so an expanded row shows the command it ran
