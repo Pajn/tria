@@ -1646,6 +1646,21 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
             .right_aligned(),
         );
     }
+    // On the border of the box holding the message it is about, rather than in a popup.
+    if let Some(send) = app.confirm_transcript_send {
+        let key = match send {
+            crate::app::TranscriptSend::Now => "Enter",
+            crate::app::TranscriptSend::Queued => "Ctrl-s",
+        };
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(
+                " this goes to the main agent, with context about the subagent · {key} or y sends · anything else keeps writing "
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let text_area = Rect {

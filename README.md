@@ -559,6 +559,12 @@ because it is the same renderer — the transcript's rows are translated into th
 tool calls the server would have sent for the same work. `q` or `Esc` goes back to the list,
 and the conversation returns to where it was.
 
+There is no sending to a subagent: the protocol has nowhere to address one. A message written
+while a transcript is open therefore goes to the main agent, and because it reads like a reply
+to the transcript on screen, tria asks first — `Enter` (or `Ctrl-s` when queueing) again or `y`
+sends, anything else goes back to writing. What is sent starts with `Sent looking at the
+transcript for subagent <id>:`, so the agent knows what the message was written against.
+
 The transcript is a file the provider wrote on the machine that ran the agent, fetched with
 `projects.readFile`, which takes an absolute path for exactly this. It therefore works against
 a remote server too. The server stops reading at a megabyte and the header says so when the

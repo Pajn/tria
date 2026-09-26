@@ -345,6 +345,22 @@ struct Queued {
     after_turn: Option<Id>,
 }
 
+/// How a message written over a subagent's transcript goes once it is agreed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptSend {
+    Now,
+    Queued,
+}
+
+/// The message as the agent gets it: with the subagent whose transcript it was written
+/// over, when there was one, so a "this" or a "why did it" has something to point at.
+fn over_transcript(subagent: Option<&str>, text: &str) -> String {
+    match subagent {
+        Some(id) => format!("Sent looking at the transcript for subagent {id}:\n\n{text}"),
+        None => text.to_string(),
+    }
+}
+
 /// A rewind worked out and waiting on `Enter` or `f`, for the thread it was asked in.
 pub struct RewindAsk {
     pub thread_id: Id,
@@ -702,6 +718,10 @@ pub struct App {
     /// is not stopping a task: everything the agent has running goes with it, and it
     /// sits one shifted keystroke away from the `s` that stops the one task.
     pub confirm_stop_session: bool,
+    /// Set while a message written over a subagent's transcript is waiting to be agreed
+    /// to. There is no sending to a subagent, so it goes to the main agent, and the
+    /// transcript on screen makes it easy to think otherwise.
+    pub confirm_transcript_send: Option<TranscriptSend>,
     pub worktree_selected: usize,
     /// The worktrees that are still on the disk, so the sidebar can mark the threads
     /// holding one without asking the disk about every row it draws.
@@ -830,6 +850,7 @@ impl App {
             literal_next: false,
             worktree_confirm: None,
             confirm_stop_session: false,
+            confirm_transcript_send: None,
             worktree_selected: 0,
             live_worktrees: HashSet::new(),
             removing: HashSet::new(),
@@ -1426,6 +1447,16 @@ impl App {
     }
 
     fn send_message(&mut self) {
+        if self.transcript.is_some() {
+            return self.ask_to_send_over_transcript(TranscriptSend::Now);
+        }
+        self.send_composed(None);
+    }
+
+    /// Send what is in the composer. A message written while a subagent's transcript was
+    /// open says so, since the agent receiving it has no other way of knowing what the
+    /// message was written against.
+    fn send_composed(&mut self, subagent: Option<String>) {
         let text = self.composer.text().trim_end().to_string();
         if text.trim().is_empty() {
             return;
@@ -1497,7 +1528,7 @@ impl App {
             let shell = &thread.detail.shell;
             let command = commands::turn_start(
                 thread.id(),
-                &text,
+                &over_transcript(subagent.as_deref(), &text),
                 &shell.model_selection,
                 &shell.runtime_mode,
                 &shell.interaction_mode,
@@ -1523,6 +1554,13 @@ impl App {
     /// with it as `Enter` does. With no turn running there is nothing to wait for, and
     /// it is sent.
     fn queue_message(&mut self) {
+        if self.transcript.is_some() {
+            return self.ask_to_send_over_transcript(TranscriptSend::Queued);
+        }
+        self.queue_composed(None);
+    }
+
+    fn queue_composed(&mut self, subagent: Option<String>) {
         let text = self.composer.text().trim_end().to_string();
         if text.trim().is_empty() {
             return;
@@ -1532,7 +1570,7 @@ impl App {
             .as_ref()
             .filter(|thread| self.draft.is_none() && thread.is_running());
         let Some(thread) = running else {
-            return self.send_message();
+            return self.send_composed(subagent);
         };
         let thread_id = thread.id().to_string();
         let after_turn = thread
@@ -1550,7 +1588,9 @@ impl App {
         if !queued.text.is_empty() {
             queued.text.push_str("\n\n");
         }
-        queued.text.push_str(&text);
+        queued
+            .text
+            .push_str(&over_transcript(subagent.as_deref(), &text));
         queued.after_turn = after_turn;
         self.composer.push_history(text);
         self.composer.clear();
@@ -3709,6 +3749,36 @@ impl App {
         self.search = None;
     }
 
+    /// Ask before sending a message written over a transcript: it looks like a reply to
+    /// the subagent on screen, and it goes to the main agent.
+    fn ask_to_send_over_transcript(&mut self, send: TranscriptSend) {
+        if self.composer.text().trim().is_empty() {
+            return;
+        }
+        self.confirm_transcript_send = Some(send);
+    }
+
+    /// The answer to `ask_to_send_over_transcript`. Anything that is not the key that
+    /// asked or `y` is a no, and leaves the message in the composer and the transcript
+    /// open.
+    fn on_transcript_send_key(&mut self, send: TranscriptSend, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let agreed = match key.code {
+            KeyCode::Char('y') if !ctrl => true,
+            KeyCode::Enter => send == TranscriptSend::Now,
+            KeyCode::Char('s') if ctrl => send == TranscriptSend::Queued,
+            _ => false,
+        };
+        if !agreed {
+            return;
+        }
+        let subagent = self.transcript.as_ref().map(|t| t.agent_id.clone());
+        match send {
+            TranscriptSend::Now => self.send_composed(subagent),
+            TranscriptSend::Queued => self.queue_composed(subagent),
+        }
+    }
+
     // ── Git popup ──────────────────────────────────────────────────────
 
     /// `gl` and `:git`: run the git command in the thread's directory. Inside tmux it opens
@@ -5854,6 +5924,9 @@ impl App {
     }
 
     fn on_insert_key(&mut self, key: KeyEvent) {
+        if let Some(send) = self.confirm_transcript_send.take() {
+            return self.on_transcript_send_key(send, key);
+        }
         if std::mem::take(&mut self.literal_next) {
             self.insert_literal(key);
             return self.refresh_completion();
@@ -8553,6 +8626,69 @@ mod tests {
         assert_eq!(app.focus, Focus::Composer);
         let said = app.toast.as_ref().expect("it says why").0.clone();
         assert!(said.starts_with("not sent:"), "{said}");
+    }
+
+    fn over_a_transcript(app: &mut App) {
+        app.transcript = Some(Transcript {
+            agent_id: "agent-7".into(),
+            title: "look into it".into(),
+            subtitle: String::new(),
+            state: running_thread(),
+            truncated: false,
+            live: false,
+            restore: (Scroll::Follow, 0, Focus::Composer),
+        });
+    }
+
+    /// A message written over a subagent's transcript reads like a reply to it, and
+    /// there is no replying to a subagent: it goes to the main agent, after asking, and
+    /// says which transcript it was written against.
+    #[tokio::test]
+    async fn a_message_over_a_transcript_asks_and_says_where_it_was_written() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+        app.current_thread_id = Some("t1".into());
+        over_a_transcript(&mut app);
+        app.mode = Mode::Insert;
+        app.composer.set_text("why did it stop?");
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.confirm_transcript_send, Some(TranscriptSend::Now));
+        assert!(sent_no_command(&mut requests).await, "sent without asking");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let command = sent_command(&mut requests).await.expect("sent once agreed");
+        assert_eq!(
+            command["message"]["text"],
+            "Sent looking at the transcript for subagent agent-7:\n\nwhy did it stop?"
+        );
+        assert!(app.transcript.is_none(), "still reading the transcript");
+        assert!(app.composer.is_empty());
+    }
+
+    /// Anything but the answer is a no, and the message and the transcript stay put.
+    #[tokio::test]
+    async fn declining_a_message_over_a_transcript_keeps_it() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+        app.current_thread_id = Some("t1".into());
+        over_a_transcript(&mut app);
+        app.mode = Mode::Insert;
+        app.composer.set_text("not for the main agent");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(app.confirm_transcript_send, Some(TranscriptSend::Queued));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.confirm_transcript_send, None);
+        assert_eq!(app.composer.text(), "not for the main agent");
+        assert_eq!(app.queued_message(), None);
+        assert!(app.transcript.is_some());
+        assert!(sent_no_command(&mut requests).await);
     }
 
     /// `Enter` steers a running turn; `Ctrl-s` holds the message until the turn has
