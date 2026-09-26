@@ -2,6 +2,6 @@
 # working copy says are the same thing. rustup installs it on the first cargo
 # command run in here.
 [toolchain]
-channel = "1.98.0"
+channel = "1.98.1"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
