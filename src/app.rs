@@ -676,6 +676,20 @@ pub struct App {
     pub sidebar_visible: bool,
     /// Index into `sidebar_rows()`.
     pub sidebar_selected: usize,
+    /// Which list the sidebar shows. The threads, until somebody asks for another.
+    pub sidebar_tab: SidebarTab,
+    /// The selection and scroll each tab was left at, to come back to.
+    sidebar_places: [(usize, usize); 3],
+    /// Where each tab's name was drawn on the sidebar's title line, for a click.
+    pub sidebar_tab_spans: Vec<(u16, u16, SidebarTab)>,
+    /// The pull request `d` in the sidebar has asked about unlinking, until it is answered.
+    pub sidebar_unlinking: Option<String>,
+    /// What was last asked for from the sidebar — a pull request's link or a subagent's id —
+    /// whose reading leaves the keys there, so the next row is one keystroke away. Named,
+    /// so a read that never came leaves nothing to mislead the next one from elsewhere.
+    keep_sidebar_focus: Option<String>,
+    /// Whether the transcript open was opened from the subagent list, which `q` goes back to.
+    transcript_from_roster: bool,
     /// First visible line of the help, which is taller than most terminals.
     pub help_offset: usize,
     /// Rows the help fits and rows it has, filled by the renderer each frame.
@@ -907,6 +921,12 @@ impl App {
             custom_answer: Composer::new(),
             sidebar_visible: true,
             sidebar_selected: 0,
+            sidebar_tab: SidebarTab::Threads,
+            sidebar_places: [(0, 0); 3],
+            sidebar_tab_spans: Vec::new(),
+            sidebar_unlinking: None,
+            keep_sidebar_focus: None,
+            transcript_from_roster: false,
             help_offset: 0,
             help_viewport: (0, 0),
             show_settled: false,
@@ -1048,7 +1068,12 @@ impl App {
     /// wherever it is.
     pub fn sidebar_row_height(&self, row: &SidebarRow) -> usize {
         match (self.sidebar_layout, row) {
-            (crate::config::SidebarLayout::TwoLine, SidebarRow::Thread { .. }) => 2,
+            (
+                crate::config::SidebarLayout::TwoLine,
+                SidebarRow::Thread { .. }
+                | SidebarRow::PullRequest { .. }
+                | SidebarRow::Agent { .. },
+            ) => 2,
             _ => 1,
         }
     }
@@ -1099,8 +1124,46 @@ impl App {
         offset
     }
 
-    /// Rows of the sidebar list, including section headers.
+    /// Rows of the sidebar list as the tab it is on has them.
     pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
+        match self.sidebar_tab {
+            SidebarTab::Threads => self.thread_rows(),
+            SidebarTab::PullRequests => {
+                let rows: Vec<SidebarRow> = self
+                    .pull_request_layers()
+                    .into_iter()
+                    .map(|(pr, above)| SidebarRow::PullRequest { url: pr.url, above })
+                    .collect();
+                if rows.is_empty() {
+                    vec![SidebarRow::Empty {
+                        text: "no pull requests linked",
+                    }]
+                } else {
+                    rows
+                }
+            }
+            SidebarTab::Agents => {
+                // Newest first: the one at the top is the one most likely to be why
+                // anybody looked.
+                let rows: Vec<SidebarRow> = self
+                    .subagents()
+                    .into_iter()
+                    .rev()
+                    .map(|agent| SidebarRow::Agent { id: agent.id })
+                    .collect();
+                if rows.is_empty() {
+                    vec![SidebarRow::Empty {
+                        text: "no subagents yet",
+                    }]
+                } else {
+                    rows
+                }
+            }
+        }
+    }
+
+    /// Every thread, in its sections, with the sections' headers.
+    fn thread_rows(&self) -> Vec<SidebarRow> {
         let now = commands::now_iso();
         let sections = self.shell.sections(&now);
         let mut rows = Vec::new();
@@ -1154,13 +1217,74 @@ impl App {
     }
 
     fn select_sidebar_thread(&mut self, thread_id: &str) {
-        if let Some(index) = self
-            .sidebar_rows()
+        let Some(index) = self
+            .thread_rows()
             .iter()
             .position(|row| matches!(row, SidebarRow::Thread { id, .. } if id == thread_id))
-        {
+        else {
+            return;
+        };
+        if self.sidebar_tab == SidebarTab::Threads {
             self.sidebar_selected = index;
             self.sidebar_reveal = true;
+        } else {
+            self.sidebar_places[SidebarTab::Threads.index()].0 = index;
+        }
+    }
+
+    /// `H` and `L`: the tab to the left or right, where it was left.
+    fn switch_sidebar_tab(&mut self, by: isize) {
+        let count = SidebarTab::ALL.len() as isize;
+        let next = (self.sidebar_tab.index() as isize + by).rem_euclid(count) as usize;
+        self.show_sidebar_tab(SidebarTab::ALL[next]);
+    }
+
+    pub fn show_sidebar_tab(&mut self, tab: SidebarTab) {
+        if tab == self.sidebar_tab {
+            return;
+        }
+        self.sidebar_places[self.sidebar_tab.index()] =
+            (self.sidebar_selected, self.sidebar_offset);
+        self.sidebar_tab = tab;
+        (self.sidebar_selected, self.sidebar_offset) = self.sidebar_places[tab.index()];
+        self.sidebar_unlinking = None;
+        self.sidebar_reveal = true;
+    }
+
+    /// `y` in the sidebar: a pull request's link, or what a subagent reported.
+    fn sidebar_yank(&mut self) {
+        match self.sidebar_rows().get(self.sidebar_selected) {
+            Some(SidebarRow::PullRequest { url, .. }) => {
+                copy_to_clipboard(url);
+                self.toast(format!("copied {url}"), false);
+            }
+            Some(SidebarRow::Agent { id }) => {
+                let report = self
+                    .subagents()
+                    .into_iter()
+                    .find(|agent| &agent.id == id)
+                    .and_then(|agent| agent.result.or(agent.error));
+                match report {
+                    Some(report) => {
+                        copy_to_clipboard(&report);
+                        self.toast("yanked the report", false);
+                    }
+                    None => self.toast("it has not reported back yet", false),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `r` in the sidebar: read the row again, past anything kept of it.
+    fn sidebar_reread(&mut self) {
+        match self.sidebar_rows().get(self.sidebar_selected).cloned() {
+            Some(SidebarRow::PullRequest { url, .. }) => {
+                self.keep_sidebar_focus = Some(url.clone());
+                self.read_pull_request_as(&url, false, true);
+            }
+            Some(SidebarRow::Agent { .. }) => self.sidebar_activate(),
+            _ => {}
         }
     }
 
@@ -1181,7 +1305,23 @@ impl App {
                 self.focus = Focus::Composer;
             }
             Some(SidebarRow::Header { section, .. }) => self.toggle_section(*section),
-            None => {}
+            // Read where the conversation was, and the keys stay in the sidebar, so the
+            // next one is `j` and `Enter` away.
+            Some(SidebarRow::PullRequest { url, .. }) => {
+                let url = url.clone();
+                self.keep_sidebar_focus = Some(url.clone());
+                self.read_pull_request(&url);
+            }
+            Some(SidebarRow::Agent { id }) => {
+                let Some(index) = self.subagents().iter().position(|agent| &agent.id == id) else {
+                    return;
+                };
+                self.agent_selected = index;
+                self.keep_sidebar_focus = Some(id.clone());
+                self.transcript_from_roster = false;
+                self.read_transcript();
+            }
+            Some(SidebarRow::Empty { .. }) | None => {}
         }
     }
 
@@ -1222,6 +1362,15 @@ impl App {
         if let Some(leaving) = self.current_thread_id.clone() {
             self.release_popup_terminals(&leaving);
         }
+        // The pull requests and subagents listed are the thread's, so a new thread's list
+        // starts at its top.
+        self.sidebar_places[SidebarTab::PullRequests.index()] = (0, 0);
+        self.sidebar_places[SidebarTab::Agents.index()] = (0, 0);
+        if self.sidebar_tab != SidebarTab::Threads {
+            self.sidebar_selected = 0;
+            self.sidebar_offset = 0;
+        }
+        self.sidebar_unlinking = None;
         // A transcript belongs to the thread that ran the subagent, and a pull request to
         // the thread it is linked to; neither follows.
         self.transcript = None;
@@ -3699,7 +3848,10 @@ impl App {
             }
             KeyCode::Char('g') => self.agent_selected = 0,
             KeyCode::Char('G') => self.agent_selected = count.saturating_sub(1),
-            KeyCode::Enter | KeyCode::Char('l') => self.read_transcript(),
+            KeyCode::Enter | KeyCode::Char('l') => {
+                self.transcript_from_roster = true;
+                self.read_transcript();
+            }
             KeyCode::Char('y') => match agents.get(self.agent_selected) {
                 Some(agent) => match agent.result.as_deref().or(agent.error.as_deref()) {
                     Some(report) => {
@@ -3782,6 +3934,7 @@ impl App {
             return;
         }
         self.transcript_loading = None;
+        let agent_id_read = agent_id.clone();
         let file = match result {
             Ok(file) => file,
             Err(error) => return self.toast(format!("reading the transcript: {error}"), true),
@@ -3830,9 +3983,12 @@ impl App {
         });
         // The transcript is read, not written to, so the cursor goes where the reading
         // is done and the conversation's own place is kept for the way back. A re-read
-        // of a run still going lands at the end, which is the part that is new.
+        // of a run still going lands at the end, which is the part that is new. One asked
+        // for from the sidebar leaves the keys there, for the next.
         self.mode = Mode::Normal;
-        self.focus = Focus::Chat;
+        if self.keep_sidebar_focus.take().as_deref() != Some(agent_id_read.as_str()) {
+            self.focus = Focus::Chat;
+        }
         if reread && live {
             self.scroll = Scroll::Follow;
         } else {
@@ -4467,6 +4623,41 @@ impl App {
         }
     }
 
+    /// The open thread's pull requests as they are listed, in `:pr` and the sidebar alike:
+    /// stack by stack, the one the header speaks for first, each bottom to top, and whether
+    /// each builds on the one before it. One on the thread's branch that was never linked
+    /// is a stack of one.
+    pub fn pull_request_layers(&self) -> Vec<(crate::model::PullRequestRef, bool)> {
+        let Some(shell) = self.thread.as_ref().map(|t| &t.detail.shell) else {
+            return Vec::new();
+        };
+        let current = shell.current_pull_request(self.checked_out_branch());
+        let mut chains = shell.pull_request_chains();
+        let url = current.as_ref().map(|pr| pr.url.clone());
+        match chains
+            .iter()
+            .position(|chain| chain.layers.iter().any(|pr| Some(&pr.url) == url.as_ref()))
+        {
+            Some(index) => {
+                let chain = chains.remove(index);
+                chains.insert(0, chain);
+            }
+            None => {
+                chains.extend(current.map(|pr| crate::model::PullRequestChain { layers: vec![pr] }))
+            }
+        }
+        chains
+            .into_iter()
+            .flat_map(|chain| {
+                chain
+                    .layers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(layer, pr)| (pr, layer > 0))
+            })
+            .collect()
+    }
+
     /// `gp`: read the pull request the header shows.
     fn read_current_pull_request(&mut self) {
         let current = self.thread.as_ref().and_then(|t| {
@@ -4906,9 +5097,13 @@ impl App {
         }
         // Brought up to date under somebody, it leaves them where they were: writing, with
         // a selection, or in the middle of a search.
+        let keep_sidebar =
+            !quiet && self.keep_sidebar_focus.take().as_deref() == Some(url.as_str());
         if !reread {
             self.mode = Mode::Normal;
-            self.focus = Focus::Chat;
+            if !keep_sidebar {
+                self.focus = Focus::Chat;
+            }
             self.scroll = Scroll::Offset(0);
             self.chat_cursor = 0;
             self.chat_visual = None;
@@ -5079,48 +5274,25 @@ impl App {
                 })
                 .collect(),
             PickerKind::PullRequest => {
-                let Some(shell) = self.thread.as_ref().map(|t| &t.detail.shell) else {
-                    return;
-                };
-                let current = shell.current_pull_request(self.checked_out_branch());
-                let mut chains = shell.pull_request_chains();
-                // The stack the header speaks for goes first, as it does there; a pull
-                // request on the thread's branch that was never linked is a stack of one.
-                let url = current.as_ref().map(|pr| pr.url.clone());
-                match chains
-                    .iter()
-                    .position(|chain| chain.layers.iter().any(|pr| Some(&pr.url) == url.as_ref()))
-                {
-                    Some(index) => {
-                        let chain = chains.remove(index);
-                        chains.insert(0, chain);
-                    }
-                    None => chains.extend(
-                        current.map(|pr| crate::model::PullRequestChain { layers: vec![pr] }),
-                    ),
-                }
+                let layers = self.pull_request_layers();
                 // The repository only tells rows apart when they are not all from one.
-                let repositories = chains
+                let repositories = layers
                     .iter()
-                    .flat_map(|chain| &chain.layers)
-                    .map(|pr| pr.repository.as_str())
+                    .map(|(pr, _)| pr.repository.as_str())
                     .collect::<HashSet<_>>()
                     .len();
-                let mut items = Vec::new();
-                for chain in &chains {
-                    for (layer, pr) in chain.layers.iter().enumerate() {
-                        items.push(PickerItem {
-                            label: if layer > 0 {
-                                format!("↳ {}", pr.label())
-                            } else {
-                                pr.label()
-                            },
-                            detail: pr.facts(repositories > 1),
-                            key: pr.url.clone(),
-                        });
-                    }
-                }
-                items
+                layers
+                    .iter()
+                    .map(|(pr, above)| PickerItem {
+                        label: if *above {
+                            format!("↳ {}", pr.label())
+                        } else {
+                            pr.label()
+                        },
+                        detail: pr.facts(repositories > 1),
+                        key: pr.url.clone(),
+                    })
+                    .collect()
             }
             PickerKind::Effort => {
                 let Some(descriptor) = self.effort_descriptor() else {
@@ -5621,10 +5793,11 @@ impl App {
                 .is_some_and(|t| t.pull_request().is_some());
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc if idle => {
-                    let from_roster = self
-                        .transcript
-                        .as_ref()
-                        .is_some_and(|t| t.agent_id().is_some());
+                    let from_roster = self.transcript_from_roster
+                        && self
+                            .transcript
+                            .as_ref()
+                            .is_some_and(|t| t.agent_id().is_some());
                     self.leave_transcript();
                     if from_roster {
                         self.mode = Mode::Agents;
@@ -6336,7 +6509,29 @@ impl App {
         let prefix = self.take_prefix();
         let (height, _) = self.chat_viewport;
         if self.focus == Focus::Sidebar {
+            // Anything that is not the answer is a no: the question stands at the foot of
+            // the list until it has one.
+            if let Some(url) = self.sidebar_unlinking.take() {
+                if matches!(key.code, KeyCode::Char('d') | KeyCode::Char('y')) {
+                    self.unlink_pull_request(&url);
+                    self.sidebar_move(0);
+                }
+                return;
+            }
+            let listing = self.sidebar_tab != SidebarTab::Threads;
             match key.code {
+                KeyCode::Char('H') => self.switch_sidebar_tab(-1),
+                KeyCode::Char('L') => self.switch_sidebar_tab(1),
+                KeyCode::Char('y') if listing && prefix.is_none() => self.sidebar_yank(),
+                KeyCode::Char('r') if listing => self.sidebar_reread(),
+                // Asked first: it takes the pull request off the thread for every client.
+                KeyCode::Char('d') if self.sidebar_tab == SidebarTab::PullRequests => {
+                    if let Some(SidebarRow::PullRequest { url, .. }) =
+                        self.sidebar_rows().get(self.sidebar_selected)
+                    {
+                        self.sidebar_unlinking = Some(url.clone());
+                    }
+                }
                 KeyCode::Char('j') | KeyCode::Down => self.sidebar_move(1),
                 KeyCode::Char('k') | KeyCode::Up => self.sidebar_move(-1),
                 KeyCode::Char('g') if prefix == Some('g') => {
@@ -6555,6 +6750,24 @@ impl App {
                     self.scroll_by(delta);
                 }
             }
+            MouseEventKind::Down(MouseButton::Left)
+                if self
+                    .sidebar_inner
+                    .is_some_and(|r| r.y > 0 && mouse.row == r.y - 1)
+                    && self
+                        .sidebar_tab_spans
+                        .iter()
+                        .any(|(from, to, _)| (*from..*to).contains(&mouse.column)) =>
+            {
+                if let Some((_, _, tab)) = self
+                    .sidebar_tab_spans
+                    .iter()
+                    .find(|(from, to, _)| (*from..*to).contains(&mouse.column))
+                {
+                    let tab = *tab;
+                    self.show_sidebar_tab(tab);
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) if in_sidebar => {
                 let Some(inner) = self.sidebar_inner else {
                     return;
@@ -6579,7 +6792,15 @@ impl App {
                         self.sidebar_selected = index;
                         self.toggle_section(*section);
                     }
-                    None => {}
+                    Some(SidebarRow::PullRequest { .. } | SidebarRow::Agent { .. }) => {
+                        let stay = self.focus == Focus::Sidebar;
+                        self.sidebar_selected = index;
+                        self.sidebar_activate();
+                        if !stay {
+                            self.keep_sidebar_focus = None;
+                        }
+                    }
+                    Some(SidebarRow::Empty { .. }) | None => {}
                 }
             }
             // Clicking in the composer is asking to write there, which means putting
@@ -7669,6 +7890,35 @@ pub enum SidebarRow {
         id: Id,
         parked: bool,
     },
+    /// One of the open thread's pull requests, and whether it builds on the one above.
+    PullRequest {
+        url: String,
+        above: bool,
+    },
+    /// One of the subagents the open thread has run.
+    Agent {
+        id: String,
+    },
+    /// What a tab says when it has nothing to list.
+    Empty {
+        text: &'static str,
+    },
+}
+
+/// What the sidebar lists: every thread, or the open thread's pull requests or subagents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarTab {
+    Threads,
+    PullRequests,
+    Agents,
+}
+
+impl SidebarTab {
+    pub const ALL: [SidebarTab; 3] = [Self::Threads, Self::PullRequests, Self::Agents];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
+    }
 }
 
 // ── Event loop ─────────────────────────────────────────────────────────
@@ -10012,6 +10262,151 @@ mod tests {
             .expect("an event");
         apply(&mut app, event);
         assert_eq!(rows(&app), vec!["✓ docs", "  bug"], "put back");
+    }
+
+    /// The sidebar with the open thread's pull requests showing, and the keys in it.
+    fn sidebar_on_pull_requests(app: &mut App) {
+        app.thread = Some(stacked_thread());
+        app.current_thread_id = Some("t1".into());
+        app.sidebar_visible = true;
+        app.focus = Focus::Sidebar;
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+    }
+
+    /// `H` and `L` go through the tabs, and each is where it was left.
+    #[tokio::test]
+    async fn the_sidebar_has_tabs_that_keep_their_place() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        sidebar_on_pull_requests(&mut app);
+        assert_eq!(app.sidebar_tab, SidebarTab::PullRequests);
+        let rows = app.sidebar_rows();
+        assert!(
+            matches!(&rows[0], SidebarRow::PullRequest { above: false, url } if url.ends_with("/1"))
+        );
+        assert!(
+            matches!(&rows[1], SidebarRow::PullRequest { above: true, url } if url.ends_with("/2"))
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.sidebar_selected, 1);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+        assert_eq!(app.sidebar_tab, SidebarTab::Agents);
+        assert!(matches!(app.sidebar_rows()[0], SidebarRow::Empty { .. }));
+        app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
+        assert_eq!(app.sidebar_selected, 1, "back where it was left");
+        app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
+        assert_eq!(app.sidebar_tab, SidebarTab::Threads);
+    }
+
+    /// `Enter` on a pull request reads it in place of the conversation and leaves the keys
+    /// in the sidebar, so the next one is `j` and `Enter` away.
+    #[tokio::test]
+    async fn enter_in_the_sidebar_reads_and_stays() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        sidebar_on_pull_requests(&mut app);
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let asked = calls(&mut requests, 2).await;
+        assert!(
+            asked
+                .iter()
+                .any(|(tag, p)| tag == "pullRequests.detail" && p["number"] == 2)
+        );
+        let mut second = open_detail("layer 2");
+        second["number"] = json!(2);
+        second["url"] = json!("https://github.com/o/r/pull/2");
+        app.on_pull_request("https://github.com/o/r/pull/2".into(), Ok(second));
+        assert!(
+            app.transcript
+                .as_ref()
+                .and_then(|t| t.pull_request())
+                .is_some()
+        );
+        assert_eq!(app.focus, Focus::Sidebar, "the keys stayed");
+
+        // Read from anywhere else, it takes the keys to what is read, as before.
+        app.pull_request_loading = Some("https://github.com/o/r/pull/1".into());
+        app.on_pull_request(
+            "https://github.com/o/r/pull/1".into(),
+            Ok(open_detail("layer 1")),
+        );
+        assert_eq!(app.focus, Focus::Chat);
+    }
+
+    /// The pull requests listed are the open thread's, so another thread's list starts at
+    /// its top, and the threads tab still follows the thread that is open.
+    #[tokio::test]
+    async fn another_thread_starts_its_list_at_the_top() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        sidebar_on_pull_requests(&mut app);
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.sidebar_selected, 1);
+        app.open_thread("t2");
+        assert_eq!(app.sidebar_selected, 0);
+        assert_eq!(app.sidebar_tab, SidebarTab::PullRequests, "the tab stays");
+    }
+
+    /// `d` asks before unlinking, and only the answer does it.
+    #[tokio::test]
+    async fn d_in_the_sidebar_asks_before_unlinking() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        sidebar_on_pull_requests(&mut app);
+        let d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+        app.on_key(d);
+        assert!(app.sidebar_unlinking.is_some());
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(sent_no_command(&mut requests).await, "a no");
+        assert_eq!(app.sidebar_selected, 0, "and the no is all the key did");
+
+        app.on_key(d);
+        app.on_key(d);
+        let command = sent_command(&mut requests).await.expect("unlinked");
+        assert_eq!(command["type"], "thread.pull-request.unlink");
+        assert_eq!(command["number"], 1);
+    }
+
+    /// The tabs are the sidebar's title, with the counts of what the open thread has, and
+    /// a click on one shows it.
+    #[tokio::test]
+    async fn the_tabs_are_drawn_and_clicked() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(stacked_thread());
+        app.current_thread_id = Some("t1".into());
+        app.sidebar_visible = true;
+        let screen = drawn(&mut app);
+        assert!(
+            screen.contains("threads · PRs 2 · agents"),
+            "{}",
+            screen.lines().next().unwrap_or_default()
+        );
+        let (from, _, _) = *app
+            .sidebar_tab_spans
+            .iter()
+            .find(|(_, _, tab)| *tab == SidebarTab::PullRequests)
+            .expect("the PRs tab was drawn");
+        let row = app.sidebar_inner.expect("the sidebar was drawn").y - 1;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: from + 1,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.sidebar_tab, SidebarTab::PullRequests);
+        let screen = drawn(&mut app);
+        assert!(
+            screen.contains("#1 layer 1") && screen.contains("↳ #2 layer 2"),
+            "{screen}"
+        );
     }
 
     #[tokio::test]

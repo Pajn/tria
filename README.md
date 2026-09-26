@@ -103,6 +103,7 @@ Press `?` inside the app for the full list.
 | `/` | fuzzy thread picker, which also searches what the threads said |
 | `Tab` / `Shift-Tab` | cycle focus: composer, chat, thread list. `Esc` returns to the composer |
 | `s` `S` | toggle the sidebar / the settled shelf |
+| `H` `L` | thread list focused: the tab to the left or right — threads, pull requests, subagents |
 | `n` | new thread (pick a project; `^R` renames the one under the cursor) |
 | `gw` | new thread: start it in a fresh worktree, or the project's checkout |
 | `m` | change model |
@@ -855,6 +856,29 @@ The second line is the thread's branch; a thread working in the project's own ch
 branch of its own recorded, so it says the project's name instead, and the open thread falls
 back to the ref its checkout is on. `⌂` in front of it means a settled thread still holds a
 worktree. The other value is `one-line`, which is the default.
+
+### Tabs
+
+The sidebar has three tabs, named across its top: the threads, and the open thread's pull
+requests and subagents. `H` and `L` move between them with the sidebar focused, a click on a
+name does too, and each tab is where it was left. The threads are what tria starts on. The
+other two follow the open thread, so moving through threads with `J` and `K` shows each one's
+pull requests or subagents; a new thread's list starts at its top. Their names count what the
+thread has, and say when something there wants looking at: `✗` beside the pull requests while
+an open one is failing its checks, a spinner beside the subagents while one is working.
+
+The pull requests are listed as `:pr` lists them, stack by stack with `↳` on the layers that
+build on another. Each row leads with where the pull request stands — `●` open, `◌` draft, `◆`
+merged, `⊘` closed — and then its title. Under it the two-line layout puts its number, how its
+checks stand (`✓` passing, `✗` failing, `○` running), what its review decided (`✔` approved,
+`✎` changes requested, `…` waiting on a reviewer), and its branch last, which is what gives
+way when the sidebar is narrow. The one-line layout puts the two marks before the number. The subagents are listed newest first, with how
+long each has taken, and in two lines what it is doing or how it came out.
+
+`Enter` reads the one under the cursor in place of the conversation, as `:pr` and `gA` do,
+and leaves the keys in the sidebar, so the next is `j` and `Enter` away; the one being read is
+marked there. `r` reads it again, `y` copies a pull request's link or a subagent's report, and
+`d` unlinks a pull request from the thread, after asking.
 
 ## Other subcommands
 

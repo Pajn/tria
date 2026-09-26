@@ -16,7 +16,10 @@ use ratatui_image::sliced::SignedPosition;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{App, Checkout, Focus, Mode, PickerKind, Scroll, Section, SidebarRow, approval_options},
+    app::{
+        App, Checkout, Focus, Mode, PickerKind, Scroll, Section, SidebarRow, SidebarTab,
+        approval_options,
+    },
     config::SidebarLayout,
     model::ThreadStatus,
     picture,
@@ -637,6 +640,47 @@ pub fn status_style(status: ThreadStatus) -> Style {
     }
 }
 
+/// A tab's name with how many it lists, when it lists any.
+fn counted(name: &str, count: usize) -> String {
+    match count {
+        0 => name.to_string(),
+        count => format!("{name} {count}"),
+    }
+}
+
+/// Where a pull request stands, as the mark it leads its row with.
+fn pull_request_state(pr: &crate::model::PullRequestRef) -> (&'static str, Style) {
+    match pr.state.as_deref() {
+        Some("merged") => ("◆", Style::default().fg(Color::Magenta)),
+        Some("closed") => ("⊘", Style::default().fg(Color::Red)),
+        _ if pr.is_draft => ("◌", Style::default().fg(Color::Gray)),
+        _ => ("●", Style::default().fg(Color::Green)),
+    }
+}
+
+/// How its checks stand, in the marks the header and the pull request itself use.
+fn pull_request_checks(pr: &crate::model::PullRequestRef) -> Option<Span<'static>> {
+    let (glyph, color) = match pr.checks_state.as_deref()? {
+        "passing" => ("✓", Color::Green),
+        "failing" => ("✗", Color::Red),
+        "pending" => ("○", Color::Yellow),
+        _ => return None,
+    };
+    Some(Span::styled(glyph, Style::default().fg(color)))
+}
+
+/// What its review decided. Shapes of their own, since a check mark already means the
+/// checks passed: approved, changes asked for, still waiting on somebody.
+fn pull_request_review(pr: &crate::model::PullRequestRef) -> Option<Span<'static>> {
+    let (glyph, color) = match pr.review_decision.as_deref()? {
+        "approved" => ("✔", Color::Green),
+        "changes-requested" => ("✎", Color::Red),
+        "review-required" => ("…", Color::Yellow),
+        _ => return None,
+    };
+    Some(Span::styled(glyph, Style::default().fg(color)))
+}
+
 fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Sidebar;
     let border_style = if focused {
@@ -644,18 +688,84 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let block = Block::default()
+    // The tabs are the title: each names its list, and the two that are the open thread's
+    // say how many and whether anything there wants looking at — a pull request failing
+    // its checks, a subagent still working.
+    let layers = app.pull_request_layers();
+    let agents = app.subagents();
+    let failing = layers
+        .iter()
+        .any(|(pr, _)| pr.is_open() && pr.checks_state.as_deref() == Some("failing"));
+    let working = agents.iter().any(|agent| agent.status.is_active());
+    let mut title: Vec<Span> = vec![Span::raw(" ")];
+    let mut spans = Vec::new();
+    let mut at = area.x + 1;
+    for (index, tab) in SidebarTab::ALL.iter().enumerate() {
+        if index > 0 {
+            title.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            at += 3;
+        }
+        let style = if *tab == app.sidebar_tab {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let mut parts = match tab {
+            SidebarTab::Threads => vec![Span::styled("threads".to_string(), style)],
+            SidebarTab::PullRequests => vec![Span::styled(counted("PRs", layers.len()), style)],
+            SidebarTab::Agents => vec![Span::styled(counted("agents", agents.len()), style)],
+        };
+        match tab {
+            SidebarTab::PullRequests if failing => {
+                parts.push(Span::styled(" ✗", Style::default().fg(Color::Red)))
+            }
+            SidebarTab::Agents if working => parts.push(Span::styled(
+                format!(" {}", app.spinner_frame()),
+                Style::default().fg(Color::Cyan),
+            )),
+            _ => {}
+        }
+        let width: u16 = parts.iter().map(|p| p.content.chars().count() as u16).sum();
+        spans.push((at, at + width, *tab));
+        at += width;
+        title.extend(parts);
+    }
+    title.push(Span::raw(" "));
+    app.sidebar_tab_spans = spans;
+    let mut block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(border_style)
-        .title(Line::from(vec![Span::styled(
-            " threads ",
-            Style::default().fg(Color::DarkGray),
-        )]));
+        .title(Line::from(title));
+    if let Some(url) = &app.sidebar_unlinking {
+        let number = layers
+            .iter()
+            .find(|(pr, _)| &pr.url == url)
+            .map(|(pr, _)| format!("#{}", pr.number))
+            .unwrap_or_else(|| "it".to_string());
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(" unlink {number}? d again or y "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
     app.sidebar_inner = Some(inner);
 
     let rows = app.sidebar_rows();
+    let reading_url = app
+        .transcript
+        .as_ref()
+        .and_then(|t| t.pull_request())
+        .map(|d| d.url.clone());
+    let reading_agent = app
+        .transcript
+        .as_ref()
+        .and_then(|t| t.agent_id())
+        .map(str::to_string);
     let width = inner.width as usize;
     let dim = Style::default().fg(Color::DarkGray);
     let two_line = app.sidebar_layout == SidebarLayout::TwoLine;
@@ -666,9 +776,14 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     } else if focused {
         Some(app.sidebar_selected.min(rows.len() - 1))
     } else {
-        rows.iter().position(
-            |row| matches!(row, SidebarRow::Thread { id, .. } if Some(id) == app.current_thread_id.as_ref()),
-        )
+        // Unfocused, the mark is on what is open: the thread, or the pull request or
+        // subagent being read in place of it.
+        rows.iter().position(|row| match row {
+            SidebarRow::Thread { id, .. } => Some(id) == app.current_thread_id.as_ref(),
+            SidebarRow::PullRequest { url, .. } => Some(url) == reading_url.as_ref(),
+            SidebarRow::Agent { id } => Some(id) == reading_agent.as_ref(),
+            _ => false,
+        })
     };
     // Which list has the keys is the border's to say, so the mark is the same either
     // way: it is answering which row, not which pane.
@@ -708,6 +823,131 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     Span::styled(label, dim.add_modifier(Modifier::BOLD)),
                     Span::styled(hint, dim.add_modifier(Modifier::DIM)),
                 ]))
+            }
+            SidebarRow::Empty { text } => {
+                ListItem::new(Line::from(Span::styled(format!("   {text}"), dim)))
+            }
+            SidebarRow::PullRequest { url, above } => {
+                let Some((pr, _)) = layers.iter().find(|(pr, _)| &pr.url == url) else {
+                    return ListItem::new(Line::from(""));
+                };
+                let (glyph, glyph_style) = pull_request_state(pr);
+                let mut title_style = Style::default();
+                if Some(url) == reading_url.as_ref() {
+                    title_style = title_style.add_modifier(Modifier::BOLD);
+                }
+                let arrow = if *above { "↳ " } else { "" };
+                let title = pr
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("#{}", pr.number));
+                // The checks and the review are what a glance is for, so they come before
+                // anything that could be cut off, and the branch goes last.
+                let marks: Vec<Span> = [pull_request_checks(pr), pull_request_review(pr)]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                if !two_line {
+                    let mut line = vec![Span::styled(format!(" {glyph} "), glyph_style)];
+                    for mark in &marks {
+                        line.push(mark.clone());
+                        line.push(Span::raw(" "));
+                    }
+                    let used = 3 + marks.len() * 2 + arrow.chars().count();
+                    line.push(Span::styled(arrow, dim));
+                    line.push(Span::styled(
+                        fit(&pr.label(), width.saturating_sub(used + 1)),
+                        title_style,
+                    ));
+                    return ListItem::new(Line::from(line));
+                }
+                let first = Line::from(vec![
+                    Span::styled(format!(" {glyph} "), glyph_style),
+                    Span::styled(arrow, dim),
+                    Span::styled(
+                        fit(&title, width.saturating_sub(4 + arrow.chars().count())),
+                        title_style,
+                    ),
+                ]);
+                let number = format!("#{}", pr.number);
+                let mut second = vec![Span::styled(format!("   {number}"), dim)];
+                let mut used = 3 + number.chars().count();
+                for mark in marks {
+                    second.push(Span::raw(" "));
+                    second.push(mark);
+                    used += 2;
+                }
+                if let Some(branch) = &pr.head_branch {
+                    let room = width.saturating_sub(used + 2);
+                    if room > 0 {
+                        second.push(Span::styled(format!("  {}", fit(branch, room)), dim));
+                    }
+                }
+                ListItem::new(vec![first, Line::from(second)])
+            }
+            SidebarRow::Agent { id } => {
+                let Some(agent) = agents.iter().find(|agent| &agent.id == id) else {
+                    return ListItem::new(Line::from(""));
+                };
+                let (glyph, glyph_style) = match agent.status {
+                    subagent::Status::Pending
+                    | subagent::Status::Running
+                    | subagent::Status::Waiting => {
+                        (app.spinner_frame(), Style::default().fg(Color::Cyan))
+                    }
+                    subagent::Status::Idle => ("○", dim),
+                    subagent::Status::Completed => ("✓", Style::default().fg(Color::Green)),
+                    subagent::Status::Failed => ("✗", Style::default().fg(Color::Red)),
+                    subagent::Status::Cancelled | subagent::Status::Interrupted => {
+                        ("·", Style::default().fg(Color::Yellow))
+                    }
+                };
+                let now = crate::commands::now_iso();
+                let elapsed = agent
+                    .started_at
+                    .as_deref()
+                    .map(|started| {
+                        elapsed_label(
+                            started,
+                            agent
+                                .completed_at
+                                .as_deref()
+                                .filter(|_| !agent.status.is_active())
+                                .unwrap_or(&now),
+                        )
+                    })
+                    .unwrap_or_default();
+                let mut title_style = Style::default();
+                if Some(id) == reading_agent.as_ref() {
+                    title_style = title_style.add_modifier(Modifier::BOLD);
+                }
+                let title_width = width.saturating_sub(5 + elapsed.chars().count());
+                let title = fit(&agent.title, title_width);
+                let gap = " ".repeat(title_width.saturating_sub(title.chars().count()) + 1);
+                let first = Line::from(vec![
+                    Span::styled(format!(" {glyph} "), glyph_style),
+                    Span::styled(title, title_style),
+                    Span::raw(gap),
+                    Span::styled(elapsed, dim),
+                ]);
+                if !two_line {
+                    return ListItem::new(first);
+                }
+                let activity = agent
+                    .activity()
+                    .unwrap_or_else(|| agent.status.label().to_string());
+                let style = if agent.status == subagent::Status::Failed {
+                    Style::default().fg(Color::Red)
+                } else {
+                    dim
+                };
+                ListItem::new(vec![
+                    first,
+                    Line::from(Span::styled(
+                        format!("   {}", fit(&activity, width.saturating_sub(3))),
+                        style,
+                    )),
+                ])
             }
             SidebarRow::Thread { id, parked } => {
                 let Some(t) = app.shell.threads.get(id) else {
@@ -3303,6 +3543,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("  .                       the last change again"),
         Line::from("  gJ  3J                  join lines, since J itself is the next thread"),
         Line::from("  s / S                   toggle sidebar / settled shelf"),
+        Line::from("  H / L                   sidebar focused: threads, pull requests, subagents"),
         Line::from("  s S J K n m / ? 1-9     the app's, and only while nothing is half typed"),
         Line::from("                          at the composer: a count, an operator or a"),
         Line::from("                          selection gives them back · s is cl, S is cc"),
