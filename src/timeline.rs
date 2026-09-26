@@ -10,6 +10,8 @@ use ratatui::{
 };
 use serde_json::Value;
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::{model::Activity, picture, state::ThreadState};
 
 pub const USER_MARK: &str = "▌";
@@ -1090,17 +1092,36 @@ pub fn place_message_images(
             .filter(|(_, span)| span.content.trim_end() == IMAGE_MARK)
             .map(|(at, _)| at)
             .collect();
-        // What this one line has: each picture and the rows it asked for, none of which
-        // can be given out until the caption itself has a line number.
-        let mut here: Vec<(String, u16)> = Vec::new();
+        // Where each marker is, and how far its picture may reach: to the edge of the table
+        // cell it is in, or to the end of the line. A row of a table is one line with a
+        // picture in each cell, and each goes under its own cell.
+        let span_width = |span: &Span| UnicodeWidthStr::width(span.content.as_ref()) as u16;
+        let reach: Vec<(u16, u16)> = marks
+            .iter()
+            .map(|&mark| {
+                let column: u16 = line.spans[..mark].iter().map(span_width).sum();
+                let mut at = column;
+                let edge = line.spans[mark..]
+                    .iter()
+                    .find_map(|span| {
+                        let start = at;
+                        at += span_width(span);
+                        (span.content.as_ref() == "│").then_some(start)
+                    })
+                    .unwrap_or(width);
+                (column, edge)
+            })
+            .collect();
+        // What this one line has: each picture, the column it goes in, and the rows it asked
+        // for, none of which can be given out until the caption itself has a line number.
+        let mut here: Vec<(String, u16, u16)> = Vec::new();
         let mut shown = Vec::new();
         let mut note = None;
-        for mark in marks {
+        for (&mark, &(column, edge)) in marks.iter().zip(&reach) {
             let Some(source) = sources.next() else { break };
             let key = format!("msg:{id}/{taken}");
             taken += 1;
-            // A message sits against the left edge, so its pictures do too.
-            let room = image_room(width, height, 0);
+            let room = image_room(edge, height, column);
             let Some(path) = image_file(&source) else {
                 let Some(remote) = remote.filter(|_| is_web(&source)) else {
                     continue;
@@ -1113,9 +1134,9 @@ pub fn place_message_images(
                         match picture::place(&key, picture::Source::Data(data), room) {
                             Some(size) => {
                                 shown.push(mark);
-                                here.push((key, size.height));
+                                here.push((key, column, size.height));
                             }
-                            None => here.push((key, 0)),
+                            None => here.push((key, column, 0)),
                         }
                     }
                     Some(None) => note = note.or(Some("could not be fetched")),
@@ -1129,15 +1150,23 @@ pub fn place_message_images(
                     // The marker says there is a picture that cannot be shown. It is
                     // shown, so what is left is the caption it was written with.
                     shown.push(mark);
-                    here.push((key, size.height));
+                    here.push((key, column, size.height));
                 }
                 None => {
                     note = note.or_else(|| missing_file(&path));
-                    here.push((key, 0));
+                    here.push((key, column, 0));
                 }
             }
         }
-        if !shown.is_empty() {
+        // A marker opening its line goes, and the caption closes up. One further along,
+        // as in a table, leaves room the width it was, so the columns stay where they are.
+        let in_place = reach.len() > 1 || reach.first().is_some_and(|(column, _)| *column > 0);
+        if in_place {
+            for &mark in &shown {
+                let blank = " ".repeat(span_width(&line.spans[mark]) as usize);
+                line.spans[mark].content = blank.into();
+            }
+        } else if !shown.is_empty() {
             let mut at = 0;
             line.spans.retain(|_| {
                 let keep = !shown.contains(&at);
@@ -1151,19 +1180,39 @@ pub fn place_message_images(
                 Style::default().fg(Color::DarkGray),
             ));
         }
+        // In a table the lines the pictures take keep the row's borders, so the box still
+        // closes around them; anywhere else they are blank.
+        let under = if in_place {
+            Line::from(
+                line.spans
+                    .iter()
+                    .map(|span| match span.content.as_ref() {
+                        "│" => span.clone(),
+                        _ => Span::raw(" ".repeat(span_width(span) as usize)),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            Line::default()
+        };
         let caption = lines.len();
         lines.push(line);
-        for (key, rows) in here {
-            if rows > 0 {
+        // The pictures of one line sit side by side under it, each in its column, over as
+        // many lines as the tallest of them needs: the renderer draws them there once it
+        // knows where on the screen those lines landed.
+        let first = lines.len();
+        for (key, column, rows) in &here {
+            if *rows > 0 {
                 placed.push(Placed {
-                    line: lines.len(),
-                    indent: 0,
+                    line: first,
+                    indent: *column,
                     key: key.clone(),
                 });
-                // Blank lines, which the renderer draws the picture over once it knows
-                // where on the screen they landed.
-                lines.extend(std::iter::repeat_n(Line::default(), rows as usize));
             }
+        }
+        let rows = here.iter().map(|(_, _, rows)| *rows).max().unwrap_or(0);
+        lines.extend(std::iter::repeat_n(under, rows as usize));
+        for (key, _, _) in here {
             regions.push(Region {
                 first: caption,
                 end: lines.len(),
@@ -1762,6 +1811,80 @@ mod tests {
             ),
         ];
         assert_eq!(work(&rows)[0].status, "completed");
+    }
+
+    /// A table row with a picture in each cell puts each under its own cell, side by side
+    /// rather than one under the other at the left, and the row keeps its columns.
+    #[test]
+    fn pictures_in_a_table_go_under_their_cells() {
+        picture::draw_in_halfblocks();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(picture::test_png(160, 80))
+            .unwrap();
+        let paths: Vec<String> = ["before", "after"]
+            .iter()
+            .map(|name| {
+                let path = std::env::temp_dir().join(format!("tria-table-{name}.png"));
+                std::fs::write(&path, &bytes).unwrap();
+                path.to_str().unwrap().to_string()
+            })
+            .collect();
+        let source = format!(
+            "| Before | After |\n| --- | --- |\n| ![Home ends at its tenth section]({}) | ![Skeleton sections]({}) |\n",
+            paths[0], paths[1]
+        );
+        let mut text = render_assistant(&source, false);
+        let widths_before: Vec<usize> = text
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum()
+            })
+            .collect();
+        let (images, _, _) = place_message_images("t", &source, &mut text, 100, 40, None);
+
+        assert_eq!(images.len(), 2);
+        assert_eq!(
+            images[0].line, images[1].line,
+            "side by side, on the same lines"
+        );
+        let row = images[0].line - 1;
+        let said: String = text.lines[row]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let cell = |at: usize| {
+            UnicodeWidthStr::width(&said[..said.match_indices('│').nth(at).unwrap().0]) as u16
+        };
+        assert!(
+            images[0].indent > cell(0) && images[0].indent < cell(1),
+            "{images:?} in {said:?}"
+        );
+        assert!(
+            images[1].indent > cell(1) && images[1].indent < cell(2),
+            "{images:?} in {said:?}"
+        );
+        assert!(!said.contains(IMAGE_MARK));
+        assert_eq!(
+            UnicodeWidthStr::width(said.as_str()),
+            widths_before[3],
+            "the row is as wide as it was, so its columns still meet the header's"
+        );
+        let under: String = text.lines[images[0].line]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            under.matches('│').count(),
+            3,
+            "the box stays closed: {under:?}"
+        );
+        assert_eq!(under.trim_matches(|c| c == '│' || c == ' '), "");
     }
 
     /// A picture in a message is a picture: the marker `tui_markdown` leaves is the
