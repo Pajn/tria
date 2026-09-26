@@ -465,6 +465,24 @@ pub struct NewThreadDraft {
     pub interaction_mode: String,
     /// Start the thread in a fresh worktree rather than the project's own checkout.
     pub worktree: bool,
+    /// A pull request checked out for the thread to start in, where it was made for one.
+    pub checkout: Option<PreparedCheckout>,
+}
+
+/// A pull request checked out by the server for a thread to be written in.
+#[derive(Debug, Clone)]
+pub struct PreparedCheckout {
+    /// The thread's id, chosen before it exists so the server could set the worktree up
+    /// for it.
+    pub thread_id: Id,
+    pub number: u64,
+    pub branch: String,
+    pub worktree_path: String,
+    /// False where a worktree that was already there kept changes or commits of its own,
+    /// so what the thread starts in is not the pull request's latest.
+    pub on_head: bool,
+    /// The link the thread gets once it exists, where one could be made.
+    pub link: Option<commands::PullRequestLink>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -544,6 +562,13 @@ pub enum AppEvent {
         name: String,
         applied: bool,
         result: Result<(), String>,
+    },
+    /// The server has checked a pull request out for a thread to start in, or could not.
+    CheckoutPrepared {
+        project_id: Id,
+        thread_id: Id,
+        link: Option<commands::PullRequestLink>,
+        result: Result<Value, String>,
     },
     /// A pull request's review history came back, through the server.
     PullRequestActivity {
@@ -795,6 +820,8 @@ pub struct App {
     pull_request_synced: Option<String>,
     /// The stack the open pull request is in, as last drawn.
     pull_request_stack_seen: Option<String>,
+    /// Pull requests to put on threads being made, by the thread they go on.
+    pending_links: HashMap<Id, commands::PullRequestLink>,
     /// The labels on the pull request as the label picker shows them, what each is for, and
     /// whether the repository has more than were read.
     labels_applied: HashSet<String>,
@@ -978,6 +1005,7 @@ impl App {
             pull_request_revision: None,
             pull_request_synced: None,
             pull_request_stack_seen: None,
+            pending_links: HashMap::new(),
             labels_applied: HashSet::new(),
             labels_described: Vec::new(),
             labels_truncated: false,
@@ -1495,6 +1523,11 @@ impl App {
         // the current checkout.
         let env_mode = self.config.settings.thread_env_mode(project);
         self.swap_composer_draft(NEW_THREAD_DRAFT_KEY);
+        // What was being read belonged to the thread being left, as it does when another
+        // thread is opened.
+        self.transcript = None;
+        self.transcript_loading = None;
+        self.pull_request_loading = None;
         self.draft = Some(NewThreadDraft {
             project_id: project_id.to_string(),
             worktree: env_mode.as_deref() == Some("worktree"),
@@ -1506,6 +1539,7 @@ impl App {
                 .clone()
                 .unwrap_or_else(|| "full-access".into()),
             interaction_mode: "default".into(),
+            checkout: None,
         });
         self.current_thread_id = None;
         self.thread = None;
@@ -1693,6 +1727,9 @@ impl App {
     /// the meantime: a thread opened since the message was sent is the one wanted.
     fn on_thread_created(&mut self, thread_id: Id) {
         self.pending_create.take();
+        if let Some(link) = self.pending_links.remove(&thread_id) {
+            self.dispatch(commands::pull_request_link(&thread_id, &link));
+        }
         if self.current_thread_id.as_deref() == Some(thread_id.as_str()) {
             self.handle.open_thread(&thread_id);
         }
@@ -1757,7 +1794,12 @@ impl App {
         if let Some(draft) = self.draft.take() {
             // Resolved above, while the draft was still in place.
             let worktree = self.draft_worktree.take();
-            let thread_id = commands::new_id();
+            let checkout = draft.checkout.as_ref();
+            let thread_id = checkout.map_or_else(commands::new_id, |c| c.thread_id.clone());
+            // The pull request goes on the thread once the server has made it.
+            if let Some(link) = checkout.and_then(|c| c.link.clone()) {
+                self.pending_links.insert(thread_id.clone(), link);
+            }
             let worktree_branch = commands::worktree_branch(&thread_id);
             let title: String = text
                 .lines()
@@ -1784,8 +1826,8 @@ impl App {
                         branch: &worktree_branch,
                         start_from_origin: self.config.settings.new_worktrees_start_from_origin,
                     }),
-                    branch: None,
-                    worktree_path: None,
+                    branch: checkout.map(|c| c.branch.as_str()),
+                    worktree_path: checkout.map(|c| c.worktree_path.as_str()),
                 }),
             );
             // The view moves to the new thread now, and reads as loading until the
@@ -3154,6 +3196,11 @@ impl App {
             self.toast("only a new thread can choose; press n first", true);
             return;
         };
+        if let Some(checkout) = &draft.checkout {
+            let number = checkout.number;
+            self.toast(format!("this thread starts in #{number}'s worktree"), false);
+            return;
+        }
         draft.worktree = !draft.worktree;
         let message = if draft.worktree {
             "new thread starts in a fresh worktree"
@@ -4836,6 +4883,147 @@ impl App {
         Ok((payload, pr.number))
     }
 
+    /// `:checkout` and `c` on a pull request in the sidebar: have the server check the pull
+    /// request out in a worktree, reusing one that already has its branch, and start a new
+    /// thread there. Named by number or link, or else the one being read, the one picked in
+    /// the sidebar, or the one the header shows.
+    fn checkout_pull_request(&mut self, reference: &str) {
+        let Some(project_id) = self.current_project() else {
+            self.toast("open a thread in the project first", true);
+            return;
+        };
+        let Some(cwd) = self
+            .shell
+            .projects
+            .get(&project_id)
+            .map(|p| p.workspace_root.clone())
+        else {
+            self.toast("that project is no longer here", true);
+            return;
+        };
+        let reference = match reference {
+            "" => match self.pull_request_in_view() {
+                Some(url) => url,
+                None => {
+                    self.toast("name a pull request: :checkout 123, or its link", true);
+                    return;
+                }
+            },
+            named => named.to_string(),
+        };
+        // A pull request already on the thread is linked as the thread has it; any other
+        // link is read for what it names.
+        let link = self
+            .thread
+            .as_ref()
+            .and_then(|t| {
+                t.detail
+                    .shell
+                    .pull_requests
+                    .iter()
+                    .find(|pr| pr.url == reference && !pr.host.is_empty())
+                    .map(|pr| commands::PullRequestLink {
+                        host: pr.host.clone(),
+                        repository: pr.repository.clone(),
+                        number: pr.number,
+                        url: pr.url.clone(),
+                    })
+            })
+            .or_else(|| commands::PullRequestLink::from_url(&reference));
+        let thread_id = commands::new_id();
+        let said = link
+            .as_ref()
+            .map_or_else(|| reference.clone(), |l| format!("#{}", l.number));
+        self.toast(format!("checking out {said}…"), false);
+        let payload = json!({
+            "cwd": cwd,
+            "reference": reference,
+            "mode": "worktree",
+            "threadId": thread_id,
+        });
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result = handle
+                .call("git.preparePullRequestThread", payload)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = events.send(AppEvent::CheckoutPrepared {
+                project_id,
+                thread_id,
+                link,
+                result,
+            });
+        });
+    }
+
+    /// The pull request the screen is about: the one being read, else the one picked in
+    /// the sidebar's list, else the one the header shows.
+    fn pull_request_in_view(&self) -> Option<String> {
+        if let Some(detail) = self.transcript.as_ref().and_then(|t| t.pull_request()) {
+            return Some(detail.url.clone());
+        }
+        if self.sidebar_tab == SidebarTab::PullRequests
+            && let Some(SidebarRow::PullRequest { url, .. }) =
+                self.sidebar_rows().get(self.sidebar_selected)
+        {
+            return Some(url.clone());
+        }
+        let shell = &self.thread.as_ref()?.detail.shell;
+        shell
+            .current_pull_request(self.checked_out_branch())
+            .map(|pr| pr.url)
+    }
+
+    fn on_checkout_prepared(
+        &mut self,
+        project_id: Id,
+        thread_id: Id,
+        link: Option<commands::PullRequestLink>,
+        result: Result<Value, String>,
+    ) {
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => return self.toast(format!("checking it out: {error}"), true),
+        };
+        let pull_request = &prepared["pullRequest"];
+        let number = pull_request["number"].as_u64().unwrap_or_default();
+        let (Some(branch), Some(worktree_path)) = (
+            prepared["branch"].as_str(),
+            prepared["worktreePath"].as_str(),
+        ) else {
+            return self.toast("the server checked it out without a worktree", true);
+        };
+        let link = link.or_else(|| {
+            pull_request["url"]
+                .as_str()
+                .and_then(commands::PullRequestLink::from_url)
+        });
+        let on_head = prepared["isOnPullRequestHead"].as_bool().unwrap_or(true);
+        let checkout = PreparedCheckout {
+            thread_id,
+            number,
+            branch: branch.to_string(),
+            worktree_path: worktree_path.to_string(),
+            on_head,
+            link,
+        };
+        self.start_new_thread(&project_id);
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        draft.worktree = false;
+        draft.checkout = Some(checkout);
+        self.toast(
+            if on_head {
+                format!("#{number} is checked out; write what the thread is for")
+            } else {
+                format!("#{number}'s worktree kept changes of its own, so it is not at the latest")
+            },
+            !on_head,
+        );
+    }
+
     /// `L` and `:labels`: the repository's labels, to put on the pull request being read or
     /// take off it. Only offered where the host can change them and the viewer may.
     fn edit_labels(&mut self) {
@@ -5666,6 +5854,7 @@ impl App {
             "sidebar" => self.sidebar_visible = !self.sidebar_visible,
             "pr" | "pull" => self.open_pull_request(true),
             "labels" | "label" => self.edit_labels(),
+            "checkout" => self.checkout_pull_request(arg),
             "tmux" => self.switch_tmux_session(),
             "split" => self.split_tmux_pane(),
             "window" | "tab" => self.new_tmux_window(),
@@ -6610,6 +6799,14 @@ impl App {
                 KeyCode::Char('L') => self.switch_sidebar_tab(1),
                 KeyCode::Char('y') if listing && prefix.is_none() => self.sidebar_yank(),
                 KeyCode::Char('r') if listing => self.sidebar_reread(),
+                KeyCode::Char('c') if self.sidebar_tab == SidebarTab::PullRequests => {
+                    if let Some(SidebarRow::PullRequest { url, .. }) =
+                        self.sidebar_rows().get(self.sidebar_selected)
+                    {
+                        let url = url.clone();
+                        self.checkout_pull_request(&url);
+                    }
+                }
                 // Asked first: it takes the pull request off the thread for every client.
                 KeyCode::Char('d') if self.sidebar_tab == SidebarTab::PullRequests => {
                     if let Some(SidebarRow::PullRequest { url, .. }) =
@@ -8227,6 +8424,12 @@ fn apply(app: &mut App, event: AppEvent) {
         AppEvent::PullRequestImage { url, data } => app.on_pull_request_image(url, data),
         AppEvent::PullRequestActivity { url, result } => app.on_pull_request_activity(url, result),
         AppEvent::LabelCandidates { url, result } => app.on_label_candidates(url, result),
+        AppEvent::CheckoutPrepared {
+            project_id,
+            thread_id,
+            link,
+            result,
+        } => app.on_checkout_prepared(project_id, thread_id, link, result),
         AppEvent::LabelSet {
             url,
             name,
@@ -10661,6 +10864,104 @@ mod tests {
             screen.contains("#1 layer 1") && screen.contains("↳ #2 layer 2"),
             "{screen}"
         );
+    }
+
+    /// `:checkout` has the server check the pull request being read out in a worktree for
+    /// a thread made up front, starts a new thread there, and links the pull request to it
+    /// once the server has made it.
+    #[tokio::test]
+    async fn checkout_starts_a_thread_in_the_pull_requests_worktree() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let project_id = project(&mut app);
+        reading_a_pull_request(&mut app);
+        app.thread.as_mut().unwrap().detail.shell.project_id = project_id;
+        let _ = calls(&mut requests, 2).await;
+
+        app.run_command("checkout");
+        let (payload, reply) = loop {
+            match asked(&mut requests)
+                .await
+                .expect("the checkout is asked for")
+            {
+                crate::session::Request::Call {
+                    tag,
+                    payload,
+                    reply,
+                } if tag == "git.preparePullRequestThread" => {
+                    break (payload, reply);
+                }
+                _ => continue,
+            }
+        };
+        assert_eq!(payload["cwd"], "/src/p", "the project's own checkout");
+        assert_eq!(payload["reference"], "https://github.com/o/r/pull/1");
+        assert_eq!(payload["mode"], "worktree");
+        let thread_id = payload["threadId"]
+            .as_str()
+            .expect("a thread id")
+            .to_string();
+        let _ = reply.send(Ok(json!({
+            "pullRequest": {"number": 1, "title": "layer 1", "url": "https://github.com/o/r/pull/1",
+                "baseBranch": "main", "headBranch": "a", "state": "open"},
+            "branch": "a", "worktreePath": "/src/p-worktrees/a", "isOnPullRequestHead": true,
+        })));
+        let event = tokio::time::timeout(Duration::from_millis(500), sent.recv())
+            .await
+            .expect("it comes back")
+            .expect("an event");
+        apply(&mut app, event);
+        let checkout = app
+            .draft
+            .as_ref()
+            .and_then(|d| d.checkout.clone())
+            .expect("a new thread in it");
+        assert_eq!(checkout.worktree_path, "/src/p-worktrees/a");
+        assert_eq!(app.mode, Mode::Insert, "ready for what the thread is for");
+
+        app.composer.set_text("review this");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let create = sent_command(&mut requests)
+            .await
+            .expect("the thread is made");
+        assert_eq!(
+            create["threadId"],
+            thread_id.as_str(),
+            "the id the checkout was made for"
+        );
+        assert_eq!(create["bootstrap"]["createThread"]["branch"], "a");
+        assert_eq!(
+            create["bootstrap"]["createThread"]["worktreePath"],
+            "/src/p-worktrees/a"
+        );
+        assert!(
+            create["bootstrap"].get("prepareWorktree").is_none(),
+            "no second worktree"
+        );
+
+        app.on_thread_created(thread_id.clone());
+        let link = sent_command(&mut requests)
+            .await
+            .expect("the pull request is linked");
+        assert_eq!(link["type"], "thread.pull-request.link");
+        assert_eq!(link["threadId"], thread_id.as_str());
+        assert_eq!(link["host"], "github.com");
+        assert_eq!(link["repository"], "o/r");
+        assert_eq!(link["number"], 1);
+    }
+
+    /// A new thread is not written under what the thread being left had open.
+    #[tokio::test]
+    async fn a_new_thread_puts_away_what_was_being_read() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let project_id = project(&mut app);
+        reading_a_pull_request(&mut app);
+        app.start_new_thread(&project_id);
+        assert!(app.transcript.is_none());
+        assert!(app.draft.is_some());
     }
 
     #[tokio::test]

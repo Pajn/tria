@@ -264,7 +264,7 @@ newline.
 Commands, entered after `:` in normal mode: `new [project]`, `model`, `effort [level]`,
 `mode plan|default`, `perm <runtime mode>`, `rename [title]`, `project rename <name>`,
 `archive`, `delete!`, `approve [n]`, `stop`, `stop!`, `implement [new]`,
-`older`, `rewind`, `answer`, `dismiss`, `pr`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
+`older`, `rewind`, `answer`, `dismiss`, `pr`, `checkout`, `labels`, `git`, `shell`, `edit`, `view`, `tasks`, `terminals`, `tmux`,
 `reveal`,
 `worktree`, `worktrees`, `settle`, `unsettle`, `wake`, `settled`, `sidebar`, `agents`,
 `usage`, `split`, `window`, `reconnect`, `help`, `q`.
@@ -462,6 +462,16 @@ first, marked `✓`, then the rest with what each is for. `Enter` puts the one u
 on or takes it off, and the list stays open for the next. A change shows at once and goes back
 if the host refuses it. It is only offered where the server says the host can change labels
 and nothing says the viewer may not; the header lists `L` where that is so.
+
+`:checkout` starts a new thread in the pull request's own code. The server checks it out in a
+worktree — reusing one that already has its branch, and bringing it up to the pull request's
+head unless it holds changes or commits of its own — and the new thread starts there, with the
+pull request linked to it once the thread exists. The header says so, and says when a reused
+worktree was not brought up to date. With no argument it is the pull request being read, the
+one picked in the sidebar, or the one the header shows; `:checkout 123` or `:checkout <link>`
+names another, in the open thread's project. `c` on a pull request in the sidebar does the
+same. A pull request whose branch is checked out in the project's own checkout is refused:
+two checkouts cannot have one branch, so the project's checkout has to move off it first.
 
 It keeps itself up to date while it is open, reading the pull request again without a word
 and without moving you: when a turn ends, which the server announces on
@@ -882,7 +892,8 @@ long each has taken, and in two lines what it is doing or how it came out.
 `Enter` reads the one under the cursor in place of the conversation, as `:pr` and `gA` do,
 and leaves the keys in the sidebar, so the next is `j` and `Enter` away; the one being read is
 marked there. `r` reads it again, `y` copies a pull request's link or a subagent's report, and
-`d` unlinks a pull request from the thread, after asking.
+`d` unlinks a pull request from the thread, after asking, and `c` starts a thread in a pull
+request's own code, as `:checkout` does.
 
 ## Other subcommands
 

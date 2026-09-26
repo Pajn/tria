@@ -151,6 +151,53 @@ pub fn session_stop(thread_id: &str) -> Value {
     })
 }
 
+/// Put a pull request on a thread, named as the link names it.
+pub fn pull_request_link(thread_id: &str, link: &PullRequestLink) -> Value {
+    json!({
+        "type": "thread.pull-request.link",
+        "commandId": new_id(),
+        "threadId": thread_id,
+        "host": link.host,
+        "repository": link.repository,
+        "number": link.number,
+        "url": link.url,
+        "source": "manual",
+    })
+}
+
+/// What a thread's link to a pull request is made of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestLink {
+    pub host: String,
+    pub repository: String,
+    pub number: u64,
+    pub url: String,
+}
+
+impl PullRequestLink {
+    /// The link a pull request's own address makes, where it is one of the ordinary
+    /// `https://host/owner/repository/pull/number` kind.
+    pub fn from_url(url: &str) -> Option<Self> {
+        let rest = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))?;
+        let mut parts = rest.split('/');
+        let host = parts.next()?.to_string();
+        let owner = parts.next()?;
+        let repository = parts.next()?;
+        if parts.next()? != "pull" {
+            return None;
+        }
+        let number = parts.next()?.split(['?', '#']).next()?.parse().ok()?;
+        Some(Self {
+            host,
+            repository: format!("{owner}/{repository}"),
+            number,
+            url: url.to_string(),
+        })
+    }
+}
+
 /// Take a pull request off a thread. It is named as the link names it: host, repository,
 /// and number.
 pub fn pull_request_unlink(thread_id: &str, host: &str, repository: &str, number: u64) -> Value {
@@ -299,6 +346,24 @@ pub fn interaction_mode_set(thread_id: &str, interaction_mode: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pull_requests_link_is_read_from_its_address() {
+        assert_eq!(
+            PullRequestLink::from_url("https://github.com/o/r/pull/42#discussion"),
+            Some(PullRequestLink {
+                host: "github.com".into(),
+                repository: "o/r".into(),
+                number: 42,
+                url: "https://github.com/o/r/pull/42#discussion".into(),
+            })
+        );
+        assert_eq!(
+            PullRequestLink::from_url("https://github.com/o/r/issues/42"),
+            None
+        );
+        assert_eq!(PullRequestLink::from_url("42"), None);
+    }
 
     fn selection() -> ModelSelection {
         ModelSelection {

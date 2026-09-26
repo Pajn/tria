@@ -1245,24 +1245,43 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             format!("  in {}", app.shell.project_title(&draft.project_id)),
             Style::default().fg(Color::DarkGray),
         ));
-        let branch = app.vcs().and_then(|vcs| vcs.ref_name.as_deref());
-        let (label, style) = if draft.worktree {
-            ("⌂ new worktree", Style::default().fg(Color::Cyan))
-        } else {
-            ("⌂ project checkout", Style::default().fg(Color::DarkGray))
-        };
-        spans.push(Span::styled(format!("  {label}"), style));
-        if let Some(branch) = branch {
+        // A thread made for a pull request starts in its worktree, whatever `gw` says.
+        if let Some(checkout) = &draft.checkout {
             spans.push(Span::styled(
-                if draft.worktree {
-                    format!(" off {branch}")
-                } else {
-                    format!(" on {branch}")
-                },
+                format!("  ⌂ #{}'s worktree", checkout.number),
+                Style::default().fg(Color::Cyan),
+            ));
+            spans.push(Span::styled(
+                format!(" on {}", checkout.branch),
                 Style::default().fg(Color::DarkGray),
             ));
+            if !checkout.on_head {
+                spans.push(Span::styled(
+                    "  kept changes of its own, not at the latest",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
         }
-        spans.push(Span::styled("  gw", Style::default().fg(Color::DarkGray)));
+        if draft.checkout.is_none() {
+            let branch = app.vcs().and_then(|vcs| vcs.ref_name.as_deref());
+            let (label, style) = if draft.worktree {
+                ("⌂ new worktree", Style::default().fg(Color::Cyan))
+            } else {
+                ("⌂ project checkout", Style::default().fg(Color::DarkGray))
+            };
+            spans.push(Span::styled(format!("  {label}"), style));
+            if let Some(branch) = branch {
+                spans.push(Span::styled(
+                    if draft.worktree {
+                        format!(" off {branch}")
+                    } else {
+                        format!(" on {branch}")
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            spans.push(Span::styled("  gw", Style::default().fg(Color::DarkGray)));
+        }
     } else if let Some(thread) = &app.thread {
         let shell = &thread.detail.shell;
         spans.push(Span::styled(
