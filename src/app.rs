@@ -197,6 +197,7 @@ pub enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
     PullRequest,
+    Label,
     Thread,
     Model,
     Project,
@@ -530,6 +531,18 @@ pub enum AppEvent {
         project: Id,
         bytes: Option<Vec<u8>>,
     },
+    /// The repository's labels came back, for the pull request with this link.
+    LabelCandidates {
+        url: String,
+        result: Result<Value, String>,
+    },
+    /// A label went on or came off, or the host would not have it.
+    LabelSet {
+        url: String,
+        name: String,
+        applied: bool,
+        result: Result<(), String>,
+    },
     /// A pull request's review history came back, through the server.
     PullRequestActivity {
         url: String,
@@ -758,6 +771,11 @@ pub struct App {
     pull_request_synced: Option<String>,
     /// The stack the open pull request is in, as last drawn.
     pull_request_stack_seen: Option<String>,
+    /// The labels on the pull request as the label picker shows them, what each is for, and
+    /// whether the repository has more than were read.
+    labels_applied: HashSet<String>,
+    labels_described: Vec<(String, String)>,
+    pub labels_truncated: bool,
     /// Each pull request's review history as last read, by its link, or why it could not be.
     pub pull_request_activity: HashMap<String, Result<crate::pull_request::Activity, String>>,
     /// Pictures asked for, whether or not they have come back.
@@ -927,6 +945,9 @@ impl App {
             pull_request_revision: None,
             pull_request_synced: None,
             pull_request_stack_seen: None,
+            labels_applied: HashSet::new(),
+            labels_described: Vec::new(),
+            labels_truncated: false,
             pull_request_images_asked: HashSet::new(),
             gh_tokens: Default::default(),
             pane: None,
@@ -4465,35 +4486,17 @@ impl App {
     /// Read a pull request, `quiet`ly to bring an open one up to date, and `fresh` past the
     /// server's cache of what the host said, which it keeps until it has reason to doubt it.
     fn read_pull_request_as(&mut self, url: &str, quiet: bool, fresh: bool) {
-        let Some(shell) = self.thread.as_ref().map(|t| &t.detail.shell) else {
-            self.toast("no thread open", true);
-            return;
-        };
-        let Some(pr) = shell
-            .all_pull_requests(self.checked_out_branch())
-            .into_iter()
-            .find(|pr| pr.url == url)
-        else {
-            self.toast("that pull request is not linked to this thread", true);
-            return;
+        let (payload, number) = match self.pull_request_payload(url) {
+            Ok(found) => found,
+            Err(why) => return self.toast(why, true),
         };
         if self.pull_request_loading.as_deref() == Some(url) {
             return;
         }
-        let mut payload = json!({
-            "projectId": shell.project_id,
-            "repository": pr.repository,
-            "number": pr.number,
-        });
-        // One the server found on the branch but never linked has no host of its own; the
-        // server then takes the project's.
-        if !pr.host.is_empty() {
-            payload["host"] = json!(pr.host);
-        }
         self.pull_request_loading = Some(url.to_string());
         self.pull_request_quiet = quiet;
         if !quiet {
-            self.toast(format!("reading #{}…", pr.number), false);
+            self.toast(format!("reading #{number}…"), false);
         }
         let url = url.to_string();
         let handle = self.handle.clone();
@@ -4529,6 +4532,195 @@ impl App {
             };
             tokio::join!(detail, activity);
         });
+    }
+
+    /// How the server knows a pull request linked to the open thread: its project, host,
+    /// repository, and number. And the number, to speak of it by.
+    fn pull_request_payload(&self, url: &str) -> Result<(Value, u64), &'static str> {
+        let shell = &self.thread.as_ref().ok_or("no thread open")?.detail.shell;
+        let pr = shell
+            .all_pull_requests(self.checked_out_branch())
+            .into_iter()
+            .find(|pr| pr.url == url)
+            .ok_or("that pull request is not linked to this thread")?;
+        let mut payload = json!({
+            "projectId": shell.project_id,
+            "repository": pr.repository,
+            "number": pr.number,
+        });
+        // One the server found on the branch but never linked has no host of its own; the
+        // server then takes the project's.
+        if !pr.host.is_empty() {
+            payload["host"] = json!(pr.host);
+        }
+        Ok((payload, pr.number))
+    }
+
+    /// `L` and `:labels`: the repository's labels, to put on the pull request being read or
+    /// take off it. Only offered where the host can change them and the viewer may.
+    fn edit_labels(&mut self) {
+        let Some(detail) = self.transcript.as_ref().and_then(|t| t.pull_request()) else {
+            self.toast("read a pull request first: gp", true);
+            return;
+        };
+        if !detail.labels_editable() {
+            self.toast("its labels cannot be changed from here", true);
+            return;
+        }
+        let url = detail.url.clone();
+        let (payload, _) = match self.pull_request_payload(&url) {
+            Ok(found) => found,
+            Err(why) => return self.toast(why, true),
+        };
+        self.toast("reading the labels…", false);
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result = handle
+                .call("pullRequests.labelCandidates", payload)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = events.send(AppEvent::LabelCandidates { url, result });
+        });
+    }
+
+    fn on_label_candidates(&mut self, url: String, result: Result<Value, String>) {
+        let still_open = self
+            .transcript
+            .as_ref()
+            .and_then(|t| t.pull_request())
+            .is_some_and(|d| d.url == url);
+        if !still_open {
+            return;
+        }
+        let list = match result.and_then(|value| {
+            serde_json::from_value::<crate::pull_request::LabelCandidates>(value)
+                .map_err(|e| e.to_string())
+        }) {
+            Ok(list) => list,
+            Err(error) => return self.toast(format!("reading the labels: {error}"), true),
+        };
+        if list.candidates.is_empty() {
+            return self.toast("the repository has no labels", false);
+        }
+        self.toast = None;
+        self.labels_applied = list
+            .candidates
+            .iter()
+            .filter(|c| c.is_applied)
+            .map(|c| c.name.clone())
+            .collect();
+        self.labels_described = list
+            .candidates
+            .iter()
+            .map(|c| (c.name.clone(), c.description.clone().unwrap_or_default()))
+            .collect();
+        self.labels_truncated = list.truncated;
+        self.open_picker(PickerKind::Label);
+    }
+
+    /// A label's row: the ones on it say so first, then what the label is for.
+    fn label_item(&self, name: &str, description: &str) -> PickerItem {
+        let on = self.labels_applied.contains(name);
+        PickerItem {
+            label: format!("{} {name}", if on { "✓" } else { " " }),
+            detail: description.to_string(),
+            key: name.to_string(),
+        }
+    }
+
+    /// `Enter` on a label: put it on, or take it off, and stay for the next one.
+    fn toggle_label(&mut self) {
+        let Some(name) = self
+            .picker
+            .as_ref()
+            .and_then(|p| p.filtered().get(p.selected).map(|item| item.key.clone()))
+        else {
+            return;
+        };
+        let Some(url) = self
+            .transcript
+            .as_ref()
+            .and_then(|t| t.pull_request())
+            .map(|d| d.url.clone())
+        else {
+            return;
+        };
+        let (mut payload, _) = match self.pull_request_payload(&url) {
+            Ok(found) => found,
+            Err(why) => return self.toast(why, true),
+        };
+        let applied = !self.labels_applied.contains(&name);
+        payload["labels"] = json!([name]);
+        payload["applied"] = json!(applied);
+        // Shown as done at once, and put back if the host refuses it.
+        self.set_label_shown(&name, applied);
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result = handle
+                .call("pullRequests.setLabels", payload)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            let _ = events.send(AppEvent::LabelSet {
+                url,
+                name,
+                applied,
+                result,
+            });
+        });
+    }
+
+    fn set_label_shown(&mut self, name: &str, applied: bool) {
+        if applied {
+            self.labels_applied.insert(name.to_string());
+        } else {
+            self.labels_applied.remove(name);
+        }
+        let description = self
+            .labels_described
+            .iter()
+            .find(|(label, _)| label == name)
+            .map(|(_, description)| description.clone())
+            .unwrap_or_default();
+        let item = self.label_item(name, &description);
+        if let Some(row) = self
+            .picker
+            .as_mut()
+            .filter(|p| p.kind == PickerKind::Label)
+            .and_then(|p| p.items.iter_mut().find(|i| i.key == name))
+        {
+            *row = item;
+        }
+    }
+
+    fn on_label_set(
+        &mut self,
+        url: String,
+        name: String,
+        applied: bool,
+        result: Result<(), String>,
+    ) {
+        match result {
+            Ok(()) => {
+                let done = if applied { "put on" } else { "took off" };
+                self.toast(format!("{done} {name}"), false);
+                // The chips across the top are the pull request's own, read again.
+                let open = self
+                    .transcript
+                    .as_ref()
+                    .and_then(|t| t.pull_request())
+                    .is_some_and(|d| d.url == url);
+                if open {
+                    self.read_pull_request_as(&url, true, true);
+                }
+            }
+            Err(error) => {
+                self.set_label_shown(&name, !applied);
+                self.toast(format!("{name}: {error}"), true);
+            }
+        }
     }
 
     /// The server says pull requests may have changed: a turn has ended, and the agent may
@@ -4826,6 +5018,17 @@ impl App {
 
     fn open_picker(&mut self, kind: PickerKind) {
         let items: Vec<PickerItem> = match kind {
+            // The ones on it first, then the rest in the repository's own order.
+            PickerKind::Label => {
+                let (on, off): (Vec<_>, Vec<_>) = self
+                    .labels_described
+                    .iter()
+                    .partition(|(name, _)| self.labels_applied.contains(name));
+                on.into_iter()
+                    .chain(off)
+                    .map(|(name, description)| self.label_item(name, description))
+                    .collect()
+            }
             PickerKind::Thread => self
                 .shell
                 .sorted_threads(&commands::now_iso(), true)
@@ -5033,6 +5236,8 @@ impl App {
         match picker.kind {
             PickerKind::Thread => self.open_thread(&item.key),
             PickerKind::PullRequest => self.read_pull_request(&item.key),
+            // Toggled where the key is read, so the list stays open for the next one.
+            PickerKind::Label => {}
             PickerKind::Project => self.start_new_thread(&item.key),
             PickerKind::Model => {
                 let (instance_id, slug) = item.key.split_once('\t').unwrap_or((&item.key, ""));
@@ -5199,6 +5404,7 @@ impl App {
             }
             "sidebar" => self.sidebar_visible = !self.sidebar_visible,
             "pr" | "pull" => self.open_pull_request(true),
+            "labels" | "label" => self.edit_labels(),
             "tmux" => self.switch_tmux_session(),
             "split" => self.split_tmux_pane(),
             "window" | "tab" => self.new_tmux_window(),
@@ -5423,6 +5629,10 @@ impl App {
                     return;
                 }
                 KeyCode::Tab | KeyCode::BackTab => self.leave_transcript(),
+                KeyCode::Char('L') if idle && reading_pull_request => {
+                    self.edit_labels();
+                    return;
+                }
                 KeyCode::Char('[') if idle && reading_pull_request => {
                     self.move_through_stack(-1);
                     return;
@@ -6802,6 +7012,7 @@ impl App {
                     Mode::Normal
                 };
             }
+            KeyCode::Enter if picker.kind == PickerKind::Label => self.toggle_label(),
             KeyCode::Enter => self.picker_select(),
             // Ctrl-r rather than r: the letters go to the search, which is what the
             // list is driven by. The name being changed takes the search's place, so
@@ -7671,6 +7882,13 @@ fn apply(app: &mut App, event: AppEvent) {
         AppEvent::PullRequest { url, result } => app.on_pull_request(url, result),
         AppEvent::PullRequestImage { url, data } => app.on_pull_request_image(url, data),
         AppEvent::PullRequestActivity { url, result } => app.on_pull_request_activity(url, result),
+        AppEvent::LabelCandidates { url, result } => app.on_label_candidates(url, result),
+        AppEvent::LabelSet {
+            url,
+            name,
+            applied,
+            result,
+        } => app.on_label_set(url, name, applied, result),
         AppEvent::Favicon { project, bytes } => app.on_favicon(project, bytes),
     }
 }
@@ -9606,6 +9824,95 @@ mod tests {
                 .any(|(tag, payload)| tag == "pullRequests.detail" && payload["number"] == 2),
             "{asked:?}"
         );
+    }
+
+    /// `L` lists the repository's labels, the ones on it first; `Enter` puts one on and
+    /// shows it at once, and a label the host refuses goes back to how it was.
+    #[tokio::test]
+    async fn labels_go_on_and_come_off() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(stacked_thread());
+        app.current_thread_id = Some("t1".into());
+        let url = "https://github.com/o/r/pull/1".to_string();
+        let mut editable = open_detail("layer 1");
+        editable["capabilities"] = json!({"labels": true});
+
+        // Not until the host says it can.
+        app.pull_request_loading = Some(url.clone());
+        app.on_pull_request(url.clone(), Ok(open_detail("layer 1")));
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.0.as_str()),
+            Some("its labels cannot be changed from here")
+        );
+
+        app.pull_request_loading = Some(url.clone());
+        app.on_pull_request(url.clone(), Ok(editable));
+        let _ = calls(&mut requests, 2).await;
+        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
+        let reply = loop {
+            match asked(&mut requests)
+                .await
+                .expect("the labels are asked for")
+            {
+                crate::session::Request::Call { tag, reply, .. }
+                    if tag == "pullRequests.labelCandidates" =>
+                {
+                    break reply;
+                }
+                _ => continue,
+            }
+        };
+        let _ = reply.send(Ok(json!({"truncated": false, "candidates": [
+            {"name": "bug", "color": "d73a4a", "description": "Something is wrong", "isApplied": false},
+            {"name": "docs", "color": null, "description": null, "isApplied": true},
+        ]})));
+        let event = tokio::time::timeout(Duration::from_millis(500), sent.recv())
+            .await
+            .expect("they come back")
+            .expect("an event");
+        apply(&mut app, event);
+        let rows = |app: &App| -> Vec<String> {
+            app.picker
+                .as_ref()
+                .expect("the labels")
+                .items
+                .iter()
+                .map(|i| i.label.clone())
+                .collect()
+        };
+        assert_eq!(rows(&app), vec!["✓ docs", "  bug"]);
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            rows(&app),
+            vec!["✓ docs", "✓ bug"],
+            "shown at once, and still open"
+        );
+        let (payload, reply) = loop {
+            match asked(&mut requests).await.expect("it is put on") {
+                crate::session::Request::Call {
+                    tag,
+                    payload,
+                    reply,
+                } if tag == "pullRequests.setLabels" => break (payload, reply),
+                _ => continue,
+            }
+        };
+        assert_eq!(payload["labels"], json!(["bug"]));
+        assert_eq!(payload["applied"], true);
+        assert_eq!(payload["number"], 1);
+
+        let _ = reply.send(Err(anyhow::anyhow!("not allowed")));
+        let event = tokio::time::timeout(Duration::from_millis(500), sent.recv())
+            .await
+            .expect("the refusal comes back")
+            .expect("an event");
+        apply(&mut app, event);
+        assert_eq!(rows(&app), vec!["✓ docs", "  bug"], "put back");
     }
 
     #[tokio::test]

@@ -456,6 +456,12 @@ request's own host is fetched with the token `gh auth token` gives for that host
 a private repository's uploads need, so `gh` has to be installed and signed in where tria runs
 for those.
 
+`L`, or `:labels`, lists the repository's labels to change the pull request's: the ones on it
+first, marked `✓`, then the rest with what each is for. `Enter` puts the one under the cursor
+on or takes it off, and the list stays open for the next. A change shows at once and goes back
+if the host refuses it. It is only offered where the server says the host can change labels
+and nothing says the viewer may not; the header lists `L` where that is so.
+
 It keeps itself up to date while it is open, reading the pull request again without a word
 and without moving you: when a turn ends, which the server announces on
 `pullRequests.subscribeRefreshes` because the agent may have pushed, commented, or merged, and

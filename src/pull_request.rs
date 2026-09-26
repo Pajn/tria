@@ -74,6 +74,55 @@ pub struct Detail {
     /// Who has been asked to review and has not answered since.
     #[serde(default)]
     pub reviewers: Vec<Actor>,
+    /// What the host can do with a pull request, and what this viewer may.
+    #[serde(default)]
+    pub capabilities: Option<Capabilities>,
+    #[serde(default)]
+    pub viewer_permissions: Option<Permissions>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Capabilities {
+    /// A server that says nothing about labels has no way to change them.
+    #[serde(default)]
+    pub labels: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Permissions {
+    /// Absent is granted, like every permission the server reports.
+    #[serde(default)]
+    pub labels: Option<bool>,
+}
+
+impl Detail {
+    /// Whether its labels can be changed from here: the host has to be able to, and the
+    /// viewer must not have been told they may not.
+    pub fn labels_editable(&self) -> bool {
+        let host = self.capabilities.as_ref().and_then(|c| c.labels) == Some(true);
+        let viewer = self.viewer_permissions.as_ref().and_then(|p| p.labels) != Some(false);
+        host && viewer
+    }
+}
+
+/// A label the repository has, from `pullRequests.labelCandidates`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelCandidate {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub is_applied: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LabelCandidates {
+    #[serde(default)]
+    pub candidates: Vec<LabelCandidate>,
+    /// The repository has more labels than the server read.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// The conversation half of a pull request, from `pullRequests.activity`, which the server
@@ -1317,6 +1366,23 @@ mod tests {
             "stack 2/3  ◆ #1 › ● #2 › ◌ #3   [ ] move through it"
         );
         assert_eq!(lines[1], "#42 Add the thing");
+    }
+
+    /// Labels can be changed where the host can and the viewer has not been told otherwise;
+    /// a server that says nothing about labels cannot.
+    #[test]
+    fn labels_are_editable_where_host_and_viewer_allow() {
+        let mut pr = detail(json!([]));
+        assert!(!pr.labels_editable(), "nothing said is nothing offered");
+        pr.capabilities = Some(Capabilities { labels: Some(true) });
+        assert!(
+            pr.labels_editable(),
+            "a permission not mentioned is granted"
+        );
+        pr.viewer_permissions = Some(Permissions {
+            labels: Some(false),
+        });
+        assert!(!pr.labels_editable());
     }
 
     #[test]

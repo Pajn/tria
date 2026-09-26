@@ -973,7 +973,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
         spans.push(Span::styled(
-            if transcript.pull_request().is_some() {
+            if transcript
+                .pull_request()
+                .is_some_and(|d| d.labels_editable())
+            {
+                "  r re-reads · gx opens · L labels · q back"
+            } else if transcript.pull_request().is_some() {
                 "  r re-reads · gx opens · q back"
             } else if transcript.live {
                 "  r re-reads · q back"
@@ -2162,6 +2167,10 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         PickerKind::Project => " new thread in project · ^R renames ",
         PickerKind::Effort => " effort ",
         PickerKind::PullRequest => " pull requests · ^Y copies the link · ^D unlinks ",
+        PickerKind::Label if app.labels_truncated => {
+            " labels, not all the repository has · Enter puts on or takes off · Esc done "
+        }
+        PickerKind::Label => " labels · Enter puts on or takes off · Esc done ",
     };
     // The question stands where the keys are listed until it has its answer.
     let asking = picker.unlinking.as_ref().map(|url| {
@@ -3306,6 +3315,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
             "  gx                      open the link, picture, or pull request under the cursor",
         ),
         Line::from("  gp                      read the thread's pull request in place of the chat"),
+        Line::from("  [ ]  L                  reading one: the layer below or above, its labels"),
         Line::from("  click a link            open it in the browser"),
         Line::from(
             "  gt                      switch to the tmux session for the thread's directory",
