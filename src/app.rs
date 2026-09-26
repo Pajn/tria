@@ -755,9 +755,10 @@ pub struct App {
     /// The pull request whose detail is on its way, by its link, so a second `Enter` does
     /// not ask for it twice.
     pub pull_request_loading: Option<String>,
-    /// How many times a pull request has been read, which is the revision each read gets:
-    /// the chat rebuilds what it draws when the revision moves.
-    pull_request_reads: u64,
+    /// How many times something has been read in place of the conversation, or redrawn
+    /// there, which is the revision each read gets. The chat rebuilds what it draws only
+    /// when the revision moves, and a re-read keeps the identity of the one before it.
+    reads: u64,
     /// The pictures pull requests' descriptions show, by their links: base64, or `None`
     /// where the fetch failed. Kept for the session, so a re-read does not fetch again.
     pub pull_request_images: HashMap<String, Option<String>>,
@@ -938,7 +939,7 @@ impl App {
             transcript: None,
             transcript_loading: None,
             pull_request_loading: None,
-            pull_request_reads: 0,
+            reads: 0,
             pull_request_images: HashMap::new(),
             pull_request_activity: HashMap::new(),
             pull_request_quiet: false,
@@ -3789,11 +3790,13 @@ impl App {
         let Some(agent) = agents.iter().find(|agent| agent.id == agent_id) else {
             return;
         };
-        let (state, summary) =
+        let (mut state, summary) =
             match crate::transcript::parse(&file.contents, &agent.id, &agent.title) {
                 Ok(parsed) => parsed,
                 Err(error) => return self.toast(format!("{error}"), true),
             };
+        self.reads += 1;
+        state.revision = self.reads;
         let mut subtitle = format!(
             "{} message{} · {} tool call{}",
             summary.messages,
@@ -4459,8 +4462,8 @@ impl App {
             .as_mut()
             .filter(|t| t.pull_request().is_some())
         {
-            self.pull_request_reads += 1;
-            open.state.revision = self.pull_request_reads;
+            self.reads += 1;
+            open.state.revision = self.reads;
         }
     }
 
@@ -4754,8 +4757,8 @@ impl App {
         if self.pull_request_stack_seen.as_ref() != Some(&stack) {
             self.pull_request_stack_seen = Some(stack);
             if let Some(open) = self.transcript.as_mut() {
-                self.pull_request_reads += 1;
-                open.state.revision = self.pull_request_reads;
+                self.reads += 1;
+                open.state.revision = self.reads;
             }
         }
         let synced = self.synced_link(&url);
@@ -4838,8 +4841,8 @@ impl App {
             .as_mut()
             .filter(|t| t.pull_request().is_some_and(|d| d.url == url))
         {
-            self.pull_request_reads += 1;
-            open.state.revision = self.pull_request_reads;
+            self.reads += 1;
+            open.state.revision = self.reads;
         }
     }
 
@@ -4874,8 +4877,8 @@ impl App {
             Err(error) => return self.toast(format!("reading the pull request: {error}"), true),
         };
         self.fetch_pull_request_images(&detail);
-        self.pull_request_reads += 1;
-        let state = match crate::pull_request::state(&detail, self.pull_request_reads) {
+        self.reads += 1;
+        let state = match crate::pull_request::state(&detail, self.reads) {
             Ok(state) => state,
             Err(error) => return self.toast(format!("{error}"), true),
         };
@@ -9559,6 +9562,82 @@ mod tests {
             Some("ghe.example.com")
         );
         assert_eq!(url_host("not a link"), None);
+    }
+
+    /// A thread whose one subagent is still working.
+    fn thread_with_a_running_agent() -> ThreadState {
+        let started = json!({
+            "id": "task.started-1", "kind": "task.started", "tone": "info", "summary": "",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "payload": {"taskId": "a1", "agentKind": "agent", "taskType": "local_agent",
+                "title": "Look into it"},
+        });
+        serde_json::from_value::<crate::model::ThreadDetailSnapshot>(json!({
+            "snapshotSequence": 0,
+            "thread": {"id": "t1", "projectId": "p", "title": "A thread",
+                "modelSelection": {"instanceId": "c", "model": "m"},
+                "messages": [], "activities": [started], "proposedPlans": []},
+        }))
+        .map(ThreadState::from_snapshot)
+        .unwrap()
+    }
+
+    fn transcript_saying(replies: &[&str]) -> TranscriptFile {
+        let mut contents = String::from(
+            r#"{"type":"user","uuid":"u1","timestamp":"1","message":{"role":"user","content":"Look into it"}}"#,
+        );
+        for (n, reply) in replies.iter().enumerate() {
+            contents.push('\n');
+            contents.push_str(
+                &json!({"type": "assistant", "uuid": format!("a{n}"), "timestamp": format!("{}", n + 2),
+                    "message": {"role": "assistant", "content": [{"type": "text", "text": reply}]}})
+                .to_string(),
+            );
+        }
+        TranscriptFile {
+            contents,
+            truncated: false,
+        }
+    }
+
+    fn drawn(app: &mut App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `r` on an agent still working reads what it has written since, and that is what
+    /// the view then shows — not what was drawn the first time.
+    #[tokio::test]
+    async fn reading_a_running_agent_again_shows_what_it_has_written_since() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_with_a_running_agent());
+        app.current_thread_id = Some("t1".into());
+
+        app.transcript_loading = Some("a1".into());
+        app.on_transcript("a1".into(), Ok(transcript_saying(&["Looking now."])));
+        assert!(drawn(&mut app).contains("Looking now."));
+
+        app.transcript_loading = Some("a1".into());
+        app.on_transcript(
+            "a1".into(),
+            Ok(transcript_saying(&["Looking now.", "Found it in ws.ts."])),
+        );
+        assert!(
+            drawn(&mut app).contains("Found it in ws.ts."),
+            "the second read is on the screen"
+        );
     }
 
     fn stacked_thread() -> ThreadState {
