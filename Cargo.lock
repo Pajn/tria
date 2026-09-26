@@ -3228,7 +3228,7 @@ dependencies = [
 
 [[package]]
 name = "tria"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
