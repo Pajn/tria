@@ -4378,18 +4378,26 @@ impl App {
                         })
                 })
                 .collect(),
-            PickerKind::PullRequest => self
-                .thread
-                .as_ref()
-                .map(|t| t.detail.shell.all_pull_requests())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|pr| PickerItem {
-                    label: pr.label(),
-                    detail: pr.state.clone().unwrap_or_default(),
-                    key: pr.url,
-                })
-                .collect(),
+            PickerKind::PullRequest => {
+                let prs = self
+                    .thread
+                    .as_ref()
+                    .map(|t| t.detail.shell.all_pull_requests())
+                    .unwrap_or_default();
+                // The repository only tells rows apart when they are not all from one.
+                let repositories = prs
+                    .iter()
+                    .map(|pr| pr.repository.as_str())
+                    .collect::<HashSet<_>>()
+                    .len();
+                prs.iter()
+                    .map(|pr| PickerItem {
+                        label: pr.label(),
+                        detail: pr.facts(repositories > 1),
+                        key: pr.url.clone(),
+                    })
+                    .collect()
+            }
             PickerKind::Effort => {
                 let Some(descriptor) = self.effort_descriptor() else {
                     self.toast("current model has no effort option", true);
@@ -6264,6 +6272,20 @@ impl App {
                         picker.query.set_text(&title);
                     }
                     None => self.toast("no project under the cursor", true),
+                }
+            }
+            // Ctrl-y for the same reason as Ctrl-r: the letters are the search.
+            KeyCode::Char('y') if ctrl && picker.kind == PickerKind::PullRequest => {
+                match picker
+                    .filtered()
+                    .get(picker.selected)
+                    .map(|item| item.key.clone())
+                {
+                    Some(url) => {
+                        copy_to_clipboard(&url);
+                        self.toast(format!("copied {url}"), false);
+                    }
+                    None => self.toast("no pull request under the cursor", true),
                 }
             }
             KeyCode::Down | KeyCode::Tab => {

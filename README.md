@@ -386,6 +386,12 @@ every twenty seconds otherwise. The pull request on the thread's branch wins; ot
 `gx` opens it in the browser through the platform's URL opener. `:pr` does the same, and
 offers a picker when several pull requests are linked.
 
+A thread can have several pull requests linked, as a stack or side by side. The header shows
+one and counts the rest after it, `+2`, with the worst checks among the ones still open: a
+failure lower in a stack holds up the one shown, so it is not left to be found. The `:pr`
+picker lists every one with its state, checks, and review decision, and its repository when
+they are not all from one; `Ctrl-y` copies the link under the cursor.
+
 ## Programs
 
 `g` and one more key run a program in a terminal of the thread's own, as a popup inside tria:

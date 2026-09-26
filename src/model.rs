@@ -213,24 +213,59 @@ pub struct BranchPullRequest {
 /// What the UI shows for a thread's pull request.
 #[derive(Debug, Clone)]
 pub struct PullRequestRef {
+    pub repository: String,
     pub number: u64,
     pub url: String,
     pub title: Option<String>,
     pub state: Option<String>,
     pub is_draft: bool,
     pub checks_state: Option<String>,
+    pub review_decision: Option<String>,
 }
 
 impl PullRequestRef {
     fn from_linked(pr: &PullRequest) -> Self {
         Self {
+            repository: pr.repository.clone(),
             number: pr.number,
             url: pr.url.clone(),
             title: pr.snapshot.as_ref().map(|s| s.title.clone()),
             state: pr.snapshot.as_ref().map(|s| s.state.clone()),
             is_draft: pr.snapshot.as_ref().is_some_and(|s| s.is_draft),
             checks_state: pr.snapshot.as_ref().and_then(|s| s.checks_state.clone()),
+            review_decision: pr.snapshot.as_ref().and_then(|s| s.review_decision.clone()),
         }
+    }
+
+    /// Still to land. A pull request not synced yet has no state, and is taken to be open
+    /// until it says otherwise.
+    pub fn is_open(&self) -> bool {
+        matches!(self.state.as_deref(), None | Some("open"))
+    }
+
+    /// The facts after the title in a list of them: where it stands, its checks, its
+    /// review, and its repository when the list spans more than one.
+    pub fn facts(&self, with_repository: bool) -> String {
+        let mut facts: Vec<String> = Vec::new();
+        match self.state.as_deref() {
+            Some("open") if self.is_draft => facts.push("draft".into()),
+            Some(state) => facts.push(state.to_string()),
+            None => {}
+        }
+        match self.checks_state.as_deref() {
+            Some("passing") => facts.push("✓ checks passing".into()),
+            Some("failing") => facts.push("✗ checks failing".into()),
+            Some("pending") => facts.push("○ checks pending".into()),
+            _ => {}
+        }
+        // GitHub's words for it, `CHANGES_REQUESTED` and the like, read as words.
+        if let Some(review) = self.review_decision.as_deref().filter(|r| !r.is_empty()) {
+            facts.push(review.to_lowercase().replace('_', " "));
+        }
+        if with_repository {
+            facts.push(self.repository.clone());
+        }
+        facts.join(" · ")
     }
 
     pub fn label(&self) -> String {
@@ -493,12 +528,14 @@ impl ThreadShell {
                     })
                     .map(PullRequestRef::from_linked)
                     .unwrap_or(PullRequestRef {
+                        repository: branch_pr.repository.clone(),
                         number: branch_pr.number,
                         url: branch_pr.url.clone(),
                         title: None,
                         state: None,
                         is_draft: false,
                         checks_state: None,
+                        review_decision: None,
                     }),
             );
         }
@@ -518,6 +555,28 @@ impl ThreadShell {
             }
         }
         out
+    }
+
+    /// The worst checks among the open pull requests given: one failing anywhere holds up
+    /// whatever depends on it, so it is the one worth seeing.
+    pub fn worst_checks<'a>(prs: impl IntoIterator<Item = &'a PullRequestRef>) -> Option<&'a str> {
+        let mut worst = None;
+        for checks in prs
+            .into_iter()
+            .filter(|pr| pr.is_open())
+            .filter_map(|pr| pr.checks_state.as_deref())
+        {
+            let rank = |c: &str| match c {
+                "failing" => 3,
+                "pending" => 2,
+                "passing" => 1,
+                _ => 0,
+            };
+            if rank(checks) > worst.map(rank).unwrap_or(0) {
+                worst = Some(checks);
+            }
+        }
+        worst
     }
 
     pub fn is_settled(&self) -> bool {
@@ -1056,6 +1115,51 @@ mod tests {
         let detail: ThreadDetail = serde_json::from_str(json).unwrap();
         assert_eq!(detail.shell.title, "T");
         assert!(!detail.shell.has_pending_approvals);
+    }
+
+    fn shell_with_prs(prs: serde_json::Value) -> ThreadShell {
+        let mut shell = serde_json::json!({"id":"t","projectId":"p","title":"T",
+            "modelSelection":{"instanceId":"claudeAgent","model":"m"}});
+        shell["pullRequests"] = prs;
+        serde_json::from_value(shell).unwrap()
+    }
+
+    fn linked(number: u64, state: &str, checks: Option<&str>) -> serde_json::Value {
+        serde_json::json!({"repository":"o/r","number":number,
+            "url":format!("https://github.com/o/r/pull/{number}"),
+            "snapshot":{"state":state,"title":format!("pr {number}"),"checksState":checks}})
+    }
+
+    /// A failing pull request anywhere in the thread is the one to see; a merged one
+    /// no longer holds anything up, whatever its checks said.
+    #[test]
+    fn the_worst_checks_are_from_the_open_ones() {
+        let shell = shell_with_prs(serde_json::json!([
+            linked(1, "merged", Some("failing")),
+            linked(2, "open", Some("passing")),
+            linked(3, "open", Some("pending")),
+        ]));
+        let prs = shell.all_pull_requests();
+        assert_eq!(ThreadShell::worst_checks(&prs), Some("pending"));
+        assert_eq!(ThreadShell::worst_checks(&prs[..1]), Some("passing"));
+        assert_eq!(ThreadShell::worst_checks(&[]), None);
+    }
+
+    #[test]
+    fn facts_read_as_words() {
+        let shell = shell_with_prs(serde_json::json!([{"repository":"o/r","number":4,
+            "url":"https://github.com/o/r/pull/4",
+            "snapshot":{"state":"open","title":"t","isDraft":true,"checksState":"failing",
+                "reviewDecision":"CHANGES_REQUESTED"}}]));
+        let pr = &shell.all_pull_requests()[0];
+        assert_eq!(
+            pr.facts(false),
+            "draft · ✗ checks failing · changes requested"
+        );
+        assert_eq!(
+            pr.facts(true),
+            "draft · ✗ checks failing · changes requested · o/r"
+        );
     }
 }
 

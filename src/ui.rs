@@ -936,6 +936,15 @@ fn draw_sidebar_icons(frame: &mut Frame, app: &App, inner: Rect, rows: &[Sidebar
     }
 }
 
+fn checks_glyph(checks: Option<&str>) -> Option<(&'static str, Color)> {
+    match checks {
+        Some("passing") => Some(("✓", Color::Green)),
+        Some("failing") => Some(("✗", Color::Red)),
+        Some("pending") => Some(("○", Color::Yellow)),
+        _ => None,
+    }
+}
+
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
     // While a transcript is open the header names what is being read, since the chat
@@ -1039,7 +1048,8 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             ));
         }
-        if let Some(pr) = shell.primary_pull_request() {
+        let prs = shell.all_pull_requests();
+        if let Some((pr, others)) = prs.split_first() {
             let state_style = match pr.state.as_deref() {
                 Some("merged") => Style::default().fg(Color::Magenta),
                 Some("closed") => Style::default().fg(Color::Red),
@@ -1047,7 +1057,10 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 _ => Style::default().fg(Color::Green),
             };
             let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-            let room = (area.width as usize).saturating_sub(used + 28).max(12);
+            let reserved = if others.is_empty() { 28 } else { 36 };
+            let room = (area.width as usize)
+                .saturating_sub(used + reserved)
+                .max(12);
             spans.push(Span::styled(format!("  #{}", pr.number), state_style));
             if let Some(title) = &pr.title {
                 spans.push(Span::styled(
@@ -1064,12 +1077,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 Some("closed") => tags.push("closed"),
                 _ => {}
             }
-            let checks = match pr.checks_state.as_deref() {
-                Some("passing") => Some(("✓", Color::Green)),
-                Some("failing") => Some(("✗", Color::Red)),
-                Some("pending") => Some(("○", Color::Yellow)),
-                _ => None,
-            };
+            let checks = checks_glyph(pr.checks_state.as_deref());
             if !tags.is_empty() {
                 spans.push(Span::styled(
                     format!(" ({})", tags.join(", ")),
@@ -1082,8 +1090,27 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(color),
                 ));
             }
+            // The rest are counted, with the worst of their checks: one failing further
+            // down a stack holds up the one shown.
+            if !others.is_empty() {
+                spans.push(Span::styled(
+                    format!("  +{}", others.len()),
+                    Style::default().fg(Color::Gray),
+                ));
+                let worst = crate::model::ThreadShell::worst_checks(others);
+                if let Some((glyph, color)) = checks_glyph(worst) {
+                    spans.push(Span::styled(
+                        format!(" {glyph}"),
+                        Style::default().fg(color),
+                    ));
+                }
+            }
             spans.push(Span::styled(
-                "  gx opens",
+                if others.is_empty() {
+                    "  gx opens"
+                } else {
+                    "  gx opens · :pr lists all"
+                },
                 Style::default().fg(Color::DarkGray).dim(),
             ));
         }
@@ -2088,7 +2115,7 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         PickerKind::Model => " models ",
         PickerKind::Project => " new thread in project · ^R renames ",
         PickerKind::Effort => " effort ",
-        PickerKind::PullRequest => " pull requests ",
+        PickerKind::PullRequest => " pull requests · ^Y copies the link ",
     };
     let found = picker.rows().len() - picker.filtered().len();
     let mut block = Block::bordered()
