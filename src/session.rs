@@ -111,6 +111,10 @@ pub enum Update {
         thread_id: Id,
         error: String,
     },
+    /// The server's count of the times pull requests may have changed under it, which it
+    /// moves when a turn ends. The first one after connecting is where it stands, not a
+    /// change.
+    PullRequestsRefreshed(u64),
     Error(String),
 }
 
@@ -325,6 +329,18 @@ async fn run(
                 None
             }
         };
+        // Like the terminal list, a convenience: a server without it only means pull requests
+        // are read again by hand.
+        let mut refreshes = match client
+            .subscribe("pullRequests.subscribeRefreshes", json!({}))
+            .await
+        {
+            Ok(sub) => Some(sub),
+            Err(err) => {
+                tracing::info!(%err, "pull request refreshes unavailable");
+                None
+            }
+        };
         // Attachments belong to one socket; a reconnect drops it and the UI re-attaches.
         let mut attached: Option<Subscription> = None;
         // Subscriptions belong to the socket that made them, so the watches are dropped
@@ -369,6 +385,12 @@ async fn run(
             };
             let attached_next = async {
                 match attached.as_mut() {
+                    Some(sub) => sub.next().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let refresh_next = async {
+                match refreshes.as_mut() {
                     Some(sub) => sub.next().await,
                     None => std::future::pending().await,
                 }
@@ -502,6 +524,20 @@ async fn run(
                             let _ = updates.send(Update::Error(format!("terminal detached: {err}")));
                         }
                         None => attached = None,
+                    }
+                }
+                item = refresh_next => {
+                    match item {
+                        Some(Ok(value)) => {
+                            if let Some(revision) = value.as_u64() {
+                                let _ = updates.send(Update::PullRequestsRefreshed(revision));
+                            }
+                        }
+                        Some(Err(err)) => {
+                            tracing::info!(%err, "pull request refreshes stopped");
+                            refreshes = None;
+                        }
+                        None => refreshes = None,
                     }
                 }
                 item = terminal_next => {

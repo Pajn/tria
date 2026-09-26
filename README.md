@@ -451,7 +451,12 @@ request's own host is fetched with the token `gh auth token` gives for that host
 a private repository's uploads need, so `gh` has to be installed and signed in where tria runs
 for those.
 
-Nothing pushes changes to it: `r` reads it again, keeping the place. A message written while it
+It keeps itself up to date while it is open, reading the pull request again without a word
+and without moving you: when a turn ends, which the server announces on
+`pullRequests.subscribeRefreshes` because the agent may have pushed, commented, or merged, and
+when the server's own sync with the host brings news of it to the thread list — checks
+finishing, a review, a merge. `r` reads it again by hand. Each of these asks the server to drop
+its copy first, since it keeps what the host said until it has reason to doubt it. A message written while it
 is open goes to the main agent, after asking, starting with `Sent looking at pull request
 <repository>#<number> (<link>):`.
 

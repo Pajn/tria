@@ -748,6 +748,14 @@ pub struct App {
     /// The pictures pull requests' descriptions show, by their links: base64, or `None`
     /// where the fetch failed. Kept for the session, so a re-read does not fetch again.
     pub pull_request_images: HashMap<String, Option<String>>,
+    /// Whether the read on its way was one nobody asked for, which says nothing and opens
+    /// nothing: it only brings a pull request already open up to date.
+    pull_request_quiet: bool,
+    /// The server's refresh count as last heard, to tell a change from where it stands.
+    pull_request_revision: Option<u64>,
+    /// The open pull request's link as the thread list last had it, to notice the server's
+    /// sync bringing news of it.
+    pull_request_synced: Option<String>,
     /// Each pull request's review history as last read, by its link, or why it could not be.
     pub pull_request_activity: HashMap<String, Result<crate::pull_request::Activity, String>>,
     /// Pictures asked for, whether or not they have come back.
@@ -913,6 +921,9 @@ impl App {
             pull_request_reads: 0,
             pull_request_images: HashMap::new(),
             pull_request_activity: HashMap::new(),
+            pull_request_quiet: false,
+            pull_request_revision: None,
+            pull_request_synced: None,
             pull_request_images_asked: HashSet::new(),
             gh_tokens: Default::default(),
             pane: None,
@@ -3812,7 +3823,7 @@ impl App {
         };
         if let Some(detail) = open.pull_request() {
             let url = detail.url.clone();
-            return self.read_pull_request(&url);
+            return self.read_pull_request_as(&url, false, true);
         }
         let Some(open) = open.agent_id().map(str::to_string) else {
             return;
@@ -4445,6 +4456,12 @@ impl App {
     /// Ask the server for a pull request's detail, to read it in place of the conversation.
     /// The server asks the host, so this is the one read that can be slow.
     fn read_pull_request(&mut self, url: &str) {
+        self.read_pull_request_as(url, false, false);
+    }
+
+    /// Read a pull request, `quiet`ly to bring an open one up to date, and `fresh` past the
+    /// server's cache of what the host said, which it keeps until it has reason to doubt it.
+    fn read_pull_request_as(&mut self, url: &str, quiet: bool, fresh: bool) {
         let Some(shell) = self.thread.as_ref().map(|t| &t.detail.shell) else {
             self.toast("no thread open", true);
             return;
@@ -4471,25 +4488,95 @@ impl App {
             payload["host"] = json!(pr.host);
         }
         self.pull_request_loading = Some(url.to_string());
-        self.toast(format!("reading #{}…", pr.number), false);
-        // The review history is asked for beside the detail rather than after it: it is
-        // the slower of the two, and the view fills it in when it comes.
-        for (tag, activity) in [
-            ("pullRequests.detail", false),
-            ("pullRequests.activity", true),
-        ] {
-            let url = url.to_string();
-            let payload = payload.clone();
-            let handle = self.handle.clone();
-            let events = self.events.clone();
-            tokio::spawn(async move {
-                let result = handle.call(tag, payload).await.map_err(|e| e.to_string());
-                let _ = events.send(if activity {
-                    AppEvent::PullRequestActivity { url, result }
-                } else {
-                    AppEvent::PullRequest { url, result }
+        self.pull_request_quiet = quiet;
+        if !quiet {
+            self.toast(format!("reading #{}…", pr.number), false);
+        }
+        let url = url.to_string();
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            if fresh {
+                let reference = json!({ "reference": payload });
+                if let Err(err) = handle.call("pullRequests.invalidate", reference).await {
+                    tracing::info!(%err, "the server kept its copy of the pull request");
+                }
+            }
+            // The review history is asked for beside the detail rather than after it: it
+            // is the slower of the two, and the view fills it in when it comes.
+            let detail = async {
+                let result = handle
+                    .call("pullRequests.detail", payload.clone())
+                    .await
+                    .map_err(|e| e.to_string());
+                let _ = events.send(AppEvent::PullRequest {
+                    url: url.clone(),
+                    result,
                 });
-            });
+            };
+            let activity = async {
+                let result = handle
+                    .call("pullRequests.activity", payload.clone())
+                    .await
+                    .map_err(|e| e.to_string());
+                let _ = events.send(AppEvent::PullRequestActivity {
+                    url: url.clone(),
+                    result,
+                });
+            };
+            tokio::join!(detail, activity);
+        });
+    }
+
+    /// The server says pull requests may have changed: a turn has ended, and the agent may
+    /// have pushed, commented, or merged. The first count after connecting is only where it
+    /// stands, unless it moved while the connection was down.
+    fn on_pull_requests_refreshed(&mut self, revision: u64) {
+        let changed = self
+            .pull_request_revision
+            .is_some_and(|seen| seen != revision);
+        self.pull_request_revision = Some(revision);
+        if changed {
+            self.refresh_open_pull_request();
+        }
+    }
+
+    /// The server syncs linked pull requests with the host on its own, and the thread list
+    /// carries what it found. News of the one being read — checks finishing, a review, a
+    /// merge — is a reason to read it again.
+    fn notice_pull_request_sync(&mut self) {
+        let Some(url) = self
+            .transcript
+            .as_ref()
+            .and_then(|t| t.pull_request())
+            .map(|detail| detail.url.clone())
+        else {
+            return;
+        };
+        let synced = self.synced_link(&url);
+        if synced.is_some() && synced != self.pull_request_synced {
+            let had = std::mem::replace(&mut self.pull_request_synced, synced);
+            if had.is_some() {
+                self.refresh_open_pull_request();
+            }
+        }
+    }
+
+    /// What the thread list says of a linked pull request, as something to compare.
+    fn synced_link(&self, url: &str) -> Option<String> {
+        let shell = &self.thread.as_ref()?.detail.shell;
+        let link = shell.pull_requests.iter().find(|pr| pr.url == url)?;
+        Some(format!("{:?}", link.snapshot))
+    }
+
+    fn refresh_open_pull_request(&mut self) {
+        if let Some(url) = self
+            .transcript
+            .as_ref()
+            .and_then(|t| t.pull_request())
+            .map(|detail| detail.url.clone())
+        {
+            self.read_pull_request_as(&url, true, true);
         }
     }
 
@@ -4528,6 +4615,16 @@ impl App {
             return;
         }
         self.pull_request_loading = None;
+        let quiet = std::mem::take(&mut self.pull_request_quiet);
+        // A read nobody asked for only brings up to date what is still open.
+        let open = self
+            .transcript
+            .as_ref()
+            .and_then(|t| t.pull_request())
+            .is_some_and(|open| open.url == url);
+        if quiet && !open {
+            return;
+        }
         let detail = match result.and_then(|value| {
             serde_json::from_value::<crate::pull_request::Detail>(value).map_err(|e| e.to_string())
         }) {
@@ -4537,6 +4634,10 @@ impl App {
                 url: url.clone(),
                 ..detail
             },
+            Err(error) if quiet => {
+                tracing::info!(%error, "bringing the pull request up to date");
+                return;
+            }
             Err(error) => return self.toast(format!("reading the pull request: {error}"), true),
         };
         self.fetch_pull_request_images(&detail);
@@ -4546,11 +4647,10 @@ impl App {
             Err(error) => return self.toast(format!("{error}"), true),
         };
         // A re-read keeps the place in it; anything else starts at the top.
-        let reread = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .is_some_and(|open| open.url == url);
+        let reread = open;
+        if !reread {
+            self.pull_request_synced = self.synced_link(&url);
+        }
         let restore = match &self.transcript {
             Some(open) => open.restore,
             None => (self.scroll, self.chat_cursor, self.focus),
@@ -4565,15 +4665,19 @@ impl App {
             live: false,
             restore,
         });
-        self.toast = None;
-        self.mode = Mode::Normal;
-        self.focus = Focus::Chat;
+        if !quiet {
+            self.toast = None;
+        }
+        // Brought up to date under somebody, it leaves them where they were: writing, with
+        // a selection, or in the middle of a search.
         if !reread {
+            self.mode = Mode::Normal;
+            self.focus = Focus::Chat;
             self.scroll = Scroll::Offset(0);
             self.chat_cursor = 0;
+            self.chat_visual = None;
+            self.search = None;
         }
-        self.chat_visual = None;
-        self.search = None;
     }
 
     /// Take the pull request with this link off the open thread, and out of the picker
@@ -6720,7 +6824,16 @@ impl App {
     // ── Server updates ─────────────────────────────────────────────────
 
     fn on_update(&mut self, update: Update) {
+        let may_sync = matches!(update, Update::Shell(_) | Update::Thread { .. });
+        self.apply_update(update);
+        if may_sync {
+            self.notice_pull_request_sync();
+        }
+    }
+
+    fn apply_update(&mut self, update: Update) {
         match update {
+            Update::PullRequestsRefreshed(revision) => self.on_pull_requests_refreshed(revision),
             Update::Status(status) => {
                 if let Status::Reconnecting { attempt, error } = &status
                     && *attempt == 1
@@ -9274,6 +9387,141 @@ mod tests {
             command["message"]["text"],
             "Sent looking at pull request o/r#1 (https://github.com/o/r/pull/1):\n\nis this ready?"
         );
+    }
+
+    /// A thread with a pull request open in place of its conversation.
+    fn reading_a_pull_request(app: &mut App) {
+        app.thread = Some(stacked_thread());
+        app.current_thread_id = Some("t1".into());
+        app.pull_request_loading = Some("https://github.com/o/r/pull/1".into());
+        app.on_pull_request(
+            "https://github.com/o/r/pull/1".into(),
+            Ok(open_detail("layer 1")),
+        );
+    }
+
+    fn open_detail(title: &str) -> Value {
+        json!({
+            "repository": "o/r", "number": 1, "title": title,
+            "url": "https://github.com/o/r/pull/1", "state": "open",
+            "headBranch": "a", "baseBranch": "main",
+        })
+    }
+
+    /// The calls asked for, by name, and what with.
+    async fn calls(
+        requests: &mut mpsc::UnboundedReceiver<crate::session::Request>,
+        how_many: usize,
+    ) -> Vec<(String, Value)> {
+        let mut calls = Vec::new();
+        while calls.len() < how_many {
+            match asked(requests).await {
+                Some(crate::session::Request::Call {
+                    tag,
+                    payload,
+                    reply,
+                }) => {
+                    // Answered, so a read waiting on this one goes on to the next.
+                    let _ = reply.send(Ok(Value::Null));
+                    calls.push((tag, payload));
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        calls
+    }
+
+    /// The first count after connecting is where the server stands; a change is a turn
+    /// that ended, and the pull request open is read again, past the server's copy of it,
+    /// without a word.
+    #[tokio::test]
+    async fn a_pull_request_is_read_again_when_the_server_says_so() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        reading_a_pull_request(&mut app);
+        app.toast = None;
+
+        app.on_update(crate::session::Update::PullRequestsRefreshed(4));
+        assert!(
+            asked_nothing(&mut requests).await,
+            "where it stands is not a change"
+        );
+
+        app.on_update(crate::session::Update::PullRequestsRefreshed(5));
+        let calls = calls(&mut requests, 3).await;
+        let tags: Vec<&str> = calls.iter().map(|(tag, _)| tag.as_str()).collect();
+        assert_eq!(tags[0], "pullRequests.invalidate", "past the server's copy");
+        assert_eq!(calls[0].1["reference"]["number"], 1);
+        assert!(tags.contains(&"pullRequests.detail") && tags.contains(&"pullRequests.activity"));
+        assert!(app.toast.is_none(), "without a word");
+    }
+
+    /// The server's own sync bringing news of the pull request open is a reason to read it
+    /// again; news of anything else is not.
+    #[tokio::test]
+    async fn news_from_the_sync_reads_it_again() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        reading_a_pull_request(&mut app);
+        let _ = calls(&mut requests, 2).await;
+
+        app.notice_pull_request_sync();
+        assert!(asked_nothing(&mut requests).await, "nothing new yet");
+
+        let shell = &mut app.thread.as_mut().unwrap().detail.shell;
+        let link = shell
+            .pull_requests
+            .iter_mut()
+            .find(|pr| pr.number == 1)
+            .unwrap();
+        link.snapshot.as_mut().unwrap().checks_state = Some("failing".into());
+        app.notice_pull_request_sync();
+        let tags: Vec<String> = calls(&mut requests, 3)
+            .await
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert!(
+            tags.contains(&"pullRequests.detail".to_string()),
+            "{tags:?}"
+        );
+    }
+
+    /// Brought up to date while somebody is writing, it leaves them writing; one that
+    /// comes back after the view was put away does not bring it back.
+    #[tokio::test]
+    async fn a_quiet_read_disturbs_nobody() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        reading_a_pull_request(&mut app);
+        app.mode = Mode::Insert;
+        app.focus = Focus::Composer;
+        app.refresh_open_pull_request();
+        app.on_pull_request(
+            "https://github.com/o/r/pull/1".into(),
+            Ok(open_detail("renamed")),
+        );
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(
+            app.transcript
+                .as_ref()
+                .and_then(|t| t.pull_request())
+                .map(|d| d.title.as_str()),
+            Some("renamed")
+        );
+
+        app.refresh_open_pull_request();
+        app.leave_transcript();
+        app.on_pull_request(
+            "https://github.com/o/r/pull/1".into(),
+            Ok(open_detail("late")),
+        );
+        assert!(app.transcript.is_none(), "put away, it stays away");
     }
 
     #[tokio::test]

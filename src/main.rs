@@ -203,6 +203,9 @@ async fn dump(origin: &str, cfg: &config::Config, thread_id: &str, seconds: u64)
         };
         match update {
             session::Update::Status(status) => println!("status: {status:?}"),
+            session::Update::PullRequestsRefreshed(revision) => {
+                println!("pull requests refreshed: {revision}")
+            }
             session::Update::Config(config) => println!(
                 "config: {} providers, pagination={}",
                 config.providers.len(),
