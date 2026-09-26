@@ -23,7 +23,9 @@ use crate::{
 };
 
 /// The region key a check row is known by, for `gx` to find its link.
-pub const CHECK_KEY: &str = "pr-check:";
+const CHECK_KEY: &str = "pr-check:";
+/// The region key a reviewer's row is known by, which also folds what they last said.
+const REVIEW_KEY: &str = "pr-review:";
 const PASSED_KEY: &str = "pr:passed";
 const SKIPPED_KEY: &str = "pr:skipped";
 const BODY_KEY: &str = "pr:body";
@@ -69,6 +71,46 @@ pub struct Detail {
     pub auto_merge_method: Option<String>,
     #[serde(default)]
     pub workflow_approvals_required: Option<u64>,
+    /// Who has been asked to review and has not answered since.
+    #[serde(default)]
+    pub reviewers: Vec<Actor>,
+}
+
+/// The conversation half of a pull request, from `pullRequests.activity`, which the server
+/// reads separately because a long review history is slow to page through.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Activity {
+    #[serde(default)]
+    pub comments: Vec<Comment>,
+    #[serde(default)]
+    pub review_threads: Vec<ReviewThread>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Comment {
+    /// issue-comment | review-comment | review
+    pub kind: String,
+    #[serde(default)]
+    pub author: Option<Actor>,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The host's word for a review's verdict: APPROVED, CHANGES_REQUESTED, COMMENTED,
+    /// DISMISSED, or PENDING for one not yet submitted.
+    #[serde(default)]
+    pub review_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewThread {
+    #[serde(default)]
+    pub is_resolved: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -144,24 +186,600 @@ pub fn state(detail: &Detail, revision: u64) -> Result<ThreadState> {
 
 /// The view's blocks: where it stands, its checks, and what it says. `images` is what
 /// has come back for the pictures the description points at, by their links.
+///
+/// `activity` is the review history, `None` while it is on its way. A reviewer's row is
+/// open by default when theirs is the latest review, so `za` there shuts it rather than
+/// opening it.
 pub fn blocks(
     detail: &Detail,
+    activity: Option<&Result<Activity, String>>,
     expanded: &HashSet<String>,
     open_levels: u8,
     size: (u16, u16),
     images: &HashMap<String, Option<String>>,
+    now: &str,
 ) -> Vec<Block> {
     let open = |key: &str| open_levels > 0 || expanded.contains(key);
+    let flipped =
+        |key: &str, by_default: bool| open_levels > 0 || expanded.contains(key) != by_default;
     vec![
         summary(detail),
         checks(detail, &open),
-        body(detail, &open, size, images),
+        reviews(detail, activity, &flipped, now, size, images),
+        body(detail, &open, &flipped, size, images),
     ]
 }
 
-/// The pictures the description shows, to be fetched.
-pub fn image_urls(detail: &Detail) -> Vec<String> {
-    crate::timeline::web_images(&markdown_images(&detail.body))
+/// The link a region of the view stands for, for `gx`: a check's page, or the review a
+/// reviewer's row shows.
+pub fn link_at(key: &str, detail: &Detail, activity: Option<&Activity>) -> Option<String> {
+    if let Some(url) = key.strip_prefix(CHECK_KEY) {
+        return Some(url.to_string());
+    }
+    let login = key.strip_prefix(REVIEW_KEY)?;
+    reviewers(detail, activity?)
+        .into_iter()
+        .find(|reviewer| reviewer.login == login)?
+        .shown?
+        .url
+        .clone()
+}
+
+/// Where a reviewer stands, as the host decides it: their latest approval, request for
+/// changes, or dismissal, and only when they have none of those, that they commented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Verdict {
+    ChangesRequested,
+    Waiting,
+    Commented,
+    Approved,
+    Dismissed,
+}
+
+impl Verdict {
+    fn from_state(state: &str) -> Option<Self> {
+        match state {
+            "APPROVED" => Some(Self::Approved),
+            "CHANGES_REQUESTED" => Some(Self::ChangesRequested),
+            "DISMISSED" => Some(Self::Dismissed),
+            "COMMENTED" => Some(Self::Commented),
+            _ => None,
+        }
+    }
+
+    /// Glyph, what a row says they did, what the count calls them, and colour.
+    fn looks(self) -> (&'static str, &'static str, &'static str, Color) {
+        match self {
+            Self::ChangesRequested => ("✗", "requested changes", "changes requested", Color::Red),
+            Self::Waiting => ("○", "review requested", "waiting", Color::Yellow),
+            Self::Commented => ("◇", "commented", "commented", Color::Gray),
+            Self::Approved => ("✓", "approved", "approved", Color::Green),
+            Self::Dismissed => ("⊘", "was dismissed", "dismissed", Color::DarkGray),
+        }
+    }
+}
+
+struct Reviewer<'a> {
+    login: &'a str,
+    verdict: Verdict,
+    /// What they said before being asked again, for a reviewer who is waiting.
+    earlier: Option<Verdict>,
+    /// The review the row stands for: their latest with something to say, else their
+    /// latest at all.
+    shown: Option<&'a Comment>,
+    latest_at: &'a str,
+}
+
+/// Everybody who has reviewed or is waiting to, most pressing first and newest first
+/// within that. The author's own replies are not reviews of their work.
+fn reviewers<'a>(detail: &'a Detail, activity: &'a Activity) -> Vec<Reviewer<'a>> {
+    let author = detail.author.as_ref().map(|a| a.login.as_str());
+    let mut reviews: Vec<&Comment> = activity
+        .comments
+        .iter()
+        .filter(|c| c.kind == "review")
+        .filter(|c| {
+            c.review_state
+                .as_deref()
+                .and_then(Verdict::from_state)
+                .is_some()
+        })
+        .filter(|c| {
+            c.author
+                .as_ref()
+                .is_some_and(|a| Some(a.login.as_str()) != author)
+        })
+        .collect();
+    reviews.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+    let mut out: Vec<Reviewer> = Vec::new();
+    for review in reviews {
+        let login = review
+            .author
+            .as_ref()
+            .map(|a| a.login.as_str())
+            .unwrap_or_default();
+        let verdict = review.review_state.as_deref().and_then(Verdict::from_state);
+        let Some(verdict) = verdict else { continue };
+        let at = match out.iter().position(|r| r.login == login) {
+            Some(at) => at,
+            None => {
+                out.push(Reviewer {
+                    login,
+                    verdict,
+                    earlier: None,
+                    shown: None,
+                    latest_at: "",
+                });
+                out.len() - 1
+            }
+        };
+        let reviewer = &mut out[at];
+        if verdict != Verdict::Commented || reviewer.verdict == Verdict::Commented {
+            reviewer.verdict = verdict;
+        }
+        if !prose(&review.body).is_empty()
+            || reviewer.shown.is_none_or(|s| prose(&s.body).is_empty())
+        {
+            reviewer.shown = Some(review);
+        }
+        reviewer.latest_at = &review.created_at;
+    }
+    for asked in &detail.reviewers {
+        match out.iter_mut().find(|r| r.login == asked.login) {
+            Some(reviewer) => {
+                reviewer.earlier = Some(reviewer.verdict);
+                reviewer.verdict = Verdict::Waiting;
+            }
+            None => out.push(Reviewer {
+                login: &asked.login,
+                verdict: Verdict::Waiting,
+                earlier: None,
+                shown: None,
+                latest_at: "",
+            }),
+        }
+    }
+    out.sort_by(|a, b| a.verdict.cmp(&b.verdict).then(b.latest_at.cmp(a.latest_at)));
+    out
+}
+
+/// How long ago, in the largest unit that fits: `4m`, `3h`, `2d`, `5w`.
+fn ago(since: &str, now: &str) -> String {
+    let parse = |text: &str| {
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()
+    };
+    let (Some(since), Some(now)) = (parse(since), parse(now)) else {
+        return String::new();
+    };
+    let seconds = (now - since).whole_seconds().max(0);
+    match seconds {
+        0..60 => "just now".to_string(),
+        60..3_600 => format!("{}m ago", seconds / 60),
+        3_600..86_400 => format!("{}h ago", seconds / 3_600),
+        86_400..1_209_600 => format!("{}d ago", seconds / 86_400),
+        _ => format!("{}w ago", seconds / 604_800),
+    }
+}
+
+fn reviews(
+    detail: &Detail,
+    activity: Option<&Result<Activity, String>>,
+    open: &dyn Fn(&str, bool) -> bool,
+    now: &str,
+    (width, height): (u16, u16),
+    images: &HashMap<String, Option<String>>,
+) -> Block {
+    let mut drawn = Drawn::default();
+    let activity = match activity {
+        None => {
+            drawn.lines.push(Line::from(vec![
+                heading("Reviews"),
+                Span::styled("  loading…", dim()),
+            ]));
+            drawn.lines.push(Line::default());
+            return block("pr-reviews", drawn.lines, drawn.rows);
+        }
+        Some(Err(error)) => {
+            drawn.lines.push(Line::from(vec![
+                heading("Reviews"),
+                Span::styled(format!("  could not be read: {error}"), dim()),
+            ]));
+            drawn.lines.push(Line::default());
+            return block("pr-reviews", drawn.lines, drawn.rows);
+        }
+        Some(Ok(activity)) => activity,
+    };
+    let reviewers = reviewers(detail, activity);
+    let unresolved = activity
+        .review_threads
+        .iter()
+        .filter(|t| !t.is_resolved)
+        .count();
+
+    let mut header = vec![heading("Reviews")];
+    let mut counted: Vec<(Verdict, usize)> = Vec::new();
+    for reviewer in &reviewers {
+        match counted.last_mut() {
+            Some((verdict, count)) if *verdict == reviewer.verdict => *count += 1,
+            _ => counted.push((reviewer.verdict, 1)),
+        }
+    }
+    if counted.is_empty() {
+        header.push(Span::styled("  none yet", dim()));
+    }
+    for (index, (verdict, count)) in counted.iter().enumerate() {
+        let (glyph, _, word, color) = verdict.looks();
+        header.push(Span::styled(
+            if index == 0 { "  " } else { " · " }.to_string(),
+            dim(),
+        ));
+        header.push(Span::styled(
+            format!("{glyph} {count} {word}"),
+            Style::default().fg(color),
+        ));
+    }
+    if unresolved > 0 {
+        header.push(Span::styled(
+            format!(
+                " · {unresolved} unresolved thread{}",
+                if unresolved == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    drawn.lines.push(Line::from(header));
+
+    // The latest review is the one most likely to be why anybody is looking.
+    let newest = reviewers
+        .iter()
+        .filter(|r| r.shown.is_some_and(|s| !prose(&s.body).is_empty()))
+        .max_by(|a, b| a.latest_at.cmp(b.latest_at))
+        .map(|r| r.login);
+    for reviewer in &reviewers {
+        let (glyph, did, _, color) = reviewer.verdict.looks();
+        let key = format!("{REVIEW_KEY}{}", reviewer.login);
+        let said = reviewer
+            .shown
+            .map(|s| prose(&s.body))
+            .filter(|b| !b.is_empty());
+        let is_open = said.is_some() && open(&key, newest == Some(reviewer.login));
+        let first = drawn.lines.len();
+        let mut spans = vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(color)),
+            Span::raw(format!("@{}", reviewer.login)),
+            Span::styled(format!(" {did}"), Style::default().fg(color)),
+        ];
+        if let Some(earlier) = reviewer.earlier {
+            spans.push(Span::styled(
+                format!(" · earlier {}", earlier.looks().1),
+                dim(),
+            ));
+        }
+        if let Some(shown) = reviewer.shown {
+            let when = ago(&shown.created_at, now);
+            if !when.is_empty() {
+                spans.push(Span::styled(format!(" · {when}"), dim()));
+            }
+        }
+        if said.is_some() {
+            spans.push(Span::styled(if is_open { " ▾" } else { " ▸" }, dim()));
+        }
+        drawn.lines.push(Line::from(spans));
+        let foldable = said.is_some();
+        if let (true, Some(said)) = (is_open, said) {
+            let id = format!("review-{}", reviewer.login);
+            let body = draw_markdown(&id, &said, open, (width.saturating_sub(2), height), images);
+            drawn.append(body, 2);
+        }
+        drawn.rows.push(Region {
+            first,
+            end: drawn.lines.len(),
+            key,
+            foldable,
+        });
+    }
+    drawn.lines.push(Line::default());
+    let mut block = block("pr-reviews", drawn.lines, drawn.rows);
+    block.images = drawn.images;
+    block.pictures = drawn.pictures;
+    block
+}
+
+/// The pictures the description and the reviews shown show, to be fetched.
+pub fn image_urls(detail: &Detail, activity: Option<&Activity>) -> Vec<String> {
+    let pictures = |body: &str| crate::timeline::web_images(&markdown_images(&prose(body)));
+    let mut urls = pictures(&detail.body);
+    for reviewer in activity.map(|a| reviewers(detail, a)).unwrap_or_default() {
+        if let Some(review) = reviewer.shown {
+            urls.extend(pictures(&review.body));
+        }
+    }
+    urls
+}
+
+/// Markdown drawn for the view as the chat draws a message, pictures and all, with each
+/// `<details>` folded to its summary until `za` opens it.
+#[derive(Default)]
+struct Drawn {
+    lines: Vec<Line<'static>>,
+    rows: Vec<Region>,
+    images: Vec<crate::timeline::Placed>,
+    pictures: Vec<(String, crate::timeline::Picture)>,
+}
+
+impl Drawn {
+    /// Take in what was drawn on its own, below what is here and `indent` columns in.
+    fn append(&mut self, other: Drawn, indent: u16) {
+        let offset = self.lines.len();
+        for mut line in other.lines {
+            if indent > 0 {
+                line.spans.insert(0, Span::raw(" ".repeat(indent as usize)));
+            }
+            self.lines.push(line);
+        }
+        self.rows
+            .extend(other.rows.into_iter().map(|region| Region {
+                first: region.first + offset,
+                end: region.end + offset,
+                ..region
+            }));
+        self.images.extend(
+            other
+                .images
+                .into_iter()
+                .map(|placed| crate::timeline::Placed {
+                    line: placed.line + offset,
+                    indent: placed.indent + indent,
+                    ..placed
+                }),
+        );
+        self.pictures.extend(other.pictures);
+    }
+}
+
+/// Draw markdown whose folds are known by `id`. A `<details>` is shut unless it was written
+/// `<details open>`, as the host shows it.
+fn draw_markdown(
+    id: &str,
+    source: &str,
+    open: &dyn Fn(&str, bool) -> bool,
+    (width, height): (u16, u16),
+    images: &HashMap<String, Option<String>>,
+) -> Drawn {
+    let mut drawn = Drawn::default();
+    for (n, segment) in split_details(&markdown_images(source))
+        .into_iter()
+        .enumerate()
+    {
+        match segment {
+            Segment::Markdown(text) => {
+                let mut rendered = crate::timeline::markdown(text.trim_matches('\n'));
+                let (images, rows, pictures) = crate::timeline::place_message_images(
+                    &format!("{id}-{n}"),
+                    &text,
+                    &mut rendered,
+                    width,
+                    height,
+                    Some(images),
+                );
+                let lines = rendered.lines;
+                drawn.append(
+                    Drawn {
+                        lines,
+                        rows,
+                        images,
+                        pictures,
+                    },
+                    0,
+                );
+            }
+            Segment::Details {
+                summary,
+                inner,
+                open: by_default,
+            } => {
+                let key = format!("{id}/details/{n}");
+                let is_open = open(&key, by_default);
+                let first = drawn.lines.len();
+                drawn.lines.push(Line::from(vec![
+                    Span::styled(if is_open { "▾ " } else { "▸ " }, dim()),
+                    Span::styled(summary, Style::default().add_modifier(Modifier::BOLD)),
+                ]));
+                if is_open {
+                    let inner = draw_markdown(
+                        &format!("{id}/{n}"),
+                        &inner,
+                        open,
+                        (width.saturating_sub(2), height),
+                        images,
+                    );
+                    drawn.append(inner, 2);
+                }
+                drawn.rows.push(fold_region(&key, first, drawn.lines.len()));
+            }
+        }
+    }
+    drawn
+}
+
+enum Segment {
+    Markdown(String),
+    Details {
+        summary: String,
+        inner: String,
+        open: bool,
+    },
+}
+
+/// Markdown cut at its top-level `<details>` blocks, which nest. Code is left as written.
+fn split_details(source: &str) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let mut markdown = String::new();
+    let mut raw = String::new();
+    let mut fence: Option<char> = None;
+    let mut depth = 0usize;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let mark = ['`', '~']
+            .into_iter()
+            .find(|mark| trimmed.starts_with(&mark.to_string().repeat(3)));
+        let in_code = fence.is_some() || mark.is_some();
+        match (fence, mark) {
+            (None, Some(mark)) => fence = Some(mark),
+            (Some(open), Some(mark)) if open == mark => fence = None,
+            _ => {}
+        }
+        // Lowercasing ASCII keeps every byte where it was, so positions carry over.
+        let lower = line.to_ascii_lowercase();
+        let opens = if in_code {
+            0
+        } else {
+            lower.matches("<details").count()
+        };
+        let closes = if in_code {
+            0
+        } else {
+            lower.matches("</details>").count()
+        };
+        if depth == 0 {
+            let Some(at) = lower.find("<details").filter(|_| opens > 0) else {
+                markdown.push_str(line);
+                continue;
+            };
+            markdown.push_str(&line[..at]);
+            if !markdown.trim().is_empty() {
+                out.push(Segment::Markdown(std::mem::take(&mut markdown)));
+            }
+            markdown.clear();
+            raw.push_str(&line[at..]);
+        } else {
+            raw.push_str(line);
+        }
+        depth = (depth + opens).saturating_sub(closes);
+        if depth == 0 {
+            out.push(details(&std::mem::take(&mut raw)));
+        }
+    }
+    // An unclosed one runs to the end, as it does in HTML.
+    if depth > 0 {
+        out.push(details(&raw));
+    }
+    if !markdown.trim().is_empty() {
+        out.push(Segment::Markdown(markdown));
+    }
+    out
+}
+
+/// One `<details>` block, from its opening tag to its closing one.
+fn details(raw: &str) -> Segment {
+    let lower = raw.to_ascii_lowercase();
+    let tag_end = lower.find('>').map_or(raw.len(), |at| at + 1);
+    let open = lower[..tag_end].contains(" open");
+    let end = lower
+        .rfind("</details>")
+        .filter(|end| *end >= tag_end)
+        .unwrap_or(raw.len());
+    let mut inner = &raw[tag_end..end];
+    let mut summary = String::new();
+    let lower = inner.to_ascii_lowercase();
+    if let Some(start) = lower
+        .find("<summary")
+        .filter(|at| lower[..*at].trim().is_empty())
+    {
+        let text_start = lower[start..].find('>').map(|at| start + at + 1);
+        if let (Some(from), Some(to)) = (text_start, lower.find("</summary>"))
+            && to >= from
+        {
+            summary = strip_tags(&inner[from..to]);
+            inner = &inner[to + "</summary>".len()..];
+        }
+    }
+    if summary.is_empty() {
+        summary = "Details".to_string();
+    }
+    Segment::Details {
+        summary,
+        inner: inner.to_string(),
+        open,
+    }
+}
+
+/// Text with its tags taken out and its whitespace run together, for a line of its own.
+fn strip_tags(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in text.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What a body says, with its HTML comments taken out: a pull request template's
+/// instructions, bots' bookkeeping, anything the host itself does not show.
+pub fn prose(text: &str) -> String {
+    without_comments(text).trim().to_string()
+}
+
+/// The markdown with its HTML comments cut out. They are found by the markdown parser, so
+/// one written inside code is code and stays. An unclosed comment runs to the end, as it
+/// does in HTML.
+fn without_comments(text: &str) -> String {
+    use pulldown_cmark::{Event, Options, Parser};
+    if !text.contains("<!--") {
+        return text.to_string();
+    }
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_GFM);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    let mut cut: Vec<std::ops::Range<usize>> = Vec::new();
+    // Where a comment began that has not ended yet: an HTML block hands its lines over
+    // one at a time, so a comment can span several of them.
+    let mut open: Option<usize> = None;
+    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+        if !matches!(event, Event::Html(_) | Event::InlineHtml(_)) {
+            continue;
+        }
+        let mut at = range.start;
+        while at < range.end {
+            let rest = &text[at..range.end];
+            match open {
+                Some(start) => match rest.find("-->") {
+                    Some(end) => {
+                        cut.push(start..at + end + 3);
+                        open = None;
+                        at += end + 3;
+                    }
+                    None => break,
+                },
+                None => match rest.find("<!--") {
+                    Some(begin) => {
+                        open = Some(at + begin);
+                        at += begin + 4;
+                    }
+                    None => break,
+                },
+            }
+        }
+    }
+    if let Some(start) = open {
+        cut.push(start..text.len());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    for range in cut {
+        out.push_str(&text[from..range.start]);
+        from = range.end;
+    }
+    out.push_str(&text[from..]);
+    out
 }
 
 /// The description with each `<img>` tag written as the markdown image it stands for. A
@@ -501,44 +1119,36 @@ fn fold_region(key: &str, first: usize, end: usize) -> Region {
 fn body(
     detail: &Detail,
     open: &dyn Fn(&str) -> bool,
-    (width, height): (u16, u16),
+    flipped: &dyn Fn(&str, bool) -> bool,
+    size: (u16, u16),
     images: &HashMap<String, Option<String>>,
 ) -> Block {
     let mut lines = vec![Line::from(heading("Description"))];
     let mut rows = Vec::new();
-    if detail.body.trim().is_empty() {
+    let said = prose(&detail.body);
+    if said.is_empty() {
         lines.push(Line::from(Span::styled("No description.", dim())));
         lines.push(Line::default());
         return block("pr-body", lines, rows);
     }
-    let source = markdown_images(detail.body.trim_end());
-    let mut rendered = crate::timeline::markdown(&source);
-    let (placed, regions, pictures) = crate::timeline::place_message_images(
-        "pr-body",
-        &source,
-        &mut rendered,
-        width,
-        height,
-        Some(images),
-    );
-    let rendered = rendered.lines;
-    let total = rendered.len();
+    let drawn = draw_markdown("pr-body", &said, flipped, size, images);
+    let total = drawn.lines.len();
     // Folded, it stops after its opening lines, or after the picture those lines run into:
     // half a picture is not a preview of one.
     let shown = if total > BODY_FOLD && !open(BODY_KEY) {
-        regions
+        drawn
+            .rows
             .iter()
-            .filter(|region| region.first < BODY_SHOWN)
+            .filter(|region| !region.foldable && region.first < BODY_SHOWN)
             .map(|region| region.end)
             .fold(BODY_SHOWN, usize::max)
             .min(total)
     } else {
         total
     };
-    // The heading is the block's first line, so everything the description placed moves
-    // down by one.
+    // The heading is the block's first line, so everything drawn moves down by one.
     let offset = lines.len();
-    lines.extend(rendered.into_iter().take(shown));
+    lines.extend(drawn.lines.into_iter().take(shown));
     if shown < total {
         lines.push(Line::from(Span::styled(
             format!("… {} more lines · za unfolds", total - shown),
@@ -549,18 +1159,20 @@ fn body(
         rows.push(fold_region(BODY_KEY, 0, lines.len()));
     }
     rows.extend(
-        regions
+        drawn
+            .rows
             .into_iter()
-            .filter(|region| region.end <= shown)
+            .filter(|region| region.first < shown)
             .map(|region| Region {
                 first: region.first + offset,
-                end: region.end + offset,
+                end: region.end.min(shown) + offset,
                 ..region
             }),
     );
     lines.push(Line::default());
     let mut block = block("pr-body", lines, rows);
-    block.images = placed
+    block.images = drawn
+        .images
         .into_iter()
         .filter(|placed| placed.line < shown)
         .map(|placed| crate::timeline::Placed {
@@ -568,7 +1180,7 @@ fn body(
             ..placed
         })
         .collect();
-    block.pictures = pictures;
+    block.pictures = drawn.pictures;
     block
 }
 
@@ -653,7 +1265,7 @@ mod tests {
         let mut with_image = detail(json!([]));
         with_image.body = body.to_string();
         assert_eq!(
-            image_urls(&with_image),
+            image_urls(&with_image, None),
             vec!["https://github.com/user-attachments/assets/abc".to_string()]
         );
     }
@@ -665,24 +1277,200 @@ mod tests {
         let mut with_image = detail(json!([]));
         with_image.body = "![Shot](https://example.com/shot.png)".to_string();
         let caption = |images: &HashMap<String, Option<String>>| {
-            text(&body(&with_image, &|_| false, (80, 24), images))[1].clone()
+            text(&body(&with_image, &|_| false, &|_, o| o, (80, 24), images))[1].clone()
         };
         assert!(caption(&HashMap::new()).ends_with(" · loading…"));
         let failed = HashMap::from([("https://example.com/shot.png".to_string(), None)]);
         assert!(caption(&failed).ends_with(" · could not be fetched"));
     }
 
+    fn review(login: &str, state: &str, body: &str, at: &str) -> serde_json::Value {
+        json!({"kind": "review", "author": {"login": login}, "body": body, "createdAt": at,
+            "url": format!("https://github.com/o/r/pull/42#{login}-{at}"), "reviewState": state})
+    }
+
+    fn activity(comments: serde_json::Value) -> Activity {
+        serde_json::from_value(json!({"comments": comments,
+            "reviewThreads": [{"isResolved": false}, {"isResolved": true}]}))
+        .unwrap()
+    }
+
+    const NOW: &str = "2026-01-10T00:00:00Z";
+
+    /// A reviewer stands where their last approval or request for changes put them, and a
+    /// later comment does not take that back. Somebody asked again is waiting, and says what
+    /// they said before; the author answering in the thread is not a reviewer.
+    #[test]
+    fn reviewers_stand_where_their_verdicts_put_them() {
+        let mut detail = detail(json!([]));
+        detail.reviewers = vec![
+            Actor {
+                login: "carol".into(),
+            },
+            Actor {
+                login: "dan".into(),
+            },
+        ];
+        let activity = activity(json!([
+            review("alice", "APPROVED", "", "2026-01-01T00:00:00Z"),
+            review("alice", "COMMENTED", "one nit", "2026-01-02T00:00:00Z"),
+            review(
+                "bob",
+                "CHANGES_REQUESTED",
+                "Please split this.",
+                "2026-01-08T00:00:00Z"
+            ),
+            review("carol", "APPROVED", "ok", "2026-01-03T00:00:00Z"),
+            review("someone", "COMMENTED", "fixed", "2026-01-09T00:00:00Z"),
+            review("eve", "PENDING", "draft", "2026-01-09T00:00:00Z"),
+        ]));
+        let lines = text(&reviews(
+            &detail,
+            Some(&Ok(activity)),
+            &|_, open| open,
+            NOW,
+            (80, 24),
+            &HashMap::new(),
+        ));
+        assert_eq!(
+            lines,
+            vec![
+                "Reviews  ✗ 1 changes requested · ○ 2 waiting · ✓ 1 approved · 1 unresolved thread",
+                "✗ @bob requested changes · 2d ago ▾",
+                "  Please split this.",
+                "○ @carol review requested · earlier approved · 7d ago ▸",
+                "○ @dan review requested",
+                "✓ @alice approved · 8d ago ▸",
+                "",
+            ]
+        );
+    }
+
+    /// The latest review is open to begin with, so `za` on it shuts it; the others open.
+    #[test]
+    fn only_the_latest_review_starts_open() {
+        let detail = detail(json!([]));
+        let activity = activity(json!([
+            review("alice", "APPROVED", "Looks good.", "2026-01-01T00:00:00Z"),
+            review("bob", "COMMENTED", "Why this way?", "2026-01-05T00:00:00Z"),
+        ]));
+        let shut_by_hand = |key: &str, open: bool| open != (key == "pr-review:bob");
+        let lines = text(&reviews(
+            &detail,
+            Some(&Ok(activity.clone())),
+            &shut_by_hand,
+            NOW,
+            (80, 24),
+            &HashMap::new(),
+        ));
+        assert!(!lines.iter().any(|l| l.contains("Why this way?")));
+        let opened = |key: &str, open: bool| open != (key == "pr-review:alice");
+        let lines = text(&reviews(
+            &detail,
+            Some(&Ok(activity.clone())),
+            &opened,
+            NOW,
+            (80, 24),
+            &HashMap::new(),
+        ));
+        assert!(lines.iter().any(|l| l.contains("Looks good.")));
+        assert_eq!(
+            link_at("pr-review:alice", &detail, Some(&activity)).as_deref(),
+            Some("https://github.com/o/r/pull/42#alice-2026-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn reviews_on_their_way_say_so() {
+        let detail = detail(json!([]));
+        assert_eq!(
+            text(&reviews(
+                &detail,
+                None,
+                &|_, o| o,
+                NOW,
+                (80, 24),
+                &HashMap::new()
+            ))[0],
+            "Reviews  loading…"
+        );
+        let failed = Err("gh is not signed in".to_string());
+        assert_eq!(
+            text(&reviews(
+                &detail,
+                Some(&failed),
+                &|_, o| o,
+                NOW,
+                (80, 24),
+                &HashMap::new()
+            ))[0],
+            "Reviews  could not be read: gh is not signed in"
+        );
+    }
+
+    /// Comments are what the host does not show, wherever they are and however long; one
+    /// written in code is code.
+    #[test]
+    fn html_comments_are_not_shown() {
+        let body = "<!-- template: say why -->\nWhy.\n\nMore <!-- inline --> text.\n\n\
+            <!--\nlong\ninstructions\n-->\n\n```\n<!-- kept -->\n```\n\nand `<!-- kept -->`\n";
+        assert_eq!(
+            prose(body),
+            "Why.\n\nMore  text.\n\n\n\n```\n<!-- kept -->\n```\n\nand `<!-- kept -->`"
+        );
+        assert_eq!(prose("<!-- only a template -->"), "");
+        // Opening a block of its own, it runs to the end; inside a paragraph it is not a
+        // comment at all, and the host shows it as text too.
+        assert_eq!(prose("before\n\n<!-- never closed\nafter"), "before");
+        assert_eq!(prose("a <!-- b"), "a <!-- b");
+    }
+
+    /// A `<details>` is its summary until `za` opens it, unless it was written open; one
+    /// inside it folds on its own.
+    #[test]
+    fn details_fold_to_their_summary() {
+        let source = "Intro.\n\n<details><summary><b>Walkthrough</b></summary>\n\nThe steps.\n\n\
+            <details open>\n<summary>Inner</summary>\n\nDeep.\n</details>\n</details>\n\nAfter.\n";
+        let lines = |open: &dyn Fn(&str, bool) -> bool| -> Vec<String> {
+            let drawn = draw_markdown("b", source, open, (80, 24), &HashMap::new());
+            drawn
+                .lines
+                .iter()
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        assert_eq!(
+            lines(&|_, open| open),
+            vec!["Intro.", "▸ Walkthrough", "After."]
+        );
+        let opened = lines(&|key, open| open != (key == "b/details/1"));
+        assert_eq!(
+            opened,
+            vec![
+                "Intro.",
+                "▾ Walkthrough",
+                "  The steps.",
+                "  ▾ Inner",
+                "    Deep.",
+                "After."
+            ]
+        );
+        let drawn = draw_markdown("b", source, &|_, open| open, (80, 24), &HashMap::new());
+        let fold = drawn.rows.iter().find(|r| r.key == "b/details/1").unwrap();
+        assert!(fold.foldable && (fold.first, fold.end) == (1, 2));
+    }
+
     #[test]
     fn a_long_description_folds() {
         let mut long = detail(json!([]));
         long.body = (1..=40).map(|n| format!("line {n}\n\n")).collect();
-        let shut = body(&long, &|_| false, (80, 24), &HashMap::new());
+        let shut = body(&long, &|_| false, &|_, o| o, (80, 24), &HashMap::new());
         assert!(
             text(&shut)
                 .iter()
                 .any(|line| line.contains("more lines · za unfolds"))
         );
-        let open = body(&long, &|_| true, (80, 24), &HashMap::new());
+        let open = body(&long, &|_| true, &|_, o| o, (80, 24), &HashMap::new());
         assert!(text(&open).iter().any(|line| line == "line 40"));
     }
 }

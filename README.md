@@ -425,11 +425,26 @@ whether auto-merge is on.
 Then the checks, counted by state, with every one that is failing, needs action, or is still
 running listed on its own row and the ones that passed or were skipped folded into a count;
 `za` on the count lists them. `gx` on a check's row opens that check; anywhere else it opens
-the pull request. Then the description, rendered like a message and folded to its opening
-lines when it is long.
+the pull request.
 
-Pictures in the description are drawn under their captions, as they are in a message, and `gx`
-on one opens it. That covers the `<img>` tags GitHub writes when a picture is dropped into a
+Then the reviews, read with `pullRequests.activity`, which the server answers separately and
+more slowly, so the section says `loading…` until it arrives. Each reviewer has a row saying
+where they stand, the way the host decides it: their latest approval or request for changes,
+and only when they have given neither, that they commented. Those asked to review and not
+answered since are waiting, with what they said before if they were asked again. Requests for
+changes come first, then those waiting, and the count of unresolved review threads is beside
+the heading. The latest review is open with what it said; `za` on any other reviewer's row
+opens theirs, and `gx` opens it on the host. The author's own replies are not counted as
+reviews.
+
+Then the description, rendered like a message and folded to its opening lines when it is long.
+
+The description and the reviews are drawn as the host shows them: HTML comments, such as a
+template's instructions or a bot's bookkeeping, are left out, and each `<details>` is its
+summary on a row of its own, with `za` opening it unless it was written `<details open>`.
+
+Pictures in the description and the reviews are drawn under their captions, as they are in a
+message, and `gx` on one opens it. That covers the `<img>` tags GitHub writes when a picture is dropped into a
 pull request as well as markdown images. They are fetched by tria itself, since the server has
 no way to hand them over; the caption says `loading…` until one arrives. A picture on the pull
 request's own host is fetched with the token `gh auth token` gives for that host, which is what

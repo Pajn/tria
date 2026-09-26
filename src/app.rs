@@ -530,6 +530,11 @@ pub enum AppEvent {
         project: Id,
         bytes: Option<Vec<u8>>,
     },
+    /// A pull request's review history came back, through the server.
+    PullRequestActivity {
+        url: String,
+        result: Result<Value, String>,
+    },
     /// A picture a pull request's description shows came back, base64, or failed to.
     PullRequestImage {
         url: String,
@@ -743,6 +748,8 @@ pub struct App {
     /// The pictures pull requests' descriptions show, by their links: base64, or `None`
     /// where the fetch failed. Kept for the session, so a re-read does not fetch again.
     pub pull_request_images: HashMap<String, Option<String>>,
+    /// Each pull request's review history as last read, by its link, or why it could not be.
+    pub pull_request_activity: HashMap<String, Result<crate::pull_request::Activity, String>>,
     /// Pictures asked for, whether or not they have come back.
     pull_request_images_asked: HashSet<String>,
     /// `gh`'s tokens, by the directory it was run in and the host asked about.
@@ -905,6 +912,7 @@ impl App {
             pull_request_loading: None,
             pull_request_reads: 0,
             pull_request_images: HashMap::new(),
+            pull_request_activity: HashMap::new(),
             pull_request_images_asked: HashSet::new(),
             gh_tokens: Default::default(),
             pane: None,
@@ -4279,12 +4287,21 @@ impl App {
             self.open_url(&url);
             return;
         }
-        // A check's row in a pull request is its link, kept off the row to leave room.
-        let check = self.region_at(self.chat_cursor).and_then(|(key, _)| {
-            key.strip_prefix(crate::pull_request::CHECK_KEY)
-                .map(str::to_string)
-        });
-        if let Some(url) = check {
+        // A check's or a reviewer's row in a pull request stands for a link, kept off the
+        // row to leave room.
+        let row = self
+            .transcript
+            .as_ref()
+            .and_then(|t| t.pull_request())
+            .zip(self.region_at(self.chat_cursor))
+            .and_then(|(detail, (key, _))| {
+                let activity = self
+                    .pull_request_activity
+                    .get(&detail.url)
+                    .and_then(|a| a.as_ref().ok());
+                crate::pull_request::link_at(&key, detail, activity)
+            });
+        if let Some(url) = row {
             self.open_url(&url);
             return;
         }
@@ -4370,7 +4387,11 @@ impl App {
     fn fetch_pull_request_images(&mut self, detail: &crate::pull_request::Detail) {
         let host = url_host(&detail.url).map(str::to_string);
         let directory = self.thread_directory();
-        for url in crate::pull_request::image_urls(detail) {
+        let activity = self
+            .pull_request_activity
+            .get(&detail.url)
+            .and_then(|a| a.as_ref().ok());
+        for url in crate::pull_request::image_urls(detail, activity) {
             if !self.pull_request_images_asked.insert(url.clone()) {
                 continue;
             }
@@ -4451,16 +4472,55 @@ impl App {
         }
         self.pull_request_loading = Some(url.to_string());
         self.toast(format!("reading #{}…", pr.number), false);
-        let url = url.to_string();
-        let handle = self.handle.clone();
-        let events = self.events.clone();
-        tokio::spawn(async move {
-            let result = handle
-                .call("pullRequests.detail", payload)
-                .await
-                .map_err(|e| e.to_string());
-            let _ = events.send(AppEvent::PullRequest { url, result });
+        // The review history is asked for beside the detail rather than after it: it is
+        // the slower of the two, and the view fills it in when it comes.
+        for (tag, activity) in [
+            ("pullRequests.detail", false),
+            ("pullRequests.activity", true),
+        ] {
+            let url = url.to_string();
+            let payload = payload.clone();
+            let handle = self.handle.clone();
+            let events = self.events.clone();
+            tokio::spawn(async move {
+                let result = handle.call(tag, payload).await.map_err(|e| e.to_string());
+                let _ = events.send(if activity {
+                    AppEvent::PullRequestActivity { url, result }
+                } else {
+                    AppEvent::PullRequest { url, result }
+                });
+            });
+        }
+    }
+
+    fn on_pull_request_activity(&mut self, url: String, result: Result<Value, String>) {
+        let activity = result.and_then(|value| {
+            serde_json::from_value::<crate::pull_request::Activity>(value)
+                .map_err(|e| e.to_string())
         });
+        // What was read before stays in view over a re-read that failed.
+        if activity.is_err() && matches!(self.pull_request_activity.get(&url), Some(Ok(_))) {
+            return;
+        }
+        self.pull_request_activity.insert(url.clone(), activity);
+        // The reviews shown can have pictures of their own.
+        let detail = self
+            .transcript
+            .as_ref()
+            .and_then(|t| t.pull_request())
+            .filter(|d| d.url == url)
+            .cloned();
+        if let Some(detail) = detail {
+            self.fetch_pull_request_images(&detail);
+        }
+        if let Some(open) = self
+            .transcript
+            .as_mut()
+            .filter(|t| t.pull_request().is_some_and(|d| d.url == url))
+        {
+            self.pull_request_reads += 1;
+            open.state.revision = self.pull_request_reads;
+        }
     }
 
     fn on_pull_request(&mut self, url: String, result: Result<Value, String>) {
@@ -4471,7 +4531,12 @@ impl App {
         let detail = match result.and_then(|value| {
             serde_json::from_value::<crate::pull_request::Detail>(value).map_err(|e| e.to_string())
         }) {
-            Ok(detail) => detail,
+            // Known by the link it was asked for by, which is what its review history is
+            // kept under too.
+            Ok(detail) => crate::pull_request::Detail {
+                url: url.clone(),
+                ..detail
+            },
             Err(error) => return self.toast(format!("reading the pull request: {error}"), true),
         };
         self.fetch_pull_request_images(&detail);
@@ -7439,6 +7504,7 @@ fn apply(app: &mut App, event: AppEvent) {
         AppEvent::Transcript { agent_id, result } => app.on_transcript(agent_id, result),
         AppEvent::PullRequest { url, result } => app.on_pull_request(url, result),
         AppEvent::PullRequestImage { url, data } => app.on_pull_request_image(url, data),
+        AppEvent::PullRequestActivity { url, result } => app.on_pull_request_activity(url, result),
         AppEvent::Favicon { project, bytes } => app.on_favicon(project, bytes),
     }
 }
@@ -9166,21 +9232,24 @@ mod tests {
         app.open_picker(PickerKind::PullRequest);
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        let (tag, payload, reply) = loop {
-            match asked(&mut requests).await.expect("the detail is asked for") {
-                crate::session::Request::Call {
-                    tag,
-                    payload,
-                    reply,
-                } => break (tag, payload, reply),
-                _ => continue,
+        // The detail and the review history are asked for together, in either order.
+        let mut calls = HashMap::new();
+        while calls.len() < 2 {
+            if let crate::session::Request::Call {
+                tag,
+                payload,
+                reply,
+            } = asked(&mut requests).await.expect("both are asked for")
+            {
+                calls.insert(tag, (payload, reply));
             }
-        };
-        assert_eq!(tag, "pullRequests.detail");
-        assert_eq!(
-            payload,
-            json!({"projectId": project, "host": "github.com", "repository": "o/r", "number": 1})
-        );
+        }
+        let (activity, _unanswered) = calls.remove("pullRequests.activity").expect("the history");
+        let (payload, reply) = calls.remove("pullRequests.detail").expect("the detail");
+        let identity =
+            json!({"projectId": project, "host": "github.com", "repository": "o/r", "number": 1});
+        assert_eq!(payload, identity);
+        assert_eq!(activity, identity);
         let _ = reply.send(Ok(json!({
             "repository": "o/r", "number": 1, "title": "layer 1", "body": "Why.",
             "url": "https://github.com/o/r/pull/1", "state": "open",

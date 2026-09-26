@@ -1221,10 +1221,12 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             let blocks = match app.transcript.as_ref().and_then(|t| t.pull_request()) {
                 Some(detail) => crate::pull_request::blocks(
                     detail,
+                    app.pull_request_activity.get(&detail.url),
                     &app.expanded,
                     app.open_levels,
                     (inner.width, inner.height),
                     &app.pull_request_images,
+                    &crate::commands::now_iso(),
                 ),
                 None => timeline::build(
                     thread,
