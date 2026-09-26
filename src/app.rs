@@ -9640,6 +9640,26 @@ mod tests {
         );
     }
 
+    /// With a selection up in the composer, `gg` grows it to the top rather than being
+    /// taken for the start of one of the app's own `g` keys.
+    #[tokio::test]
+    async fn gg_grows_a_selection_in_the_composer() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.composer.set_text("one\ntwo\nthree");
+        app.mode = Mode::Normal;
+        app.focus = Focus::Composer;
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        for c in ['v', 'g', 'g'] {
+            app.on_key(key(c));
+        }
+        assert_eq!(app.composer.row, 0);
+        assert!(app.composer.vim_busy(), "still selecting");
+        app.on_key(key('y'));
+        assert!(!app.composer.vim_busy());
+    }
+
     fn stacked_thread() -> ThreadState {
         let mut thread = running_thread();
         let pr = |number: u64, head: &str, base: &str| {

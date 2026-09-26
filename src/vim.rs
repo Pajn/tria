@@ -80,6 +80,11 @@ enum Pending {
         inner: bool,
     },
     Replace,
+    /// `g` in the middle of a command, waiting for the second `g` of `gg`. With nothing
+    /// begun, `g` is the app's prefix and never reaches here.
+    G {
+        op: Option<Op>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +241,12 @@ impl Composer {
             }
             Pending::Select { .. } => {}
             Pending::Replace => out.push('r'),
+            Pending::G { op } => {
+                if let Some(op) = op {
+                    out.push(op_char(op));
+                }
+                out.push('g');
+            }
         }
         if let Pending::Object { inner, .. } | Pending::Select { inner } = self.vim.pending {
             out.push(if inner { 'i' } else { 'a' });
@@ -421,6 +432,18 @@ impl Composer {
                 let effect = self.replace_chars(ch, count);
                 self.recorded(What::Replace { ch, count }, effect)
             }
+            Pending::G { op } => {
+                self.vim.pending = Pending::None;
+                match key.code {
+                    KeyCode::Char('g') => self.run_motion(op, Motion::Top),
+                    // Anything else was not `gg`, and an operator waiting on it is let go.
+                    _ if op.is_some() => {
+                        self.vim_cancel();
+                        Effect::None
+                    }
+                    _ => Effect::None,
+                }
+            }
             Pending::Op(op) => self.op_key(op, key.code),
             Pending::None if self.vim.visual.is_some() => self.visual_key(key.code),
             Pending::None => self.plain_key(key.code),
@@ -503,6 +526,10 @@ impl Composer {
                 self.vim.pending = Pending::Select { inner: false };
                 Effect::None
             }
+            KeyCode::Char('g') => {
+                self.vim.pending = Pending::G { op: None };
+                Effect::None
+            }
             KeyCode::Char('f') => self.start_find(None, FindKind::Forward),
             KeyCode::Char('F') => self.start_find(None, FindKind::Backward),
             KeyCode::Char('t') => self.start_find(None, FindKind::TillForward),
@@ -580,6 +607,10 @@ impl Composer {
             }
             KeyCode::Char('0') if self.vim.count.is_some() => {
                 self.push_digit(0);
+                Effect::None
+            }
+            KeyCode::Char('g') => {
+                self.vim.pending = Pending::G { op: None };
                 Effect::None
             }
             KeyCode::Char('d') => self.start_op(Op::Delete),
@@ -709,6 +740,10 @@ impl Composer {
             }
             KeyCode::Char('a') => {
                 self.vim.pending = Pending::Object { op, inner: false };
+                Effect::None
+            }
+            KeyCode::Char('g') => {
+                self.vim.pending = Pending::G { op: Some(op) };
                 Effect::None
             }
             KeyCode::Char('f') => self.start_find(Some(op), FindKind::Forward),
@@ -1571,6 +1606,36 @@ mod tests {
             .chars()
             .map(|ch| c.vim_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)))
             .collect()
+    }
+
+    /// `gg` is a motion like any other once the composer is in the middle of something:
+    /// it grows a selection, gives an operator its range, and goes to the line a count
+    /// names. The app only takes `g` as its own prefix when nothing has begun.
+    #[test]
+    fn gg_moves_mid_command() {
+        let mut c = composer("one\ntwo\nthree");
+        c.row = 2;
+        keys(&mut c, "vgg");
+        assert_eq!((c.row, c.col), (0, 0));
+        assert!(
+            c.vim.visual.is_some(),
+            "the selection grew rather than ending"
+        );
+
+        let mut c = composer("one\ntwo\nthree");
+        c.row = 1;
+        keys(&mut c, "dgg");
+        assert_eq!(c.text(), "three");
+
+        let mut c = composer("one\ntwo\nthree");
+        keys(&mut c, "3gg");
+        assert_eq!(c.row, 2);
+
+        let mut c = composer("one\ntwo\nthree");
+        c.row = 2;
+        keys(&mut c, "Vgg");
+        c.vim_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(c.vim.visual.is_none());
     }
 
     #[test]
