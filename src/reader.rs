@@ -223,6 +223,9 @@ enum Intent {
 struct Asked {
     intent: Intent,
     origin: Origin,
+    /// Asked for again while this was on its way, and whether past the server's copy. What
+    /// comes back was read before that, so it is read once more.
+    again: Option<bool>,
 }
 
 /// The reading on the screen.
@@ -626,13 +629,20 @@ impl<R> Reader<R> {
                         asked.intent == Intent::Loud && matches!(other, Source::PullRequest(_))
                     }))
                 .then_some(Toast::Clear);
-                if self.in_flight(&source, intent, origin) {
+                if self.in_flight(&source, intent, origin, false) {
                     return Step {
                         toast,
                         ..Step::default()
                     };
                 }
-                self.ask(source, Asked { intent, origin });
+                self.ask(
+                    source,
+                    Asked {
+                        intent,
+                        origin,
+                        again: None,
+                    },
+                );
                 Step {
                     fetches: vec![Fetch::Transcript {
                         agent_id,
@@ -650,13 +660,20 @@ impl<R> Reader<R> {
                 };
                 let source = Source::PullRequest(url.clone());
                 let toast = loud.then(|| Toast::Say(format!("reading #{number}…")));
-                if self.in_flight(&source, intent, origin) {
+                if self.in_flight(&source, intent, origin, fresh) {
                     return Step {
                         toast,
                         ..Step::default()
                     };
                 }
-                self.ask(source, Asked { intent, origin });
+                self.ask(
+                    source,
+                    Asked {
+                        intent,
+                        origin,
+                        again: None,
+                    },
+                );
                 Step {
                     fetches: vec![Fetch::PullRequest {
                         url,
@@ -674,13 +691,24 @@ impl<R> Reader<R> {
 
     /// Whether a read of this is already on its way, so it is not asked for twice. One
     /// asked for out loud while a quiet one is on its way makes that one loud, so what it
-    /// brings back opens as though it were asked for, which it now was.
-    fn in_flight(&mut self, source: &Source, intent: Intent, origin: Origin) -> bool {
-        if !self.asked.contains_key(source) {
+    /// brings back opens as though it were asked for, which it now was. Either way what
+    /// comes back was read before this was asked, so it is marked to be read once more.
+    fn in_flight(&mut self, source: &Source, intent: Intent, origin: Origin, fresh: bool) -> bool {
+        let Some(asked) = self.asked.get_mut(source) else {
             return false;
-        }
+        };
+        let again = Some(asked.again.unwrap_or(false) || fresh);
         if intent == Intent::Loud {
-            self.ask(source.clone(), Asked { intent, origin });
+            self.ask(
+                source.clone(),
+                Asked {
+                    intent,
+                    origin,
+                    again,
+                },
+            );
+        } else {
+            asked.again = again;
         }
         true
     }
@@ -821,6 +849,30 @@ impl<R> Reader<R> {
     /// A pull request's detail came back from the host, through the server. `here` is
     /// where the conversation is, kept for the way back should this open over it.
     pub fn on_pull_request(
+        &mut self,
+        thread: &Thread,
+        url: String,
+        result: Result<Value, String>,
+        here: R,
+    ) -> Step {
+        let source = Source::PullRequest(url.clone());
+        let again = self
+            .asked
+            .get(&source)
+            .and_then(|asked| Some((asked.again?, asked.origin)));
+        let mut step = self.pull_request_answered(thread, url, result, here);
+        // Asked for again while it was on its way: a label just set, or news from the sync,
+        // may not be in what came back, so what is open is brought up to date once more.
+        if let Some((fresh, origin)) = again
+            && self.source().as_ref() == Some(&source)
+        {
+            let more = self.request(thread, source, Intent::Quiet, origin, fresh);
+            step.fetches.extend(more.fetches);
+        }
+        step
+    }
+
+    fn pull_request_answered(
         &mut self,
         thread: &Thread,
         url: String,
@@ -984,7 +1036,9 @@ impl<R> Reader<R> {
             if !self.images_asked.insert(url.clone()) {
                 continue;
             }
-            let own = host.filter(|host| url_host(&url) == Some(*host));
+            // The token goes only where the pull request is, and never in the clear.
+            let own =
+                host.filter(|host| url.starts_with("https://") && url_host(&url) == Some(*host));
             fetches.push(Fetch::Image {
                 token_host: own.map(str::to_string),
                 directory: thread.directory.map(str::to_string),
@@ -1850,14 +1904,18 @@ pub(crate) mod tests {
     }
 
     /// The pictures a description shows are fetched once each, those on the pull request's
-    /// own host with `gh`'s token for it; one that failed is asked for on the next read.
+    /// own host with `gh`'s token for it, and only over HTTPS; one that failed is asked for
+    /// on the next read.
     #[test]
     fn pictures_are_fetched_once_and_again_after_failing() {
         let thread = stacked_thread();
         let own = "https://github.com/user-attachments/assets/1.png";
         let elsewhere = "https://example.com/2.png";
+        let plain = "http://github.com/user-attachments/assets/3.png";
         let mut detail = open_detail("layer 1");
-        detail["body"] = json!(format!("![one]({own})\n\n![two]({elsewhere})"));
+        detail["body"] = json!(format!(
+            "![one]({own})\n\n![two]({elsewhere})\n\n![three]({plain})"
+        ));
         let images = |step: &Step| -> Vec<(String, Option<String>)> {
             step.fetches
                 .iter()
@@ -1889,6 +1947,7 @@ pub(crate) mod tests {
             vec![
                 (own.to_string(), Some("github.com".to_string())),
                 (elsewhere.to_string(), None),
+                (plain.to_string(), None),
             ]
         );
         assert!(images(&read(&mut reader)).is_empty(), "asked for once");
@@ -1944,6 +2003,35 @@ pub(crate) mod tests {
         assert_eq!(labels(&reader), vec!["bug"]);
         let step = reader.label_set(&lent(&thread), SECOND, "docs", true);
         assert_eq!(step.outcome, Outcome::Nothing, "not the one open");
+    }
+
+    /// A label set while a read is on its way is read for once more when that one comes
+    /// back, since what it brings was read before the label went on.
+    #[test]
+    fn a_label_set_while_a_read_is_on_its_way_is_read_for_again() {
+        let thread = stacked_thread();
+        let mut editable = open_detail("layer 1");
+        editable["capabilities"] = json!({"labels": true});
+        let mut reader = reading_the_first(&thread);
+        let _ = reader.on_pull_request(
+            &lent(&thread),
+            FIRST.into(),
+            Ok(editable.clone()),
+            CONVERSATION,
+        );
+        let sync = reader.refresh(&lent(&thread));
+        assert_eq!(pull_request_fetches(&sync), vec![(FIRST.to_string(), true)]);
+        let step = reader.label_set(&lent(&thread), FIRST, "bug", true);
+        assert!(pull_request_fetches(&step).is_empty(), "one is on its way");
+
+        // What the sync's read brings was read before the label went on.
+        let step = reader.on_pull_request(&lent(&thread), FIRST.into(), Ok(editable), CONVERSATION);
+        assert_eq!(pull_request_fetches(&step), vec![(FIRST.to_string(), true)]);
+        let mut labelled = open_detail("layer 1");
+        labelled["labels"] = json!([{"name": "bug"}]);
+        let step = reader.on_pull_request(&lent(&thread), FIRST.into(), Ok(labelled), CONVERSATION);
+        assert!(pull_request_fetches(&step).is_empty(), "and only once");
+        assert_eq!(reader.pull_request().unwrap().labels[0].name, "bug");
     }
 
     /// Forgotten with the thread, nothing read for it opens afterwards.
