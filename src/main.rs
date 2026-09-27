@@ -18,6 +18,7 @@ mod recovery;
 mod rpc;
 mod server;
 mod session;
+mod sidebar_view;
 mod state;
 mod subagent;
 mod table;

@@ -15,14 +15,13 @@ use ratatui_image::sliced::SignedPosition;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{
-        App, Checkout, Focus, Mode, PickerKind, Section, SidebarRow, SidebarTab, approval_options,
-    },
+    app::{App, Checkout, Focus, Mode, PickerKind, Section, SidebarRow, approval_options},
     config::SidebarLayout,
     model::ThreadStatus,
     picture,
     reader::{Badge, Source},
     session::Status,
+    sidebar_view::Tab,
     subagent,
 };
 
@@ -64,6 +63,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_sidebar(frame, app, sidebar_area);
     } else {
         app.sidebar_inner = None;
+        app.sidebar_view.resize(0);
     }
 
     let pending = app
@@ -497,12 +497,12 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut title: Vec<Span> = vec![Span::raw(" ")];
     let mut spans = Vec::new();
     let mut at = area.x + 1;
-    for (index, tab) in SidebarTab::ALL.iter().enumerate() {
+    for (index, tab) in Tab::ALL.iter().enumerate() {
         if index > 0 {
             title.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
             at += 3;
         }
-        let style = if *tab == app.sidebar_tab {
+        let style = if *tab == app.sidebar_view.tab() {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
@@ -510,15 +510,15 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(Color::DarkGray)
         };
         let mut parts = match tab {
-            SidebarTab::Threads => vec![Span::styled("threads".to_string(), style)],
-            SidebarTab::PullRequests => vec![Span::styled(counted("PRs", layers.len()), style)],
-            SidebarTab::Agents => vec![Span::styled(counted("agents", agents.len()), style)],
+            Tab::Threads => vec![Span::styled("threads".to_string(), style)],
+            Tab::PullRequests => vec![Span::styled(counted("PRs", layers.len()), style)],
+            Tab::Agents => vec![Span::styled(counted("agents", agents.len()), style)],
         };
         match tab {
-            SidebarTab::PullRequests if failing => {
+            Tab::PullRequests if failing => {
                 parts.push(Span::styled(" ✗", Style::default().fg(Color::Red)))
             }
-            SidebarTab::Agents if working => parts.push(Span::styled(
+            Tab::Agents if working => parts.push(Span::styled(
                 format!(" {}", app.spinner_frame()),
                 Style::default().fg(Color::Cyan),
             )),
@@ -551,28 +551,23 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     app.sidebar_inner = Some(inner);
+    app.sidebar_view.resize(inner.height);
 
     let rows = app.sidebar_rows();
+    let lent = app.sidebar_view_rows(&rows);
+    let offset = app.sidebar_view.offset(&lent);
     let reading_url = app.reader.pull_request().map(|d| d.url.clone());
     let reading_agent = app.reader.agent_id().map(str::to_string);
     let width = inner.width as usize;
     let dim = Style::default().fg(Color::DarkGray);
     let two_line = app.sidebar_layout == SidebarLayout::TwoLine;
     // Selection is drawn by hand so the wheel can scroll the list without the
-    // selected row dragging the viewport back.
-    let selected = if rows.is_empty() {
-        None
-    } else if focused {
-        Some(app.sidebar_selected.min(rows.len() - 1))
+    // selected row dragging the viewport back. Unfocused, the mark is on what is open:
+    // the thread, or the pull request or subagent being read in place of it.
+    let selected = if focused {
+        app.sidebar_view.selection(&lent)
     } else {
-        // Unfocused, the mark is on what is open: the thread, or the pull request or
-        // subagent being read in place of it.
-        rows.iter().position(|row| match row {
-            SidebarRow::Thread { id, .. } => Some(id) == app.current_thread_id.as_ref(),
-            SidebarRow::PullRequest { url, .. } => Some(url) == reading_url.as_ref(),
-            SidebarRow::Agent { id } => Some(id) == reading_agent.as_ref(),
-            _ => false,
-        })
+        app.sidebar_open_row(&rows)
     };
     // Which list has the keys is the border's to say, so the mark is the same either
     // way: it is answering which row, not which pane.
@@ -849,20 +844,11 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let height = inner.height as usize;
-    let max_offset = app.sidebar_max_offset(&rows, height);
-    app.sidebar_offset = app.sidebar_offset.min(max_offset);
-    if app.sidebar_reveal {
-        app.sidebar_reveal = false;
-        if let Some(sel) = selected {
-            app.sidebar_offset = app.sidebar_offset_showing(&rows, sel, height);
-        }
-    }
-    let mut state = ListState::default().with_offset(app.sidebar_offset);
+    let mut state = ListState::default().with_offset(offset);
     let list = List::new(items);
     frame.render_stateful_widget(list, inner, &mut state);
     if two_line {
-        draw_sidebar_icons(frame, app, inner, &rows);
+        draw_sidebar_icons(frame, app, inner, &rows[offset.min(rows.len())..]);
     }
 }
 
@@ -925,9 +911,10 @@ fn draw_drawn_icon(frame: &mut Frame, name: &str, colour: Option<&str>, area: Re
     false
 }
 
+/// The icons of `rows`, the rows in view from the top of the list down.
 fn draw_sidebar_icons(frame: &mut Frame, app: &App, inner: Rect, rows: &[SidebarRow]) {
     let mut line = 0usize;
-    for row in rows.iter().skip(app.sidebar_offset) {
+    for row in rows {
         let height = app.sidebar_row_height(row);
         if line >= inner.height as usize {
             break;
@@ -4534,8 +4521,11 @@ mod tests {
         app.sidebar_layout = SidebarLayout::TwoLine;
         with_threads(&mut app);
         app.focus = crate::app::Focus::Sidebar;
-        // The header is row zero, so the first thread is row one.
-        app.sidebar_selected = 1;
+        // The header is row zero, so the first thread is one down.
+        app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         let buffer = screen(100, &mut app);
 
         // Up to the icon, which is a picture and paints over the row it is on, and short
