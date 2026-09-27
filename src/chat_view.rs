@@ -670,19 +670,24 @@ pub fn match_ranges(line: &str, query: &str) -> Vec<(usize, usize)> {
         line.to_string()
     };
     if haystack.len() != line.len() {
-        // Lowercasing changed byte lengths; fall back to char-wise matching.
-        let hay: Vec<char> = haystack.chars().collect();
+        // Lowercasing changed byte lengths, and can change how many characters there are
+        // too (`İ` lowers to two), so match over the lowered characters, each kept with
+        // the bytes of the character of `line` it came from.
+        let mut hay: Vec<char> = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (byte, ch) in line.char_indices() {
+            for lower in ch.to_lowercase() {
+                hay.push(lower);
+                spans.push((byte, byte + ch.len_utf8()));
+            }
+        }
         let needle: Vec<char> = query.chars().collect();
         let mut out = Vec::new();
-        let byte_offsets: Vec<usize> = line.char_indices().map(|(i, _)| i).collect();
         let mut i = 0;
         while i + needle.len() <= hay.len() {
             if hay[i..i + needle.len()] == needle[..] {
-                let start = byte_offsets[i];
-                let end = byte_offsets
-                    .get(i + needle.len())
-                    .copied()
-                    .unwrap_or(line.len());
+                let start = spans[i].0;
+                let end = spans[i + needle.len() - 1].1;
                 out.push((start, end));
                 i += needle.len();
             } else {
@@ -1084,6 +1089,9 @@ mod tests {
         assert!(!line_matches("nx cache", "Nx"));
         assert_eq!(match_ranges("a nx b NX", "nx"), vec![(2, 4), (7, 9)]);
         assert_eq!(match_ranges("ÄÖ nx", "nx"), vec![(5, 7)]);
+        // `İ` lowers to two characters, so the lowered line is longer than the line.
+        assert_eq!(match_ranges("İa", "a"), vec![(2, 3)]);
+        assert_eq!(match_ranges("İa", "i"), vec![(0, 2)]);
         assert!(match_ranges("abc", "").is_empty());
     }
 }
