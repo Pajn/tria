@@ -23,6 +23,7 @@ use crate::{
     composer::Composer,
     list_cursor::{ListCursor, Row},
     model::{Id, ModelSelection, ServerConfig, ShellItem, ThreadDetailSnapshot, ThreadItem},
+    outbox::{self, Outbox},
     picture,
     question::QuestionDraft,
     reader::{self, Origin, Reader, Source, TranscriptFile},
@@ -324,40 +325,11 @@ fn fuzzy_score(query: &str, label: &str, detail: &str) -> Option<i64> {
     Some(score)
 }
 
-/// A thread asked for and not yet made. Kept whole so a refusal can put back what was
-/// typed: the message is otherwise gone, and the view is left on a thread that will
-/// never exist.
-struct PendingCreate {
-    thread_id: Id,
-    draft: NewThreadDraft,
-    text: String,
-}
-
-/// A message written during a turn and held back until that turn is over, where
-/// `Enter` would have steered the turn with it. It is tria's, not the server's: the
-/// protocol has no queue, and a message the server has been given cannot be taken
-/// back, so this is the only kind that can be.
-struct Queued {
-    text: String,
-    /// The turn that was running when it was queued. A list entry about any other
-    /// turn is older than the one it waits for, and says nothing about it.
-    after_turn: Option<Id>,
-}
-
 /// How a message written over a subagent's transcript goes once it is agreed to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptSend {
     Now,
     Queued,
-}
-
-/// The message as the agent gets it: with what it was written over, when it was written
-/// over something, so a "this" or a "why did it" has something to point at.
-fn over_transcript(context: Option<&str>, text: &str) -> String {
-    match context {
-        Some(context) => format!("{context}\n\n{text}"),
-        None => text.to_string(),
-    }
 }
 
 /// A rewind worked out and waiting on `Enter` or `f`, for the thread it was asked in.
@@ -508,9 +480,9 @@ pub enum AppEvent {
     Tick,
     Update(Box<Update>),
     Dispatched(Result<(), String>),
-    /// The server has made a thread a new message asked for, so there is now something
-    /// to subscribe to.
-    ThreadCreated(Id),
+    /// The server answered something the outbox sent: a message, a thread made for one,
+    /// or a pull request put on that thread.
+    Outbox(outbox::Answer),
     /// What a worktree has uncommitted, once the server has looked.
     WorktreeChecked {
         path: String,
@@ -521,18 +493,6 @@ pub enum AppEvent {
     WorktreeRemoved {
         path: String,
         result: Result<(), String>,
-    },
-    /// The server would not make the thread a new message asked for.
-    CreateRefused {
-        thread_id: Id,
-        error: String,
-    },
-    /// The server would not take a message sent to a thread that already exists. The
-    /// text comes back with it: it left the composer when it was sent.
-    SendRefused {
-        thread_id: Id,
-        text: String,
-        error: String,
     },
     /// A thread made to build a plan exists now, and is where to look.
     PlanThreadCreated(Id),
@@ -690,9 +650,9 @@ pub struct App {
     /// Unsent composer text per thread, keyed by thread id, so switching threads keeps a
     /// half-written message where it belongs. New-thread drafts use `NEW_THREAD_DRAFT_KEY`.
     drafts: HashMap<String, String>,
-    /// Messages waiting for their thread's turn to end, one per thread: a second one
-    /// queued behind the first joins it, as one message is what the turn gets next.
-    queued: HashMap<Id, Queued>,
+    /// Messages on their way to the server, held back for a turn to end, or making the
+    /// thread they are for, until each is taken or given back.
+    outbox: Outbox,
     /// A message a search found, to go to once its thread is open and laid out.
     jump: Option<Jump>,
     /// What the word being typed could be finished as, while there is anything.
@@ -711,8 +671,6 @@ pub struct App {
     pub agent_cursor: ListCursor<String>,
     /// What is read in place of the thread's conversation, and the reads on their way.
     pub reader: Reader<Restore>,
-    /// Pull requests to put on threads being made, by the thread they go on.
-    pending_links: HashMap<Id, commands::PullRequestLink>,
     /// The labels on the pull request as the label picker shows them, what each is for, and
     /// whether the repository has more than were read.
     labels_applied: HashSet<String>,
@@ -735,8 +693,6 @@ pub struct App {
     watched_cwds: Vec<String>,
     /// The open thread's checkout, which is the one the header speaks for.
     pub(crate) vcs_cwd: Option<String>,
-    /// Set between asking for a thread and hearing whether it was made.
-    pending_create: Option<PendingCreate>,
     /// Set when the open thread stopped receiving updates, until they come back.
     pub lost_stream: Option<LostStream>,
     /// The worktree list as it was when it was opened, so it does not move under the
@@ -784,9 +740,6 @@ pub struct App {
     vcs_refreshed: Instant,
     /// The model to start the next new thread with, remembered from the last choice.
     new_thread_model: Option<ModelSelection>,
-    /// Project directory and base branch for a new thread's worktree, resolved as the
-    /// message is sent.
-    draft_worktree: Option<(String, String)>,
     /// Links on screen, rebuilt each draw, so a click knows what it landed on.
     pub links: Vec<Link>,
     /// Programs bound to `g` and a key, from the config file.
@@ -859,7 +812,6 @@ impl App {
             terminal_cursor: ListCursor::default(),
             agent_cursor: ListCursor::default(),
             reader: Reader::default(),
-            pending_links: HashMap::new(),
             labels_applied: HashSet::new(),
             labels_described: Vec::new(),
             labels_truncated: false,
@@ -870,7 +822,6 @@ impl App {
             checkouts: HashMap::new(),
             watched_cwds: Vec::new(),
             vcs_cwd: None,
-            pending_create: None,
             lost_stream: None,
             worktrees: Vec::new(),
             prefix_timeout: Some(crate::config::DEFAULT_PREFIX_TIMEOUT),
@@ -890,10 +841,9 @@ impl App {
             was_running: false,
             vcs_refreshed: Instant::now(),
             new_thread_model: None,
-            draft_worktree: None,
             links: Vec::new(),
             drafts: HashMap::new(),
-            queued: HashMap::new(),
+            outbox: Outbox::default(),
             jump: None,
             completion: None,
             completion_dismissed: None,
@@ -1439,6 +1389,12 @@ impl App {
         self.release_queued(thread);
     }
 
+    /// Hand the thread list's news of a thread to the outbox, which sends what it had
+    /// queued once the turn is over.
+    fn release_queued(&mut self, thread: &crate::model::ThreadShell) {
+        self.with_outbox(|outbox, here| outbox.on_shell(thread, here));
+    }
+
     /// Say out loud that a thread has stopped working, to somebody who is not looking
     /// at it. Which thread it is does not come into it — the open one finishing while
     /// you are in another window is the case this is for — but the change does: a
@@ -1482,14 +1438,6 @@ impl App {
     // ── Dispatch ───────────────────────────────────────────────────────
 
     fn dispatch(&self, command: Value) {
-        self.dispatch_opening(command, None);
-    }
-
-    /// Dispatch a command and, when it is a command that makes a thread, say so once the
-    /// server has applied it. A thread is the command's doing, so there is nothing to
-    /// subscribe to until the command has been through: asking first is asking for a
-    /// thread nobody has yet. A command that fails makes nothing, and says so instead.
-    fn dispatch_opening(&self, command: Value, creates: Option<Id>) {
         let handle = self.handle.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
@@ -1498,117 +1446,147 @@ impl App {
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string());
-            match (&result, creates) {
-                (Ok(()), Some(thread_id)) => {
-                    let _ = events.send(AppEvent::ThreadCreated(thread_id));
-                }
-                (Err(error), Some(thread_id)) => {
-                    let _ = events.send(AppEvent::CreateRefused {
-                        thread_id,
-                        error: error.clone(),
-                    });
-                    return;
-                }
-                _ => {}
-            }
             let _ = events.send(AppEvent::Dispatched(result));
         });
     }
 
-    /// Send a message to a thread that already exists, keeping hold of the text until
-    /// the server has taken it. The composer is emptied when a message goes, because
-    /// that is what sending looks like; a message the server refuses has to come back,
-    /// or the only copy of it is one keypress of history away and nothing says so.
-    fn dispatch_message(&self, command: Value, thread_id: Id, text: String) {
+    /// Ask the outbox something, lending it where things stand on screen, and do what
+    /// it answers.
+    fn with_outbox(&mut self, ask: impl FnOnce(&mut Outbox, &outbox::Here) -> outbox::Step) {
+        let here = outbox::Here {
+            thread: self.current_thread_id.as_deref(),
+            composer_empty: self.composer.is_empty(),
+            drafts: &self.drafts,
+        };
+        let step = ask(&mut self.outbox, &here);
+        self.take_outbox_step(step);
+    }
+
+    /// Do what the outbox answered: move the view, put back what did not go, send what
+    /// is to go, and say what it says.
+    fn take_outbox_step(&mut self, step: outbox::Step) {
+        match step.go {
+            None => {}
+            Some(outbox::Go::Opening(thread_id)) => {
+                self.current_thread_id = Some(thread_id);
+                self.thread = None;
+            }
+            Some(outbox::Go::Made(thread_id)) => self.handle.open_thread(&thread_id),
+            Some(outbox::Go::Draft(draft)) => {
+                self.current_thread_id = None;
+                self.thread = None;
+                self.draft = Some(*draft);
+                self.handle.close_thread();
+                self.sync_vcs_watch();
+                self.mode = Mode::Insert;
+                self.focus = Focus::Composer;
+            }
+        }
+        for back in step.give_backs {
+            match back.slot {
+                outbox::Slot::Composer => {
+                    self.composer.set_text(&back.text);
+                    // Sending leaves you in insert mode with an empty composer, which is
+                    // where the text goes back to. Anywhere else — a list, a pane, the
+                    // chat — the view is left where it is and the text is simply there
+                    // when you come back to it.
+                    if matches!(self.mode, Mode::Normal | Mode::Insert) {
+                        self.focus = Focus::Composer;
+                    }
+                    if self.mode != Mode::Insert {
+                        self.composer.clamp_normal();
+                    }
+                }
+                outbox::Slot::Draft => {
+                    self.drafts.insert(back.thread, back.text);
+                }
+                // Most of what comes back went into the history as it was sent, and a
+                // second copy would only stand between `Ctrl-p` and what came before it.
+                // What was never sent as it is, such as a queued message's parts joined,
+                // goes in now, so the toast saying it is there is true.
+                outbox::Slot::History => {
+                    if !self.composer.remembers(&back.text) {
+                        self.composer.push_history(back.text);
+                    }
+                }
+            }
+        }
+        for command in step.commands {
+            self.carry(command);
+        }
+        match step.toast {
+            None => {}
+            Some(outbox::Toast::Warn(text)) => self.toast(text, true),
+        }
+    }
+
+    /// Send what the outbox asked for, as the server's command for it, and hand the
+    /// answer back as an event.
+    fn carry(&self, command: outbox::Command) {
+        let ticket = command.ticket();
+        let command = match command {
+            outbox::Command::Start {
+                thread,
+                text,
+                model_selection,
+                runtime_mode,
+                interaction_mode,
+                ..
+            } => commands::turn_start(
+                &thread,
+                &text,
+                &model_selection,
+                &runtime_mode,
+                &interaction_mode,
+                None,
+            ),
+            outbox::Command::Create {
+                thread, text, new, ..
+            } => {
+                tracing::info!(
+                    %thread,
+                    project = %new.project_id,
+                    worktree = ?new.worktree,
+                    "creating a thread"
+                );
+                let branch = commands::worktree_branch(&thread);
+                commands::turn_start(
+                    &thread,
+                    &text,
+                    &new.model_selection,
+                    &new.runtime_mode,
+                    &new.interaction_mode,
+                    Some(commands::NewThread {
+                        project_id: &new.project_id,
+                        title: &new.title,
+                        model_selection: &new.model_selection,
+                        runtime_mode: &new.runtime_mode,
+                        interaction_mode: &new.interaction_mode,
+                        worktree: new.worktree.as_ref().map(|w| commands::Worktree {
+                            project_cwd: &w.project_cwd,
+                            base_branch: &w.base_branch,
+                            branch: &branch,
+                            start_from_origin: w.start_from_origin,
+                        }),
+                        branch: new.branch.as_deref(),
+                        worktree_path: new.worktree_path.as_deref(),
+                    }),
+                )
+            }
+            outbox::Command::Link { thread, link, .. } => {
+                commands::pull_request_link(&thread, &link)
+            }
+        };
         let handle = self.handle.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
-            match handle.dispatch(command).await {
-                Ok(_) => {}
-                Err(error) => {
-                    let _ = events.send(AppEvent::SendRefused {
-                        thread_id,
-                        text,
-                        error: error.to_string(),
-                    });
-                }
-            }
+            let result = handle
+                .dispatch(command)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            let _ = events.send(AppEvent::Outbox(outbox::Answer { ticket, result }));
         });
-    }
-
-    /// A message that was not sent goes back where it was written: into the composer if
-    /// that is still where you are and nothing has been written since, and into the
-    /// thread's parked draft if you have gone elsewhere. Where neither is free, what was
-    /// typed is not lost — it is in the composer's history — and the toast says so
-    /// rather than writing over whatever took its place.
-    fn on_send_refused(&mut self, thread_id: Id, text: String, error: String) {
-        let here = self.current_thread_id.as_deref() == Some(thread_id.as_str());
-        if here && self.composer.is_empty() {
-            self.composer.set_text(&text);
-            // Sending leaves you in insert mode with an empty composer, which is where
-            // the text goes back to. Anywhere else — a list, a pane, the chat — the view
-            // is left where it is and the text is simply there when you come back to it.
-            if matches!(self.mode, Mode::Normal | Mode::Insert) {
-                self.focus = Focus::Composer;
-            }
-            if self.mode != Mode::Insert {
-                self.composer.clamp_normal();
-            }
-            self.toast(format!("not sent: {error}"), true);
-            return;
-        }
-        if !here && !self.drafts.contains_key(thread_id.as_str()) {
-            self.drafts.insert(thread_id.to_string(), text);
-            self.toast(
-                format!("not sent: {error} · the message is back in that thread"),
-                true,
-            );
-            return;
-        }
-        self.toast(
-            format!("not sent: {error} · it is in the composer's history (Ctrl-p)"),
-            true,
-        );
-    }
-
-    /// Subscribe to a thread the server has just made, unless the view has moved on in
-    /// the meantime: a thread opened since the message was sent is the one wanted.
-    fn on_thread_created(&mut self, thread_id: Id) {
-        self.pending_create.take();
-        if let Some(link) = self.pending_links.remove(&thread_id) {
-            self.dispatch(commands::pull_request_link(&thread_id, &link));
-        }
-        if self.current_thread_id.as_deref() == Some(thread_id.as_str()) {
-            self.handle.open_thread(&thread_id);
-        }
-    }
-
-    /// The server would not make the thread. The view is on one that does not exist and
-    /// the message has left the composer, so both go back: what was typed is the work,
-    /// and it is the only copy. Staying on the draft also keeps the view still, rather
-    /// than falling through to whichever thread happens to be first in the list.
-    fn on_create_refused(&mut self, thread_id: Id, error: String) {
-        let pending = self
-            .pending_create
-            .take()
-            .filter(|pending| pending.thread_id == thread_id);
-        let Some(pending) = pending else {
-            self.toast(error, true);
-            return;
-        };
-        // Unless the view has moved on by itself, in which case it is where it is meant
-        // to be and the message is still in the composer's history.
-        if self.current_thread_id.as_deref() == Some(thread_id.as_str()) {
-            self.current_thread_id = None;
-            self.thread = None;
-            self.draft = Some(pending.draft);
-            self.composer.set_text(&pending.text);
-            self.handle.close_thread();
-            self.sync_vcs_watch();
-            self.mode = Mode::Insert;
-            self.focus = Focus::Composer;
-        }
-        self.toast(error, true);
     }
 
     fn send_message(&mut self) {
@@ -1636,82 +1614,34 @@ impl App {
         // Read the slot before sending: starting a new thread moves the view to it, and the
         // parked text belongs to the slot the message was written in.
         let draft_key = self.draft_key();
-        if self.draft.is_some() && !self.resolve_draft_worktree() {
-            return;
-        }
-        if let Some(draft) = self.draft.take() {
-            // Resolved above, while the draft was still in place.
-            let worktree = self.draft_worktree.take();
-            let checkout = draft.checkout.as_ref();
-            let thread_id = checkout.map_or_else(commands::new_id, |c| c.thread_id.clone());
-            // The pull request goes on the thread once the server has made it.
-            if let Some(link) = checkout.and_then(|c| c.link.clone()) {
-                self.pending_links.insert(thread_id.clone(), link);
-            }
-            let worktree_branch = commands::worktree_branch(&thread_id);
-            let title: String = text
-                .lines()
-                .next()
-                .unwrap_or("New thread")
-                .chars()
-                .take(60)
-                .collect();
-            let command = commands::turn_start(
-                &thread_id,
-                &text,
-                &draft.model_selection,
-                &draft.runtime_mode,
-                &draft.interaction_mode,
-                Some(commands::NewThread {
-                    project_id: &draft.project_id,
-                    title: title.trim(),
-                    model_selection: &draft.model_selection,
-                    runtime_mode: &draft.runtime_mode,
-                    interaction_mode: &draft.interaction_mode,
-                    worktree: worktree.as_ref().map(|(cwd, base)| commands::Worktree {
-                        project_cwd: cwd,
-                        base_branch: base,
-                        branch: &worktree_branch,
-                        start_from_origin: self.config.settings.new_worktrees_start_from_origin,
-                    }),
-                    branch: checkout.map(|c| c.branch.as_str()),
-                    worktree_path: checkout.map(|c| c.worktree_path.as_str()),
-                }),
-            );
-            // The view moves to the new thread now, and reads as loading until the
-            // server has made it and the subscription has something to say.
-            tracing::info!(
-                thread = %thread_id,
-                project = %draft.project_id,
-                worktree = ?worktree,
-                "creating a thread"
-            );
-            self.current_thread_id = Some(thread_id.clone());
-            self.thread = None;
-            self.pending_create = Some(PendingCreate {
-                thread_id: thread_id.clone(),
-                draft,
-                text: text.clone(),
-            });
-            self.dispatch_opening(command, Some(thread_id));
+        let step = if self.draft.is_some() {
+            // Resolved while the draft is still in place.
+            let worktree = match self.draft_worktree() {
+                Ok(worktree) => worktree,
+                Err(why) => return self.toast(why, true),
+            };
+            let Some(draft) = self.draft.take() else {
+                return;
+            };
+            self.outbox.create(draft, &text, worktree)
         } else if let Some(thread) = &self.thread {
-            let shell = &thread.detail.shell;
-            let command = commands::turn_start(
-                thread.id(),
-                &over_transcript(context.as_deref(), &text),
-                &shell.model_selection,
-                &shell.runtime_mode,
-                &shell.interaction_mode,
-                None,
-            );
-            self.dispatch_message(command, thread.id().to_string(), text.clone());
+            self.outbox
+                .send(&thread.detail.shell, &text, context.as_deref())
         } else {
             self.toast(
                 "no thread open; press n for a new thread or / to pick one",
                 true,
             );
             return;
-        }
+        };
+        self.take_outbox_step(step);
+        self.sent(text, draft_key);
+    }
+
+    /// What sending looks like, once a message has gone or been queued: the composer
+    /// empty, the message one `Ctrl-p` away, nothing parked for where it was written, and
+    /// the conversation followed to where it will show.
+    fn sent(&mut self, text: String, draft_key: Option<String>) {
         self.composer.push_history(text);
         self.composer.clear();
         if let Some(key) = draft_key {
@@ -1739,41 +1669,22 @@ impl App {
             .thread
             .as_ref()
             .filter(|thread| self.draft.is_none() && thread.is_running());
-        let Some(thread) = running else {
+        if running.is_none() {
             return self.send_composed(context);
+        }
+        self.leave_reading();
+        let Some(thread) = &self.thread else {
+            return;
         };
         let thread_id = thread.id().to_string();
-        let after_turn = thread
-            .detail
-            .shell
-            .latest_turn
-            .as_ref()
-            .filter(|turn| turn.state == "running")
-            .map(|turn| turn.turn_id.clone());
-        self.leave_reading();
-        let queued = self.queued.entry(thread_id.clone()).or_insert(Queued {
-            text: String::new(),
-            after_turn: None,
-        });
-        if !queued.text.is_empty() {
-            queued.text.push_str("\n\n");
-        }
-        queued
-            .text
-            .push_str(&over_transcript(context.as_deref(), &text));
-        queued.after_turn = after_turn;
-        self.composer.push_history(text);
-        self.composer.clear();
-        self.drafts.remove(&thread_id);
-        self.chat_view.follow();
+        self.outbox
+            .queue(&thread.detail.shell, &text, context.as_deref());
+        self.sent(text, Some(thread_id));
     }
 
     /// What the open thread has queued, for the composer to show.
     pub fn queued_message(&self) -> Option<&str> {
-        let thread_id = self.current_thread_id.as_ref()?;
-        self.queued
-            .get(thread_id)
-            .map(|queued| queued.text.as_str())
+        self.outbox.queued(self.current_thread_id.as_ref()?)
     }
 
     /// Take the open thread's queued message back into an empty composer, to be
@@ -1782,58 +1693,15 @@ impl App {
         if !self.composer.is_empty() {
             return false;
         }
-        let Some(queued) = self
+        let Some(text) = self
             .current_thread_id
             .as_ref()
-            .and_then(|thread_id| self.queued.remove(thread_id))
+            .and_then(|thread_id| self.outbox.recall(thread_id))
         else {
             return false;
         };
-        self.composer.set_text(&queued.text);
+        self.composer.set_text(&text);
         true
-    }
-
-    /// Send what a thread has queued once its turn is over. A turn that completed is
-    /// what it was waiting for. One that was interrupted or failed is not: the message
-    /// was written for a turn that did not get where it was going, so it comes back to
-    /// be read again rather than going out on its own.
-    fn release_queued(&mut self, thread: &crate::model::ThreadShell) {
-        let Some(queued) = self.queued.get(&thread.id) else {
-            return;
-        };
-        let turn = thread.latest_turn.as_ref();
-        if thread.is_running()
-            || queued
-                .after_turn
-                .as_ref()
-                .is_some_and(|waited| turn.map(|t| &t.turn_id) != Some(waited))
-        {
-            return;
-        }
-        let Some(queued) = self.queued.remove(&thread.id) else {
-            return;
-        };
-        match turn.map(|t| t.state.as_str()) {
-            Some("completed") => {
-                let command = commands::turn_start(
-                    &thread.id,
-                    &queued.text,
-                    &thread.model_selection,
-                    &thread.runtime_mode,
-                    &thread.interaction_mode,
-                    None,
-                );
-                self.dispatch_message(command, thread.id.clone(), queued.text);
-            }
-            state => {
-                let why = match state {
-                    Some("interrupted") => "the turn was interrupted",
-                    Some("error") => "the turn failed",
-                    _ => "the turn did not finish",
-                };
-                self.on_send_refused(thread.id.clone(), queued.text, why.into());
-            }
-        }
     }
 
     /// Ask the server what the threads said, once the thread list's query has held
@@ -2980,19 +2848,17 @@ impl App {
         self.handle.refresh_vcs();
     }
 
-    /// Work out where a new thread's worktree would branch from, reporting why not when
-    /// it cannot. Returns false when the message should not be sent.
-    fn resolve_draft_worktree(&mut self) -> bool {
-        self.draft_worktree = None;
+    /// Work out where a new thread's worktree would branch from, where it wants one, or
+    /// why it cannot, in which case the message is not to be sent.
+    fn draft_worktree(&self) -> Result<Option<outbox::Worktree>, &'static str> {
         let Some(draft) = self.draft.as_ref() else {
-            return true;
+            return Ok(None);
         };
         if !draft.worktree {
-            return true;
+            return Ok(None);
         }
         let Some(project) = self.shell.projects.get(&draft.project_id) else {
-            self.toast("unknown project", true);
-            return false;
+            return Err("unknown project");
         };
         // The worktree branches off whatever the project's checkout has now, which is
         // what the watch reports.
@@ -3001,16 +2867,17 @@ impl App {
             .filter(|vcs| vcs.is_repo)
             .and_then(|vcs| vcs.ref_name.clone());
         let Some(base) = base else {
-            let message = if self.vcs().is_none() {
+            return Err(if self.vcs().is_none() {
                 "still reading the project's checkout; send again in a moment"
             } else {
                 "no branch to base a worktree on; gw starts in the checkout instead"
-            };
-            self.toast(message, true);
-            return false;
+            });
         };
-        self.draft_worktree = Some((project.workspace_root.clone(), base));
-        true
+        Ok(Some(outbox::Worktree {
+            project_cwd: project.workspace_root.clone(),
+            base_branch: base,
+            start_from_origin: self.config.settings.new_worktrees_start_from_origin,
+        }))
     }
 
     /// The link drawn at a screen position, if any.
@@ -6853,6 +6720,7 @@ impl App {
                 {
                     open.sync_shell(thread);
                 }
+                let mut dropped = outbox::Step::default();
                 match &item {
                     // The first list is what is already there, so none of it is news.
                     ShellItem::Snapshot { snapshot } => {
@@ -6865,7 +6733,9 @@ impl App {
                     }
                     ShellItem::ThreadUpserted { thread, .. } => self.note_thread(thread),
                     ShellItem::ThreadRemoved { thread_id, .. } => {
-                        self.queued.remove(thread_id);
+                        // What was being written for it has nowhere to go.
+                        dropped = self.outbox.on_removed(thread_id);
+                        self.drafts.remove(thread_id);
                         self.marks.remove(thread_id);
                         self.statuses.remove(thread_id);
                         self.unseen.remove(thread_id);
@@ -6880,6 +6750,7 @@ impl App {
                     self.current_thread_id = None;
                     self.toast("thread was removed", false);
                 }
+                self.take_outbox_step(dropped);
                 if self.shell.synchronized {
                     self.open_where_asked();
                 }
@@ -7548,16 +7419,10 @@ fn apply(app: &mut App, event: AppEvent) {
             }
         }
         AppEvent::Update(update) => app.on_update(*update),
-        AppEvent::ThreadCreated(thread_id) => app.on_thread_created(thread_id),
+        AppEvent::Outbox(answer) => app.with_outbox(|outbox, here| outbox.on_answer(answer, here)),
         AppEvent::RewindRefused { thread_id, error } => app.on_rewind_refused(thread_id, error),
         AppEvent::PlanThreadCreated(thread_id) => app.open_thread(&thread_id),
         AppEvent::ThreadSearch { query, result } => app.on_thread_search(query, result),
-        AppEvent::CreateRefused { thread_id, error } => app.on_create_refused(thread_id, error),
-        AppEvent::SendRefused {
-            thread_id,
-            text,
-            error,
-        } => app.on_send_refused(thread_id, text, error),
         AppEvent::UsageRead(read) => app.on_usage_read(read),
         AppEvent::WorktreeChecked {
             path,
@@ -7862,36 +7727,83 @@ mod tests {
         );
     }
 
+    /// The server's answer to the next command dispatched: refused, as a send is refused.
+    async fn refuse_the_next_command(
+        app: &mut App,
+        requests: &mut mpsc::UnboundedReceiver<crate::session::Request>,
+        sent: &mut mpsc::UnboundedReceiver<AppEvent>,
+    ) -> Value {
+        let (command, reply) = loop {
+            match asked(requests).await.expect("a command") {
+                crate::session::Request::Dispatch { command, reply } => break (command, reply),
+                _ => continue,
+            }
+        };
+        drop(reply);
+        let answer = tokio::time::timeout(Duration::from_millis(500), sent.recv())
+            .await
+            .expect("the refusal comes back")
+            .expect("an event");
+        apply(app, answer);
+        command
+    }
+
     /// A refused create used to leave the view on a thread that was never made and the
     /// message nowhere at all.
     #[tokio::test]
     async fn a_thread_the_server_refuses_gives_the_message_back() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         let project_id = project(&mut app);
         app.start_new_thread(&project_id);
         app.composer.set_text("the message");
         app.send_message();
-
-        let thread_id = app
-            .current_thread_id
-            .clone()
-            .expect("a thread was asked for");
+        assert!(app.current_thread_id.is_some(), "a thread was asked for");
         assert!(app.draft.is_none() && app.composer.text().is_empty());
+        app.mode = Mode::Normal;
+        app.focus = Focus::Chat;
 
-        app.on_create_refused(thread_id, "git worktree add failed".into());
-
+        let create = refuse_the_next_command(&mut app, &mut requests, &mut sent).await;
+        assert!(create.get("bootstrap").is_some(), "{create}");
         assert!(
             app.current_thread_id.is_none(),
             "still on a thread that is not there"
         );
         assert_eq!(app.draft.map(|d| d.project_id), Some(project_id));
         assert_eq!(app.composer.text(), "the message");
-        assert_eq!(
-            app.toast.map(|t| t.0),
-            Some("git worktree add failed".to_string())
-        );
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.focus, Focus::Composer);
+    }
+
+    /// What comes back to the history is not put there twice: a create refused after
+    /// another message went leaves the history as it was sent.
+    #[tokio::test]
+    async fn a_message_given_back_to_the_history_is_there_once() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let project_id = project(&mut app);
+        app.start_new_thread(&project_id);
+        app.composer.set_text("X");
+        app.send_message();
+        let mut thread = running_thread();
+        thread.detail.shell.id = "t2".into();
+        app.thread = Some(thread);
+        app.current_thread_id = Some("t2".into());
+        app.composer.set_text("Y");
+        app.send_message();
+
+        let create = refuse_the_next_command(&mut app, &mut requests, &mut sent).await;
+        assert_eq!(create["message"]["text"], "X");
+        let said = app.toast.as_ref().expect("it says so").0.clone();
+        assert!(said.contains("history"), "{said}");
+        app.composer.history_prev();
+        assert_eq!(app.composer.text(), "Y");
+        app.composer.history_prev();
+        assert_eq!(app.composer.text(), "X");
+        app.composer.history_prev();
+        assert_eq!(app.composer.text(), "X", "nothing before it");
     }
 
     fn shell_thread(id: &str, project: &str, worktree: Option<&str>) -> crate::model::ThreadShell {
@@ -9153,9 +9065,11 @@ mod tests {
             .expect("the refusal comes back")
             .expect("an event");
         assert!(
-            matches!(&refusal, AppEvent::SendRefused { thread_id, text, .. }
-                if thread_id == "t1" && text == "the message"),
-            "the refusal carries the message it refused"
+            matches!(
+                &refusal,
+                AppEvent::Outbox(outbox::Answer { result: Err(_), .. })
+            ),
+            "the refusal comes back to the outbox"
         );
         apply(&mut app, refusal);
         assert_eq!(app.composer.text(), "the message");
@@ -9959,9 +9873,12 @@ mod tests {
 
         app.composer.set_text("review this");
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let create = sent_command(&mut requests)
-            .await
-            .expect("the thread is made");
+        let (create, reply) = loop {
+            match asked(&mut requests).await.expect("the thread is made") {
+                crate::session::Request::Dispatch { command, reply } => break (command, reply),
+                _ => continue,
+            }
+        };
         assert_eq!(
             create["threadId"],
             thread_id.as_str(),
@@ -9977,7 +9894,12 @@ mod tests {
             "no second worktree"
         );
 
-        app.on_thread_created(thread_id.clone());
+        let _ = reply.send(Ok(1));
+        let made = tokio::time::timeout(Duration::from_millis(500), sent.recv())
+            .await
+            .expect("it comes back")
+            .expect("an event");
+        apply(&mut app, made);
         let link = sent_command(&mut requests)
             .await
             .expect("the pull request is linked");
@@ -10081,17 +10003,6 @@ mod tests {
             "sent into the running turn"
         );
 
-        // A list entry from before the turn began says nothing about this one.
-        upsert(
-            &mut app,
-            listed("t1", Some(("an-earlier-turn", "completed"))),
-        );
-        upsert(&mut app, listed("t1", Some(("turn", "running"))));
-        assert!(
-            sent_no_command(&mut requests).await,
-            "sent before the turn ended"
-        );
-
         upsert(&mut app, listed("t1", Some(("turn", "completed"))));
         let command = sent_command(&mut requests)
             .await
@@ -10099,52 +10010,6 @@ mod tests {
         assert_eq!(command["type"], "thread.turn.start");
         assert_eq!(command["message"]["text"], "first\n\nsecond");
         assert_eq!(app.queued_message(), None);
-    }
-
-    /// A queued message is still tria's, so it can be taken back to change or drop.
-    #[tokio::test]
-    async fn up_takes_a_queued_message_back() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(running_thread());
-        app.current_thread_id = Some("t1".into());
-        app.mode = Mode::Insert;
-        app.focus = Focus::Composer;
-
-        app.composer.set_text("not yet");
-        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.composer.text(), "not yet");
-        assert_eq!(app.queued_message(), None);
-
-        upsert(&mut app, listed("t1", Some(("turn", "completed"))));
-        assert!(
-            sent_no_command(&mut requests).await,
-            "a recalled message went out"
-        );
-    }
-
-    /// A turn stopped part way is not the one the message was written to follow, so the
-    /// message comes back rather than going out behind it.
-    #[tokio::test]
-    async fn a_queued_message_comes_back_when_the_turn_is_interrupted() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(running_thread());
-        app.current_thread_id = Some("t1".into());
-        app.mode = Mode::Insert;
-        app.focus = Focus::Composer;
-
-        app.composer.set_text("after that");
-        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        upsert(&mut app, listed("t1", Some(("turn", "interrupted"))));
-
-        assert!(sent_no_command(&mut requests).await);
-        assert_eq!(app.composer.text(), "after that");
-        assert_eq!(app.queued_message(), None);
-        assert!(app.toast.as_ref().unwrap().0.contains("interrupted"));
     }
 
     /// With no turn running there is nothing to wait for.
@@ -10933,31 +10798,31 @@ mod tests {
         assert!(refreshed, "the thread was not asked for again");
     }
 
-    /// Where the composer is not free, putting the message back would write over
-    /// something else somebody typed. It goes to the thread it was meant for if that
-    /// draft is free, and otherwise it stays in the history and the toast says so.
-    #[test]
-    fn a_refused_message_does_not_write_over_what_took_its_place() {
+    /// A thread the server removes takes what was being written for it along: its parked
+    /// draft, and what it had queued, which is said out loud and left in the history.
+    #[tokio::test]
+    async fn a_removed_thread_takes_what_was_written_for_it() {
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         app.thread = Some(running_thread());
         app.current_thread_id = Some("t1".into());
+        app.mode = Mode::Insert;
+        app.composer.set_text("after that");
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.composer.set_text("half written");
+        app.open_thread("t2");
+        assert!(app.drafts.contains_key("t1"));
 
-        // Something written since: the composer is left alone.
-        app.composer.set_text("the next one");
-        app.on_send_refused("t1".into(), "the message".into(), "refused".into());
-        assert_eq!(app.composer.text(), "the next one");
-        assert!(app.toast.as_ref().unwrap().0.contains("history"));
-
-        // Somewhere else entirely: it waits in the thread it was written in.
-        app.current_thread_id = Some("t2".into());
-        app.on_send_refused("t1".into(), "the message".into(), "refused".into());
-        assert_eq!(
-            app.drafts.get("t1").map(String::as_str),
-            Some("the message")
-        );
-        assert_eq!(app.composer.text(), "the next one");
+        app.on_update(Update::Shell(ShellItem::ThreadRemoved {
+            sequence: 1,
+            thread_id: "t1".into(),
+        }));
+        assert!(!app.drafts.contains_key("t1"), "a draft for nothing");
+        let said = app.toast.as_ref().expect("it says so").0.clone();
+        assert!(said.contains("queued message was dropped"), "{said}");
+        app.composer.history_prev();
+        assert_eq!(app.composer.text(), "after that");
     }
 
     /// The app keeps a handful of letters the composer's Vim has no use for, but a key

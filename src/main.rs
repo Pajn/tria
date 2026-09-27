@@ -11,6 +11,7 @@ mod list_cursor;
 mod lucide;
 mod model;
 mod notify;
+mod outbox;
 mod picture;
 mod pull_request;
 mod question;

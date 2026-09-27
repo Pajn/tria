@@ -80,6 +80,11 @@ impl Composer {
         self.col = char_len(&self.lines[self.row]);
     }
 
+    /// Whether `text` is anywhere in the history, for `Ctrl-p` to find.
+    pub fn remembers(&self, text: &str) -> bool {
+        self.history.iter().any(|entry| entry == text)
+    }
+
     pub fn push_history(&mut self, text: String) {
         if self.history.last() != Some(&text) {
             self.history.push(text);
