@@ -84,7 +84,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     let question_rows = user_input
         .as_ref()
-        .map(|q| question_panel_rows(app, q, main_area.width))
+        .map(|q| question_panel_rows(app, q, main_area.width, main_area.height))
         .unwrap_or(0);
     let composer_rows = app
         .composer
@@ -1308,63 +1308,91 @@ fn draw_approval(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn question_panel_rows(app: &App, pending: &crate::state::PendingUserInput, width: u16) -> u16 {
-    let index = app
-        .question
-        .as_ref()
-        .filter(|d| d.request_id == pending.request_id)
-        .map(|d| d.index)
-        .unwrap_or(0);
-    let Some(question) = pending.questions.get(index) else {
-        return 0;
-    };
-    let text_rows = Paragraph::new(question.text.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(width.saturating_sub(4)) as u16;
-    // border + question text + options + custom line + hint line
-    (1 + text_rows + question.options.len() as u16 + 2).min(16)
-}
-
-fn draw_question(
-    frame: &mut Frame,
+fn question_panel_rows(
     app: &App,
     pending: &crate::state::PendingUserInput,
-    area: Rect,
-) {
+    width: u16,
+    height: u16,
+) -> u16 {
+    let Some(panel) = question_panel(app, pending, width) else {
+        return 0;
+    };
+    // The border, then every row the panel wraps to, up to half the screen so the chat
+    // is still there to check an answer against.
+    (1 + panel.lines.len() as u16).min(16.max(height / 2))
+}
+
+/// The question panel as it is drawn: its title, and each row it wraps to at `width`.
+struct QuestionPanel {
+    title: String,
+    accent: Style,
+    lines: Vec<Line<'static>>,
+    /// The row of the custom answer's field, and the cursor's column in what it shows,
+    /// while it is being written.
+    field_cursor: Option<(u16, u16)>,
+}
+
+/// `body` wrapped to what is left of `width` after `prefix`, the rows after the first
+/// starting under the first rather than under the prefix, and each row in `style`
+/// across the whole width.
+fn hang(
+    prefix: Vec<Span<'static>>,
+    body: Vec<Span<'static>>,
+    width: u16,
+    style: Style,
+) -> Vec<Line<'static>> {
+    let indent: usize = prefix.iter().map(|span| span.width()).sum();
+    let room = (width as usize).saturating_sub(indent).max(1) as u16;
+    let wrapped = crate::timeline::wrap(&Text::from(Line::from(body)), room);
+    let mut prefix = Some(prefix);
+    wrapped
+        .lines
+        .into_iter()
+        .map(|row| {
+            let mut spans = prefix
+                .take()
+                .unwrap_or_else(|| vec![Span::raw(" ".repeat(indent))]);
+            spans.extend(row.spans);
+            let used: usize = spans.iter().map(|span| span.width()).sum();
+            spans.push(Span::raw(" ".repeat((width as usize).saturating_sub(used))));
+            Line::from(spans).style(style)
+        })
+        .collect()
+}
+
+fn question_panel(
+    app: &App,
+    pending: &crate::state::PendingUserInput,
+    width: u16,
+) -> Option<QuestionPanel> {
     let active = matches!(app.mode, Mode::Question | Mode::QuestionCustom);
     let draft = app
         .question
         .as_ref()
         .filter(|d| d.request_id == pending.request_id);
     let index = draft.map(|d| d.index).unwrap_or(0);
-    let Some(question) = pending.questions.get(index) else {
-        return;
-    };
+    let question = pending.questions.get(index)?;
     let accent = if active {
         Style::default().fg(Color::Magenta)
     } else {
         Style::default().fg(Color::Yellow)
     };
+    let dim = Style::default().fg(Color::DarkGray);
 
     let mut title = format!(" {} ", question.header);
     if pending.questions.len() > 1 {
         title.push_str(&format!("· {}/{} ", index + 1, pending.questions.len()));
     }
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(accent)
-        .title(Line::from(Span::styled(
-            title,
-            accent.add_modifier(Modifier::BOLD),
-        )));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        format!("  {}", question.text),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
+    let mut lines: Vec<Line<'static>> = hang(
+        vec![Span::raw("  ")],
+        vec![Span::styled(
+            question.text.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )],
+        width,
+        Style::default(),
+    );
     let selected = draft
         .map(|d| d.current_answer().selected.clone())
         .unwrap_or_default();
@@ -1380,58 +1408,31 @@ fn draw_question(
             (false, true) => "(•)",
             (false, false) => "( )",
         };
+        // The option under the keys is tinted the way the chat's cursor line is, which
+        // everything on it, the dim description too, can still be read over.
         let row_style = if active && highlight == i {
-            Style::default().bg(Color::DarkGray)
+            Style::default().bg(Color::Indexed(236))
         } else {
             Style::default()
         };
-        let mut spans = vec![
+        let prefix = vec![
             Span::styled(format!("  {} ", i + 1), accent.add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!("{marker} "),
-                if is_selected {
-                    accent
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                },
-            ),
-            Span::styled(option.label.clone(), row_style),
+            Span::styled(format!("{marker} "), if is_selected { accent } else { dim }),
         ];
+        let mut body = vec![Span::raw(option.label.clone())];
         if !option.description.is_empty() {
-            spans.push(Span::styled(
-                format!(
-                    "  {}",
-                    fit(
-                        &option.description,
-                        inner
-                            .width
-                            .saturating_sub(option.label.chars().count() as u16 + 12)
-                            as usize
-                    )
-                ),
-                Style::default().fg(Color::DarkGray),
-            ));
+            body.push(Span::styled(format!("  {}", option.description), dim));
         }
-        lines.push(Line::from(spans).style(row_style));
+        lines.extend(hang(prefix, body, width, row_style));
     }
     // The field is one row of the panel, so a long answer scrolls inside it rather than
     // wrapping and pushing the hint off the bottom. `  c > ` takes the first six columns.
-    let field_width = inner.width.saturating_sub(6) as usize;
+    let field_width = width.saturating_sub(6) as usize;
     let mut field_cursor = None;
     if question.allow_custom {
         if app.mode == Mode::QuestionCustom {
             let (visible, cursor) = app.custom_answer.line_window(field_width);
-            // The rows above the field are however many the question text and the
-            // options wrapped to, which is not one apiece.
-            let row: u16 = lines
-                .iter()
-                .map(|line| {
-                    Paragraph::new(line.clone())
-                        .wrap(Wrap { trim: false })
-                        .line_count(inner.width) as u16
-                })
-                .sum();
-            field_cursor = Some((row, cursor as u16));
+            field_cursor = Some((lines.len() as u16, cursor as u16));
             lines.push(Line::from(vec![
                 Span::styled("  c ", accent.add_modifier(Modifier::BOLD)),
                 Span::styled("> ", accent),
@@ -1446,15 +1447,15 @@ fn draw_question(
         } else {
             lines.push(Line::from(vec![
                 Span::styled("  c ", accent.add_modifier(Modifier::BOLD)),
-                Span::styled("( ) ", Style::default().fg(Color::DarkGray)),
-                Span::styled("type a custom answer", Style::default().fg(Color::DarkGray)),
+                Span::styled("( ) ", dim),
+                Span::styled("type a custom answer", dim),
             ]));
         }
     }
     let hint = if !active {
-        "  a or Enter to answer".to_string()
+        "a or Enter to answer".to_string()
     } else if app.mode == Mode::QuestionCustom {
-        "  Enter confirm · Esc back".to_string()
+        "Enter confirm · Esc back".to_string()
     } else {
         let mut parts = vec![if question.multi_select {
             "digits/Space toggle · Enter next"
@@ -1471,15 +1472,44 @@ fn draw_question(
             parts.push("d dismiss");
         }
         parts.push("Esc leave");
-        format!("  {}", parts.join(" · "))
+        parts.join(" · ")
     };
-    lines.push(Line::from(Span::styled(
-        hint,
-        Style::default().fg(Color::DarkGray),
-    )));
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    lines.extend(hang(
+        vec![Span::raw("  ")],
+        vec![Span::styled(hint, dim)],
+        width,
+        Style::default(),
+    ));
+    Some(QuestionPanel {
+        title,
+        accent,
+        lines,
+        field_cursor,
+    })
+}
 
-    if let Some((row, cursor)) = field_cursor
+fn draw_question(
+    frame: &mut Frame,
+    app: &App,
+    pending: &crate::state::PendingUserInput,
+    area: Rect,
+) {
+    let Some(panel) = question_panel(app, pending, area.width) else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(panel.accent)
+        .title(Line::from(Span::styled(
+            panel.title,
+            panel.accent.add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // Already wrapped, one line a row, so the rows drawn are the rows counted.
+    frame.render_widget(Paragraph::new(panel.lines), inner);
+
+    if let Some((row, cursor)) = panel.field_cursor
         && row < inner.height
     {
         frame.set_cursor_position((
@@ -4103,6 +4133,91 @@ mod tests {
             !drawn.iter().any(|symbol| symbol == "\u{26A7}\u{FE0F}"),
             "and the symbol it is joined to is not drawn on top of it"
         );
+    }
+
+    /// A question whose first option says a lot, being answered with that option marked.
+    fn answering_a_long_option() -> App {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let snapshot: crate::model::ThreadDetailSnapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p", "title": "Test",
+                "modelSelection": {"instanceId": "instance", "model": "a-model"},
+                "runtimeMode": "full-access", "latestTurn": null, "session": null,
+                "messages": [], "activities": [{
+                    "id": "a1", "kind": "user-input.requested",
+                    "payload": {"requestId": "r1", "questions": [{
+                        "id": "q1", "header": "Pick", "question": "Which one?",
+                        "options": [
+                            {"label": "Keep the cache",
+                             "description": "hold on to what was built last time and only rebuild what changed since then, which is quicker"},
+                            {"label": "Start over", "description": "build it all"},
+                        ]
+                    }]}
+                }]
+            }
+        }))
+        .unwrap();
+        app.thread = Some(crate::state::ThreadState::from_snapshot(snapshot));
+        let pending = app.thread.as_ref().unwrap().pending_user_input().unwrap();
+        app.question = Some(crate::question::QuestionDraft::new(&pending));
+        app.mode = Mode::Question;
+        app
+    }
+
+    /// A long option wraps under itself rather than being cut short, and every row of
+    /// it is drawn.
+    #[test]
+    fn a_long_option_wraps_under_itself() {
+        let mut app = answering_a_long_option();
+        let drawn = chat(60, &mut app);
+        assert!(!drawn.contains('…'), "nothing cut short:\n{drawn}");
+        for word in ["quicker", "Start over", "build it all", "Esc leave"] {
+            assert!(drawn.contains(word), "{word} is drawn:\n{drawn}");
+        }
+        // The rows after the first start under the option's words, not under its number.
+        let first = drawn
+            .lines()
+            .position(|l| l.contains("Keep the cache"))
+            .unwrap();
+        let at = drawn.lines().nth(first).unwrap().find("Keep").unwrap();
+        let next = drawn.lines().nth(first + 1).unwrap();
+        assert_eq!(
+            next.len() - next.trim_start().len(),
+            at,
+            "hangs under it:\n{drawn}"
+        );
+    }
+
+    /// Everything on the option marked is written in a colour of its own, not the one it
+    /// is marked with.
+    #[test]
+    fn the_option_marked_can_be_read() {
+        let mut app = answering_a_long_option();
+        let buffer = screen(60, &mut app);
+        let area = buffer.area;
+        let row = (0..area.height)
+            .find(|&y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("Keep the cache")
+            })
+            .unwrap();
+        for x in 0..area.width {
+            let cell = &buffer[(x, row)];
+            if cell.symbol().trim().is_empty() {
+                continue;
+            }
+            assert_ne!(
+                cell.fg,
+                cell.bg,
+                "{:?} at {x} is written in its background",
+                cell.symbol()
+            );
+        }
     }
 
     fn screen(width: u16, app: &mut App) -> ratatui::buffer::Buffer {
