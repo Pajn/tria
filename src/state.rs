@@ -1,6 +1,9 @@
 //! Pure reducers for the shell (project and thread list) and one open thread.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use serde_json::Value;
 
@@ -307,10 +310,21 @@ pub struct ThreadState {
     pub synchronized: bool,
     pub has_more: bool,
     pub before_cursor: Option<String>,
-    /// Bumped on every change so renderers can cache derived output.
+    /// Moved on by every change, so what is laid out from the state can be kept until it
+    /// moves. No two states share one: see `REVISIONS`.
     pub revision: u64,
     /// Set when an event could not be applied incrementally and a fresh snapshot is needed.
     pub needs_snapshot: bool,
+}
+
+/// Every revision any thread state has had, counted once for all of them. A state built
+/// afresh — a thread opened again, or a snapshot taken in place of what was there — then
+/// never repeats a revision an earlier one had, so what was laid out from the old state is
+/// never taken for the new one.
+static REVISIONS: AtomicU64 = AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    REVISIONS.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Context worth summarising. Below this there is not enough behind the thread for a
@@ -348,9 +362,14 @@ impl ThreadState {
             synchronized: false,
             has_more,
             before_cursor,
-            revision: 1,
+            revision: next_revision(),
             needs_snapshot: false,
         }
+    }
+
+    /// Move the revision on, after a change to anything drawn from the state.
+    pub fn touch(&mut self) {
+        self.revision = next_revision();
     }
 
     pub fn id(&self) -> &str {
@@ -443,7 +462,7 @@ impl ThreadState {
             "thread.reverted" => self.needs_snapshot = true,
             _ => return,
         }
-        self.revision += 1;
+        self.touch();
     }
 
     fn apply_message(&mut self, incoming: MessageSent) {
@@ -505,7 +524,7 @@ impl ThreadState {
         mine.pin_order_key = shell.pin_order_key.clone();
         mine.archived_at = shell.archived_at.clone();
         mine.updated_at = shell.updated_at.clone();
-        self.revision += 1;
+        self.touch();
     }
 
     pub fn is_running(&self) -> bool {
@@ -918,6 +937,32 @@ mod tests {
         }))
         .unwrap();
         ThreadState::from_snapshot(snapshot)
+    }
+
+    /// What is laid out from a thread is kept for as long as its revision stands, so a
+    /// snapshot taken in place of the state, or the thread opened again, never comes back
+    /// with a revision the state had before.
+    #[test]
+    fn a_state_built_afresh_never_repeats_a_revision() {
+        let mut open = thread();
+        let mut seen = vec![open.revision];
+        open.sync_shell(&open.detail.shell.clone());
+        seen.push(open.revision);
+        let again = thread();
+        open.apply(ThreadItem::Snapshot {
+            snapshot: serde_json::from_value(json!({
+                "snapshotSequence": 11,
+                "thread": {
+                    "id": "t1", "projectId": "p1", "title": "Test",
+                    "modelSelection": {"instanceId": "claudeAgent", "model": "m"},
+                    "messages": [], "activities": []
+                }
+            }))
+            .unwrap(),
+        });
+        assert!(!seen.contains(&open.revision), "{seen:?} {}", open.revision);
+        assert!(!seen.contains(&again.revision));
+        assert_ne!(open.revision, again.revision);
     }
 
     /// A thread whose last message asked for the context to be compacted, in the shape

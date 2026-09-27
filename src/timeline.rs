@@ -72,6 +72,11 @@ pub struct Placed {
     pub indent: u16,
     /// What the image is known by in the drawing cache.
     pub key: String,
+    /// The picture itself and the room it was placed in, to place it again when the
+    /// drawing cache has let it go: the screen was handed to another program, or other
+    /// pictures pushed it out. The lines it sits on are only ever blank.
+    pub picture: Picture,
+    pub room: Size,
 }
 
 #[derive(Debug, Clone)]
@@ -976,18 +981,20 @@ fn render_work(
                 ]));
             }
             for image in &entry.images {
-                match picture::place(
-                    &image.key,
-                    image.source,
-                    image_room(width, height, IMAGE_INDENT),
+                let room = image_room(width, height, IMAGE_INDENT);
+                match (
+                    picture::place(&image.key, image.source, room),
+                    Picture::of(image.source),
                 ) {
                     // Blank lines, which the renderer draws the image over once it knows
                     // where on the screen they landed.
-                    Some(size) => {
+                    (Some(size), Some(picture)) => {
                         images.push(Placed {
                             line: lines.len(),
                             indent: IMAGE_INDENT,
                             key: image.key.clone(),
+                            picture,
+                            room,
                         });
                         lines.extend(std::iter::repeat_n(
                             Line::from(" ".repeat(IMAGE_INDENT as usize)),
@@ -997,7 +1004,7 @@ fn render_work(
                     // Nothing here can draw it. A file a tool read is often a temporary
                     // one that has since been cleaned up, and that is worth saying: the
                     // row above names the file, and this says what became of it.
-                    None => lines.push(Line::from(vec![
+                    _ => lines.push(Line::from(vec![
                         Span::styled("      → ", dim),
                         Span::styled(missing(image), Style::default().fg(Color::Gray)),
                     ])),
@@ -1021,6 +1028,14 @@ fn render_work(
 }
 
 impl Picture {
+    /// Where its bytes are, to be placed from.
+    pub fn source(&self) -> picture::Source<'_> {
+        match self {
+            Picture::File(path) => picture::Source::File(path),
+            Picture::Data(data) => picture::Source::Data(data),
+        }
+    }
+
     /// Where a row's picture is, given what it was drawn from. Bytes and pixels are
     /// pictures tria made rather than ones anybody sent — the furniture it draws around
     /// the conversation — and no row has one, so there is nothing there to open.
@@ -1046,7 +1061,14 @@ fn missing(image: &ToolImage<'_>) -> &'static str {
 /// The room one image is given: what the text around it leaves of the width, and half
 /// the window, so what follows an image is still in view.
 fn image_room(width: u16, height: u16, indent: u16) -> Size {
-    Size::new(width.saturating_sub(indent + 2), (height / 2).clamp(4, 24))
+    Size::new(width.saturating_sub(indent + 2), picture_rows(height))
+}
+
+/// How many rows a picture may take in a chat this tall. It is all the chat's height is
+/// used for in building its blocks, so blocks built at two heights that give pictures the
+/// same rows are the same blocks.
+pub fn picture_rows(height: u16) -> u16 {
+    (height / 2).clamp(4, 24)
 }
 
 /// The pictures a message's own markdown points at, drawn under the lines that name them.
@@ -1114,7 +1136,7 @@ pub fn place_message_images(
             .collect();
         // What this one line has: each picture, the column it goes in, and the rows it asked
         // for, none of which can be given out until the caption itself has a line number.
-        let mut here: Vec<(String, u16, u16)> = Vec::new();
+        let mut here: Vec<(String, u16, u16, Size)> = Vec::new();
         let mut shown = Vec::new();
         let mut note = None;
         for (&mark, &(column, edge)) in marks.iter().zip(&reach) {
@@ -1134,9 +1156,9 @@ pub fn place_message_images(
                         match picture::place(&key, picture::Source::Data(data), room) {
                             Some(size) => {
                                 shown.push(mark);
-                                here.push((key, column, size.height));
+                                here.push((key, column, size.height, room));
                             }
-                            None => here.push((key, column, 0)),
+                            None => here.push((key, column, 0, room)),
                         }
                     }
                     Some(None) => note = note.or(Some("could not be fetched")),
@@ -1150,11 +1172,11 @@ pub fn place_message_images(
                     // The marker says there is a picture that cannot be shown. It is
                     // shown, so what is left is the caption it was written with.
                     shown.push(mark);
-                    here.push((key, column, size.height));
+                    here.push((key, column, size.height, room));
                 }
                 None => {
                     note = note.or_else(|| missing_file(&path));
-                    here.push((key, column, 0));
+                    here.push((key, column, 0, room));
                 }
             }
         }
@@ -1201,18 +1223,21 @@ pub fn place_message_images(
         // many lines as the tallest of them needs: the renderer draws them there once it
         // knows where on the screen those lines landed.
         let first = lines.len();
-        for (key, column, rows) in &here {
-            if *rows > 0 {
+        for (key, column, rows, room) in &here {
+            let picture = pictures.iter().find(|(k, _)| k == key);
+            if let Some((_, picture)) = picture.filter(|_| *rows > 0) {
                 placed.push(Placed {
                     line: first,
                     indent: *column,
                     key: key.clone(),
+                    picture: picture.clone(),
+                    room: *room,
                 });
             }
         }
-        let rows = here.iter().map(|(_, _, rows)| *rows).max().unwrap_or(0);
+        let rows = here.iter().map(|(_, _, rows, _)| *rows).max().unwrap_or(0);
         lines.extend(std::iter::repeat_n(under, rows as usize));
-        for (key, _, _) in here {
+        for (key, _, _, _) in here {
             regions.push(Region {
                 first: caption,
                 end: lines.len(),

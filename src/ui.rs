@@ -1,7 +1,6 @@
 //! Rendering. Layout: optional thread sidebar, header, chat, approval panel,
 //! composer, status line. Overlays: picker and help.
 
-use std::collections::HashSet;
 use std::num::NonZeroU16;
 
 use ratatui::{
@@ -17,8 +16,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{
-        App, Checkout, Focus, Mode, PickerKind, Scroll, Section, SidebarRow, SidebarTab,
-        approval_options,
+        App, Checkout, Focus, Mode, PickerKind, Section, SidebarRow, SidebarTab, approval_options,
     },
     config::SidebarLayout,
     model::ThreadStatus,
@@ -26,7 +24,6 @@ use crate::{
     reader::{Badge, Source},
     session::Status,
     subagent,
-    timeline::{self, Block as ChatBlock, BlockKey},
 };
 
 const SIDEBAR_WIDTH: u16 = 34;
@@ -51,37 +48,6 @@ const SELECTED: Color = Color::Indexed(238);
 /// line drawing with more pixels than the lines have detail.
 const MOST_ICON_PIXELS: u32 = 64;
 const COMPOSER_MAX_ROWS: u16 = 8;
-
-/// Cached rendered chat blocks with their wrapped heights.
-#[derive(Default)]
-pub struct ChatCache {
-    key: Option<(String, u64, u16, u16, u64, u8, usize)>,
-    blocks: Vec<CachedBlock>,
-    total: usize,
-    /// Every content line as displayed, filled on demand for search.
-    lines: Option<Vec<String>>,
-}
-
-pub struct CachedBlock {
-    block: ChatBlock,
-    /// The block's text broken into the rows it is drawn as.
-    wrapped: timeline::Wrapped,
-    /// Toggle regions in wrapped content lines relative to the block start.
-    rows: Vec<timeline::Region>,
-    exports: Vec<(String, String)>,
-    /// Images in wrapped content lines relative to the block start.
-    images: Vec<timeline::Placed>,
-}
-
-impl CachedBlock {
-    fn height(&self) -> usize {
-        self.wrapped.lines.len()
-    }
-}
-
-thread_local! {
-    static CACHE: std::cell::RefCell<ChatCache> = std::cell::RefCell::new(ChatCache::default());
-}
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -246,8 +212,9 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
     {
         return;
     }
-    let offset = app.chat_offset();
-    let (cursor, column) = app.chat_spot();
+    let layout = &app.chat_layout;
+    let offset = layout.offset(app.scroll);
+    let (cursor, column) = layout.spot(app.chat_cursor, app.chat_column);
     let row = |line: usize| {
         (line >= offset)
             .then(|| chat.y + (line - offset) as u16)
@@ -273,7 +240,7 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
     );
     if let Some(anchor) = app.chat_visual {
         let style = Style::default().bg(Color::Blue).fg(Color::White);
-        let head = (anchor.line, anchor.column.min(chat_len(anchor.line)));
+        let head = (anchor.line, anchor.column.min(layout.len(anchor.line)));
         let spot = (cursor, column);
         let (first, last) = if head <= spot {
             (head, spot)
@@ -285,14 +252,14 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
                 (0, chat.width)
             } else {
                 let from = if line == first.0 {
-                    chat_column(line, first.1)
+                    layout.column(line, first.1)
                 } else {
                     0
                 };
                 let to = if line == last.0 {
-                    chat_column(line, last.1 + 1)
+                    layout.column(line, last.1 + 1)
                 } else {
-                    chat_column(line, chat_len(line))
+                    layout.column(line, layout.len(line))
                 };
                 // An empty line still shows that it is in the selection.
                 (from, to.max(from + 1))
@@ -304,7 +271,7 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
     // whichever way round that cell is not so it shows on the tinted line and inside a
     // selection alike.
     if let Some(y) = row(cursor) {
-        let x = chat.x + chat_column(cursor, column);
+        let x = chat.x + layout.column(cursor, column);
         if x < chat.x + chat.width
             && let Some(cell) = buffer.cell_mut(Position::new(x, y))
         {
@@ -316,51 +283,6 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
             cell.set_style(style);
         }
     }
-}
-
-/// Plain text of a block or tool row by export key.
-pub fn chat_export(key: &str) -> Option<String> {
-    CACHE.with(|cache| {
-        cache
-            .borrow()
-            .blocks
-            .iter()
-            .flat_map(|b| b.exports.iter())
-            .find(|(k, _)| k == key)
-            .map(|(_, text)| text.clone())
-    })
-}
-
-/// Plain text of the whole conversation as currently loaded.
-pub fn chat_export_all() -> String {
-    CACHE.with(|cache| {
-        cache
-            .borrow()
-            .blocks
-            .iter()
-            .filter_map(|b| b.exports.first().map(|(_, text)| text.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n")
-    })
-}
-
-/// Every content line of the chat as displayed, marks and indents and all, kept from one
-/// rebuild to the next for search to read.
-pub fn chat_lines() -> Vec<String> {
-    CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.lines.is_none() {
-            let mut lines = Vec::with_capacity(cache.total);
-            for cached in &cache.blocks {
-                lines.extend(cached.wrapped.lines.iter().map(|line| {
-                    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                    text.trim_end().to_string()
-                }));
-            }
-            cache.lines = Some(lines);
-        }
-        cache.lines.clone().unwrap_or_default()
-    })
 }
 
 /// Paint search matches on the visible chat rows, reading the drawn cells so highlights land
@@ -473,103 +395,6 @@ fn apply_search_highlights(frame: &mut Frame, app: &App, chat: Rect) {
             }
         }
     }
-}
-
-/// The chat text from one point to another, each a content line and a character on it,
-/// the end exclusive. What comes back is what was written rather than what was drawn: the
-/// marks and indents the chat decorates its lines with are left out, and a line broken
-/// over several rows comes back as the one line it was, spaces and all.
-pub fn chat_span(start: (usize, usize), end: (usize, usize)) -> Option<String> {
-    CACHE.with(|cache| {
-        let cache = cache.borrow();
-        // The pieces to take, each a byte range of one line of one block. Rows of the
-        // same line join into one piece, which puts back the space a break swallowed.
-        let mut pieces: Vec<(usize, usize, usize, usize)> = Vec::new();
-        let mut y = 0usize;
-        for (index, cached) in cache.blocks.iter().enumerate() {
-            let block_start = y;
-            y += cached.height();
-            if y <= start.0 || block_start > end.0 {
-                continue;
-            }
-            for (row, at) in cached.wrapped.rows.iter().enumerate() {
-                let line = block_start + row;
-                if line < start.0 || line > end.0 {
-                    continue;
-                }
-                let from = if line == start.0 {
-                    cached.wrapped.byte(row, start.1)
-                } else {
-                    at.start
-                };
-                let to = if line == end.0 {
-                    cached.wrapped.byte(row, end.1)
-                } else {
-                    at.end
-                };
-                match pieces.last_mut() {
-                    Some(last) if (last.0, last.1) == (index, at.line) => last.3 = to.max(last.3),
-                    _ => pieces.push((index, at.line, from, to)),
-                }
-            }
-        }
-        if pieces.is_empty() {
-            return None;
-        }
-        Some(
-            pieces
-                .iter()
-                .map(|&(block, line, from, to)| {
-                    &cache.blocks[block].wrapped.texts[line][from..to.max(from)]
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-    })
-}
-
-/// The block a content line belongs to, and which of its rows the line is.
-fn locate(cache: &ChatCache, line: usize) -> Option<(&CachedBlock, usize)> {
-    let mut y = 0usize;
-    for cached in &cache.blocks {
-        if line < y + cached.height() {
-            return Some((cached, line - y));
-        }
-        y += cached.height();
-    }
-    None
-}
-
-/// The character of a content line drawn at a column of the chat, for a click or a drag.
-pub fn chat_index(line: usize, column: u16) -> usize {
-    CACHE.with(|cache| {
-        let cache = cache.borrow();
-        locate(&cache, line).map_or(0, |(block, row)| block.wrapped.index(row, column))
-    })
-}
-
-/// Where a character of a content line is drawn, as a column of the chat.
-pub fn chat_column(line: usize, index: usize) -> u16 {
-    CACHE.with(|cache| {
-        let cache = cache.borrow();
-        locate(&cache, line).map_or(0, |(block, row)| block.wrapped.column(row, index))
-    })
-}
-
-/// What a content line says, without the decoration it is drawn with.
-pub fn chat_row(line: usize) -> String {
-    CACHE.with(|cache| {
-        let cache = cache.borrow();
-        locate(&cache, line).map_or(String::new(), |(block, row)| block.wrapped.text(row).into())
-    })
-}
-
-/// How many characters a content line can be addressed by, its decoration not counted.
-pub fn chat_len(line: usize) -> usize {
-    CACHE.with(|cache| {
-        let cache = cache.borrow();
-        locate(&cache, line).map_or(0, |(block, row)| block.wrapped.len(row))
-    })
 }
 
 /// Highlight the drag over the chat cells it covers.
@@ -1404,10 +1229,10 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         height: area.height,
     };
     app.chat_area = inner;
+    app.chat_layout.resize(inner.width, inner.height);
     // A subagent's transcript, or a pull request, is read in place of the conversation,
     // through the same chat: scrolled, searched, and yanked like it.
-    let open = app.reader.conversation().or(app.thread.as_ref());
-    let Some(thread) = open else {
+    if app.reader.conversation().or(app.thread.as_ref()).is_none() {
         let text = if app.draft.is_some() {
             "Type your first message below and press Enter."
         } else if app.current_thread_id.is_some() {
@@ -1426,214 +1251,50 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
             inner,
         );
-        app.chat_viewport = (inner.height as usize, 0);
         return;
-    };
+    }
 
-    let expanded_hash = hash_set(&app.expanded);
-    let revision = if app.reader.is_open() {
-        app.reader.revision()
-    } else {
-        thread.revision
-    };
-    let key = (
-        thread.id().to_string(),
-        revision,
-        inner.width,
-        inner.height,
-        expanded_hash,
-        app.open_levels,
-        app.spinner % 8,
-    );
-    CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let needs_rebuild = match &cache.key {
-            Some(existing) => {
-                existing.0 != key.0
-                    || existing.1 != key.1
-                    || existing.2 != key.2
-                    || existing.3 != key.3
-                    || existing.4 != key.4
-                    || existing.5 != key.5
-                    || (thread.is_running() && existing.6 != key.6)
-            }
-            None => true,
+    app.chat();
+    let layout = &app.chat_layout;
+    if app.focus == Focus::Chat {
+        app.chat_cursor = layout.cursor(app.scroll, app.chat_cursor);
+    }
+    let offset = layout.offset(app.scroll);
+    let mut y = inner.y;
+    for shown in layout.shown(offset) {
+        let rect = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: shown.lines.len() as u16,
         };
-        if needs_rebuild {
-            // What is read in place of the conversation draws itself; everything after this
-            // treats its blocks like any others.
-            let blocks = if app.reader.is_open() {
-                app.reader.blocks(
-                    app.thread.as_ref(),
-                    &app.expanded,
-                    app.open_levels,
-                    (inner.width, inner.height),
-                    &crate::commands::now_iso(),
-                )
-            } else {
-                timeline::build(
-                    thread,
-                    &app.expanded,
-                    app.open_levels,
-                    inner.width,
-                    inner.height,
-                )
-            };
-            let mut total = 0usize;
-            let blocks: Vec<CachedBlock> = blocks
-                .into_iter()
-                .map(|mut block| {
-                    let exports = std::mem::take(&mut block.exports);
-                    let wrapped = timeline::wrap(&block.text, inner.width);
-                    total += wrapped.lines.len();
-                    // Where each line of the text starts turns text-line row ranges into
-                    // content lines, and says where an image's reserved lines landed.
-                    let (rows, images) = if block.rows.is_empty() {
-                        (Vec::new(), Vec::new())
-                    } else {
-                        let starts = &wrapped.starts;
-                        let rows = block
-                            .rows
-                            .iter()
-                            .map(|region| timeline::Region {
-                                first: starts[region.first],
-                                end: starts[region.end.min(starts.len() - 1)],
-                                ..region.clone()
-                            })
-                            .collect();
-                        let images = block
-                            .images
-                            .iter()
-                            .map(|placed| timeline::Placed {
-                                line: starts[placed.line.min(starts.len() - 1)],
-                                ..placed.clone()
-                            })
-                            .collect();
-                        (rows, images)
-                    };
-                    CachedBlock {
-                        block,
-                        wrapped,
-                        rows,
-                        exports,
-                        images,
-                    }
-                })
-                .collect();
-            cache.blocks = blocks;
-            cache.total = total;
-            cache.key = Some(key);
-            cache.lines = None;
-        }
-
-        let height = inner.height as usize;
-        let max_offset = cache.total.saturating_sub(height);
-        let offset = match app.scroll {
-            Scroll::Follow => max_offset,
-            Scroll::Offset(o) => o.min(max_offset),
-        };
-        app.chat_viewport = (height, cache.total);
-        app.work_ranges.clear();
-        app.picture_ranges.clear();
-        app.chat_pictures.clear();
-        app.block_ranges.clear();
-        app.message_starts.clear();
-        if app.focus == Focus::Chat {
-            app.chat_cursor = if app.scroll == Scroll::Follow {
-                cache.total.saturating_sub(1)
-            } else {
-                app.chat_cursor.min(cache.total.saturating_sub(1))
-            };
-        }
-
-        let mut y = 0usize;
-        let mut cursor = inner.y;
-        let bottom = inner.y + inner.height;
-        for cached in &cache.blocks {
-            let CachedBlock {
-                block,
-                wrapped,
-                rows,
-                exports,
-                images,
-            } = cached;
-            let start = y;
-            let end = y + cached.height();
-            y = end;
-            if matches!(block.key, BlockKey::Message(_) | BlockKey::Section(_)) {
-                app.message_starts.push(start);
-            }
-            if let Some((key, _)) = exports.first() {
-                app.block_ranges.push((start, end, key.clone()));
-            }
-            app.chat_pictures.extend(block.pictures.iter().cloned());
-            if matches!(block.key, BlockKey::Message(_)) {
-                app.picture_ranges
-                    .extend(rows.iter().map(|region| timeline::Region {
-                        first: start + region.first,
-                        end: start + region.end,
-                        ..region.clone()
-                    }));
-            }
-            if let BlockKey::Section(_) = &block.key {
-                app.work_ranges
-                    .extend(rows.iter().map(|region| timeline::Region {
-                        first: start + region.first,
-                        end: start + region.end,
-                        ..region.clone()
-                    }));
-            }
-            if let BlockKey::Work(key) = &block.key {
-                app.work_ranges.push(timeline::Region {
-                    first: start,
-                    end,
-                    key: key.clone(),
-                    foldable: true,
-                });
-                for region in rows {
-                    app.work_ranges.push(timeline::Region {
-                        first: start + region.first,
-                        end: start + region.end,
-                        ..region.clone()
-                    });
-                }
-            }
-            if end <= offset {
+        // Already broken to the width, so the widget is only placing the rows.
+        frame.render_widget(Paragraph::new(Text::from(shown.lines.to_vec())), rect);
+        // Over the blank lines the block left for them, and clipped to what of the
+        // block is on the screen: an image scrolls like the text it sits in. Each is
+        // placed again first, which costs nothing while the drawing cache still has it
+        // and puts it back where the cache let it go, with nothing laid out again.
+        for placed in shown.images {
+            if picture::place(&placed.key, placed.picture.source(), placed.room).is_none() {
                 continue;
             }
-            if cursor >= bottom {
-                break;
-            }
-            let skip = offset.saturating_sub(start);
-            let visible = (cached.height() - skip).min((bottom - cursor) as usize);
-            let rect = Rect {
-                x: inner.x,
-                y: cursor,
-                width: inner.width,
-                height: visible as u16,
-            };
-            // Already broken to the width, so the widget is only placing the rows.
-            frame.render_widget(
-                Paragraph::new(Text::from(wrapped.lines[skip..skip + visible].to_vec())),
+            picture::draw(
+                frame,
+                &placed.key,
                 rect,
+                SignedPosition::from((
+                    placed.indent as i16,
+                    placed.line as i16 - shown.skip as i16,
+                )),
             );
-            // Over the blank lines the block left for them, and clipped to what of the
-            // block is on the screen: an image scrolls like the text it sits in.
-            for placed in images {
-                picture::draw(
-                    frame,
-                    &placed.key,
-                    rect,
-                    SignedPosition::from((placed.indent as i16, placed.line as i16 - skip as i16)),
-                );
-            }
-            cursor += visible as u16;
         }
+        y += rect.height;
+    }
 
-        if cache.total > height {
-            draw_scrollbar(frame, area, offset, cache.total, height);
-        }
-    });
+    let (total, height) = (layout.total(), layout.height());
+    if total > height {
+        draw_scrollbar(frame, area, offset, total, height);
+    }
 }
 
 fn draw_scrollbar(frame: &mut Frame, area: Rect, offset: usize, total: usize, height: usize) {
@@ -3674,15 +3335,6 @@ fn fit(text: &str, max: usize) -> String {
     }
 }
 
-fn hash_set(set: &HashSet<String>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut keys: Vec<&String> = set.iter().collect();
-    keys.sort();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    keys.hash(&mut hasher);
-    hasher.finish()
-}
-
 #[cfg(test)]
 mod tests {
     use base64::Engine;
@@ -4095,16 +3747,16 @@ mod tests {
 
         let buffer = screen(60, &mut app);
         let region = app
-            .picture_ranges
+            .chat_layout
+            .picture_ranges()
             .first()
             .cloned()
             .expect("the message has a picture");
         assert_eq!(
-            app.chat_pictures,
-            [(
-                region.key.clone(),
-                crate::timeline::Picture::File(path.to_string_lossy().into_owned())
-            )],
+            app.chat_layout.picture_at(region.first),
+            Some(&crate::timeline::Picture::File(
+                path.to_string_lossy().into_owned()
+            )),
             "and `gx` opens the file itself"
         );
         // Half-blocks are colour rather than glyphs, so a drawn row is a painted one.
@@ -4121,6 +3773,46 @@ mod tests {
         assert!(
             painted(app.chat_area.y + (region.end - 1 - app.chat_offset()) as u16),
             "and runs to the end of the lines it was given"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The drawing cache lets pictures go: the screen is handed to another program and
+    /// back, or other pictures push them out. Nothing about the thread changed, so the
+    /// chat is not laid out again, and the picture is drawn all the same.
+    #[test]
+    fn a_picture_the_drawing_cache_let_go_is_still_drawn() {
+        crate::picture::draw_in_halfblocks();
+        let path = std::env::temp_dir().join("tria-a-forgotten-picture.png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(crate::picture::test_png(120, 60))
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_answering(&format!(
+            "Here it is.\n\n![the viewer serving a run]({})\n",
+            path.display()
+        )));
+        screen(60, &mut app);
+        let builds = app.chat_layout.builds();
+        let region = app.chat_layout.picture_ranges()[0].clone();
+        let y = app.chat_area.y + (region.first + 1 - app.chat_offset()) as u16;
+
+        crate::picture::forget();
+        let buffer = screen(60, &mut app);
+        assert_eq!(
+            app.chat_layout.builds(),
+            builds,
+            "nothing was laid out again"
+        );
+        assert!(
+            (0..buffer.area.width).any(|x| buffer[(x, y)]
+                .style()
+                .bg
+                .is_some_and(|bg| bg != Color::Reset)),
+            "the picture is drawn under its caption"
         );
         std::fs::remove_file(&path).unwrap();
     }
@@ -4423,29 +4115,6 @@ mod tests {
         );
     }
 
-    /// What is taken out of the chat is what was written into it, not what was drawn: no
-    /// marks, and a message broken over rows comes back as the one line it was.
-    #[test]
-    fn what_is_yanked_is_the_message_and_not_its_decoration() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        let said = "one two three four five six seven eight";
-        app.thread = Some(thread_saying(said));
-        chat(30, &mut app);
-
-        let start = app.message_starts.first().copied().unwrap();
-        // The label is the block's first row; the message itself starts under it and
-        // runs over the two rows it was broken into.
-        let text = chat_span((start + 1, 0), (start + 2, usize::MAX)).unwrap();
-        assert_eq!(text, said);
-        // And a piece of a row is only that piece.
-        assert_eq!(
-            chat_span((start + 1, 4), (start + 1, 7)),
-            Some("two".into())
-        );
-    }
-
     #[tokio::test]
     async fn a_pane_that_did_not_start_shows_why_and_how_to_close_it() {
         let (handle, _requests) = crate::session::Handle::detached();
@@ -4470,9 +4139,10 @@ mod tests {
         app.thread = Some(thread_saying("read this"));
         app.focus = Focus::Chat;
         app.mode = Mode::Insert;
-        app.scroll = Scroll::Offset(0);
+        app.scroll = crate::app::Scroll::Offset(0);
+        // The first frame is what tells the chat how big it is.
         chat(50, &mut app);
-        app.chat_cursor = app.message_starts[0] + 1;
+        app.chat_cursor = app.chat().message_starts()[0] + 1;
         let buffer = screen(50, &mut app);
         let y = app.chat_area.y + (app.chat_cursor - app.chat_offset()) as u16;
         for x in app.chat_area.x..app.chat_area.right() {
@@ -4503,7 +4173,7 @@ mod tests {
         chat(30, &mut app);
 
         // "two" on the first row of the message.
-        let line = app.message_starts.first().copied().unwrap() + 1;
+        let line = app.chat().message_starts()[0] + 1;
         app.focus = crate::app::Focus::Chat;
         // Following new output keeps the cursor on the last line; this is a reader
         // looking at something further up.
@@ -4524,14 +4194,13 @@ mod tests {
             .collect();
         assert_eq!(marked, "two");
         // And the cursor, at the far end of it, is turned the other way round again.
-        let x = app.chat_area.x + chat_column(line, 6);
+        let x = app.chat_area.x + app.chat_layout.column(line, 6);
         assert!(
             buffer[(x, y)]
                 .style()
                 .add_modifier
                 .contains(Modifier::REVERSED)
         );
-        assert_eq!(chat_span((line, 4), (line, 7)), Some("two".into()));
     }
 
     /// The line being read is tinted and the cursor is the one character on it, so the
@@ -4544,7 +4213,7 @@ mod tests {
         app.thread = Some(thread_saying("one two three four five six seven eight"));
         chat(30, &mut app);
 
-        let line = app.message_starts.first().copied().unwrap() + 1;
+        let line = app.chat().message_starts()[0] + 1;
         app.focus = crate::app::Focus::Chat;
         app.scroll = crate::app::Scroll::Offset(0);
         app.chat_cursor = line;
@@ -4560,7 +4229,10 @@ mod tests {
                     .contains(Modifier::REVERSED)
             })
             .collect();
-        assert_eq!(marked, vec![app.chat_area.x + chat_column(line, 4)]);
+        assert_eq!(
+            marked,
+            vec![app.chat_area.x + app.chat_layout.column(line, 4)]
+        );
 
         // The line carries the tint from edge to edge, and no other line does.
         let tint = |y: u16| {
@@ -5308,11 +4980,6 @@ mod redraw {
                     crossterm::event::KeyCode::Char('y'),
                     crossterm::event::KeyModifiers::CONTROL,
                 ));
-                // The chat is drawn from a cache the thread's revision keys, and only a
-                // change to the thread bumps it. A scroll is not one.
-                if let Some(thread) = app.thread.as_mut() {
-                    thread.revision += 1;
-                }
             }
         }
         terminal.backend_mut().flush().unwrap();

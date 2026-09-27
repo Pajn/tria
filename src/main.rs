@@ -1,5 +1,6 @@
 mod app;
 mod auth;
+mod chat_layout;
 mod commands;
 mod completion;
 mod composer;

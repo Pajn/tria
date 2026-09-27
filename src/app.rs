@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
+    chat_layout::{self, ChatLayout},
     commands,
     composer::Composer,
     model::{Id, ModelSelection, ServerConfig, ShellItem, ThreadDetailSnapshot, ThreadItem},
@@ -666,8 +667,9 @@ pub struct App {
     /// Set by Ctrl-l: the next frame is painted over a cleared screen rather than
     /// diffed against the last one.
     pub repaint: bool,
-    /// Filled by the renderer each frame so key handling can page correctly.
-    pub chat_viewport: (usize, usize),
+    /// The chat as it is laid out at the size it was last drawn: its lines, and what is
+    /// on each of them. Read through `chat`, which lays it out again when it is behind.
+    pub chat_layout: ChatLayout,
     /// First visible sidebar row; the renderer reads and clamps it.
     pub sidebar_offset: usize,
     /// Set by keyboard navigation so the renderer scrolls the selection into view.
@@ -692,8 +694,6 @@ pub struct App {
     pub chat_visual: Option<ChatAnchor>,
     /// Count typed before a chat motion.
     chat_count: Option<usize>,
-    /// First content line of every message block, for `{` and `}`.
-    pub message_starts: Vec<usize>,
     pub search: Option<Search>,
     pub search_input: Option<SearchInput>,
     /// Unsent composer text per thread, keyed by thread id, so switching threads keeps a
@@ -702,7 +702,7 @@ pub struct App {
     /// Messages waiting for their thread's turn to end, one per thread: a second one
     /// queued behind the first joins it, as one message is what the turn gets next.
     queued: HashMap<Id, Queued>,
-    /// A message a search found, to go to once its thread is open and drawn.
+    /// A message a search found, to go to once its thread is open and laid out.
     jump: Option<Jump>,
     /// What the word being typed could be finished as, while there is anything.
     pub completion: Option<CompletionMenu>,
@@ -806,8 +806,6 @@ pub struct App {
     pub pending_external: Option<ExternalCommand>,
     /// A tmux popup still running, with what to do when it closes.
     popup: Option<(std::process::Child, Option<FollowUp>)>,
-    /// Content-line range of every block with its export key.
-    pub block_ranges: Vec<(usize, usize, String)>,
     /// Mouse selection in the chat, in screen cells.
     pub selection: Option<Selection>,
     /// Text to push to the clipboard after the next frame is drawn.
@@ -818,14 +816,6 @@ pub struct App {
     open_at: Option<String>,
     /// Whether the project for `open_at` has been asked for, so it is asked for once.
     open_asked: bool,
-    pub work_ranges: Vec<crate::timeline::Region>,
-    /// Content-line range of every picture a message's own markdown put in the chat. A
-    /// work row is found by the region it folds; a message folds nothing, so its pictures
-    /// are found by the lines they were given.
-    pub picture_ranges: Vec<crate::timeline::Region>,
-    /// Every picture the open rows have, under the key the row that has it is keyed by.
-    /// Filled by the renderer with each frame, like the regions above it.
-    pub chat_pictures: Vec<(String, crate::timeline::Picture)>,
     quit: bool,
 }
 
@@ -868,7 +858,7 @@ impl App {
             spinner: 0,
             pending_prefix: None,
             repaint: false,
-            chat_viewport: (0, 0),
+            chat_layout: ChatLayout::default(),
             sidebar_offset: 0,
             sidebar_reveal: false,
             sidebar_inner: None,
@@ -880,7 +870,6 @@ impl App {
             chat_column: 0,
             chat_visual: None,
             chat_count: None,
-            message_starts: Vec::new(),
             search: None,
             search_input: None,
             terminals: Vec::new(),
@@ -935,14 +924,10 @@ impl App {
             editor: "nvim".to_string(),
             pending_external: None,
             popup: None,
-            block_ranges: Vec::new(),
             selection: None,
             clipboard_pending: None,
             open_at: None,
             open_asked: false,
-            work_ranges: Vec::new(),
-            picture_ranges: Vec::new(),
-            chat_pictures: Vec::new(),
             quit: false,
         }
     }
@@ -1968,7 +1953,7 @@ impl App {
         picker.content.found_for = query;
     }
 
-    /// Go to the message a search found, once its thread is open and drawn: the line
+    /// Go to the message a search found, once its thread is open and laid out: the line
     /// in it that matches, with the query left as the chat's search so `n` and `N`
     /// go on to the rest. A message older than what is loaded has the older turns
     /// asked for until it turns up or there are none left.
@@ -2005,8 +1990,8 @@ impl App {
             return;
         };
         let key = format!("msg:{}", message.id);
-        let Some(&(start, end, _)) = self.block_ranges.iter().find(|(_, _, k)| *k == key) else {
-            // Not drawn yet; the next frame will have it.
+        let Some((start, end)) = self.chat().block_lines(&key) else {
+            // Not laid out yet: the chat has not been drawn, so has no size to lay it out at.
             return;
         };
         let Some(jump) = self.jump.take() else {
@@ -2123,10 +2108,9 @@ impl App {
         }
         let line = self.chat_cursor;
         let id = self
-            .block_ranges
-            .iter()
-            .find(|(start, end, _)| *start <= line && line < *end)
-            .and_then(|(_, _, key)| key.strip_prefix("msg:"))
+            .chat()
+            .block_at(line)
+            .and_then(|key| key.strip_prefix("msg:"))
             .map(str::to_string);
         match id {
             Some(id) => self.ask_rewind(Some(&id)),
@@ -3061,7 +3045,7 @@ impl App {
     }
 
     /// The links on the cursor's line, for opening one without the mouse.
-    fn link_at_cursor(&self) -> Option<String> {
+    fn link_at_cursor(&mut self) -> Option<String> {
         if self.focus != Focus::Chat {
             return None;
         }
@@ -4235,25 +4219,22 @@ impl App {
             self.toast("no thread open", true);
             return;
         }
-        let text = ui::chat_export_all();
+        let text = self.chat().export_all();
         self.view_in_editor("thread", &text);
     }
 
     /// `ge` in the chat: the message, plan, tool row, or tool group under the cursor.
     fn view_at_cursor(&mut self) {
         let line = self.chat_cursor;
+        let chat = self.chat();
         // A tool row is more specific than its group, which is more specific than a block.
-        let key = self.region_at(line).map(|(key, _)| key).or_else(|| {
-            self.block_ranges
-                .iter()
-                .find(|(start, end, _)| *start <= line && line < *end)
-                .map(|(_, _, key)| key.clone())
-        });
-        let Some(key) = key else {
-            self.toast("nothing under the cursor", true);
-            return;
-        };
-        match ui::chat_export(&key) {
+        let text = chat
+            .region_at(line)
+            .map(|(key, _)| key)
+            .or_else(|| chat.block_at(line))
+            .and_then(|key| chat.export(key))
+            .map(str::to_string);
+        match text {
             Some(text) => self.view_in_editor("block", &text),
             None => self.toast("nothing under the cursor", true),
         }
@@ -4457,9 +4438,11 @@ impl App {
         }
         // A check's or a reviewer's row in a pull request stands for a link, kept off the
         // row to leave room.
+        self.chat();
         let row = self
+            .chat_layout
             .region_at(self.chat_cursor)
-            .and_then(|(key, _)| self.reader.link_at(&key));
+            .and_then(|(key, _)| self.reader.link_at(key));
         if let Some(url) = row {
             self.open_url(&url);
             return;
@@ -4476,29 +4459,10 @@ impl App {
         self.open_pull_request(pick);
     }
 
-    /// The picture under the chat cursor: the one the row it is in has, open or shut, or
-    /// the one a message drew there. The cursor is inside the row wherever it is on the
-    /// picture itself, since the lines it was drawn over belong to the row that opened it.
-    fn picture_at_cursor(&self) -> Option<crate::timeline::Picture> {
-        let key = match self.region_at(self.chat_cursor) {
-            Some((key, _)) => key,
-            None => self.picture_range_at(self.chat_cursor)?,
-        };
-        self.chat_pictures
-            .iter()
-            .find(|(row, _)| *row == key)
-            .map(|(_, picture)| picture.clone())
-    }
-
-    /// What a message's picture is known by, where one was drawn on this line. The
-    /// smallest range wins, so two pictures on one line are told apart by the lines they
-    /// were each drawn on.
-    fn picture_range_at(&self, line: usize) -> Option<String> {
-        self.picture_ranges
-            .iter()
-            .filter(|region| region.first <= line && line < region.end)
-            .min_by_key(|region| region.end - region.first)
-            .map(|region| region.key.clone())
+    /// The picture under the chat cursor.
+    fn picture_at_cursor(&mut self) -> Option<crate::timeline::Picture> {
+        let line = self.chat_cursor;
+        self.chat().picture_at(line).cloned()
     }
 
     /// Hand a picture to whatever this machine opens pictures with. One the provider
@@ -5445,6 +5409,49 @@ impl App {
     /// Lines kept between the cursor and the viewport edge while moving.
     const SCROLLOFF: usize = 3;
 
+    /// The chat as it is now, laid out again first if what it shows, its folds, or its
+    /// size have moved since it last was. Whatever goes on to change the rest of the app
+    /// reads `chat_layout` after this rather than holding on to what it returns.
+    pub fn chat(&mut self) -> &ChatLayout {
+        let Self {
+            chat_layout,
+            reader,
+            thread,
+            expanded,
+            open_levels,
+            ..
+        } = self;
+        let now = time::OffsetDateTime::now_utc();
+        let key = chat_layout::Key::of(
+            reader,
+            thread.as_ref(),
+            expanded,
+            *open_levels,
+            now.unix_timestamp() / 60,
+        );
+        match key {
+            None => chat_layout.clear(),
+            // What is read in place of the conversation draws itself; everything after
+            // this treats its blocks like any others.
+            Some(key) => chat_layout.lay_out(key, |width, height| {
+                if reader.is_open() {
+                    reader.blocks(
+                        thread.as_ref(),
+                        expanded,
+                        *open_levels,
+                        (width, height),
+                        &commands::now_iso(),
+                    )
+                } else {
+                    thread.as_ref().map_or_else(Vec::new, |thread| {
+                        crate::timeline::build(thread, expanded, *open_levels, width, height)
+                    })
+                }
+            }),
+        }
+        chat_layout
+    }
+
     fn focus_chat(&mut self) {
         if self.thread.is_none() {
             self.toast("open a thread first (/ or Tab), or n for a new one", false);
@@ -5454,35 +5461,34 @@ impl App {
         // composer, and drawing a selection nothing is about to act on is a lie.
         self.composer.vim_cancel();
         self.focus = Focus::Chat;
-        let (height, total) = self.chat_viewport;
+        self.chat();
+        let chat = &self.chat_layout;
         if self.scroll == Scroll::Follow {
-            self.chat_cursor = total.saturating_sub(1);
+            self.chat_cursor = chat.total().saturating_sub(1);
         } else {
-            let offset = self.chat_offset();
-            self.chat_cursor = self
-                .chat_cursor
-                .clamp(offset, (offset + height).saturating_sub(1).max(offset));
+            let offset = chat.offset(self.scroll);
+            self.chat_cursor = self.chat_cursor.clamp(
+                offset,
+                (offset + chat.height()).saturating_sub(1).max(offset),
+            );
         }
     }
 
-    /// The chat cursor as a line and the character it is on. The column is held where it
-    /// was put, so passing a short line does not pull the cursor left for good.
-    pub fn chat_spot(&self) -> (usize, usize) {
-        let line = self.chat_cursor;
-        (
-            line,
-            self.chat_column.min(ui::chat_len(line).saturating_sub(1)),
-        )
+    /// The chat cursor as a line and the character it is on.
+    pub fn chat_spot(&mut self) -> (usize, usize) {
+        let (line, column) = (self.chat_cursor, self.chat_column);
+        self.chat().spot(line, column)
     }
 
     /// `w` and `b` over the characters of the chat, carrying on into the line above or
     /// below when the one under the cursor runs out.
     fn chat_word(&mut self, forward: bool) {
         let n = self.take_chat_count();
-        let (_, total) = self.chat_viewport;
         for _ in 0..n {
             let (mut line, mut column) = self.chat_spot();
-            let mut chars: Vec<char> = ui::chat_row(line).chars().collect();
+            let chat = &self.chat_layout;
+            let total = chat.total();
+            let mut chars: Vec<char> = chat.row(line).chars().collect();
             if forward {
                 let from = word_class(chars.get(column).copied());
                 while column < chars.len() && word_class(Some(chars[column])) == from {
@@ -5497,7 +5503,7 @@ impl App {
                     }
                     line += 1;
                     column = 0;
-                    chars = ui::chat_row(line).chars().collect();
+                    chars = chat.row(line).chars().collect();
                     // A blank line is a stop of its own, as it is in Vim.
                     if chars.is_empty() {
                         break;
@@ -5512,7 +5518,7 @@ impl App {
                         break;
                     }
                     line -= 1;
-                    chars = ui::chat_row(line).chars().collect();
+                    chars = chat.row(line).chars().collect();
                     column = chars.len();
                     if chars.is_empty() {
                         break;
@@ -5531,14 +5537,16 @@ impl App {
     /// Place the cursor and scroll just enough to keep it in view with a margin. Landing on
     /// the last line resumes following new output.
     fn set_chat_cursor(&mut self, line: usize) {
-        let (height, total) = self.chat_viewport;
+        self.chat();
+        let chat = &self.chat_layout;
+        let (height, total) = (chat.height(), chat.total());
         if total == 0 || height == 0 {
             return;
         }
         let line = line.min(total - 1);
         self.chat_cursor = line;
-        let max_offset = total.saturating_sub(height);
-        let mut offset = self.chat_offset();
+        let max_offset = chat.offset(Scroll::Follow);
+        let mut offset = chat.offset(self.scroll);
         let margin = Self::SCROLLOFF.min(height.saturating_sub(1) / 2);
         if line < offset + margin {
             offset = line.saturating_sub(margin);
@@ -5555,7 +5563,8 @@ impl App {
 
     /// Scroll the view and carry the cursor along, like Vim's Ctrl-d and Ctrl-u.
     fn chat_scroll_by(&mut self, delta: isize) {
-        let (height, total) = self.chat_viewport;
+        self.chat();
+        let (height, total) = (self.chat_layout.height(), self.chat_layout.total());
         let before = self.chat_offset();
         self.scroll_by(delta);
         let after = self.chat_offset();
@@ -5612,7 +5621,8 @@ impl App {
                 _ => {}
             }
         }
-        let (height, total) = self.chat_viewport;
+        let chat = self.chat();
+        let (height, total) = (chat.height(), chat.total());
         let cursor = self.chat_cursor;
         // A key that moves the cursor within a line is only itself: `gl` opens git and
         // Ctrl-b pages up.
@@ -5639,7 +5649,7 @@ impl App {
             }
             KeyCode::Char('l') | KeyCode::Right if plain => {
                 let n = self.take_chat_count();
-                let last = ui::chat_len(cursor).saturating_sub(1);
+                let last = self.chat().len(cursor).saturating_sub(1);
                 self.chat_column = (self.chat_spot().1 + n).min(last);
             }
             KeyCode::Char('0') if plain => self.chat_column = 0,
@@ -5675,9 +5685,10 @@ impl App {
             }
             KeyCode::Char('{') => {
                 let n = self.take_chat_count();
+                let starts = self.chat().message_starts();
                 let mut target = cursor;
                 for _ in 0..n {
-                    match self.message_starts.iter().rev().find(|&&s| s < target) {
+                    match starts.iter().rev().find(|&&s| s < target) {
                         Some(&s) => target = s,
                         None => break,
                     }
@@ -5686,9 +5697,10 @@ impl App {
             }
             KeyCode::Char('}') => {
                 let n = self.take_chat_count();
+                let starts = self.chat().message_starts();
                 let mut target = cursor;
                 for _ in 0..n {
-                    match self.message_starts.iter().find(|&&s| s > target) {
+                    match starts.iter().find(|&&s| s > target) {
                         Some(&s) => target = s,
                         None => {
                             target = total.saturating_sub(1);
@@ -5735,7 +5747,7 @@ impl App {
                     // A character-wise selection reaches through the character the
                     // cursor is on, which is where the block cursor is drawn.
                     Some(anchor) if !anchor.whole_lines => {
-                        let head = (anchor.line, anchor.column.min(ui::chat_len(anchor.line)));
+                        let head = (anchor.line, anchor.column.min(self.chat().len(anchor.line)));
                         let (first, last) = if head <= spot {
                             (head, spot)
                         } else {
@@ -5756,7 +5768,7 @@ impl App {
                         )
                     }
                 };
-                match ui::chat_span(start, end) {
+                match self.chat().span(start, end) {
                     Some(text) if !text.trim().is_empty() => {
                         let lines = text.lines().count();
                         copy_to_clipboard(&text);
@@ -5912,46 +5924,16 @@ impl App {
 
     /// The next matching content line after (or before) `from`, wrapping around the
     /// conversation. Returns the line and whether the search wrapped.
-    fn find_match(&self, search: &Search, from: usize) -> Option<(usize, bool)> {
-        let lines = ui::chat_lines();
-        if lines.is_empty() || search.query.is_empty() {
-            return None;
-        }
-        let matches = |line: &str| line_matches(line, &search.query);
-        let len = lines.len();
-        if search.backward {
-            let from = from.min(len);
-            (0..from)
-                .rev()
-                .find(|&i| matches(&lines[i]))
-                .map(|i| (i, false))
-                .or_else(|| {
-                    (from..len)
-                        .rev()
-                        .find(|&i| matches(&lines[i]))
-                        .map(|i| (i, true))
-                })
-        } else {
-            (from + 1..len)
-                .find(|&i| matches(&lines[i]))
-                .map(|i| (i, false))
-                .or_else(|| {
-                    (0..=from.min(len - 1))
-                        .find(|&i| matches(&lines[i]))
-                        .map(|i| (i, true))
-                })
-        }
+    fn find_match(&mut self, search: &Search, from: usize) -> Option<(usize, bool)> {
+        self.chat().find(search, from)
     }
 
     // ── Scrolling ──────────────────────────────────────────────────────
 
     fn scroll_by(&mut self, delta: isize) {
-        let (height, total) = self.chat_viewport;
-        let max_offset = total.saturating_sub(height);
-        let current = match self.scroll {
-            Scroll::Follow => max_offset,
-            Scroll::Offset(o) => o.min(max_offset),
-        };
+        let scroll = self.scroll;
+        let chat = self.chat();
+        let (max_offset, current) = (chat.offset(Scroll::Follow), chat.offset(scroll));
         let next = (current as isize + delta).clamp(0, max_offset as isize) as usize;
         self.scroll = if next >= max_offset {
             Scroll::Follow
@@ -5967,29 +5949,18 @@ impl App {
     }
 
     /// First content line shown in the chat viewport.
-    pub fn chat_offset(&self) -> usize {
-        let (height, total) = self.chat_viewport;
-        match self.scroll {
-            Scroll::Follow => total.saturating_sub(height),
-            Scroll::Offset(o) => o.min(total.saturating_sub(height)),
-        }
-    }
-
-    /// The tightest toggle region covering a content line, with whether folding it shows
-    /// anything: a tool row inside an expanded group wins over the group itself, even
-    /// when the row has nothing to unfold — folding its group instead is not what the
-    /// click asked for.
-    fn region_at(&self, line: usize) -> Option<(String, bool)> {
-        self.work_ranges
-            .iter()
-            .filter(|region| region.first <= line && line < region.end)
-            .min_by_key(|region| region.end - region.first)
-            .map(|region| (region.key.clone(), region.foldable))
+    pub fn chat_offset(&mut self) -> usize {
+        let scroll = self.scroll;
+        self.chat().offset(scroll)
     }
 
     /// Fold what is under a content line, saying so when there is nothing to fold.
     fn fold_at(&mut self, line: usize, quiet: bool) {
-        match self.region_at(line) {
+        let region = self
+            .chat()
+            .region_at(line)
+            .map(|(key, foldable)| (key.to_string(), foldable));
+        match region {
             Some((key, true)) => self.toggle_expanded(key),
             Some((key, false)) => {
                 if self.local_disk
@@ -6043,7 +6014,7 @@ impl App {
                 .entry(id.clone())
                 .or_insert(crate::recovery::Recovery::Loading);
         }
-        thread.revision += 1;
+        thread.touch();
         let thread_id = thread.id().to_string();
         let request = uuid::Uuid::new_v4().to_string();
         self.tool_recovery_request = Some(request.clone());
@@ -6092,7 +6063,7 @@ impl App {
             }
             thread.recovered_tools.insert(id, payload);
         }
-        thread.revision += 1;
+        thread.touch();
     }
 
     fn open_work_level(&mut self, all: bool) {
@@ -6105,21 +6076,24 @@ impl App {
     }
 
     fn toggle_work_group(&mut self) {
-        let (height, _) = self.chat_viewport;
-        let offset = self.chat_offset();
+        let scroll = self.scroll;
+        let chat = self.chat();
+        let height = chat.height();
+        let offset = chat.offset(scroll);
         let middle = offset + height / 2;
-        let key = self
+        let key = chat
             .region_at(middle)
             .filter(|(_, foldable)| *foldable)
             .map(|(key, _)| key)
             .or_else(|| {
-                self.work_ranges
+                chat.work_ranges()
                     .iter()
                     .rev()
                     .find(|region| region.first < offset + height)
-                    .map(|region| region.key.clone())
+                    .map(|region| region.key.as_str())
             })
-            .or_else(|| self.work_ranges.last().map(|region| region.key.clone()));
+            .or_else(|| chat.work_ranges().last().map(|region| region.key.as_str()))
+            .map(str::to_string);
         if let Some(key) = key {
             self.toggle_expanded(key);
         }
@@ -6293,7 +6267,7 @@ impl App {
     fn on_normal_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let prefix = self.take_prefix();
-        let (height, _) = self.chat_viewport;
+        let height = self.chat_layout.height();
         if self.focus == Focus::Sidebar {
             // Anything that is not the answer is a no: the question stands at the foot of
             // the list until it has one.
@@ -6646,7 +6620,8 @@ impl App {
                                 self.focus = Focus::Chat;
                                 self.chat_visual = None;
                                 self.set_chat_cursor(line);
-                                self.chat_column = ui::chat_index(line, at.x - self.chat_area.x);
+                                let column = at.x - self.chat_area.x;
+                                self.chat_column = self.chat().index(line, column);
                             }
                             // A link takes the click; folding would be a surprise.
                             if let Some(url) = self.link_at(at) {
@@ -6666,13 +6641,15 @@ impl App {
     }
 
     /// What a drag over the chat covers, the marks and indents it was drawn with left out.
-    fn chat_under(&self, from: Position, to: Position) -> Option<String> {
-        let offset = self.chat_offset();
+    fn chat_under(&mut self, from: Position, to: Position) -> Option<String> {
+        let (scroll, area) = (self.scroll, self.chat_area);
+        let chat = self.chat();
+        let offset = chat.offset(scroll);
         let spot = |at: Position, past: usize| {
-            let line = offset + at.y.saturating_sub(self.chat_area.y) as usize;
-            (line, ui::chat_index(line, at.x - self.chat_area.x) + past)
+            let line = offset + at.y.saturating_sub(area.y) as usize;
+            (line, chat.index(line, at.x - area.x) + past)
         };
-        ui::chat_span(spot(from, 0), spot(to, 1))
+        chat.span(spot(from, 0), spot(to, 1))
     }
 
     /// Called by the event loop as it starts the frame after a selection resolved.
@@ -6827,8 +6804,8 @@ impl App {
                     self.composer.history_next();
                 }
             }
-            KeyCode::PageUp => self.scroll_by(-(self.chat_viewport.0 as isize)),
-            KeyCode::PageDown => self.scroll_by(self.chat_viewport.0 as isize),
+            KeyCode::PageUp => self.scroll_by(-(self.chat_layout.height() as isize)),
+            KeyCode::PageDown => self.scroll_by(self.chat_layout.height() as isize),
             KeyCode::Char('p') if ctrl => {
                 if !self.recall_queued() {
                     self.composer.history_prev();
@@ -7341,7 +7318,7 @@ fn prepend_page(thread: &mut ThreadState, snapshot: ThreadDetailSnapshot) {
             thread.before_cursor = None;
         }
     }
-    thread.revision += 1;
+    thread.touch();
 }
 
 pub fn approval_options(approval: &PendingApproval) -> Vec<ApprovalOption> {
@@ -7995,8 +7972,9 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
             }
             terminal.draw(|frame| ui::draw(frame, &mut app)).map(|_| ())
         });
-        // Where a search said to go is a line of the chat, and there are only lines
-        // once the chat has been drawn.
+        // Where a search said to go is a line of the chat laid out at the size it is drawn,
+        // and a thread just opened is only drawn at its own size — its draft, its panels —
+        // once a frame has shown it.
         app.settle_jump();
         if let Err(err) = drawn.and_then(|result| result) {
             break Err(err.into());
@@ -8720,62 +8698,6 @@ mod tests {
         app.thread = None;
         app.reveal_directory();
         assert!(app.toast.unwrap().0.contains("no thread open"));
-    }
-
-    /// `gx` on a row with a picture opens the picture, which is the one thing on a chat
-    /// line that is really somewhere else: the terminal only ever drew a thumbnail.
-    #[test]
-    fn the_picture_under_the_cursor_is_the_one_that_opens() {
-        use crate::timeline::{Picture, Region};
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.work_ranges = vec![
-            Region {
-                first: 0,
-                end: 9,
-                key: "work-1".into(),
-                foldable: true,
-            },
-            Region {
-                first: 2,
-                end: 8,
-                key: "work-1/t1".into(),
-                foldable: true,
-            },
-        ];
-        app.chat_pictures = vec![("work-1/t1".into(), Picture::File("/tmp/shot.png".into()))];
-
-        // Anywhere in the row, including the lines the picture was drawn over.
-        app.chat_cursor = 5;
-        assert_eq!(
-            app.picture_at_cursor(),
-            Some(Picture::File("/tmp/shot.png".into()))
-        );
-        // The group around it is not the row, and has no picture of its own.
-        app.chat_cursor = 1;
-        assert_eq!(app.picture_at_cursor(), None);
-
-        // A picture a message drew belongs to no row at all: it answers for the caption
-        // and the lines under it, and `gx` opens it from any of them.
-        app.picture_ranges = vec![Region {
-            first: 20,
-            end: 26,
-            key: "msg:m1/0".into(),
-            foldable: false,
-        }];
-        app.chat_pictures
-            .push(("msg:m1/0".into(), Picture::File("/tmp/shown.png".into())));
-        for line in [20, 25] {
-            app.chat_cursor = line;
-            assert_eq!(
-                app.picture_at_cursor(),
-                Some(Picture::File("/tmp/shown.png".into())),
-                "line {line}"
-            );
-        }
-        app.chat_cursor = 26;
-        assert_eq!(app.picture_at_cursor(), None, "and no further");
     }
 
     /// A picture that came inside a transcript is not a file anywhere, so opening it
@@ -10450,8 +10372,8 @@ mod tests {
         assert_eq!(picker.hit(1).map(|h| h.thread_id.as_str()), Some("t2"));
     }
 
-    /// Opening a match goes to the line that has it, and leaves the query as the chat's
-    /// search for `n` to go on with.
+    /// Opening a match goes to the line that has it, not to the top of the message it
+    /// is in, and leaves the query as the chat's search for `n` to go on with.
     #[test]
     fn a_match_opens_where_it_was_said() {
         let (handle, _requests) = crate::session::Handle::detached();
@@ -10459,19 +10381,7 @@ mod tests {
         let mut app = App::new(handle, events);
         app.thread = Some(rewindable_thread());
         app.current_thread_id = Some("t1".into());
-        app.chat_viewport = (10, 40);
-        app.block_ranges = (0..8)
-            .map(|i| {
-                (
-                    i * 5,
-                    i * 5 + 5,
-                    format!(
-                        "msg:{}",
-                        ["u1", "a1", "u2", "a2", "u3", "a3", "u4", "a4"][i]
-                    ),
-                )
-            })
-            .collect();
+        app.chat_layout.resize(60, 10);
         // `u3` says "u3" and was sent at 10:05.
         app.jump = Some(Jump {
             thread_id: "t1".into(),
@@ -10481,9 +10391,147 @@ mod tests {
         });
         app.settle_jump();
         assert!(app.jump.is_none());
-        assert_eq!(app.chat_cursor, 20);
+        let (start, _) = app.chat().block_lines("msg:u3").unwrap();
+        // The message's first row names who said it; what they said is under it.
+        assert_eq!(app.chat_cursor, start + 1);
+        let cursor = app.chat_cursor;
+        assert_eq!(app.chat().row(cursor).trim(), "u3");
         assert_eq!(app.focus, Focus::Chat);
         assert_eq!(app.search.as_ref().map(|s| s.query.as_str()), Some("u3"));
+    }
+
+    /// A question, the calls made answering it, and the answer.
+    fn thread_at_work() -> ThreadState {
+        let call = |id: &str, at: &str| {
+            json!({"id": id, "kind": "tool.completed", "tone": "tool", "summary": "Read",
+                "createdAt": format!("2026-01-01T10:00:{at}Z"),
+                "payload": {"toolCallId": id, "status": "completed", "title": "Read",
+                    "detail": format!("Read: /src/{id}.rs")}})
+        };
+        let snapshot: ThreadDetailSnapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p", "title": "Test",
+                "modelSelection": {"instanceId": "instance", "model": "a-model"},
+                "messages": [
+                    {"id": "u1", "role": "user", "text": "look around",
+                        "createdAt": "2026-01-01T10:00:00Z"},
+                    {"id": "a1", "role": "assistant", "text": "found it",
+                        "createdAt": "2026-01-01T10:00:09Z"},
+                ],
+                "activities": [call("c1", "01"), call("c2", "02"), call("c3", "03")]
+            }
+        }))
+        .expect("a thread the server could have sent");
+        ThreadState::from_snapshot(snapshot)
+    }
+
+    /// Keys come in batches, and the screen is drawn after the batch. A motion that
+    /// follows a fold in the same batch moves through the chat as the fold left it, not
+    /// as the last frame showed it.
+    #[test]
+    fn a_motion_after_a_fold_in_the_same_batch_lands_on_the_new_layout() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_at_work());
+        app.current_thread_id = Some("t1".into());
+        drawn(&mut app);
+        app.focus = Focus::Chat;
+        app.scroll = Scroll::Offset(0);
+        app.chat_cursor = 0;
+
+        for key in ['z', 'R', '}'] {
+            app.on_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        let answer = app.chat().message_starts()[1];
+        assert!(answer > 3, "the calls are open above the answer");
+        assert_eq!(app.chat_cursor, answer);
+    }
+
+    /// The spinner turns while a thread works, and nothing laid out in the chat draws
+    /// it, so the chat is not laid out again for it.
+    #[tokio::test]
+    async fn the_chat_is_not_laid_out_again_as_the_spinner_turns() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+        app.current_thread_id = Some("t1".into());
+        drawn(&mut app);
+        let builds = app.chat_layout.builds();
+        for _ in 0..8 {
+            apply(&mut app, AppEvent::Tick);
+            drawn(&mut app);
+        }
+        assert!(app.spinner >= 8, "the spinner turned");
+        assert_eq!(app.chat_layout.builds(), builds);
+
+        // What the thread says is another matter.
+        app.thread.as_mut().unwrap().touch();
+        drawn(&mut app);
+        assert_eq!(app.chat_layout.builds(), builds + 1);
+    }
+
+    /// A pull request says how long ago each review was, which moves on with the clock
+    /// and nothing else, so it is laid out again when the minute turns. A thread is not.
+    #[test]
+    fn a_pull_request_is_laid_out_again_when_the_minute_turns() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(stacked_thread());
+        let key = |app: &App, minute| {
+            chat_layout::Key::of(&app.reader, app.thread.as_ref(), &app.expanded, 0, minute)
+        };
+        assert_eq!(key(&app, 1), key(&app, 2), "a thread keeps no time");
+
+        showing(&mut app, open_detail("layer 1"));
+        assert!(key(&app, 1).is_some());
+        assert_ne!(key(&app, 1), key(&app, 2));
+    }
+
+    /// A search can open a thread whose chat is not the height the last one's was: its
+    /// draft takes more of the screen, or a question does. The match is gone to once a
+    /// frame has shown the thread, so it is in view at the height the thread is drawn at.
+    #[test]
+    fn a_match_in_a_thread_drawn_shorter_is_in_view() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let mut before = rewindable_thread();
+        before.detail.shell.id = "t0".into();
+        app.thread = Some(before);
+        app.current_thread_id = Some("t0".into());
+        drawn(&mut app);
+        let tall = app.chat_layout.height();
+
+        // The search opens `t1`, whose draft is six lines long.
+        app.thread = Some(rewindable_thread());
+        app.current_thread_id = Some("t1".into());
+        app.composer.set_text("one\ntwo\nthree\nfour\nfive\nsix");
+        app.jump = Some(Jump {
+            thread_id: "t1".into(),
+            created_at: Some("2026-01-01T10:09:00Z".into()),
+            query: "a4".into(),
+            asked_before: None,
+        });
+        // As the event loop goes: the frame, then the jump.
+        drawn(&mut app);
+        app.settle_jump();
+        assert!(app.jump.is_none());
+        let height = app.chat_layout.height();
+        assert!(height < tall, "the draft takes rows from the chat");
+        let offset = app.chat_offset();
+        let cursor = app.chat_cursor;
+        assert!(
+            (offset..offset + height).contains(&cursor),
+            "{cursor} is not in {offset}..{}",
+            offset + height
+        );
+        assert_eq!(app.chat().row(cursor).trim(), "a4");
+        drawn(&mut app);
+        assert_eq!(app.chat_cursor, cursor, "and the frame leaves it there");
     }
 
     /// A match older than what is loaded has the older turns asked for, once.
