@@ -18,12 +18,17 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
+    chat_view::{self, ChatView, Hit, Search},
     commands,
     composer::Composer,
+    list_cursor::{ListCursor, Row},
     model::{Id, ModelSelection, ServerConfig, ShellItem, ThreadDetailSnapshot, ThreadItem},
+    outbox::{self, NEW_THREAD_DRAFT_KEY, NewThreadDraft, Outbox, PreparedCheckout},
     picture,
     question::QuestionDraft,
+    reader::{self, Origin, Reader, Source, TranscriptFile},
     session::{self, Handle, Status, Update},
+    sidebar_view::{self, SidebarView},
     state::{ApprovalOption, PendingApproval, Shell, ThreadState},
     ui, vim,
 };
@@ -34,9 +39,6 @@ const TERMINAL_ROWS: u16 = 30;
 
 /// The terminal `g!` reuses, one per thread.
 const SHELL_TERMINAL_ID: &str = "tria-shell";
-
-/// Draft key for a thread that does not exist yet.
-const NEW_THREAD_DRAFT_KEY: &str = "\0new-thread";
 
 /// Rows moved per mouse wheel notch.
 const MOUSE_SCROLL_LINES: usize = 3;
@@ -51,9 +53,6 @@ const TICK: Duration = Duration::from_millis(120);
 /// enough that a stream which never stops still gets drawn.
 const BATCH: usize = 512;
 const TOAST_TTL: Duration = Duration::from_secs(6);
-/// How often a running agent's open transcript is read again when nothing it did said so.
-const TRANSCRIPT_POLL: Duration = Duration::from_secs(5);
-
 /// How often to look for worktrees that have gone from the disk. They only go when
 /// something removes one, which is rare and is usually this.
 const WORKTREE_REFRESH: Duration = Duration::from_secs(60);
@@ -93,13 +92,6 @@ pub enum Mode {
     Terminals,
     /// Attached to a terminal: keys go to the shell, `Ctrl-\` comes back.
     TerminalPane,
-}
-
-/// An accepted chat search, reused by `n` and `N` and for highlighting.
-#[derive(Debug, Clone)]
-pub struct Search {
-    pub query: String,
-    pub backward: bool,
 }
 
 /// A search being typed: the query so far, its direction, and where the cursor was.
@@ -330,26 +322,6 @@ fn fuzzy_score(query: &str, label: &str, detail: &str) -> Option<i64> {
     Some(score)
 }
 
-/// A thread asked for and not yet made. Kept whole so a refusal can put back what was
-/// typed: the message is otherwise gone, and the view is left on a thread that will
-/// never exist.
-struct PendingCreate {
-    thread_id: Id,
-    draft: NewThreadDraft,
-    text: String,
-}
-
-/// A message written during a turn and held back until that turn is over, where
-/// `Enter` would have steered the turn with it. It is tria's, not the server's: the
-/// protocol has no queue, and a message the server has been given cannot be taken
-/// back, so this is the only kind that can be.
-struct Queued {
-    text: String,
-    /// The turn that was running when it was queued. A list entry about any other
-    /// turn is older than the one it waits for, and says nothing about it.
-    after_turn: Option<Id>,
-}
-
 /// How a message written over a subagent's transcript goes once it is agreed to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptSend {
@@ -357,38 +329,11 @@ pub enum TranscriptSend {
     Queued,
 }
 
-/// The message as the agent gets it: with what it was written over, when it was written
-/// over something, so a "this" or a "why did it" has something to point at.
-fn over_transcript(context: Option<&str>, text: &str) -> String {
-    match context {
-        Some(context) => format!("{context}\n\n{text}"),
-        None => text.to_string(),
-    }
-}
-
 /// A rewind worked out and waiting on `Enter` or `f`, for the thread it was asked in.
 pub struct RewindAsk {
     pub thread_id: Id,
     pub rewind: crate::state::Rewind,
 }
-
-/// A rewind the server has been asked for. The command is taken before the work is
-/// done, so what says it happened is the messages going, and what says it did not is a
-/// failure the server writes into the thread.
-struct PendingRewind {
-    thread_id: Id,
-    rewind: crate::state::Rewind,
-    /// Failures already in the thread when it was asked for, which are not this one's.
-    failures_seen: HashSet<Id>,
-    deadline: Instant,
-}
-
-/// How long a rewind is waited for before its messages are given back anyway. A
-/// Claude rewind reads and forks the session's history, which is not instant.
-/// The activity the server writes into a thread when a rewind did not happen.
-const REWIND_FAILED: &str = "checkpoint.revert.failed";
-
-const REWIND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A message to go to, from a search of what threads said.
 struct Jump {
@@ -408,16 +353,6 @@ pub struct CompletionMenu {
     pub trigger: crate::composer::Trigger,
     pub items: Vec<crate::completion::Item>,
     pub selected: usize,
-}
-
-/// What a plan calls itself: its first heading.
-fn plan_title(markdown: &str) -> Option<&str> {
-    markdown
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with('#'))
-        .map(|line| line.trim_start_matches('#').trim())
-        .filter(|title| !title.is_empty())
 }
 
 /// The last two parts of a path, which is what tells one worktree from another.
@@ -453,42 +388,34 @@ pub struct ThreadWorktree {
 pub struct WorktreeConfirm {
     /// The worktree, looked up again each frame so what is listed stays the live list.
     pub path: String,
+    /// The first of its files in view.
     pub offset: usize,
+    /// How many files the box has room for, told by the frame that draws it: the list is
+    /// scrolled no further than leaves it full.
+    pub room: usize,
 }
 
-/// A thread being composed that does not exist on the server yet.
-#[derive(Debug, Clone)]
-pub struct NewThreadDraft {
-    pub project_id: Id,
-    pub model_selection: ModelSelection,
-    pub runtime_mode: String,
-    pub interaction_mode: String,
-    /// Start the thread in a fresh worktree rather than the project's own checkout.
-    pub worktree: bool,
-    /// A pull request checked out for the thread to start in, where it was made for one.
-    pub checkout: Option<PreparedCheckout>,
+impl WorktreeConfirm {
+    pub fn new(path: String) -> Self {
+        Self {
+            path,
+            offset: 0,
+            room: 0,
+        }
+    }
+
+    /// The furthest a list of `files` can be scrolled: the first of the last boxful.
+    pub fn last(&self, files: usize) -> usize {
+        files.saturating_sub(self.room.max(1))
+    }
 }
 
-/// A pull request checked out by the server for a thread to be written in.
-#[derive(Debug, Clone)]
-pub struct PreparedCheckout {
-    /// The thread's id, chosen before it exists so the server could set the worktree up
-    /// for it.
-    pub thread_id: Id,
-    pub number: u64,
-    pub branch: String,
-    pub worktree_path: String,
-    /// False where a worktree that was already there kept changes or commits of its own,
-    /// so what the thread starts in is not the pull request's latest.
-    pub on_head: bool,
-    /// The link the thread gets once it exists, where one could be made.
-    pub link: Option<commands::PullRequestLink>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scroll {
-    Follow,
-    Offset(usize),
+/// A turn as the command for it, marked as building a plan where it builds one.
+fn building(command: Value, implementing: Option<outbox::Implementing>) -> Value {
+    match implementing {
+        Some(plan) => commands::implementing(command, &plan.thread, &plan.plan),
+        None => command,
+    }
 }
 
 pub enum AppEvent {
@@ -501,9 +428,9 @@ pub enum AppEvent {
     Tick,
     Update(Box<Update>),
     Dispatched(Result<(), String>),
-    /// The server has made a thread a new message asked for, so there is now something
-    /// to subscribe to.
-    ThreadCreated(Id),
+    /// The server answered something the outbox sent: a message, a thread made for one,
+    /// or a pull request put on that thread.
+    Outbox(outbox::Answer),
     /// What a worktree has uncommitted, once the server has looked.
     WorktreeChecked {
         path: String,
@@ -515,29 +442,10 @@ pub enum AppEvent {
         path: String,
         result: Result<(), String>,
     },
-    /// The server would not make the thread a new message asked for.
-    CreateRefused {
-        thread_id: Id,
-        error: String,
-    },
-    /// The server would not take a message sent to a thread that already exists. The
-    /// text comes back with it: it left the composer when it was sent.
-    SendRefused {
-        thread_id: Id,
-        text: String,
-        error: String,
-    },
-    /// A thread made to build a plan exists now, and is where to look.
-    PlanThreadCreated(Id),
     /// What the server found in the threads' messages, for the query it was asked.
     ThreadSearch {
         query: String,
         result: Result<Value, String>,
-    },
-    /// The server would not take a rewind at all.
-    RewindRefused {
-        thread_id: Id,
-        error: String,
     },
     /// The config was read again for the usage window, or was not.
     UsageRead(Result<Box<ServerConfig>, String>),
@@ -603,71 +511,9 @@ pub struct LostStream {
     retry_at: Instant,
 }
 
-/// A transcript as the server read it off disk.
-#[derive(Debug)]
-pub struct TranscriptFile {
-    pub contents: String,
-    /// The server stops reading at a megabyte; the tail of a long run is then missing.
-    pub truncated: bool,
-}
-
-/// Something read in place of the thread's conversation: a subagent's own conversation,
-/// or one of the thread's pull requests.
-pub struct Transcript {
-    pub source: Reading,
-    pub title: String,
-    pub subtitle: String,
-    /// The transcript rendered as a thread, so the chat draws it like any other.
-    pub state: ThreadState,
-    pub truncated: bool,
-    /// Whether the agent was still working when this was read, so what is shown is as
-    /// far as it had got rather than the whole run.
-    pub live: bool,
-    /// Where the conversation underneath was, to put it back on the way out.
-    restore: (Scroll, usize, Focus),
-}
-
-/// What an open [`Transcript`] is of.
-pub enum Reading {
-    Subagent(String),
-    PullRequest(Box<crate::pull_request::Detail>),
-}
-
-impl Transcript {
-    /// The subagent being read, when it is one.
-    pub fn agent_id(&self) -> Option<&str> {
-        match &self.source {
-            Reading::Subagent(id) => Some(id),
-            Reading::PullRequest(_) => None,
-        }
-    }
-
-    pub fn pull_request(&self) -> Option<&crate::pull_request::Detail> {
-        match &self.source {
-            Reading::PullRequest(detail) => Some(detail),
-            Reading::Subagent(_) => None,
-        }
-    }
-
-    /// What a message written over it says first, so the agent knows what "this" is.
-    fn context(&self) -> String {
-        match &self.source {
-            Reading::Subagent(id) => format!("Sent looking at the transcript for subagent {id}:"),
-            Reading::PullRequest(detail) => format!(
-                "Sent looking at pull request {}#{} ({}):",
-                detail.repository, detail.number, detail.url
-            ),
-        }
-    }
-
-    /// What it is, in a sentence about it.
-    pub fn noun(&self) -> &'static str {
-        match self.source {
-            Reading::Subagent(_) => "the subagent",
-            Reading::PullRequest(_) => "the pull request",
-        }
-    }
-}
+/// Where the conversation was when a reading opened over it: how it was scrolled, the line
+/// the cursor was on, and which pane had the keys. The reader keeps it for the way back.
+pub type Restore = (chat_view::Place, Focus);
 
 pub struct App {
     pub handle: Handle,
@@ -701,36 +547,20 @@ pub struct App {
     /// The one-line field a custom answer is typed into.
     pub custom_answer: Composer,
     pub sidebar_visible: bool,
-    /// Index into `sidebar_rows()`.
-    pub sidebar_selected: usize,
-    /// Which list the sidebar shows. The threads, until somebody asks for another.
-    pub sidebar_tab: SidebarTab,
-    /// The selection and scroll each tab was left at, to come back to.
-    sidebar_places: [(usize, usize); 3],
+    /// The sidebar's list: the tab it is on, what is selected there and how far it is
+    /// scrolled, and where the other tabs were left. The threads, until somebody asks for
+    /// another. Lent its rows by `sidebar_rows`, per call.
+    pub sidebar_view: SidebarView<SidebarKey>,
     /// Where each tab's name was drawn on the sidebar's title line, for a click.
-    pub sidebar_tab_spans: Vec<(u16, u16, SidebarTab)>,
+    pub sidebar_tab_spans: Vec<(u16, u16, sidebar_view::Tab)>,
     /// The pull request `d` in the sidebar has asked about unlinking, until it is answered.
     pub sidebar_unlinking: Option<String>,
-    /// What was last asked for from the sidebar — a pull request's link or a subagent's id —
-    /// whose reading leaves the keys there, so the next row is one keystroke away. Named,
-    /// so a read that never came leaves nothing to mislead the next one from elsewhere.
-    keep_sidebar_focus: Option<String>,
-    /// Whether the transcript open was opened from the subagent list, which `q` goes back to.
-    transcript_from_roster: bool,
-    /// Whether the transcript read on its way was one nobody asked for, bringing a running
-    /// agent's up to date: it says nothing, and moves nobody.
-    transcript_quiet: bool,
-    /// When the open transcript was last read, and the running agent as it stood then, to
-    /// tell when it is worth reading again.
-    transcript_read_at: Option<Instant>,
-    transcript_seen: Option<String>,
     /// First visible line of the help, which is taller than most terminals.
     pub help_offset: usize,
     /// Rows the help fits and rows it has, filled by the renderer each frame.
     pub help_viewport: (usize, usize),
     pub show_settled: bool,
     pub show_snoozed: bool,
-    pub scroll: Scroll,
     pub expanded: HashSet<String>,
     /// How many levels of the work folds stand open whatever anybody folded by hand:
     /// none, the groups, or the groups and every call inside them. `zr` and `zm` step it
@@ -743,12 +573,9 @@ pub struct App {
     /// Set by Ctrl-l: the next frame is painted over a cleared screen rather than
     /// diffed against the last one.
     pub repaint: bool,
-    /// Filled by the renderer each frame so key handling can page correctly.
-    pub chat_viewport: (usize, usize),
-    /// First visible sidebar row; the renderer reads and clamps it.
-    pub sidebar_offset: usize,
-    /// Set by keyboard navigation so the renderer scrolls the selection into view.
-    pub sidebar_reveal: bool,
+    /// The chat as it is laid out at the size it was last drawn, and where the reader is
+    /// in it. Read through `chat`, which lays it out again when it is behind.
+    pub chat_view: ChatView,
     /// Screen regions from the last frame, for mouse hit testing.
     pub sidebar_inner: Option<Rect>,
     pub chat_area: Rect,
@@ -759,27 +586,13 @@ pub struct App {
     /// The icon each project is known by, once asked for. `None` where the server found
     /// the project none.
     favicons: HashMap<Id, Option<Vec<u8>>>,
-    /// Line the chat cursor is on, as a content line index. Tracks the last line while
-    /// the view follows new output.
-    pub chat_cursor: usize,
-    /// Character the chat cursor is on, held where it was so a shorter line in passing
-    /// does not lose the column.
-    pub chat_column: usize,
-    /// Where a visual selection in the chat began.
-    pub chat_visual: Option<ChatAnchor>,
-    /// Count typed before a chat motion.
-    chat_count: Option<usize>,
-    /// First content line of every message block, for `{` and `}`.
-    pub message_starts: Vec<usize>,
-    pub search: Option<Search>,
+    /// A search being typed on the command line, before it is the chat's.
     pub search_input: Option<SearchInput>,
-    /// Unsent composer text per thread, keyed by thread id, so switching threads keeps a
-    /// half-written message where it belongs. New-thread drafts use `NEW_THREAD_DRAFT_KEY`.
-    drafts: HashMap<String, String>,
-    /// Messages waiting for their thread's turn to end, one per thread: a second one
-    /// queued behind the first joins it, as one message is what the turn gets next.
-    queued: HashMap<Id, Queued>,
-    /// A message a search found, to go to once its thread is open and drawn.
+    /// What is written, from being written to being taken: parked per thread while
+    /// another is open, on its way to the server, held back for a turn to end, making the
+    /// thread it is for, or taken back out of a thread by a rewind.
+    outbox: Outbox,
+    /// A message a search found, to go to once its thread is open and laid out.
     jump: Option<Jump>,
     /// What the word being typed could be finished as, while there is anything.
     pub completion: Option<CompletionMenu>,
@@ -788,49 +601,19 @@ pub struct App {
     completion_dismissed: Option<crate::composer::Trigger>,
     /// A rewind asked about and not yet answered, which takes the next key.
     pub rewind_ask: Option<RewindAsk>,
-    rewinding: Option<PendingRewind>,
     /// Every terminal session the server knows about, across threads.
     pub terminals: Vec<crate::model::TerminalSummary>,
-    /// Selection in the terminal panel.
-    pub terminal_selected: usize,
-    /// Selection in the subagent roster.
-    pub agent_selected: usize,
-    /// The subagent transcript being read, in place of the thread's conversation.
-    pub transcript: Option<Transcript>,
-    /// The subagent whose transcript is on its way, so the row can say so and a second
-    /// keypress does not ask for it twice.
-    pub transcript_loading: Option<String>,
-    /// The pull request whose detail is on its way, by its link, so a second `Enter` does
-    /// not ask for it twice.
-    pub pull_request_loading: Option<String>,
-    /// How many times something has been read in place of the conversation, or redrawn
-    /// there, which is the revision each read gets. The chat rebuilds what it draws only
-    /// when the revision moves, and a re-read keeps the identity of the one before it.
-    reads: u64,
-    /// The pictures pull requests' descriptions show, by their links: base64, or `None`
-    /// where the fetch failed. Kept for the session, so a re-read does not fetch again.
-    pub pull_request_images: HashMap<String, Option<String>>,
-    /// Whether the read on its way was one nobody asked for, which says nothing and opens
-    /// nothing: it only brings a pull request already open up to date.
-    pull_request_quiet: bool,
-    /// The server's refresh count as last heard, to tell a change from where it stands.
-    pull_request_revision: Option<u64>,
-    /// The open pull request's link as the thread list last had it, to notice the server's
-    /// sync bringing news of it.
-    pull_request_synced: Option<String>,
-    /// The stack the open pull request is in, as last drawn.
-    pull_request_stack_seen: Option<String>,
-    /// Pull requests to put on threads being made, by the thread they go on.
-    pending_links: HashMap<Id, commands::PullRequestLink>,
+    /// The cursor in the terminal panel, on a terminal by its id.
+    pub terminal_cursor: ListCursor<String>,
+    /// The cursor in the subagent roster, on a subagent by its id.
+    pub agent_cursor: ListCursor<String>,
+    /// What is read in place of the thread's conversation, and the reads on their way.
+    pub reader: Reader<Restore>,
     /// The labels on the pull request as the label picker shows them, what each is for, and
     /// whether the repository has more than were read.
     labels_applied: HashSet<String>,
     labels_described: Vec<(String, String)>,
     pub labels_truncated: bool,
-    /// Each pull request's review history as last read, by its link, or why it could not be.
-    pub pull_request_activity: HashMap<String, Result<crate::pull_request::Activity, String>>,
-    /// Pictures asked for, whether or not they have come back.
-    pull_request_images_asked: HashSet<String>,
     /// `gh`'s tokens, by the directory it was run in and the host asked about.
     gh_tokens: std::sync::Arc<tokio::sync::Mutex<HashMap<(String, String), String>>>,
     /// The attached terminal, when one is open.
@@ -848,8 +631,6 @@ pub struct App {
     watched_cwds: Vec<String>,
     /// The open thread's checkout, which is the one the header speaks for.
     pub(crate) vcs_cwd: Option<String>,
-    /// Set between asking for a thread and hearing whether it was made.
-    pending_create: Option<PendingCreate>,
     /// Set when the open thread stopped receiving updates, until they come back.
     pub lost_stream: Option<LostStream>,
     /// The worktree list as it was when it was opened, so it does not move under the
@@ -876,7 +657,9 @@ pub struct App {
     /// to. There is no sending to a subagent, so it goes to the main agent, and the
     /// transcript on screen makes it easy to think otherwise.
     pub confirm_transcript_send: Option<TranscriptSend>,
-    pub worktree_selected: usize,
+    /// The cursor in the worktree list, on a row by the thread it is of: two threads can
+    /// work in the one worktree, and each has its row.
+    pub worktree_cursor: ListCursor<String>,
     /// The worktrees that are still on the disk, so the sidebar can mark the threads
     /// holding one without asking the disk about every row it draws.
     live_worktrees: HashSet<String>,
@@ -895,9 +678,6 @@ pub struct App {
     vcs_refreshed: Instant,
     /// The model to start the next new thread with, remembered from the last choice.
     new_thread_model: Option<ModelSelection>,
-    /// Project directory and base branch for a new thread's worktree, resolved as the
-    /// message is sent.
-    draft_worktree: Option<(String, String)>,
     /// Links on screen, rebuilt each draw, so a click knows what it landed on.
     pub links: Vec<Link>,
     /// Programs bound to `g` and a key, from the config file.
@@ -910,8 +690,6 @@ pub struct App {
     pub pending_external: Option<ExternalCommand>,
     /// A tmux popup still running, with what to do when it closes.
     popup: Option<(std::process::Child, Option<FollowUp>)>,
-    /// Content-line range of every block with its export key.
-    pub block_ranges: Vec<(usize, usize, String)>,
     /// Mouse selection in the chat, in screen cells.
     pub selection: Option<Selection>,
     /// Text to push to the clipboard after the next frame is drawn.
@@ -922,14 +700,6 @@ pub struct App {
     open_at: Option<String>,
     /// Whether the project for `open_at` has been asked for, so it is asked for once.
     open_asked: bool,
-    pub work_ranges: Vec<crate::timeline::Region>,
-    /// Content-line range of every picture a message's own markdown put in the chat. A
-    /// work row is found by the region it folds; a message folds nothing, so its pictures
-    /// are found by the lines they were given.
-    pub picture_ranges: Vec<crate::timeline::Region>,
-    /// Every picture the open rows have, under the key the row that has it is keyed by.
-    /// Filled by the renderer with each frame, like the regions above it.
-    pub chat_pictures: Vec<(String, crate::timeline::Picture)>,
     quit: bool,
 }
 
@@ -956,60 +726,33 @@ impl App {
             question: None,
             custom_answer: Composer::new(),
             sidebar_visible: true,
-            sidebar_selected: 0,
-            sidebar_tab: SidebarTab::Threads,
-            sidebar_places: [(0, 0); 3],
+            sidebar_view: SidebarView::default(),
             sidebar_tab_spans: Vec::new(),
             sidebar_unlinking: None,
-            keep_sidebar_focus: None,
-            transcript_from_roster: false,
-            transcript_quiet: false,
-            transcript_read_at: None,
-            transcript_seen: None,
             help_offset: 0,
             help_viewport: (0, 0),
             show_settled: false,
             show_snoozed: true,
-            scroll: Scroll::Follow,
             expanded: HashSet::new(),
             open_levels: 0,
             toast: None,
             spinner: 0,
             pending_prefix: None,
             repaint: false,
-            chat_viewport: (0, 0),
-            sidebar_offset: 0,
-            sidebar_reveal: false,
+            chat_view: ChatView::default(),
             sidebar_inner: None,
             chat_area: Rect::default(),
             composer_area: Rect::default(),
             origin: String::new(),
             favicons: HashMap::new(),
-            chat_cursor: 0,
-            chat_column: 0,
-            chat_visual: None,
-            chat_count: None,
-            message_starts: Vec::new(),
-            search: None,
             search_input: None,
             terminals: Vec::new(),
-            terminal_selected: 0,
-            agent_selected: 0,
-            transcript: None,
-            transcript_loading: None,
-            pull_request_loading: None,
-            reads: 0,
-            pull_request_images: HashMap::new(),
-            pull_request_activity: HashMap::new(),
-            pull_request_quiet: false,
-            pull_request_revision: None,
-            pull_request_synced: None,
-            pull_request_stack_seen: None,
-            pending_links: HashMap::new(),
+            terminal_cursor: ListCursor::default(),
+            agent_cursor: ListCursor::default(),
+            reader: Reader::default(),
             labels_applied: HashSet::new(),
             labels_described: Vec::new(),
             labels_truncated: false,
-            pull_request_images_asked: HashSet::new(),
             gh_tokens: Default::default(),
             pane: None,
             pending_pane_command: None,
@@ -1017,7 +760,6 @@ impl App {
             checkouts: HashMap::new(),
             watched_cwds: Vec::new(),
             vcs_cwd: None,
-            pending_create: None,
             lost_stream: None,
             worktrees: Vec::new(),
             prefix_timeout: Some(crate::config::DEFAULT_PREFIX_TIMEOUT),
@@ -1028,7 +770,7 @@ impl App {
             worktree_confirm: None,
             confirm_stop_session: false,
             confirm_transcript_send: None,
-            worktree_selected: 0,
+            worktree_cursor: ListCursor::default(),
             live_worktrees: HashSet::new(),
             removing: HashSet::new(),
             worktrees_checked: None,
@@ -1037,15 +779,12 @@ impl App {
             was_running: false,
             vcs_refreshed: Instant::now(),
             new_thread_model: None,
-            draft_worktree: None,
             links: Vec::new(),
-            drafts: HashMap::new(),
-            queued: HashMap::new(),
+            outbox: Outbox::default(),
             jump: None,
             completion: None,
             completion_dismissed: None,
             rewind_ask: None,
-            rewinding: None,
             programs: vec![crate::config::Program {
                 key: 'l',
                 command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
@@ -1054,14 +793,10 @@ impl App {
             editor: "nvim".to_string(),
             pending_external: None,
             popup: None,
-            block_ranges: Vec::new(),
             selection: None,
             clipboard_pending: None,
             open_at: None,
             open_asked: false,
-            work_ranges: Vec::new(),
-            picture_ranges: Vec::new(),
-            chat_pictures: Vec::new(),
             quit: false,
         }
     }
@@ -1118,57 +853,55 @@ impl App {
         }
     }
 
-    /// The row drawn `line` lines down the list, for a click to land on.
-    pub fn sidebar_row_at(&self, rows: &[SidebarRow], line: usize) -> Option<usize> {
-        let mut bottom = 0;
-        for (index, row) in rows.iter().enumerate().skip(self.sidebar_offset) {
-            bottom += self.sidebar_row_height(row);
-            if line < bottom {
-                return Some(index);
-            }
-        }
-        None
+    /// The rows as the sidebar's view is lent them: what each is, and the lines it takes.
+    pub fn sidebar_view_rows(&self, rows: &[SidebarRow]) -> Vec<sidebar_view::Row<SidebarKey>> {
+        rows.iter()
+            .map(|row| sidebar_view::Row {
+                key: row.key(),
+                height: self.sidebar_row_height(row),
+            })
+            .collect()
     }
 
-    /// The furthest the list can be scrolled: the first row that still leaves every row
-    /// after it room to be drawn.
-    pub fn sidebar_max_offset(&self, rows: &[SidebarRow], height: usize) -> usize {
-        let mut used = 0;
-        for (index, row) in rows.iter().enumerate().rev() {
-            used += self.sidebar_row_height(row);
-            if used > height {
-                return index + 1;
-            }
-        }
-        0
+    /// The rows of the tab the sidebar is on, as its view is lent them.
+    fn sidebar_lent(&self) -> Vec<sidebar_view::Row<SidebarKey>> {
+        self.sidebar_view_rows(&self.sidebar_rows())
     }
 
-    /// An offset that has `selected` on screen, moving the list as little as it takes.
-    pub fn sidebar_offset_showing(
-        &self,
-        rows: &[SidebarRow],
-        selected: usize,
-        height: usize,
-    ) -> usize {
-        let mut offset = self.sidebar_offset.min(selected);
-        while offset < selected {
-            let used: usize = rows[offset..=selected]
-                .iter()
-                .map(|row| self.sidebar_row_height(row))
-                .sum();
-            if used <= height {
-                break;
-            }
-            offset += 1;
-        }
-        offset
+    /// Settle the sidebar's list on the rows it has now, as each frame is about to be drawn:
+    /// a selection that asked to be shown is, once, at the size the last frame gave it.
+    pub fn settle_sidebar(&mut self) {
+        let rows = self.sidebar_lent();
+        self.sidebar_view.settle(&rows);
+    }
+
+    /// The row selected in the sidebar's list, wherever the list has moved it to.
+    fn sidebar_selected_row(&self) -> Option<SidebarRow> {
+        let rows = self.sidebar_rows();
+        let at = self
+            .sidebar_view
+            .selection(&self.sidebar_view_rows(&rows))?;
+        rows.into_iter().nth(at)
+    }
+
+    /// The row of what is open, which is what the list marks while the keys are elsewhere:
+    /// the thread, or the pull request or subagent being read in place of it.
+    pub fn sidebar_open_row(&self, rows: &[SidebarRow]) -> Option<usize> {
+        let reading_url = self.reader.pull_request().map(|d| &d.url);
+        let reading_agent = self.reader.agent_id();
+        rows.iter().position(|row| match row {
+            SidebarRow::Thread { id, .. } => Some(id) == self.current_thread_id.as_ref(),
+            SidebarRow::PullRequest { url, .. } => Some(url) == reading_url,
+            SidebarRow::Agent { id } => Some(id.as_str()) == reading_agent,
+            _ => false,
+        })
     }
 
     /// Rows of the sidebar list as the tab it is on has them.
     pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
-        match self.sidebar_tab {
-            SidebarTab::Threads => self.thread_rows(),
-            SidebarTab::PullRequests => {
+        match self.sidebar_view.tab() {
+            sidebar_view::Tab::Threads => self.thread_rows(),
+            sidebar_view::Tab::PullRequests => {
                 let rows: Vec<SidebarRow> = self
                     .pull_request_layers()
                     .into_iter()
@@ -1182,7 +915,7 @@ impl App {
                     rows
                 }
             }
-            SidebarTab::Agents => {
+            sidebar_view::Tab::Agents => {
                 // Newest first: the one at the top is the one most likely to be why
                 // anybody looked.
                 let rows: Vec<SidebarRow> = self
@@ -1257,56 +990,60 @@ impl App {
     }
 
     fn select_sidebar_thread(&mut self, thread_id: &str) {
-        let Some(index) = self
+        let listed = self
             .thread_rows()
             .iter()
-            .position(|row| matches!(row, SidebarRow::Thread { id, .. } if id == thread_id))
-        else {
-            return;
-        };
-        if self.sidebar_tab == SidebarTab::Threads {
-            self.sidebar_selected = index;
-            self.sidebar_reveal = true;
-        } else {
-            self.sidebar_places[SidebarTab::Threads.index()].0 = index;
+            .any(|row| matches!(row, SidebarRow::Thread { id, .. } if id == thread_id));
+        if listed {
+            let key = SidebarKey::Thread(thread_id.to_string());
+            self.sidebar_view.select(sidebar_view::Tab::Threads, key);
         }
     }
 
     /// `H` and `L`: the tab to the left or right, where it was left.
     fn switch_sidebar_tab(&mut self, by: isize) {
-        let count = SidebarTab::ALL.len() as isize;
-        let next = (self.sidebar_tab.index() as isize + by).rem_euclid(count) as usize;
-        self.show_sidebar_tab(SidebarTab::ALL[next]);
+        let rows = self.sidebar_lent();
+        if self.sidebar_view.turn(&rows, by) {
+            self.sidebar_unlinking = None;
+        }
     }
 
-    pub fn show_sidebar_tab(&mut self, tab: SidebarTab) {
-        if tab == self.sidebar_tab {
+    /// A click on a tab's name: that tab, where it was left, with what it marks brought
+    /// into view — the selection while the keys are in the list, what is open while they
+    /// are elsewhere.
+    pub fn show_sidebar_tab(&mut self, tab: sidebar_view::Tab) {
+        let rows = self.sidebar_lent();
+        if !self.sidebar_view.show(&rows, tab) {
             return;
         }
-        self.sidebar_places[self.sidebar_tab.index()] =
-            (self.sidebar_selected, self.sidebar_offset);
-        self.sidebar_tab = tab;
-        (self.sidebar_selected, self.sidebar_offset) = self.sidebar_places[tab.index()];
         self.sidebar_unlinking = None;
-        self.sidebar_reveal = true;
+        if self.focus == Focus::Sidebar {
+            self.sidebar_view.reveal();
+        } else {
+            let rows = self.sidebar_rows();
+            if let Some(open) = self.sidebar_open_row(&rows) {
+                let lent = self.sidebar_view_rows(&rows);
+                self.sidebar_view.show_row(&lent, open);
+            }
+        }
     }
 
     /// `y` in the sidebar: a pull request's link, or what a subagent reported.
     fn sidebar_yank(&mut self) {
-        match self.sidebar_rows().get(self.sidebar_selected) {
+        match &self.sidebar_selected_row() {
             Some(SidebarRow::PullRequest { url, .. }) => {
                 copy_to_clipboard(url);
                 self.toast(format!("copied {url}"), false);
             }
             Some(SidebarRow::Agent { id }) => {
-                let report = self
-                    .subagents()
-                    .into_iter()
+                let agents = self.subagents();
+                let report = agents
+                    .iter()
                     .find(|agent| &agent.id == id)
-                    .and_then(|agent| agent.result.or(agent.error));
+                    .and_then(|agent| agent.report());
                 match report {
                     Some(report) => {
-                        copy_to_clipboard(&report);
+                        copy_to_clipboard(report);
                         self.toast("yanked the report", false);
                     }
                     None => self.toast("it has not reported back yet", false),
@@ -1318,10 +1055,12 @@ impl App {
 
     /// `r` in the sidebar: read the row again, past anything kept of it.
     fn sidebar_reread(&mut self) {
-        match self.sidebar_rows().get(self.sidebar_selected).cloned() {
+        match self.sidebar_selected_row() {
             Some(SidebarRow::PullRequest { url, .. }) => {
-                self.keep_sidebar_focus = Some(url.clone());
-                self.read_pull_request_as(&url, false, true);
+                let origin = self.sidebar_origin();
+                self.read_with(|reader, thread| {
+                    reader.reread(thread, Source::PullRequest(url), origin)
+                });
             }
             Some(SidebarRow::Agent { .. }) => self.sidebar_activate(),
             _ => {}
@@ -1336,30 +1075,32 @@ impl App {
         }
     }
 
+    /// Where a read asked for from the sidebar's list comes from: the sidebar, whose keys
+    /// it leaves there, when the keys were there to ask; a click from anywhere else takes
+    /// the keys to what is read, as any other read does.
+    fn sidebar_origin(&self) -> Origin {
+        if self.focus == Focus::Sidebar {
+            Origin::Sidebar
+        } else {
+            Origin::Chat
+        }
+    }
+
     fn sidebar_activate(&mut self) {
-        let rows = self.sidebar_rows();
-        match rows.get(self.sidebar_selected) {
+        let origin = self.sidebar_origin();
+        match self.sidebar_selected_row() {
             Some(SidebarRow::Thread { id, .. }) => {
-                let id = id.clone();
                 self.open_thread(&id);
                 self.focus = Focus::Composer;
             }
-            Some(SidebarRow::Header { section, .. }) => self.toggle_section(*section),
+            Some(SidebarRow::Header { section, .. }) => self.toggle_section(section),
             // Read where the conversation was, and the keys stay in the sidebar, so the
             // next one is `j` and `Enter` away.
             Some(SidebarRow::PullRequest { url, .. }) => {
-                let url = url.clone();
-                self.keep_sidebar_focus = Some(url.clone());
-                self.read_pull_request(&url);
+                self.open_reading(Source::PullRequest(url), origin);
             }
             Some(SidebarRow::Agent { id }) => {
-                let Some(index) = self.subagents().iter().position(|agent| &agent.id == id) else {
-                    return;
-                };
-                self.agent_selected = index;
-                self.keep_sidebar_focus = Some(id.clone());
-                self.transcript_from_roster = false;
-                self.read_transcript();
+                self.open_reading(Source::Subagent(id), origin);
             }
             Some(SidebarRow::Empty { .. }) | None => {}
         }
@@ -1378,17 +1119,14 @@ impl App {
 
     /// Park the composer text for the current thread and load the target's, if any.
     fn swap_composer_draft(&mut self, target: &str) {
-        if let Some(key) = self.draft_key() {
-            let text = self.composer.text();
-            if text.trim().is_empty() {
-                self.drafts.remove(&key);
-            } else {
-                self.drafts.insert(key, text);
-            }
-        }
+        let leaving = self.draft_key();
+        let text = self.composer.text();
+        let parked = self
+            .outbox
+            .swap(leaving.as_deref(), &text, target)
+            .map(str::to_string);
         self.composer.clear();
-        if let Some(text) = self.drafts.get(target) {
-            let text = text.clone();
+        if let Some(text) = parked {
             self.composer.set_text(&text);
             self.composer.leave_insert();
         }
@@ -1404,18 +1142,13 @@ impl App {
         }
         // The pull requests and subagents listed are the thread's, so a new thread's list
         // starts at its top.
-        self.sidebar_places[SidebarTab::PullRequests.index()] = (0, 0);
-        self.sidebar_places[SidebarTab::Agents.index()] = (0, 0);
-        if self.sidebar_tab != SidebarTab::Threads {
-            self.sidebar_selected = 0;
-            self.sidebar_offset = 0;
-        }
+        self.sidebar_view
+            .start_over(sidebar_view::Tab::PullRequests);
+        self.sidebar_view.start_over(sidebar_view::Tab::Agents);
         self.sidebar_unlinking = None;
         // A transcript belongs to the thread that ran the subagent, and a pull request to
         // the thread it is linked to; neither follows.
-        self.transcript = None;
-        self.transcript_loading = None;
-        self.pull_request_loading = None;
+        self.reader.forget();
         self.tool_recovery_request = None;
         self.current_thread_id = Some(thread_id.to_string());
         self.lost_stream = None;
@@ -1426,7 +1159,7 @@ impl App {
         if matches!(self.mode, Mode::Question | Mode::QuestionCustom) {
             self.mode = Mode::Normal;
         }
-        self.scroll = Scroll::Follow;
+        self.chat_view.follow();
         self.expanded.clear();
         // The view moving is the one thing a report of trouble always mentions and the
         // one thing the screen keeps no record of.
@@ -1525,9 +1258,7 @@ impl App {
         self.swap_composer_draft(NEW_THREAD_DRAFT_KEY);
         // What was being read belonged to the thread being left, as it does when another
         // thread is opened.
-        self.transcript = None;
-        self.transcript_loading = None;
-        self.pull_request_loading = None;
+        self.reader.forget();
         self.draft = Some(NewThreadDraft {
             project_id: project_id.to_string(),
             worktree: env_mode.as_deref() == Some("worktree"),
@@ -1545,7 +1276,7 @@ impl App {
         self.thread = None;
         self.handle.close_thread();
         self.sync_vcs_watch();
-        self.scroll = Scroll::Follow;
+        self.chat_view.follow();
         self.mode = Mode::Insert;
         self.focus = Focus::Composer;
     }
@@ -1591,6 +1322,12 @@ impl App {
         self.release_queued(thread);
     }
 
+    /// Hand the thread list's news of a thread to the outbox, which sends what it had
+    /// queued once the turn is over.
+    fn release_queued(&mut self, thread: &crate::model::ThreadShell) {
+        self.with_outbox(|outbox, here| outbox.on_shell(thread, here));
+    }
+
     /// Say out loud that a thread has stopped working, to somebody who is not looking
     /// at it. Which thread it is does not come into it — the open one finishing while
     /// you are in another window is the case this is for — but the change does: a
@@ -1634,14 +1371,6 @@ impl App {
     // ── Dispatch ───────────────────────────────────────────────────────
 
     fn dispatch(&self, command: Value) {
-        self.dispatch_opening(command, None);
-    }
-
-    /// Dispatch a command and, when it is a command that makes a thread, say so once the
-    /// server has applied it. A thread is the command's doing, so there is nothing to
-    /// subscribe to until the command has been through: asking first is asking for a
-    /// thread nobody has yet. A command that fails makes nothing, and says so instead.
-    fn dispatch_opening(&self, command: Value, creates: Option<Id>) {
         let handle = self.handle.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
@@ -1650,121 +1379,190 @@ impl App {
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string());
-            match (&result, creates) {
-                (Ok(()), Some(thread_id)) => {
-                    let _ = events.send(AppEvent::ThreadCreated(thread_id));
-                }
-                (Err(error), Some(thread_id)) => {
-                    let _ = events.send(AppEvent::CreateRefused {
-                        thread_id,
-                        error: error.clone(),
-                    });
-                    return;
-                }
-                _ => {}
-            }
             let _ = events.send(AppEvent::Dispatched(result));
         });
     }
 
-    /// Send a message to a thread that already exists, keeping hold of the text until
-    /// the server has taken it. The composer is emptied when a message goes, because
-    /// that is what sending looks like; a message the server refuses has to come back,
-    /// or the only copy of it is one keypress of history away and nothing says so.
-    fn dispatch_message(&self, command: Value, thread_id: Id, text: String) {
+    /// Ask the outbox something, lending it where things stand on screen, and do what
+    /// it answers.
+    fn with_outbox(&mut self, ask: impl FnOnce(&mut Outbox, &outbox::Here) -> outbox::Step) {
+        let composer = self.composer.text();
+        let here = outbox::Here {
+            thread: self.current_thread_id.as_deref(),
+            composer: &composer,
+        };
+        let step = ask(&mut self.outbox, &here);
+        self.take_outbox_step(step);
+    }
+
+    /// Show the outbox the open thread as it now stands, for a rewind on its way there.
+    fn notice_open_thread(&mut self) {
+        let Some(thread) = &self.thread else {
+            return;
+        };
+        let composer = self.composer.text();
+        let here = outbox::Here {
+            thread: self.current_thread_id.as_deref(),
+            composer: &composer,
+        };
+        let step = self.outbox.on_thread(thread, &here);
+        self.take_outbox_step(step);
+    }
+
+    /// Do what the outbox answered: move the view, put back what did not go, send what
+    /// is to go, and say what it says.
+    fn take_outbox_step(&mut self, step: outbox::Step) {
+        match step.go {
+            None => {}
+            Some(outbox::Go::Opening(thread_id)) => {
+                self.current_thread_id = Some(thread_id);
+                self.thread = None;
+            }
+            Some(outbox::Go::Made(thread_id)) => self.handle.open_thread(&thread_id),
+            Some(outbox::Go::Open(thread_id)) => self.open_thread(&thread_id),
+            Some(outbox::Go::Draft(draft)) => {
+                self.current_thread_id = None;
+                self.thread = None;
+                self.draft = Some(*draft);
+                self.handle.close_thread();
+                self.sync_vcs_watch();
+                self.mode = Mode::Insert;
+                self.focus = Focus::Composer;
+            }
+        }
+        for back in step.give_backs {
+            match back.slot {
+                outbox::Slot::Composer => {
+                    self.composer.set_text(&back.text);
+                    // Sending leaves you in insert mode with an empty composer, which is
+                    // where the text goes back to. Anywhere else — a list, a pane, the
+                    // chat — the view is left where it is and the text is simply there
+                    // when you come back to it.
+                    if matches!(self.mode, Mode::Normal | Mode::Insert) {
+                        self.focus = Focus::Composer;
+                    }
+                    if self.mode != Mode::Insert {
+                        self.composer.clamp_normal();
+                    }
+                }
+                outbox::Slot::Rewound => {
+                    self.composer.set_text(&back.text);
+                    if matches!(self.mode, Mode::Normal | Mode::Insert) {
+                        self.composer.checkpoint();
+                        self.focus = Focus::Composer;
+                        self.mode = Mode::Insert;
+                    }
+                }
+                // Most of what comes back went into the history as it was sent, and a
+                // second copy would only stand between `Ctrl-p` and what came before it.
+                // What was never sent as it is, such as a queued message's parts joined,
+                // goes in now, so the toast saying it is there is true.
+                outbox::Slot::History => {
+                    if !self.composer.remembers(&back.text) {
+                        self.composer.push_history(back.text);
+                    }
+                }
+            }
+        }
+        for command in step.commands {
+            self.carry(command);
+        }
+        match step.toast {
+            None => {}
+            Some(outbox::Toast::Say(text)) => self.toast(text, false),
+            Some(outbox::Toast::Warn(text)) => self.toast(text, true),
+        }
+    }
+
+    /// Send what the outbox asked for, as the server's command for it, and hand the
+    /// answer back as an event.
+    fn carry(&self, command: outbox::Command) {
+        let ticket = command.ticket();
+        let command = match command {
+            outbox::Command::Start {
+                thread,
+                text,
+                model_selection,
+                runtime_mode,
+                interaction_mode,
+                implementing,
+                ..
+            } => building(
+                commands::turn_start(
+                    &thread,
+                    &text,
+                    &model_selection,
+                    &runtime_mode,
+                    &interaction_mode,
+                    None,
+                ),
+                implementing,
+            ),
+            outbox::Command::Create {
+                thread,
+                text,
+                new,
+                implementing,
+                ..
+            } => {
+                tracing::info!(
+                    %thread,
+                    project = %new.project_id,
+                    worktree = ?new.worktree,
+                    "creating a thread"
+                );
+                let branch = commands::worktree_branch(&thread);
+                let command = commands::turn_start(
+                    &thread,
+                    &text,
+                    &new.model_selection,
+                    &new.runtime_mode,
+                    &new.interaction_mode,
+                    Some(commands::NewThread {
+                        project_id: &new.project_id,
+                        title: &new.title,
+                        model_selection: &new.model_selection,
+                        runtime_mode: &new.runtime_mode,
+                        interaction_mode: &new.interaction_mode,
+                        worktree: new.worktree.as_ref().map(|w| commands::Worktree {
+                            project_cwd: &w.project_cwd,
+                            base_branch: &w.base_branch,
+                            branch: &branch,
+                            start_from_origin: w.start_from_origin,
+                        }),
+                        branch: new.branch.as_deref(),
+                        worktree_path: new.worktree_path.as_deref(),
+                    }),
+                );
+                building(command, implementing)
+            }
+            outbox::Command::Link { thread, link, .. } => {
+                commands::pull_request_link(&thread, &link)
+            }
+            outbox::Command::Revert {
+                thread,
+                turn_count,
+                restore_files,
+                ..
+            } => {
+                tracing::info!(%thread, turn_count, restore_files, "rewinding");
+                commands::thread_revert(&thread, turn_count, restore_files)
+            }
+        };
         let handle = self.handle.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
-            match handle.dispatch(command).await {
-                Ok(_) => {}
-                Err(error) => {
-                    let _ = events.send(AppEvent::SendRefused {
-                        thread_id,
-                        text,
-                        error: error.to_string(),
-                    });
-                }
-            }
+            let result = handle
+                .dispatch(command)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            let _ = events.send(AppEvent::Outbox(outbox::Answer { ticket, result }));
         });
     }
 
-    /// A message that was not sent goes back where it was written: into the composer if
-    /// that is still where you are and nothing has been written since, and into the
-    /// thread's parked draft if you have gone elsewhere. Where neither is free, what was
-    /// typed is not lost — it is in the composer's history — and the toast says so
-    /// rather than writing over whatever took its place.
-    fn on_send_refused(&mut self, thread_id: Id, text: String, error: String) {
-        let here = self.current_thread_id.as_deref() == Some(thread_id.as_str());
-        if here && self.composer.is_empty() {
-            self.composer.set_text(&text);
-            // Sending leaves you in insert mode with an empty composer, which is where
-            // the text goes back to. Anywhere else — a list, a pane, the chat — the view
-            // is left where it is and the text is simply there when you come back to it.
-            if matches!(self.mode, Mode::Normal | Mode::Insert) {
-                self.focus = Focus::Composer;
-            }
-            if self.mode != Mode::Insert {
-                self.composer.clamp_normal();
-            }
-            self.toast(format!("not sent: {error}"), true);
-            return;
-        }
-        if !here && !self.drafts.contains_key(thread_id.as_str()) {
-            self.drafts.insert(thread_id.to_string(), text);
-            self.toast(
-                format!("not sent: {error} · the message is back in that thread"),
-                true,
-            );
-            return;
-        }
-        self.toast(
-            format!("not sent: {error} · it is in the composer's history (Ctrl-p)"),
-            true,
-        );
-    }
-
-    /// Subscribe to a thread the server has just made, unless the view has moved on in
-    /// the meantime: a thread opened since the message was sent is the one wanted.
-    fn on_thread_created(&mut self, thread_id: Id) {
-        self.pending_create.take();
-        if let Some(link) = self.pending_links.remove(&thread_id) {
-            self.dispatch(commands::pull_request_link(&thread_id, &link));
-        }
-        if self.current_thread_id.as_deref() == Some(thread_id.as_str()) {
-            self.handle.open_thread(&thread_id);
-        }
-    }
-
-    /// The server would not make the thread. The view is on one that does not exist and
-    /// the message has left the composer, so both go back: what was typed is the work,
-    /// and it is the only copy. Staying on the draft also keeps the view still, rather
-    /// than falling through to whichever thread happens to be first in the list.
-    fn on_create_refused(&mut self, thread_id: Id, error: String) {
-        let pending = self
-            .pending_create
-            .take()
-            .filter(|pending| pending.thread_id == thread_id);
-        let Some(pending) = pending else {
-            self.toast(error, true);
-            return;
-        };
-        // Unless the view has moved on by itself, in which case it is where it is meant
-        // to be and the message is still in the composer's history.
-        if self.current_thread_id.as_deref() == Some(thread_id.as_str()) {
-            self.current_thread_id = None;
-            self.thread = None;
-            self.draft = Some(pending.draft);
-            self.composer.set_text(&pending.text);
-            self.handle.close_thread();
-            self.sync_vcs_watch();
-            self.mode = Mode::Insert;
-            self.focus = Focus::Composer;
-        }
-        self.toast(error, true);
-    }
-
     fn send_message(&mut self) {
-        if self.transcript.is_some() {
+        if self.reader.is_open() {
             return self.ask_to_send_over_transcript(TranscriptSend::Now);
         }
         self.send_composed(None);
@@ -1784,99 +1582,51 @@ impl App {
             return;
         }
         // The message joins the conversation, so that is what to be looking at.
-        self.leave_transcript();
+        self.leave_reading();
         // Read the slot before sending: starting a new thread moves the view to it, and the
         // parked text belongs to the slot the message was written in.
         let draft_key = self.draft_key();
-        if self.draft.is_some() && !self.resolve_draft_worktree() {
-            return;
-        }
-        if let Some(draft) = self.draft.take() {
-            // Resolved above, while the draft was still in place.
-            let worktree = self.draft_worktree.take();
-            let checkout = draft.checkout.as_ref();
-            let thread_id = checkout.map_or_else(commands::new_id, |c| c.thread_id.clone());
-            // The pull request goes on the thread once the server has made it.
-            if let Some(link) = checkout.and_then(|c| c.link.clone()) {
-                self.pending_links.insert(thread_id.clone(), link);
-            }
-            let worktree_branch = commands::worktree_branch(&thread_id);
-            let title: String = text
-                .lines()
-                .next()
-                .unwrap_or("New thread")
-                .chars()
-                .take(60)
-                .collect();
-            let command = commands::turn_start(
-                &thread_id,
-                &text,
-                &draft.model_selection,
-                &draft.runtime_mode,
-                &draft.interaction_mode,
-                Some(commands::NewThread {
-                    project_id: &draft.project_id,
-                    title: title.trim(),
-                    model_selection: &draft.model_selection,
-                    runtime_mode: &draft.runtime_mode,
-                    interaction_mode: &draft.interaction_mode,
-                    worktree: worktree.as_ref().map(|(cwd, base)| commands::Worktree {
-                        project_cwd: cwd,
-                        base_branch: base,
-                        branch: &worktree_branch,
-                        start_from_origin: self.config.settings.new_worktrees_start_from_origin,
-                    }),
-                    branch: checkout.map(|c| c.branch.as_str()),
-                    worktree_path: checkout.map(|c| c.worktree_path.as_str()),
-                }),
-            );
-            // The view moves to the new thread now, and reads as loading until the
-            // server has made it and the subscription has something to say.
-            tracing::info!(
-                thread = %thread_id,
-                project = %draft.project_id,
-                worktree = ?worktree,
-                "creating a thread"
-            );
-            self.current_thread_id = Some(thread_id.clone());
-            self.thread = None;
-            self.pending_create = Some(PendingCreate {
-                thread_id: thread_id.clone(),
-                draft,
-                text: text.clone(),
-            });
-            self.dispatch_opening(command, Some(thread_id));
+        let step = if self.draft.is_some() {
+            // Resolved while the draft is still in place.
+            let worktree = match self.draft_worktree() {
+                Ok(worktree) => worktree,
+                Err(why) => return self.toast(why, true),
+            };
+            let Some(draft) = self.draft.take() else {
+                return;
+            };
+            self.outbox.create(draft, &text, worktree)
         } else if let Some(thread) = &self.thread {
-            let shell = &thread.detail.shell;
-            let command = commands::turn_start(
-                thread.id(),
-                &over_transcript(context.as_deref(), &text),
-                &shell.model_selection,
-                &shell.runtime_mode,
-                &shell.interaction_mode,
-                None,
-            );
-            self.dispatch_message(command, thread.id().to_string(), text.clone());
+            self.outbox
+                .send(&thread.detail.shell, &text, context.as_deref())
         } else {
             self.toast(
                 "no thread open; press n for a new thread or / to pick one",
                 true,
             );
             return;
-        }
+        };
+        self.take_outbox_step(step);
+        self.sent(text, draft_key);
+    }
+
+    /// What sending looks like, once a message has gone or been queued: the composer
+    /// empty, the message one `Ctrl-p` away, nothing parked for where it was written, and
+    /// the conversation followed to where it will show.
+    fn sent(&mut self, text: String, draft_key: Option<String>) {
         self.composer.push_history(text);
         self.composer.clear();
         if let Some(key) = draft_key {
-            self.drafts.remove(&key);
+            self.outbox.unpark(&key);
         }
-        self.scroll = Scroll::Follow;
+        self.chat_view.follow();
     }
 
     /// Hold the message until the running turn is over, instead of steering the turn
     /// with it as `Enter` does. With no turn running there is nothing to wait for, and
     /// it is sent.
     fn queue_message(&mut self) {
-        if self.transcript.is_some() {
+        if self.reader.is_open() {
             return self.ask_to_send_over_transcript(TranscriptSend::Queued);
         }
         self.queue_composed(None);
@@ -1891,41 +1641,22 @@ impl App {
             .thread
             .as_ref()
             .filter(|thread| self.draft.is_none() && thread.is_running());
-        let Some(thread) = running else {
+        if running.is_none() {
             return self.send_composed(context);
+        }
+        self.leave_reading();
+        let Some(thread) = &self.thread else {
+            return;
         };
         let thread_id = thread.id().to_string();
-        let after_turn = thread
-            .detail
-            .shell
-            .latest_turn
-            .as_ref()
-            .filter(|turn| turn.state == "running")
-            .map(|turn| turn.turn_id.clone());
-        self.leave_transcript();
-        let queued = self.queued.entry(thread_id.clone()).or_insert(Queued {
-            text: String::new(),
-            after_turn: None,
-        });
-        if !queued.text.is_empty() {
-            queued.text.push_str("\n\n");
-        }
-        queued
-            .text
-            .push_str(&over_transcript(context.as_deref(), &text));
-        queued.after_turn = after_turn;
-        self.composer.push_history(text);
-        self.composer.clear();
-        self.drafts.remove(&thread_id);
-        self.scroll = Scroll::Follow;
+        self.outbox
+            .queue(&thread.detail.shell, &text, context.as_deref());
+        self.sent(text, Some(thread_id));
     }
 
     /// What the open thread has queued, for the composer to show.
     pub fn queued_message(&self) -> Option<&str> {
-        let thread_id = self.current_thread_id.as_ref()?;
-        self.queued
-            .get(thread_id)
-            .map(|queued| queued.text.as_str())
+        self.outbox.queued(self.current_thread_id.as_ref()?)
     }
 
     /// Take the open thread's queued message back into an empty composer, to be
@@ -1934,58 +1665,15 @@ impl App {
         if !self.composer.is_empty() {
             return false;
         }
-        let Some(queued) = self
+        let Some(text) = self
             .current_thread_id
             .as_ref()
-            .and_then(|thread_id| self.queued.remove(thread_id))
+            .and_then(|thread_id| self.outbox.recall(thread_id))
         else {
             return false;
         };
-        self.composer.set_text(&queued.text);
+        self.composer.set_text(&text);
         true
-    }
-
-    /// Send what a thread has queued once its turn is over. A turn that completed is
-    /// what it was waiting for. One that was interrupted or failed is not: the message
-    /// was written for a turn that did not get where it was going, so it comes back to
-    /// be read again rather than going out on its own.
-    fn release_queued(&mut self, thread: &crate::model::ThreadShell) {
-        let Some(queued) = self.queued.get(&thread.id) else {
-            return;
-        };
-        let turn = thread.latest_turn.as_ref();
-        if thread.is_running()
-            || queued
-                .after_turn
-                .as_ref()
-                .is_some_and(|waited| turn.map(|t| &t.turn_id) != Some(waited))
-        {
-            return;
-        }
-        let Some(queued) = self.queued.remove(&thread.id) else {
-            return;
-        };
-        match turn.map(|t| t.state.as_str()) {
-            Some("completed") => {
-                let command = commands::turn_start(
-                    &thread.id,
-                    &queued.text,
-                    &thread.model_selection,
-                    &thread.runtime_mode,
-                    &thread.interaction_mode,
-                    None,
-                );
-                self.dispatch_message(command, thread.id.clone(), queued.text);
-            }
-            state => {
-                let why = match state {
-                    Some("interrupted") => "the turn was interrupted",
-                    Some("error") => "the turn failed",
-                    _ => "the turn did not finish",
-                };
-                self.on_send_refused(thread.id.clone(), queued.text, why.into());
-            }
-        }
     }
 
     /// Ask the server what the threads said, once the thread list's query has held
@@ -2085,7 +1773,7 @@ impl App {
         picker.content.found_for = query;
     }
 
-    /// Go to the message a search found, once its thread is open and drawn: the line
+    /// Go to the message a search found, once its thread is open and laid out: the line
     /// in it that matches, with the query left as the chat's search so `n` and `N`
     /// go on to the rest. A message older than what is loaded has the older turns
     /// asked for until it turns up or there are none left.
@@ -2122,27 +1810,19 @@ impl App {
             return;
         };
         let key = format!("msg:{}", message.id);
-        let Some(&(start, end, _)) = self.block_ranges.iter().find(|(_, _, k)| *k == key) else {
-            // Not drawn yet; the next frame will have it.
-            return;
-        };
-        let Some(jump) = self.jump.take() else {
-            return;
-        };
         // Lower case, so the chat's search is as blind to case as the server's was
         // and finds what it found.
         let search = Search {
             query: jump.query.to_lowercase(),
             backward: false,
         };
-        let line = self
-            .find_match(&search, start.saturating_sub(1))
-            .filter(|(line, _)| (start..end).contains(line))
-            .map_or(start, |(line, _)| line);
-        self.search = Some(search);
+        if !self.chat().open_match(&key, search) {
+            // Not laid out yet: the chat has not been drawn, so has no size to lay it out at.
+            return;
+        }
+        self.jump = None;
         self.composer.vim_cancel();
         self.focus = Focus::Chat;
-        self.set_chat_cursor(line);
     }
 
     /// `:implement`: build the thread's plan here, leaving plan mode for it; with
@@ -2160,90 +1840,30 @@ impl App {
             self.toast("no thread open", true);
             return;
         };
-        if thread.is_running() {
-            self.toast(
-                "the thread is still working; implement once it is done",
-                true,
-            );
-            return;
+        let new = arg == "new";
+        let step = self.outbox.implement(thread, new);
+        // Built here, it joins the conversation, so that is what to be looking at.
+        let here = !new && !step.commands.is_empty();
+        if here {
+            self.leave_reading();
         }
-        let Some(plan) = thread.actionable_plan() else {
-            self.toast("no plan waiting to be built", true);
-            return;
-        };
-        let text = format!(
-            "{}{}",
-            commands::PLAN_PROMPT_PREFIX,
-            plan.plan_markdown.trim()
-        );
-        let shell = &thread.detail.shell;
-        let (source, plan_id) = (thread.id().to_string(), plan.id.clone());
-        if arg.is_empty() {
-            let command = commands::turn_start(
-                &source,
-                &text,
-                &shell.model_selection,
-                &shell.runtime_mode,
-                "default",
-                None,
-            );
-            self.leave_transcript();
-            self.dispatch(commands::implementing(command, &source, &plan_id));
-            self.scroll = Scroll::Follow;
-            return;
+        self.take_outbox_step(step);
+        if here {
+            self.chat_view.follow();
         }
-        let title: String = plan_title(&plan.plan_markdown)
-            .map_or_else(
-                || "Implement plan".into(),
-                |title| format!("Implement {title}"),
-            )
-            .chars()
-            .take(60)
-            .collect();
-        let thread_id = commands::new_id();
-        let command = commands::turn_start(
-            &thread_id,
-            &text,
-            &shell.model_selection,
-            &shell.runtime_mode,
-            "default",
-            Some(commands::NewThread {
-                project_id: &shell.project_id,
-                title: title.trim(),
-                model_selection: &shell.model_selection,
-                runtime_mode: &shell.runtime_mode,
-                interaction_mode: "default",
-                worktree: None,
-                branch: shell.branch.as_deref(),
-                worktree_path: shell.worktree_path.as_deref(),
-            }),
-        );
-        let command = commands::implementing(command, &source, &plan_id);
-        // The view stays on the plan until the thread building it exists: moving first
-        // would be looking at a thread that may never be made.
-        let handle = self.handle.clone();
-        let events = self.events.clone();
-        tokio::spawn(async move {
-            let _ = events.send(match handle.dispatch(command).await {
-                Ok(_) => AppEvent::PlanThreadCreated(thread_id),
-                Err(error) => AppEvent::Dispatched(Err(error.to_string())),
-            });
-        });
-        self.toast("starting a thread for the plan…", false);
     }
 
     /// `gr`: rewind to before the message under the chat cursor.
     fn rewind_at_cursor(&mut self) {
-        if self.transcript.is_some() {
+        if self.reader.is_open() {
             self.toast("what is open here is read, not rewound", true);
             return;
         }
-        let line = self.chat_cursor;
-        let id = self
-            .block_ranges
-            .iter()
-            .find(|(start, end, _)| *start <= line && line < *end)
-            .and_then(|(_, _, key)| key.strip_prefix("msg:"))
+        let chat = self.chat();
+        let id = chat
+            .layout()
+            .block_at(chat.cursor())
+            .and_then(|key| key.strip_prefix("msg:"))
             .map(str::to_string);
         match id {
             Some(id) => self.ask_rewind(Some(&id)),
@@ -2256,14 +1876,14 @@ impl App {
     /// runs — the server would drop turns from under it — or where the provider cannot
     /// drop turns from its own history.
     fn ask_rewind(&mut self, message_id: Option<&str>) {
-        if self.rewinding.is_some() {
-            self.toast("a rewind is already on its way", true);
-            return;
-        }
         let Some(thread) = &self.thread else {
             self.toast("no thread open", true);
             return;
         };
+        if self.outbox.is_rewinding(thread.id()) {
+            self.toast("a rewind is already on its way", true);
+            return;
+        }
         if thread.is_running() {
             self.toast("interrupt the turn first (Ctrl-c), then rewind", true);
             return;
@@ -2317,126 +1937,22 @@ impl App {
             self.toast("a turn started meanwhile; interrupt it first", true);
             return;
         }
-        let failures_seen = thread
-            .detail
-            .activities
-            .iter()
-            .filter(|a| a.kind == REWIND_FAILED)
-            .map(|a| a.id.clone())
-            .collect();
-        let command = commands::thread_revert(&ask.thread_id, ask.rewind.turn_count, restore_files);
-        tracing::info!(
-            thread = %ask.thread_id,
-            turn_count = ask.rewind.turn_count,
-            restore_files,
-            "rewinding"
-        );
-        let handle = self.handle.clone();
-        let events = self.events.clone();
-        let thread_id = ask.thread_id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle.dispatch(command).await {
-                let _ = events.send(AppEvent::RewindRefused {
-                    thread_id,
-                    error: error.to_string(),
-                });
-            }
-        });
-        self.rewinding = Some(PendingRewind {
-            thread_id: ask.thread_id,
-            rewind: ask.rewind,
-            failures_seen,
-            deadline: Instant::now() + REWIND_TIMEOUT,
-        });
-        self.toast("rewinding…", false);
+        let step = self
+            .outbox
+            .rewind(thread, ask.rewind, restore_files, Instant::now());
+        self.take_outbox_step(step);
     }
 
     /// Whether the open thread has a rewind on its way.
     pub fn is_rewinding(&self) -> bool {
-        self.rewinding
-            .as_ref()
-            .is_some_and(|r| self.current_thread_id.as_ref() == Some(&r.thread_id))
+        self.current_thread_id
+            .as_deref()
+            .is_some_and(|thread| self.outbox.is_rewinding(thread))
     }
 
-    fn on_rewind_refused(&mut self, thread_id: Id, error: String) {
-        if self
-            .rewinding
-            .as_ref()
-            .is_some_and(|r| r.thread_id == thread_id)
-        {
-            self.rewinding = None;
-            self.toast(format!("not rewound: {error}"), true);
-        }
-    }
-
-    /// See whether the rewind on its way has been through. The messages it drops going
-    /// is what it looks like when it has, and they come back to the composer to be
-    /// written again; a failure the server wrote into the thread since is what it looks
-    /// like when it has not. With neither by the deadline the messages are given back
-    /// anyway: a copy too many is better than none.
+    /// A rewind nobody has heard of by its deadline gives its messages back anyway.
     fn check_rewind(&mut self) {
-        let Some(pending) = &self.rewinding else {
-            return;
-        };
-        if Instant::now() >= pending.deadline {
-            if let Some(pending) = self.rewinding.take() {
-                self.give_back(pending.thread_id, pending.rewind.text);
-                self.toast(
-                    "no word of the rewind from the server · what you sent is back in the composer",
-                    true,
-                );
-            }
-            return;
-        }
-        let Some(thread) = self.thread.as_ref().filter(|t| t.id() == pending.thread_id) else {
-            return;
-        };
-        let failure = thread
-            .detail
-            .activities
-            .iter()
-            .rev()
-            .find(|a| a.kind == REWIND_FAILED && !pending.failures_seen.contains(&a.id))
-            .map(|a| a.str("detail").unwrap_or(&a.summary).to_string());
-        if let Some(detail) = failure {
-            self.rewinding = None;
-            self.toast(format!("not rewound: {detail}"), true);
-            return;
-        }
-        let gone = pending
-            .rewind
-            .message_ids
-            .iter()
-            .all(|id| !thread.detail.messages.iter().any(|m| &m.id == id));
-        if gone && let Some(pending) = self.rewinding.take() {
-            self.give_back(pending.thread_id, pending.rewind.text);
-            self.toast("rewound · what you sent that turn is back to edit", false);
-        }
-    }
-
-    /// Put text a rewind took out of the thread back where it can be written again,
-    /// after whatever is already there: the composer when the thread is open, its
-    /// parked draft when it is not.
-    fn give_back(&mut self, thread_id: Id, text: String) {
-        let join = |existing: &str| {
-            if existing.trim().is_empty() {
-                text.clone()
-            } else {
-                format!("{}\n\n{text}", existing.trim_end())
-            }
-        };
-        if self.current_thread_id.as_deref() == Some(thread_id.as_str()) {
-            let joined = join(&self.composer.text());
-            self.composer.set_text(&joined);
-            if matches!(self.mode, Mode::Normal | Mode::Insert) {
-                self.composer.checkpoint();
-                self.focus = Focus::Composer;
-                self.mode = Mode::Insert;
-            }
-        } else {
-            let joined = join(self.drafts.get(&thread_id).map_or("", String::as_str));
-            self.drafts.insert(thread_id, joined);
-        }
+        self.with_outbox(|outbox, here| outbox.tick(Instant::now(), here));
     }
 
     /// Stop what the session is doing. Usually that is the turn, and the turn is named.
@@ -2720,24 +2236,21 @@ impl App {
 
     /// Thread under the sidebar selection, when a thread row is selected.
     fn sidebar_selected_thread(&self) -> Option<String> {
-        match self.sidebar_rows().get(self.sidebar_selected) {
-            Some(SidebarRow::Thread { id, .. }) => Some(id.clone()),
+        match self.sidebar_selected_row() {
+            Some(SidebarRow::Thread { id, .. }) => Some(id),
             _ => None,
         }
     }
 
     fn on_terminals_key(&mut self, key: KeyEvent) {
-        let count = self.thread_terminals().len();
+        let rows = self.terminal_rows();
+        let cursor = &mut self.terminal_cursor;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.terminal_selected = (self.terminal_selected + 1).min(count.saturating_sub(1));
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.terminal_selected = self.terminal_selected.saturating_sub(1);
-            }
-            KeyCode::Char('g') => self.terminal_selected = 0,
-            KeyCode::Char('G') => self.terminal_selected = count.saturating_sub(1),
+            KeyCode::Char('j') | KeyCode::Down => cursor.move_by(&rows, 1),
+            KeyCode::Char('k') | KeyCode::Up => cursor.move_by(&rows, -1),
+            KeyCode::Char('g') => cursor.top(&rows),
+            KeyCode::Char('G') => cursor.bottom(&rows),
             KeyCode::Char('x') | KeyCode::Char('d') => self.close_terminal(),
             KeyCode::Char('r') => self.restart_terminal(),
             KeyCode::Char('c') => self.new_terminal(),
@@ -2784,19 +2297,31 @@ impl App {
         list
     }
 
+    /// The open thread's terminals as the panel's cursor is lent them.
+    pub fn terminal_rows(&self) -> Vec<Row<String>> {
+        let terminals = self.thread_terminals();
+        popup_rows(terminals.iter().map(|t| t.terminal_id.clone()))
+    }
+
     fn open_terminals(&mut self) {
         if self.thread.is_none() {
             self.toast("no thread open", true);
             return;
         }
-        self.terminal_selected = 0;
+        self.terminal_cursor = ListCursor::default();
         self.mode = Mode::Terminals;
     }
 
+    /// The terminal under the panel's cursor, wherever the list has moved it to.
+    fn cursor_terminal(&self) -> Option<crate::model::TerminalSummary> {
+        let terminals = self.thread_terminals();
+        let at = self.terminal_cursor.selection(&self.terminal_rows())?;
+        terminals.get(at).map(|t| (*t).clone())
+    }
+
     fn selected_terminal(&self) -> Option<(String, String, String)> {
-        self.thread_terminals()
-            .get(self.terminal_selected)
-            .map(|t| (t.thread_id.clone(), t.terminal_id.clone(), t.cwd.clone()))
+        self.cursor_terminal()
+            .map(|t| (t.thread_id, t.terminal_id, t.cwd))
     }
 
     /// Close the selected terminal. The server kills whatever is running in it.
@@ -2867,11 +2392,7 @@ impl App {
 
     /// Attach to the selected terminal and hand the keyboard to it.
     fn attach_terminal(&mut self) {
-        let Some(terminal) = self
-            .thread_terminals()
-            .get(self.terminal_selected)
-            .map(|t| (*t).clone())
-        else {
+        let Some(terminal) = self.cursor_terminal() else {
             self.toast("no terminal selected", true);
             return;
         };
@@ -3136,19 +2657,17 @@ impl App {
         self.handle.refresh_vcs();
     }
 
-    /// Work out where a new thread's worktree would branch from, reporting why not when
-    /// it cannot. Returns false when the message should not be sent.
-    fn resolve_draft_worktree(&mut self) -> bool {
-        self.draft_worktree = None;
+    /// Work out where a new thread's worktree would branch from, where it wants one, or
+    /// why it cannot, in which case the message is not to be sent.
+    fn draft_worktree(&self) -> Result<Option<outbox::Worktree>, &'static str> {
         let Some(draft) = self.draft.as_ref() else {
-            return true;
+            return Ok(None);
         };
         if !draft.worktree {
-            return true;
+            return Ok(None);
         }
         let Some(project) = self.shell.projects.get(&draft.project_id) else {
-            self.toast("unknown project", true);
-            return false;
+            return Err("unknown project");
         };
         // The worktree branches off whatever the project's checkout has now, which is
         // what the watch reports.
@@ -3157,16 +2676,17 @@ impl App {
             .filter(|vcs| vcs.is_repo)
             .and_then(|vcs| vcs.ref_name.clone());
         let Some(base) = base else {
-            let message = if self.vcs().is_none() {
+            return Err(if self.vcs().is_none() {
                 "still reading the project's checkout; send again in a moment"
             } else {
                 "no branch to base a worktree on; gw starts in the checkout instead"
-            };
-            self.toast(message, true);
-            return false;
+            });
         };
-        self.draft_worktree = Some((project.workspace_root.clone(), base));
-        true
+        Ok(Some(outbox::Worktree {
+            project_cwd: project.workspace_root.clone(),
+            base_branch: base,
+            start_from_origin: self.config.settings.new_worktrees_start_from_origin,
+        }))
     }
 
     /// The link drawn at a screen position, if any.
@@ -3178,12 +2698,12 @@ impl App {
     }
 
     /// The links on the cursor's line, for opening one without the mouse.
-    fn link_at_cursor(&self) -> Option<String> {
+    fn link_at_cursor(&mut self) -> Option<String> {
         if self.focus != Focus::Chat {
             return None;
         }
-        let offset = self.chat_offset();
-        let row = self.chat_area.y + self.chat_cursor.checked_sub(offset)? as u16;
+        let (row, _) = self.chat().cursor_cell()?;
+        let row = self.chat_area.y + row as u16;
         self.links
             .iter()
             .find(|link| link.row == row)
@@ -3469,7 +2989,7 @@ impl App {
 
     fn open_worktrees(&mut self) {
         self.worktrees = self.collect_worktrees();
-        self.worktree_selected = 0;
+        self.worktree_cursor = ListCursor::default();
         if self.worktrees.is_empty() {
             self.toast("no thread has a worktree of its own", false);
             return;
@@ -3509,21 +3029,18 @@ impl App {
         if self.worktree_confirm.is_some() {
             return self.on_worktree_confirm_key(key);
         }
-        let count = self.worktrees.len();
+        let rows = self.worktree_rows();
+        let cursor = &mut self.worktree_cursor;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.worktree_selected = (self.worktree_selected + 1).min(count.saturating_sub(1));
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.worktree_selected = self.worktree_selected.saturating_sub(1);
-            }
-            KeyCode::Char('g') => self.worktree_selected = 0,
-            KeyCode::Char('G') => self.worktree_selected = count.saturating_sub(1),
+            KeyCode::Char('j') | KeyCode::Down => cursor.move_by(&rows, 1),
+            KeyCode::Char('k') | KeyCode::Up => cursor.move_by(&rows, -1),
+            KeyCode::Char('g') => cursor.top(&rows),
+            KeyCode::Char('G') => cursor.bottom(&rows),
             KeyCode::Char('x') | KeyCode::Char('d') => self.remove_worktree(false),
             KeyCode::Char('X') | KeyCode::Char('D') => self.confirm_force_remove(),
             KeyCode::Enter | KeyCode::Char('l') => {
-                if let Some(worktree) = self.worktrees.get(self.worktree_selected) {
+                if let Some(worktree) = self.cursor_worktree() {
                     let thread_id = worktree.thread_id.clone();
                     self.mode = Mode::Normal;
                     self.open_thread(&thread_id);
@@ -3531,6 +3048,18 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// The worktrees listed, as the list's cursor is lent them: by thread, since two can
+    /// share a worktree. What is done to one is still done by its path.
+    pub fn worktree_rows(&self) -> Vec<Row<String>> {
+        popup_rows(self.worktrees.iter().map(|w| w.thread_id.clone()))
+    }
+
+    /// The worktree under the list's cursor, wherever the list has moved it to.
+    fn cursor_worktree(&self) -> Option<&ThreadWorktree> {
+        let at = self.worktree_cursor.selection(&self.worktree_rows())?;
+        self.worktrees.get(at)
     }
 
     /// The box is a question with two answers, and the rest of its keys move through
@@ -3542,10 +3071,14 @@ impl App {
             self.worktree_confirm = None;
             return;
         };
-        let last = worktree.files.len().saturating_sub(1);
+        let files = worktree.files.len();
         let Some(confirm) = self.worktree_confirm.as_mut() else {
             return;
         };
+        // No further than the box has room to show, so the first key back up moves it —
+        // and a box made taller since shows more, so it is brought back to that first.
+        let last = confirm.last(files);
+        confirm.offset = confirm.offset.min(last);
         let by = |offset: usize, delta: isize| {
             (offset as isize + delta).clamp(0, last as isize) as usize
         };
@@ -3570,7 +3103,7 @@ impl App {
     /// for it to refuse over and nothing to lose, so that one goes straight through —
     /// the question is only worth asking where there is an answer worth having.
     fn confirm_force_remove(&mut self) {
-        let Some(worktree) = self.worktrees.get(self.worktree_selected) else {
+        let Some(worktree) = self.cursor_worktree() else {
             return;
         };
         // The reasons it cannot go at all are worth giving before the question rather
@@ -3586,7 +3119,7 @@ impl App {
         // Asked again on the way in: the server's status is cached, and a list of files
         // somebody is about to agree to lose should be the one that is there now.
         self.check_worktree(path.clone());
-        self.worktree_confirm = Some(WorktreeConfirm { path, offset: 0 });
+        self.worktree_confirm = Some(WorktreeConfirm::new(path));
     }
 
     /// Why a worktree is not tria's to remove, whatever git thinks of it.
@@ -3612,7 +3145,7 @@ impl App {
     /// in it, which is the check worth having and is git's to make: it counts what is
     /// not tracked as well, which a status does not.
     fn remove_worktree(&mut self, force: bool) {
-        if let Some(worktree) = self.worktrees.get(self.worktree_selected) {
+        if let Some(worktree) = self.cursor_worktree() {
             let path = worktree.path.clone();
             self.remove_worktree_at(&path, force);
         }
@@ -3676,9 +3209,6 @@ impl App {
                 {
                     self.worktree_confirm = None;
                 }
-                self.worktree_selected = self
-                    .worktree_selected
-                    .min(self.worktrees.len().saturating_sub(1));
                 self.toast(format!("removed {}", short_path(&path)), false);
                 if self.worktrees.is_empty() && self.mode == Mode::Worktrees {
                     self.mode = Mode::Normal;
@@ -3852,14 +3382,10 @@ impl App {
 
     // ── Subagents ──────────────────────────────────────────────────────
 
-    /// The conversation on screen: a subagent's transcript when one is open, otherwise
-    /// the thread's own. The renderer reads the same two fields directly, because taking
-    /// a reference to the whole of `self` here would borrow the fields it writes.
+    /// The conversation on screen: what is being read in place of the thread's when
+    /// something is, otherwise the thread's own.
     pub fn open_conversation(&self) -> Option<&ThreadState> {
-        self.transcript
-            .as_ref()
-            .map(|transcript| &transcript.state)
-            .or(self.thread.as_ref())
+        self.reader.conversation().or(self.thread.as_ref())
     }
 
     /// The subagents the open thread has run, newest work last.
@@ -3884,35 +3410,40 @@ impl App {
         // one still working, else the last to finish, which is the one the conversation
         // has just been talking about.
         let reading = self
-            .transcript
-            .as_ref()
-            .and_then(|transcript| transcript.agent_id())
+            .reader
+            .agent_id()
             .and_then(|reading| agents.iter().position(|a| a.id == reading));
-        self.agent_selected = reading
+        let at = reading
             .or_else(|| agents.iter().position(|agent| agent.status.is_active()))
             .unwrap_or(agents.len() - 1);
+        self.agent_cursor = ListCursor::on(&self.agent_rows(), at);
         self.mode = Mode::Agents;
+    }
+
+    /// The subagents in the roster, oldest first, as its cursor is lent them.
+    pub fn agent_rows(&self) -> Vec<Row<String>> {
+        popup_rows(self.subagents().into_iter().map(|agent| agent.id))
     }
 
     fn on_agents_key(&mut self, key: KeyEvent) {
         let agents = self.subagents();
-        let count = agents.len();
+        let rows = self.agent_rows();
+        let cursor = &mut self.agent_cursor;
+        let selected = cursor.selection(&rows).and_then(|at| agents.get(at));
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('A') => self.mode = Mode::Normal,
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.agent_selected = (self.agent_selected + 1).min(count.saturating_sub(1));
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.agent_selected = self.agent_selected.saturating_sub(1);
-            }
-            KeyCode::Char('g') => self.agent_selected = 0,
-            KeyCode::Char('G') => self.agent_selected = count.saturating_sub(1),
-            KeyCode::Enter | KeyCode::Char('l') => {
-                self.transcript_from_roster = true;
-                self.read_transcript();
-            }
-            KeyCode::Char('y') => match agents.get(self.agent_selected) {
-                Some(agent) => match agent.result.as_deref().or(agent.error.as_deref()) {
+            KeyCode::Char('j') | KeyCode::Down => cursor.move_by(&rows, 1),
+            KeyCode::Char('k') | KeyCode::Up => cursor.move_by(&rows, -1),
+            KeyCode::Char('g') => cursor.top(&rows),
+            KeyCode::Char('G') => cursor.bottom(&rows),
+            KeyCode::Enter | KeyCode::Char('l') => match selected {
+                Some(agent) => {
+                    self.open_reading(Source::Subagent(agent.id.clone()), Origin::Roster)
+                }
+                None => self.toast("no subagent selected", true),
+            },
+            KeyCode::Char('y') => match selected {
+                Some(agent) => match agent.report() {
                     Some(report) => {
                         copy_to_clipboard(report);
                         self.toast("yanked the report", false);
@@ -3925,247 +3456,197 @@ impl App {
         }
     }
 
-    /// Where the provider is writing a subagent's transcript. It tells the server the
-    /// path only when the task finishes, so for one still working it is taken from a
-    /// task in the same thread that has: they are written side by side in one directory
-    /// and named after the task, and the file is there from the moment the agent starts.
-    pub fn transcript_path(&self, agent: &crate::subagent::Subagent) -> Option<String> {
-        if let Some(path) = &agent.output_file {
-            return Some(path.clone());
-        }
-        let thread = self.thread.as_ref()?;
-        let known = thread
-            .detail
-            .activities
-            .iter()
-            .rev()
-            .find_map(|activity| activity.str("outputFile"))?;
-        crate::transcript::sibling_path(known, &agent.id)
-    }
+    // ── Reading ────────────────────────────────────────────────────────
 
-    /// Fetch the selected subagent's transcript from the machine that ran it. The path
-    /// is the provider's own, outside any workspace, which is what `projects.readFile`
-    /// takes an absolute path for.
-    fn read_transcript(&mut self) {
-        self.read_transcript_as(false);
-    }
-
-    /// Read the selected subagent's transcript, `quiet`ly to bring an open one up to date.
-    fn read_transcript_as(&mut self, quiet: bool) {
-        let agents = self.subagents();
-        let Some(agent) = agents.get(self.agent_selected) else {
-            if !quiet {
-                self.toast("no subagent selected", true);
-            }
-            return;
+    /// Lend the reader the open thread for `act`, and do what it answers. Whether there
+    /// was a thread to lend: a reading belongs to the thread it was read from, so with none
+    /// open there is nothing to read, and nothing left to bring up to date.
+    fn read_with(
+        &mut self,
+        act: impl FnOnce(&mut Reader<Restore>, &reader::Thread<'_>) -> reader::Step,
+    ) -> bool {
+        let branch = self.checked_out_branch().map(str::to_string);
+        let directory = self.thread_directory();
+        let Some(state) = self.thread.as_ref() else {
+            self.reader.forget();
+            return false;
         };
-        let Some(path) = self.transcript_path(agent) else {
-            if !quiet {
-                self.toast("no transcript for this subagent yet", false);
-            }
-            return;
-        };
-        if self.transcript_loading.is_some() {
-            return;
-        }
-        let Some(cwd) = self.thread_directory() else {
-            if !quiet {
-                self.toast("thread has no directory", true);
-            }
-            return;
-        };
-        self.transcript_loading = Some(agent.id.clone());
-        self.transcript_quiet = quiet;
-        let agent_id = agent.id.clone();
-        let handle = self.handle.clone();
-        let events = self.events.clone();
-        let payload = json!({ "cwd": cwd, "relativePath": path });
-        tokio::spawn(async move {
-            let result = handle
-                .call("projects.readFile", payload)
-                .await
-                .map_err(|e| e.to_string())
-                .map(|value| TranscriptFile {
-                    contents: value
-                        .get("contents")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    truncated: value
-                        .get("truncated")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                });
-            let _ = events.send(AppEvent::Transcript { agent_id, result });
-        });
-    }
-
-    fn on_transcript(&mut self, agent_id: String, result: Result<TranscriptFile, String>) {
-        if self.transcript_loading.as_deref() != Some(agent_id.as_str()) {
-            return;
-        }
-        self.transcript_loading = None;
-        self.transcript_read_at = Some(Instant::now());
-        let quiet = std::mem::take(&mut self.transcript_quiet);
-        // A read nobody asked for only brings up to date what is still open.
-        let open = self
-            .transcript
-            .as_ref()
-            .is_some_and(|t| t.agent_id() == Some(agent_id.as_str()));
-        if quiet && !open {
-            return;
-        }
-        let agent_id_read = agent_id.clone();
-        let file = match result {
-            Ok(file) => file,
-            Err(error) if quiet => {
-                tracing::info!(%error, "bringing the transcript up to date");
-                return;
-            }
-            Err(error) => return self.toast(format!("reading the transcript: {error}"), true),
-        };
-        let agents = self.subagents();
-        let Some(agent) = agents.iter().find(|agent| agent.id == agent_id) else {
-            return;
-        };
-        let (mut state, summary) =
-            match crate::transcript::parse(&file.contents, &agent.id, &agent.title) {
-                Ok(parsed) => parsed,
-                Err(error) if quiet => {
-                    tracing::info!(%error, "bringing the transcript up to date");
-                    return;
-                }
-                Err(error) => return self.toast(format!("{error}"), true),
-            };
-        self.reads += 1;
-        state.revision = self.reads;
-        let mut subtitle = format!(
-            "{} message{} · {} tool call{}",
-            summary.messages,
-            if summary.messages == 1 { "" } else { "s" },
-            summary.tools,
-            if summary.tools == 1 { "" } else { "s" },
-        );
-        if let Some(role) = &agent.role {
-            subtitle = format!("{role} · {subtitle}");
-        }
-        // Re-reading a running agent replaces what is open, so the way back is the one
-        // taken on the way in, not wherever the reading had got to.
-        let reread = self
-            .transcript
-            .as_ref()
-            .is_some_and(|open| open.agent_id() == Some(agent_id.as_str()));
-        // Whatever is open already holds the conversation's own place.
-        let restore = match &self.transcript {
-            Some(open) => open.restore,
-            None => (self.scroll, self.chat_cursor, self.focus),
-        };
-        let live = !agent.status.is_terminal();
-        if !reread {
-            self.transcript_seen = Some(format!("{} {:?}", agent.updated_at, agent.status));
-        }
-        self.transcript = Some(Transcript {
-            source: Reading::Subagent(agent_id),
-            title: agent.title.clone(),
-            subtitle,
+        let thread = reader::Thread {
             state,
-            truncated: file.truncated,
-            live,
-            restore,
-        });
-        // The transcript is read, not written to, so the cursor goes where the reading
-        // is done and the conversation's own place is kept for the way back. A re-read
-        // of a run still going lands at the end, which is the part that is new. One asked
-        // for from the sidebar leaves the keys there, for the next.
-        // Brought up to date under somebody, it leaves them where they were: reading
-        // further up stays put, and reading at the end follows what is new.
-        if quiet {
+            branch: branch.as_deref(),
+            directory: directory.as_deref(),
+        };
+        let step = act(&mut self.reader, &thread);
+        self.take_step(step);
+        true
+    }
+
+    /// Read something in place of the conversation, because somebody asked from `origin`.
+    fn open_reading(&mut self, source: Source, origin: Origin) {
+        if !self.read_with(|reader, thread| reader.open(thread, source, origin)) {
+            self.toast("no thread open", true);
+        }
+    }
+
+    /// `r`: read what is open again. An agent still working has written more since, and a
+    /// pull request moves on while it is read.
+    fn reread_reading(&mut self) {
+        let Some(source) = self.reader.source() else {
+            return;
+        };
+        self.read_with(|reader, thread| reader.reread(thread, source, Origin::Chat));
+    }
+
+    /// Keep a running agent's open transcript up to date.
+    fn follow_reading(&mut self) {
+        self.read_with(|reader, thread| reader.tick(thread, Instant::now()));
+    }
+
+    /// Do what the reader answered: fetch what it wants, say what it says, and put the
+    /// reader where what it read has opened.
+    fn take_step(&mut self, step: reader::Step) {
+        for fetch in step.fetches {
+            self.fetch(fetch);
+        }
+        match step.toast {
+            None => {}
+            Some(reader::Toast::Clear) => self.toast = None,
+            Some(reader::Toast::Say(text)) => self.toast(text, false),
+            Some(reader::Toast::Warn(text)) => self.toast(text, true),
+        }
+        let reader::Outcome::Opened { place, take_focus } = step.outcome else {
+            return;
+        };
+        if place == reader::Place::Keep {
             return;
         }
         self.mode = Mode::Normal;
-        if self.keep_sidebar_focus.take().as_deref() != Some(agent_id_read.as_str()) {
+        if take_focus {
             self.focus = Focus::Chat;
         }
-        if reread && live {
-            self.scroll = Scroll::Follow;
-        } else {
-            self.scroll = Scroll::Offset(0);
-            self.chat_cursor = 0;
-        }
-        self.chat_visual = None;
-        self.search = None;
+        self.chat_view.open(place);
     }
 
-    /// Keep a running agent's transcript up to date while it is open. The server has no
-    /// way to say a file changed, but the thread says when the agent does something, and
-    /// that is when its transcript grows; between those, a stretch of writing is caught by
-    /// reading again every few seconds. Once the agent has finished, one last read shows
-    /// how it ended, and that is the end of it.
-    fn follow_transcript(&mut self) {
-        let Some(id) = self
-            .transcript
-            .as_ref()
-            .filter(|t| t.live)
-            .and_then(|t| t.agent_id())
-            .map(str::to_string)
-        else {
-            return;
-        };
-        if self.transcript_loading.is_some() {
-            return;
+    /// Fetch what the reader asked for, and hand it back as an event once it has come.
+    fn fetch(&mut self, fetch: reader::Fetch) {
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        match fetch {
+            reader::Fetch::Transcript {
+                agent_id,
+                cwd,
+                path,
+            } => {
+                let payload = json!({ "cwd": cwd, "relativePath": path });
+                tokio::spawn(async move {
+                    let result = handle
+                        .call("projects.readFile", payload)
+                        .await
+                        .map_err(|e| e.to_string())
+                        .map(|value| TranscriptFile {
+                            contents: value
+                                .get("contents")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            truncated: value
+                                .get("truncated")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        });
+                    let _ = events.send(AppEvent::Transcript { agent_id, result });
+                });
+            }
+            // The server asks the host, so this is the one read that can be slow.
+            reader::Fetch::PullRequest {
+                url,
+                payload,
+                fresh,
+            } => {
+                tokio::spawn(async move {
+                    if fresh {
+                        let reference = json!({ "reference": payload });
+                        if let Err(err) = handle.call("pullRequests.invalidate", reference).await {
+                            tracing::info!(%err, "the server kept its copy of the pull request");
+                        }
+                    }
+                    // The review history is asked for beside the detail rather than after
+                    // it: it is the slower of the two, and the view fills it in when it comes.
+                    let detail = async {
+                        let result = handle
+                            .call("pullRequests.detail", payload.clone())
+                            .await
+                            .map_err(|e| e.to_string());
+                        let _ = events.send(AppEvent::PullRequest {
+                            url: url.clone(),
+                            result,
+                        });
+                    };
+                    let activity = async {
+                        let result = handle
+                            .call("pullRequests.activity", payload.clone())
+                            .await
+                            .map_err(|e| e.to_string());
+                        let _ = events.send(AppEvent::PullRequestActivity {
+                            url: url.clone(),
+                            result,
+                        });
+                    };
+                    tokio::join!(detail, activity);
+                });
+            }
+            reader::Fetch::Image {
+                url,
+                token_host,
+                directory,
+            } => {
+                let tokens = self.gh_tokens.clone();
+                tokio::spawn(async move {
+                    let token = match token_host {
+                        Some(host) => gh_token(&tokens, directory.as_deref(), &host).await,
+                        None => None,
+                    };
+                    let data = fetch_image(&url, token.as_deref()).await;
+                    let _ = events.send(AppEvent::PullRequestImage { url, data });
+                });
+            }
         }
-        let agents = self.subagents();
-        let Some(index) = agents.iter().position(|agent| agent.id == id) else {
-            return;
-        };
-        let agent = &agents[index];
-        let seen = format!("{} {:?}", agent.updated_at, agent.status);
-        let moved = self.transcript_seen.as_ref() != Some(&seen);
-        let due = self
-            .transcript_read_at
-            .is_none_or(|at| at.elapsed() >= TRANSCRIPT_POLL);
-        if !moved && !due {
-            return;
-        }
-        self.transcript_seen = Some(seen);
-        self.agent_selected = index;
-        self.read_transcript_as(true);
     }
 
-    /// Read the open transcript again: an agent still working has written more since.
-    fn reload_transcript(&mut self) {
-        let Some(open) = self.transcript.as_ref() else {
-            return;
-        };
-        if let Some(detail) = open.pull_request() {
-            let url = detail.url.clone();
-            return self.read_pull_request_as(&url, false, true);
-        }
-        let Some(open) = open.agent_id().map(str::to_string) else {
-            return;
-        };
-        let agents = self.subagents();
-        let Some(index) = agents.iter().position(|agent| agent.id == open) else {
-            self.toast("that subagent is no longer in this thread", true);
-            return;
-        };
-        self.agent_selected = index;
-        self.read_transcript();
+    /// Where the conversation is now, for the reader to keep should what it read open over it.
+    fn here(&self) -> Restore {
+        (self.chat_view.place(), self.focus)
     }
 
-    /// Leave the transcript and put the conversation back where it was. Where to go next
-    /// is the caller's: `q` returns to the list the transcript was opened from, while
-    /// sending a message simply carries on.
-    fn leave_transcript(&mut self) {
-        let Some(transcript) = self.transcript.take() else {
-            return;
-        };
-        let (scroll, cursor, focus) = transcript.restore;
-        self.scroll = scroll;
-        self.chat_cursor = cursor;
+    fn on_transcript(&mut self, agent_id: String, result: Result<TranscriptFile, String>) {
+        let here = self.here();
+        self.read_with(|reader, thread| {
+            reader.on_transcript(thread, agent_id, result, here, Instant::now())
+        });
+    }
+
+    fn on_pull_request(&mut self, url: String, result: Result<Value, String>) {
+        let here = self.here();
+        self.read_with(|reader, thread| reader.on_pull_request(thread, url, result, here));
+    }
+
+    fn on_pull_request_activity(&mut self, url: String, result: Result<Value, String>) {
+        self.read_with(|reader, thread| reader.on_activity(thread, url, result));
+    }
+
+    fn on_pull_request_image(&mut self, url: String, data: Option<String>) {
+        let step = self.reader.on_image(url, data);
+        self.take_step(step);
+    }
+
+    /// Put away what is being read and put the conversation back where it was. Where to go
+    /// next is the caller's, from where the reading was asked for, which this gives back.
+    fn leave_reading(&mut self) -> Option<Origin> {
+        let closed = self.reader.close()?;
+        let (place, focus) = closed.restore;
+        self.chat_view.restore(place);
         self.focus = focus;
-        self.chat_visual = None;
-        self.search = None;
+        Some(closed.origin)
     }
 
     /// Ask before sending a message written over a transcript: it looks like a reply to
@@ -4191,7 +3672,7 @@ impl App {
         if !agreed {
             return;
         }
-        let context = self.transcript.as_ref().map(Transcript::context);
+        let context = self.reader.context();
         match send {
             TranscriptSend::Now => self.send_composed(context),
             TranscriptSend::Queued => self.queue_composed(context),
@@ -4394,25 +3875,23 @@ impl App {
             self.toast("no thread open", true);
             return;
         }
-        let text = ui::chat_export_all();
+        let text = self.chat().layout().export_all();
         self.view_in_editor("thread", &text);
     }
 
     /// `ge` in the chat: the message, plan, tool row, or tool group under the cursor.
     fn view_at_cursor(&mut self) {
-        let line = self.chat_cursor;
+        let chat = self.chat();
+        let line = chat.cursor();
+        let chat = chat.layout();
         // A tool row is more specific than its group, which is more specific than a block.
-        let key = self.region_at(line).map(|(key, _)| key).or_else(|| {
-            self.block_ranges
-                .iter()
-                .find(|(start, end, _)| *start <= line && line < *end)
-                .map(|(_, _, key)| key.clone())
-        });
-        let Some(key) = key else {
-            self.toast("nothing under the cursor", true);
-            return;
-        };
-        match ui::chat_export(&key) {
+        let text = chat
+            .region_at(line)
+            .map(|(key, _)| key)
+            .or_else(|| chat.block_at(line))
+            .and_then(|key| chat.export(key))
+            .map(str::to_string);
+        match text {
             Some(text) => self.view_in_editor("block", &text),
             None => self.toast("nothing under the cursor", true),
         }
@@ -4616,18 +4095,12 @@ impl App {
         }
         // A check's or a reviewer's row in a pull request stands for a link, kept off the
         // row to leave room.
-        let row = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .zip(self.region_at(self.chat_cursor))
-            .and_then(|(detail, (key, _))| {
-                let activity = self
-                    .pull_request_activity
-                    .get(&detail.url)
-                    .and_then(|a| a.as_ref().ok());
-                crate::pull_request::link_at(&key, detail, activity)
-            });
+        self.chat();
+        let chat = &self.chat_view;
+        let row = chat
+            .layout()
+            .region_at(chat.cursor())
+            .and_then(|(key, _)| self.reader.link_at(key));
         if let Some(url) = row {
             self.open_url(&url);
             return;
@@ -4637,41 +4110,17 @@ impl App {
             return;
         }
         // The pull request being read is the one meant, whichever the header shows.
-        if let Some(url) = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .map(|detail| detail.url.clone())
-        {
+        if let Some(url) = self.reader.pull_request().map(|detail| detail.url.clone()) {
             self.open_url(&url);
             return;
         }
         self.open_pull_request(pick);
     }
 
-    /// The picture under the chat cursor: the one the row it is in has, open or shut, or
-    /// the one a message drew there. The cursor is inside the row wherever it is on the
-    /// picture itself, since the lines it was drawn over belong to the row that opened it.
-    fn picture_at_cursor(&self) -> Option<crate::timeline::Picture> {
-        let key = match self.region_at(self.chat_cursor) {
-            Some((key, _)) => key,
-            None => self.picture_range_at(self.chat_cursor)?,
-        };
-        self.chat_pictures
-            .iter()
-            .find(|(row, _)| *row == key)
-            .map(|(_, picture)| picture.clone())
-    }
-
-    /// What a message's picture is known by, where one was drawn on this line. The
-    /// smallest range wins, so two pictures on one line are told apart by the lines they
-    /// were each drawn on.
-    fn picture_range_at(&self, line: usize) -> Option<String> {
-        self.picture_ranges
-            .iter()
-            .filter(|region| region.first <= line && line < region.end)
-            .min_by_key(|region| region.end - region.first)
-            .map(|region| region.key.clone())
+    /// The picture under the chat cursor.
+    fn picture_at_cursor(&mut self) -> Option<crate::timeline::Picture> {
+        let chat = self.chat();
+        chat.layout().picture_at(chat.cursor()).cloned()
     }
 
     /// Hand a picture to whatever this machine opens pictures with. One the provider
@@ -4702,57 +4151,6 @@ impl App {
             [only] if pick => self.read_pull_request(&only.url.clone()),
             _ if pick => self.open_picker(PickerKind::PullRequest),
             _ => self.open_url(&prs[0].url.clone()),
-        }
-    }
-
-    /// Fetch the pictures a description shows that have not been asked for yet. They are
-    /// fetched from here rather than through the server, which has no way to hand them
-    /// over; a picture on the pull request's own host is asked for with `gh`'s token for
-    /// that host, since a private repository's uploads are private too. `gh` is asked in
-    /// the thread's directory, because which account it answers for can depend on where
-    /// it is run.
-    fn fetch_pull_request_images(&mut self, detail: &crate::pull_request::Detail) {
-        let host = url_host(&detail.url).map(str::to_string);
-        let directory = self.thread_directory();
-        let activity = self
-            .pull_request_activity
-            .get(&detail.url)
-            .and_then(|a| a.as_ref().ok());
-        for url in crate::pull_request::image_urls(detail, activity) {
-            if !self.pull_request_images_asked.insert(url.clone()) {
-                continue;
-            }
-            let own = host.as_deref().filter(|host| url_host(&url) == Some(*host));
-            let host = own.map(str::to_string);
-            let directory = directory.clone();
-            let tokens = self.gh_tokens.clone();
-            let events = self.events.clone();
-            tokio::spawn(async move {
-                let token = match host {
-                    Some(host) => gh_token(&tokens, directory.as_deref(), &host).await,
-                    None => None,
-                };
-                let data = fetch_image(&url, token.as_deref()).await;
-                let _ = events.send(AppEvent::PullRequestImage { url, data });
-            });
-        }
-    }
-
-    fn on_pull_request_image(&mut self, url: String, data: Option<String>) {
-        if data.is_none() {
-            tracing::info!(%url, "a pull request's picture could not be fetched");
-            // Asked for again on the next read, which is what `r` is for.
-            self.pull_request_images_asked.remove(&url);
-        }
-        self.pull_request_images.insert(url, data);
-        // The chat redraws what it has built only when the revision moves.
-        if let Some(open) = self
-            .transcript
-            .as_mut()
-            .filter(|t| t.pull_request().is_some())
-        {
-            self.reads += 1;
-            open.state.revision = self.reads;
         }
     }
 
@@ -4804,83 +4202,20 @@ impl App {
         }
     }
 
-    /// Ask the server for a pull request's detail, to read it in place of the conversation.
-    /// The server asks the host, so this is the one read that can be slow.
+    /// Read a pull request in place of the conversation, because somebody asked.
     fn read_pull_request(&mut self, url: &str) {
-        self.read_pull_request_as(url, false, false);
+        self.open_reading(Source::PullRequest(url.to_string()), Origin::Chat);
     }
 
-    /// Read a pull request, `quiet`ly to bring an open one up to date, and `fresh` past the
-    /// server's cache of what the host said, which it keeps until it has reason to doubt it.
-    fn read_pull_request_as(&mut self, url: &str, quiet: bool, fresh: bool) {
-        let (payload, number) = match self.pull_request_payload(url) {
-            Ok(found) => found,
-            Err(why) => return self.toast(why, true),
-        };
-        if self.pull_request_loading.as_deref() == Some(url) {
-            return;
-        }
-        self.pull_request_loading = Some(url.to_string());
-        self.pull_request_quiet = quiet;
-        if !quiet {
-            self.toast(format!("reading #{number}…"), false);
-        }
-        let url = url.to_string();
-        let handle = self.handle.clone();
-        let events = self.events.clone();
-        tokio::spawn(async move {
-            if fresh {
-                let reference = json!({ "reference": payload });
-                if let Err(err) = handle.call("pullRequests.invalidate", reference).await {
-                    tracing::info!(%err, "the server kept its copy of the pull request");
-                }
-            }
-            // The review history is asked for beside the detail rather than after it: it
-            // is the slower of the two, and the view fills it in when it comes.
-            let detail = async {
-                let result = handle
-                    .call("pullRequests.detail", payload.clone())
-                    .await
-                    .map_err(|e| e.to_string());
-                let _ = events.send(AppEvent::PullRequest {
-                    url: url.clone(),
-                    result,
-                });
-            };
-            let activity = async {
-                let result = handle
-                    .call("pullRequests.activity", payload.clone())
-                    .await
-                    .map_err(|e| e.to_string());
-                let _ = events.send(AppEvent::PullRequestActivity {
-                    url: url.clone(),
-                    result,
-                });
-            };
-            tokio::join!(detail, activity);
-        });
-    }
-
-    /// How the server knows a pull request linked to the open thread: its project, host,
-    /// repository, and number. And the number, to speak of it by.
+    /// How the server knows a pull request linked to the open thread, and its number.
     fn pull_request_payload(&self, url: &str) -> Result<(Value, u64), &'static str> {
-        let shell = &self.thread.as_ref().ok_or("no thread open")?.detail.shell;
-        let pr = shell
-            .all_pull_requests(self.checked_out_branch())
-            .into_iter()
-            .find(|pr| pr.url == url)
-            .ok_or("that pull request is not linked to this thread")?;
-        let mut payload = json!({
-            "projectId": shell.project_id,
-            "repository": pr.repository,
-            "number": pr.number,
-        });
-        // One the server found on the branch but never linked has no host of its own; the
-        // server then takes the project's.
-        if !pr.host.is_empty() {
-            payload["host"] = json!(pr.host);
-        }
-        Ok((payload, pr.number))
+        let state = self.thread.as_ref().ok_or("no thread open")?;
+        let thread = reader::Thread {
+            state,
+            branch: self.checked_out_branch(),
+            directory: None,
+        };
+        reader::pull_request_payload(&thread, url)
     }
 
     /// `:checkout` and `c` on a pull request in the sidebar: have the server check the pull
@@ -4960,14 +4295,13 @@ impl App {
     /// The pull request the screen is about: the one being read, else the one picked in
     /// the sidebar's list, else the one the header shows.
     fn pull_request_in_view(&self) -> Option<String> {
-        if let Some(detail) = self.transcript.as_ref().and_then(|t| t.pull_request()) {
+        if let Some(detail) = self.reader.pull_request() {
             return Some(detail.url.clone());
         }
-        if self.sidebar_tab == SidebarTab::PullRequests
-            && let Some(SidebarRow::PullRequest { url, .. }) =
-                self.sidebar_rows().get(self.sidebar_selected)
+        if self.sidebar_view.tab() == sidebar_view::Tab::PullRequests
+            && let Some(SidebarRow::PullRequest { url, .. }) = self.sidebar_selected_row()
         {
-            return Some(url.clone());
+            return Some(url);
         }
         let shell = &self.thread.as_ref()?.detail.shell;
         shell
@@ -5027,7 +4361,7 @@ impl App {
     /// `L` and `:labels`: the repository's labels, to put on the pull request being read or
     /// take off it. Only offered where the host can change them and the viewer may.
     fn edit_labels(&mut self) {
-        let Some(detail) = self.transcript.as_ref().and_then(|t| t.pull_request()) else {
+        let Some(detail) = self.reader.pull_request() else {
             self.toast("read a pull request first: gp", true);
             return;
         };
@@ -5053,11 +4387,7 @@ impl App {
     }
 
     fn on_label_candidates(&mut self, url: String, result: Result<Value, String>) {
-        let still_open = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .is_some_and(|d| d.url == url);
+        let still_open = self.reader.pull_request().is_some_and(|d| d.url == url);
         if !still_open {
             return;
         }
@@ -5106,12 +4436,7 @@ impl App {
         else {
             return;
         };
-        let Some(url) = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .map(|d| d.url.clone())
-        else {
+        let Some(url) = self.reader.pull_request().map(|d| d.url.clone()) else {
             return;
         };
         let (mut payload, _) = match self.pull_request_payload(&url) {
@@ -5174,15 +4499,7 @@ impl App {
             Ok(()) => {
                 let done = if applied { "put on" } else { "took off" };
                 self.toast(format!("{done} {name}"), false);
-                // The chips across the top are the pull request's own, read again.
-                let open = self
-                    .transcript
-                    .as_ref()
-                    .and_then(|t| t.pull_request())
-                    .is_some_and(|d| d.url == url);
-                if open {
-                    self.read_pull_request_as(&url, true, true);
-                }
+                self.read_with(|reader, thread| reader.label_set(thread, &url, &name, applied));
             }
             Err(error) => {
                 self.set_label_shown(&name, !applied);
@@ -5191,197 +4508,19 @@ impl App {
         }
     }
 
-    /// The server says pull requests may have changed: a turn has ended, and the agent may
-    /// have pushed, commented, or merged. The first count after connecting is only where it
-    /// stands, unless it moved while the connection was down.
+    /// The server says pull requests may have changed, and the open one may be worth
+    /// reading again.
     fn on_pull_requests_refreshed(&mut self, revision: u64) {
-        let changed = self
-            .pull_request_revision
-            .is_some_and(|seen| seen != revision);
-        self.pull_request_revision = Some(revision);
-        if changed {
-            self.refresh_open_pull_request();
+        if self.reader.server_refreshed(revision) {
+            self.read_with(|reader, thread| reader.refresh(thread));
         }
     }
 
-    /// The server syncs linked pull requests with the host on its own, and the thread list
-    /// carries what it found. News of the one being read — checks finishing, a review, a
-    /// merge — is a reason to read it again.
+    /// The thread list carries what the server's own sync found, which may be news of the
+    /// pull request being read.
     fn notice_pull_request_sync(&mut self) {
-        let Some(url) = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .map(|detail| detail.url.clone())
-        else {
-            return;
-        };
-        // The strip across the top is the thread list's, so a layer landing or linked
-        // redraws it, without reading anything.
-        let stack = format!("{:?}", self.pull_request_stack());
-        if self.pull_request_stack_seen.as_ref() != Some(&stack) {
-            self.pull_request_stack_seen = Some(stack);
-            if let Some(open) = self.transcript.as_mut() {
-                self.reads += 1;
-                open.state.revision = self.reads;
-            }
-        }
-        let synced = self.synced_link(&url);
-        if synced.is_some() && synced != self.pull_request_synced {
-            let had = std::mem::replace(&mut self.pull_request_synced, synced);
-            if had.is_some() {
-                self.refresh_open_pull_request();
-            }
-        }
-    }
-
-    /// The stack the pull request being read is a layer of, bottom to top, and which layer
-    /// it is. Only a stack of more than one: a pull request on its own is not in one.
-    pub fn pull_request_stack(&self) -> Option<(Vec<crate::model::PullRequestRef>, usize)> {
-        let url = &self.transcript.as_ref()?.pull_request()?.url;
-        let shell = &self.thread.as_ref()?.detail.shell;
-        shell
-            .pull_request_chains()
-            .into_iter()
-            .filter(|chain| chain.layers.len() > 1)
-            .find_map(|chain| {
-                let at = chain.layers.iter().position(|layer| &layer.url == url)?;
-                Some((chain.layers, at))
-            })
-    }
-
-    /// `[` and `]`: read the layer below or above in the stack.
-    fn move_through_stack(&mut self, by: isize) {
-        let Some((layers, at)) = self.pull_request_stack() else {
-            self.toast("this pull request is not in a stack", false);
-            return;
-        };
-        match at.checked_add_signed(by).and_then(|next| layers.get(next)) {
-            Some(layer) => self.read_pull_request(&layer.url.clone()),
-            None if by < 0 => self.toast("already the bottom of the stack", false),
-            None => self.toast("already the top of the stack", false),
-        }
-    }
-
-    /// What the thread list says of a linked pull request, as something to compare.
-    fn synced_link(&self, url: &str) -> Option<String> {
-        let shell = &self.thread.as_ref()?.detail.shell;
-        let link = shell.pull_requests.iter().find(|pr| pr.url == url)?;
-        Some(format!("{:?}", link.snapshot))
-    }
-
-    fn refresh_open_pull_request(&mut self) {
-        if let Some(url) = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .map(|detail| detail.url.clone())
-        {
-            self.read_pull_request_as(&url, true, true);
-        }
-    }
-
-    fn on_pull_request_activity(&mut self, url: String, result: Result<Value, String>) {
-        let activity = result.and_then(|value| {
-            serde_json::from_value::<crate::pull_request::Activity>(value)
-                .map_err(|e| e.to_string())
-        });
-        // What was read before stays in view over a re-read that failed.
-        if activity.is_err() && matches!(self.pull_request_activity.get(&url), Some(Ok(_))) {
-            return;
-        }
-        self.pull_request_activity.insert(url.clone(), activity);
-        // The reviews shown can have pictures of their own.
-        let detail = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .filter(|d| d.url == url)
-            .cloned();
-        if let Some(detail) = detail {
-            self.fetch_pull_request_images(&detail);
-        }
-        if let Some(open) = self
-            .transcript
-            .as_mut()
-            .filter(|t| t.pull_request().is_some_and(|d| d.url == url))
-        {
-            self.reads += 1;
-            open.state.revision = self.reads;
-        }
-    }
-
-    fn on_pull_request(&mut self, url: String, result: Result<Value, String>) {
-        if self.pull_request_loading.as_deref() != Some(url.as_str()) {
-            return;
-        }
-        self.pull_request_loading = None;
-        let quiet = std::mem::take(&mut self.pull_request_quiet);
-        // A read nobody asked for only brings up to date what is still open.
-        let open = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .is_some_and(|open| open.url == url);
-        if quiet && !open {
-            return;
-        }
-        let detail = match result.and_then(|value| {
-            serde_json::from_value::<crate::pull_request::Detail>(value).map_err(|e| e.to_string())
-        }) {
-            // Known by the link it was asked for by, which is what its review history is
-            // kept under too.
-            Ok(detail) => crate::pull_request::Detail {
-                url: url.clone(),
-                ..detail
-            },
-            Err(error) if quiet => {
-                tracing::info!(%error, "bringing the pull request up to date");
-                return;
-            }
-            Err(error) => return self.toast(format!("reading the pull request: {error}"), true),
-        };
-        self.fetch_pull_request_images(&detail);
-        self.reads += 1;
-        let state = match crate::pull_request::state(&detail, self.reads) {
-            Ok(state) => state,
-            Err(error) => return self.toast(format!("{error}"), true),
-        };
-        // A re-read keeps the place in it; anything else starts at the top.
-        let reread = open;
-        if !reread {
-            self.pull_request_synced = self.synced_link(&url);
-        }
-        let restore = match &self.transcript {
-            Some(open) => open.restore,
-            None => (self.scroll, self.chat_cursor, self.focus),
-        };
-        self.transcript = Some(Transcript {
-            // The title is the first thing the view itself says.
-            title: format!("{}#{}", detail.repository, detail.number),
-            subtitle: "pull request".to_string(),
-            source: Reading::PullRequest(Box::new(detail)),
-            state,
-            truncated: false,
-            live: false,
-            restore,
-        });
-        if !quiet {
-            self.toast = None;
-        }
-        // Brought up to date under somebody, it leaves them where they were: writing, with
-        // a selection, or in the middle of a search.
-        let keep_sidebar =
-            !quiet && self.keep_sidebar_focus.take().as_deref() == Some(url.as_str());
-        if !reread {
-            self.mode = Mode::Normal;
-            if !keep_sidebar {
-                self.focus = Focus::Chat;
-            }
-            self.scroll = Scroll::Offset(0);
-            self.chat_cursor = 0;
-            self.chat_visual = None;
-            self.search = None;
+        if self.reader.pull_request().is_some() {
+            self.read_with(|reader, thread| reader.notice_sync(thread));
         }
     }
 
@@ -5922,10 +5061,56 @@ impl App {
         }
     }
 
-    // ── Chat cursor ────────────────────────────────────────────────────
+    // ── Chat ───────────────────────────────────────────────────────────
 
-    /// Lines kept between the cursor and the viewport edge while moving.
-    const SCROLLOFF: usize = 3;
+    /// The chat as it is now, laid out again first if what it shows, its folds, or its
+    /// size have moved since it last was. While the chat has the keys the cursor is kept
+    /// on a line it has. Something that goes on to change the rest of the app lets go of
+    /// what this returns first, and reads `chat_view` again after.
+    pub fn chat(&mut self) -> &mut ChatView {
+        let Self {
+            chat_view,
+            reader,
+            thread,
+            expanded,
+            open_levels,
+            focus,
+            ..
+        } = self;
+        let now = time::OffsetDateTime::now_utc();
+        let key = chat_view::Key::of(
+            reader,
+            thread.as_ref(),
+            expanded,
+            *open_levels,
+            now.unix_timestamp() / 60,
+        );
+        let Some(key) = key else {
+            chat_view.clear();
+            return chat_view;
+        };
+        // What is read in place of the conversation draws itself; everything after this
+        // treats its blocks like any others.
+        chat_view.lay_out(key, |width, height| {
+            if reader.is_open() {
+                reader.blocks(
+                    thread.as_ref(),
+                    expanded,
+                    *open_levels,
+                    (width, height),
+                    &commands::now_iso(),
+                )
+            } else {
+                thread.as_ref().map_or_else(Vec::new, |thread| {
+                    crate::timeline::build(thread, expanded, *open_levels, width, height)
+                })
+            }
+        });
+        if *focus == Focus::Chat {
+            chat_view.settle();
+        }
+        chat_view
+    }
 
     fn focus_chat(&mut self) {
         if self.thread.is_none() {
@@ -5936,122 +5121,14 @@ impl App {
         // composer, and drawing a selection nothing is about to act on is a lie.
         self.composer.vim_cancel();
         self.focus = Focus::Chat;
-        let (height, total) = self.chat_viewport;
-        if self.scroll == Scroll::Follow {
-            self.chat_cursor = total.saturating_sub(1);
-        } else {
-            let offset = self.chat_offset();
-            self.chat_cursor = self
-                .chat_cursor
-                .clamp(offset, (offset + height).saturating_sub(1).max(offset));
-        }
-    }
-
-    /// The chat cursor as a line and the character it is on. The column is held where it
-    /// was put, so passing a short line does not pull the cursor left for good.
-    pub fn chat_spot(&self) -> (usize, usize) {
-        let line = self.chat_cursor;
-        (
-            line,
-            self.chat_column.min(ui::chat_len(line).saturating_sub(1)),
-        )
-    }
-
-    /// `w` and `b` over the characters of the chat, carrying on into the line above or
-    /// below when the one under the cursor runs out.
-    fn chat_word(&mut self, forward: bool) {
-        let n = self.take_chat_count();
-        let (_, total) = self.chat_viewport;
-        for _ in 0..n {
-            let (mut line, mut column) = self.chat_spot();
-            let mut chars: Vec<char> = ui::chat_row(line).chars().collect();
-            if forward {
-                let from = word_class(chars.get(column).copied());
-                while column < chars.len() && word_class(Some(chars[column])) == from {
-                    column += 1;
-                }
-                loop {
-                    while chars.get(column).is_some_and(|c| c.is_whitespace()) {
-                        column += 1;
-                    }
-                    if column < chars.len() || line + 1 >= total {
-                        break;
-                    }
-                    line += 1;
-                    column = 0;
-                    chars = ui::chat_row(line).chars().collect();
-                    // A blank line is a stop of its own, as it is in Vim.
-                    if chars.is_empty() {
-                        break;
-                    }
-                }
-            } else {
-                loop {
-                    while column > 0 && chars[column - 1].is_whitespace() {
-                        column -= 1;
-                    }
-                    if column > 0 || line == 0 {
-                        break;
-                    }
-                    line -= 1;
-                    chars = ui::chat_row(line).chars().collect();
-                    column = chars.len();
-                    if chars.is_empty() {
-                        break;
-                    }
-                }
-                let to = word_class(chars.get(column.wrapping_sub(1)).copied());
-                while column > 0 && word_class(Some(chars[column - 1])) == to {
-                    column -= 1;
-                }
-            }
-            self.set_chat_cursor(line);
-            self.chat_column = column.min(chars.len().saturating_sub(1));
-        }
-    }
-
-    /// Place the cursor and scroll just enough to keep it in view with a margin. Landing on
-    /// the last line resumes following new output.
-    fn set_chat_cursor(&mut self, line: usize) {
-        let (height, total) = self.chat_viewport;
-        if total == 0 || height == 0 {
-            return;
-        }
-        let line = line.min(total - 1);
-        self.chat_cursor = line;
-        let max_offset = total.saturating_sub(height);
-        let mut offset = self.chat_offset();
-        let margin = Self::SCROLLOFF.min(height.saturating_sub(1) / 2);
-        if line < offset + margin {
-            offset = line.saturating_sub(margin);
-        } else if line + margin >= offset + height {
-            offset = (line + margin + 1).saturating_sub(height);
-        }
-        let offset = offset.min(max_offset);
-        self.scroll = if line == total - 1 || offset >= max_offset && line + 1 >= total {
-            Scroll::Follow
-        } else {
-            Scroll::Offset(offset)
-        };
+        self.chat().bring_cursor_into_view();
     }
 
     /// Scroll the view and carry the cursor along, like Vim's Ctrl-d and Ctrl-u.
     fn chat_scroll_by(&mut self, delta: isize) {
-        let (height, total) = self.chat_viewport;
-        let before = self.chat_offset();
-        self.scroll_by(delta);
-        let after = self.chat_offset();
-        let moved = after as isize - before as isize;
-        let target = (self.chat_cursor as isize + if moved == 0 { delta } else { moved })
-            .clamp(0, total.saturating_sub(1) as isize) as usize;
-        self.chat_cursor = target.clamp(after, (after + height).saturating_sub(1).max(after));
-        if self.chat_cursor + 1 >= total {
-            self.scroll = Scroll::Follow;
+        if self.chat().page(delta) {
+            self.reached_the_top();
         }
-    }
-
-    fn take_chat_count(&mut self) -> usize {
-        self.chat_count.take().unwrap_or(1).max(1)
     }
 
     fn on_chat_key(&mut self, key: KeyEvent, prefix: Option<char>) {
@@ -6060,133 +5137,78 @@ impl App {
         // and go back to the list it was opened from; anything that moves the focus
         // elsewhere closes it too, so the keyboard and the screen never disagree about
         // which conversation is in front.
-        if self.transcript.is_some() && prefix.is_none() {
-            let idle = self.chat_visual.is_none() && self.chat_count.is_none();
-            let reading_pull_request = self
-                .transcript
-                .as_ref()
-                .is_some_and(|t| t.pull_request().is_some());
+        if self.reader.is_open() && prefix.is_none() {
+            let idle = self.chat_view.is_idle();
+            let reading_pull_request = self.reader.pull_request().is_some();
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc if idle => {
-                    let from_roster = self.transcript_from_roster
-                        && self
-                            .transcript
-                            .as_ref()
-                            .is_some_and(|t| t.agent_id().is_some());
-                    self.leave_transcript();
-                    if from_roster {
+                    if self.leave_reading() == Some(Origin::Roster) {
                         self.mode = Mode::Agents;
                     }
                     return;
                 }
-                KeyCode::Tab | KeyCode::BackTab => self.leave_transcript(),
+                KeyCode::Tab | KeyCode::BackTab => {
+                    self.leave_reading();
+                }
                 KeyCode::Char('L') if idle && reading_pull_request => {
                     self.edit_labels();
                     return;
                 }
                 KeyCode::Char('[') if idle && reading_pull_request => {
-                    self.move_through_stack(-1);
+                    self.read_with(|reader, thread| reader.move_through_stack(thread, -1));
                     return;
                 }
                 KeyCode::Char(']') if idle && reading_pull_request => {
-                    self.move_through_stack(1);
+                    self.read_with(|reader, thread| reader.move_through_stack(thread, 1));
                     return;
                 }
                 // The file grows while the agent works, and a pull request moves on while it
                 // is read; nothing pushes either to us.
                 KeyCode::Char('r') if idle => {
-                    self.reload_transcript();
+                    self.reread_reading();
                     return;
                 }
                 _ => {}
             }
         }
-        let (height, total) = self.chat_viewport;
-        let cursor = self.chat_cursor;
+        let height = self.chat().height() as isize;
+        let cursor = self.chat_view.cursor();
         // A key that moves the cursor within a line is only itself: `gl` opens git and
         // Ctrl-b pages up.
         let plain = prefix.is_none() && !ctrl;
         if prefix == Some('g') && self.global_prefix_key(key) {
             return;
         }
+        // Laid out just above, for the height.
+        let view = &mut self.chat_view;
         match key.code {
-            KeyCode::Char(c @ '0'..='9') if c != '0' || self.chat_count.is_some() => {
-                let current = self.chat_count.unwrap_or(0);
-                self.chat_count = Some((current * 10 + (c as usize - '0' as usize)).min(100_000));
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                let n = self.take_chat_count();
-                self.set_chat_cursor(cursor + n);
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                let n = self.take_chat_count();
-                self.set_chat_cursor(cursor.saturating_sub(n));
-            }
-            KeyCode::Char('h') | KeyCode::Left if plain => {
-                let n = self.take_chat_count();
-                self.chat_column = self.chat_spot().1.saturating_sub(n);
-            }
-            KeyCode::Char('l') | KeyCode::Right if plain => {
-                let n = self.take_chat_count();
-                let last = ui::chat_len(cursor).saturating_sub(1);
-                self.chat_column = (self.chat_spot().1 + n).min(last);
-            }
-            KeyCode::Char('0') if plain => self.chat_column = 0,
-            // Held past the end, so the cursor stays there down a ragged block.
-            KeyCode::Char('$') if plain => self.chat_column = usize::MAX,
-            KeyCode::Char('w') if plain => self.chat_word(true),
-            KeyCode::Char('b') if plain => self.chat_word(false),
-            KeyCode::Char('d') if ctrl => self.chat_scroll_by(height as isize / 2),
-            KeyCode::Char('u') if ctrl => self.chat_scroll_by(-(height as isize / 2)),
-            KeyCode::Char('f') if ctrl => self.chat_scroll_by(height as isize),
-            KeyCode::Char('b') if ctrl => self.chat_scroll_by(-(height as isize)),
-            KeyCode::PageDown => self.chat_scroll_by(height as isize),
-            KeyCode::PageUp => self.chat_scroll_by(-(height as isize)),
+            KeyCode::Char(c @ '0'..='9') if view.digit(c as usize - '0' as usize) => {}
+            KeyCode::Char('j') | KeyCode::Down => view.down(),
+            KeyCode::Char('k') | KeyCode::Up => view.up(),
+            KeyCode::Char('h') | KeyCode::Left if plain => view.left(),
+            KeyCode::Char('l') | KeyCode::Right if plain => view.right(),
+            KeyCode::Char('0') if plain => view.line_start(),
+            KeyCode::Char('$') if plain => view.line_end(),
+            KeyCode::Char('w') if plain => view.word(true),
+            KeyCode::Char('b') if plain => view.word(false),
+            KeyCode::Char('d') if ctrl => self.chat_scroll_by(height / 2),
+            KeyCode::Char('u') if ctrl => self.chat_scroll_by(-(height / 2)),
+            KeyCode::Char('f') if ctrl => self.chat_scroll_by(height),
+            KeyCode::Char('b') if ctrl => self.chat_scroll_by(-height),
+            KeyCode::PageDown => self.chat_scroll_by(height),
+            KeyCode::PageUp => self.chat_scroll_by(-height),
             KeyCode::Char('e') if ctrl => self.chat_scroll_by(1),
             KeyCode::Char('y') if ctrl => self.chat_scroll_by(-1),
             KeyCode::Char('g') if prefix == Some('g') => {
-                self.chat_count = None;
-                self.set_chat_cursor(0);
-                self.scroll = Scroll::Offset(0);
-                // A transcript is whole as it was read; there is nothing older to fetch,
-                // and the thread underneath is not what the top of the view belongs to.
-                if self.transcript.is_none() && self.thread.as_ref().is_some_and(|t| t.has_more) {
-                    self.load_older();
-                }
+                view.top();
+                self.reached_the_top();
             }
             KeyCode::Char('e') if prefix == Some('g') => self.view_at_cursor(),
             KeyCode::Char('r') if prefix == Some('g') => self.rewind_at_cursor(),
             KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
-            KeyCode::Char('G') => {
-                self.chat_count = None;
-                self.chat_cursor = total.saturating_sub(1);
-                self.scroll = Scroll::Follow;
-            }
-            KeyCode::Char('{') => {
-                let n = self.take_chat_count();
-                let mut target = cursor;
-                for _ in 0..n {
-                    match self.message_starts.iter().rev().find(|&&s| s < target) {
-                        Some(&s) => target = s,
-                        None => break,
-                    }
-                }
-                self.set_chat_cursor(target);
-            }
-            KeyCode::Char('}') => {
-                let n = self.take_chat_count();
-                let mut target = cursor;
-                for _ in 0..n {
-                    match self.message_starts.iter().find(|&&s| s > target) {
-                        Some(&s) => target = s,
-                        None => {
-                            target = total.saturating_sub(1);
-                            break;
-                        }
-                    }
-                }
-                self.set_chat_cursor(target);
-            }
+            KeyCode::Char('G') => view.bottom(),
+            KeyCode::Char('{') => view.previous_message(),
+            KeyCode::Char('}') => view.next_message(),
             KeyCode::Char('z') => self.pending_prefix = Some(('z', Instant::now())),
             KeyCode::Char('a') if prefix == Some('z') => self.fold_at(cursor, true),
             KeyCode::Enter | KeyCode::Char(' ') => self.fold_at(cursor, false),
@@ -6201,87 +5223,37 @@ impl App {
                 self.open_levels = 0;
                 self.expanded.clear();
             }
-            // `v` takes the text a character at a time, `V` whole lines; either one
-            // pressed again lets the selection go, and each takes over from the other.
-            KeyCode::Char(key @ ('v' | 'V')) => {
-                let whole_lines = key == 'V';
-                self.chat_visual = match self.chat_visual {
-                    Some(anchor) if anchor.whole_lines == whole_lines => None,
-                    Some(anchor) => Some(ChatAnchor {
-                        whole_lines,
-                        ..anchor
-                    }),
-                    None => Some(ChatAnchor {
-                        line: cursor,
-                        column: self.chat_spot().1,
-                        whole_lines,
-                    }),
-                };
-            }
-            KeyCode::Char('y') => {
-                let spot = self.chat_spot();
-                let (start, end) = match self.chat_visual.take() {
-                    // A character-wise selection reaches through the character the
-                    // cursor is on, which is where the block cursor is drawn.
-                    Some(anchor) if !anchor.whole_lines => {
-                        let head = (anchor.line, anchor.column.min(ui::chat_len(anchor.line)));
-                        let (first, last) = if head <= spot {
-                            (head, spot)
-                        } else {
-                            (spot, head)
-                        };
-                        (first, (last.0, last.1 + 1))
-                    }
-                    Some(anchor) => (
-                        (anchor.line.min(cursor), 0),
-                        (anchor.line.max(cursor), usize::MAX),
-                    ),
-                    None => {
-                        // `yy`: the current line, or `Ny` for several.
-                        let n = self.take_chat_count();
-                        (
-                            (cursor, 0),
-                            ((cursor + n - 1).min(total.saturating_sub(1)), usize::MAX),
-                        )
-                    }
-                };
-                match ui::chat_span(start, end) {
-                    Some(text) if !text.trim().is_empty() => {
-                        let lines = text.lines().count();
-                        copy_to_clipboard(&text);
-                        self.toast(
-                            match lines {
-                                1 if start.0 == end.0 && end.1 != usize::MAX => {
-                                    "yanked selection".to_string()
-                                }
-                                1 => "yanked line".to_string(),
-                                lines => format!("yanked {lines} lines"),
-                            },
-                            false,
-                        );
-                    }
-                    _ => self.toast("nothing to yank", true),
+            KeyCode::Char(key @ ('v' | 'V')) => view.toggle_visual(key == 'V'),
+            KeyCode::Char('y') => match view.yank() {
+                Some(yank) => {
+                    copy_to_clipboard(&yank.text);
+                    self.toast(
+                        match yank.text.lines().count() {
+                            1 if yank.piece => "yanked selection".to_string(),
+                            1 => "yanked line".to_string(),
+                            lines => format!("yanked {lines} lines"),
+                        },
+                        false,
+                    );
                 }
-            }
-            KeyCode::Esc if self.chat_visual.is_some() || self.chat_count.is_some() => {
-                self.chat_visual = None;
-                self.chat_count = None;
-            }
+                None => self.toast("nothing to yank", true),
+            },
+            KeyCode::Esc if view.cancel() => {}
             KeyCode::Esc => {
                 self.toast = None;
                 self.focus = Focus::Composer;
             }
             KeyCode::Tab => {
-                self.chat_visual = None;
+                view.clear_visual();
                 self.sidebar_visible = true;
                 self.focus = Focus::Sidebar;
             }
             KeyCode::BackTab => {
-                self.chat_visual = None;
+                view.clear_visual();
                 self.focus = Focus::Composer;
             }
             KeyCode::Char('i') => {
-                self.chat_visual = None;
+                view.clear_visual();
                 self.focus = Focus::Composer;
                 self.composer.checkpoint();
                 self.mode = Mode::Insert;
@@ -6303,11 +5275,11 @@ impl App {
     // ── Chat search ────────────────────────────────────────────────────
 
     fn start_search(&mut self, backward: bool) {
-        self.chat_count = None;
+        self.chat_view.clear_count();
         self.search_input = Some(SearchInput {
             query: Composer::new(),
             backward,
-            origin: self.chat_cursor,
+            origin: self.chat_view.cursor(),
         });
         self.mode = Mode::Search;
     }
@@ -6322,7 +5294,7 @@ impl App {
                 let origin = input.origin;
                 self.search_input = None;
                 self.mode = Mode::Normal;
-                self.set_chat_cursor(origin);
+                self.chat().set_cursor(origin);
             }
             KeyCode::Enter => {
                 let input = self.search_input.take().unwrap();
@@ -6337,8 +5309,8 @@ impl App {
                     query,
                     backward: input.backward,
                 };
-                self.search = Some(search.clone());
-                self.jump_to_match(&search, input.origin, false);
+                let hit = self.chat().search_from(search, input.origin);
+                self.say_hit(hit, false);
             }
             // Everything else edits the line, with the same keys as every other field.
             _ => {
@@ -6353,132 +5325,72 @@ impl App {
         let Some(input) = self.search_input.as_ref() else {
             return;
         };
-        let (query, backward, origin) = (input.query.text(), input.backward, input.origin);
-        if query.is_empty() {
-            self.set_chat_cursor(origin);
-            return;
-        }
-        let search = Search { query, backward };
-        if let Some((line, _)) = self.find_match(&search, origin) {
-            self.set_chat_cursor(line);
-        }
+        let search = Search {
+            query: input.query.text(),
+            backward: input.backward,
+        };
+        let origin = input.origin;
+        self.chat().preview(&search, origin);
     }
 
     /// `n` and `N`: continue the last search from the cursor, `N` against its direction.
     fn search_next(&mut self, reverse: bool) {
-        self.chat_count = None;
-        let Some(mut search) = self.search.clone() else {
-            self.toast("no previous search", true);
-            return;
-        };
-        if reverse {
-            search.backward = !search.backward;
+        match self.chat().search_next(reverse) {
+            Some(hit) => self.say_hit(hit, true),
+            None => self.toast("no previous search", true),
         }
-        let from = self.chat_cursor;
-        self.jump_to_match(&search, from, true);
     }
 
-    fn jump_to_match(&mut self, search: &Search, from: usize, silent_hit: bool) {
-        match self.find_match(search, from) {
-            Some((line, wrapped)) => {
-                self.set_chat_cursor(line);
-                if wrapped {
-                    self.toast(
-                        if search.backward {
-                            "search hit TOP, continuing at BOTTOM"
-                        } else {
-                            "search hit BOTTOM, continuing at TOP"
-                        },
-                        false,
-                    );
-                } else if !silent_hit {
-                    self.toast = None;
-                }
+    /// Say where a search went: round the end, or nowhere. A plain hit puts away what was
+    /// being said, unless it is `n` going on as expected.
+    fn say_hit(&mut self, hit: Hit, silent_hit: bool) {
+        match hit {
+            Hit::Wrapped { backward } => self.toast(
+                if backward {
+                    "search hit TOP, continuing at BOTTOM"
+                } else {
+                    "search hit BOTTOM, continuing at TOP"
+                },
+                false,
+            ),
+            Hit::Found if !silent_hit => self.toast = None,
+            Hit::Found => {}
+            Hit::Missing => {
+                let query = self
+                    .chat_view
+                    .search()
+                    .map(|search| search.query.clone())
+                    .unwrap_or_default();
+                self.toast(format!("pattern not found: {query}"), true);
             }
-            None => self.toast(format!("pattern not found: {}", search.query), true),
-        }
-    }
-
-    /// The next matching content line after (or before) `from`, wrapping around the
-    /// conversation. Returns the line and whether the search wrapped.
-    fn find_match(&self, search: &Search, from: usize) -> Option<(usize, bool)> {
-        let lines = ui::chat_lines();
-        if lines.is_empty() || search.query.is_empty() {
-            return None;
-        }
-        let matches = |line: &str| line_matches(line, &search.query);
-        let len = lines.len();
-        if search.backward {
-            let from = from.min(len);
-            (0..from)
-                .rev()
-                .find(|&i| matches(&lines[i]))
-                .map(|i| (i, false))
-                .or_else(|| {
-                    (from..len)
-                        .rev()
-                        .find(|&i| matches(&lines[i]))
-                        .map(|i| (i, true))
-                })
-        } else {
-            (from + 1..len)
-                .find(|&i| matches(&lines[i]))
-                .map(|i| (i, false))
-                .or_else(|| {
-                    (0..=from.min(len - 1))
-                        .find(|&i| matches(&lines[i]))
-                        .map(|i| (i, true))
-                })
         }
     }
 
     // ── Scrolling ──────────────────────────────────────────────────────
 
     fn scroll_by(&mut self, delta: isize) {
-        let (height, total) = self.chat_viewport;
-        let max_offset = total.saturating_sub(height);
-        let current = match self.scroll {
-            Scroll::Follow => max_offset,
-            Scroll::Offset(o) => o.min(max_offset),
-        };
-        let next = (current as isize + delta).clamp(0, max_offset as isize) as usize;
-        self.scroll = if next >= max_offset {
-            Scroll::Follow
-        } else {
-            Scroll::Offset(next)
-        };
-        if next == 0 && delta < 0 {
-            // Reached the top: pull in older turns if the server has them.
-            if self.thread.as_ref().is_some_and(|t| t.has_more) {
-                self.load_older();
-            }
+        if self.chat().scroll_by(delta) {
+            self.reached_the_top();
         }
     }
 
-    /// First content line shown in the chat viewport.
-    pub fn chat_offset(&self) -> usize {
-        let (height, total) = self.chat_viewport;
-        match self.scroll {
-            Scroll::Follow => total.saturating_sub(height),
-            Scroll::Offset(o) => o.min(total.saturating_sub(height)),
+    /// Scrolled up as far as the chat goes: pull in older turns if the server has them.
+    fn reached_the_top(&mut self) {
+        // A reading is whole as it was read; there is nothing older to fetch, and the
+        // thread underneath is not what the top of the view belongs to.
+        if !self.reader.is_open() && self.thread.as_ref().is_some_and(|t| t.has_more) {
+            self.load_older();
         }
-    }
-
-    /// The tightest toggle region covering a content line, with whether folding it shows
-    /// anything: a tool row inside an expanded group wins over the group itself, even
-    /// when the row has nothing to unfold — folding its group instead is not what the
-    /// click asked for.
-    fn region_at(&self, line: usize) -> Option<(String, bool)> {
-        self.work_ranges
-            .iter()
-            .filter(|region| region.first <= line && line < region.end)
-            .min_by_key(|region| region.end - region.first)
-            .map(|region| (region.key.clone(), region.foldable))
     }
 
     /// Fold what is under a content line, saying so when there is nothing to fold.
     fn fold_at(&mut self, line: usize, quiet: bool) {
-        match self.region_at(line) {
+        let region = self
+            .chat()
+            .layout()
+            .region_at(line)
+            .map(|(key, foldable)| (key.to_string(), foldable));
+        match region {
             Some((key, true)) => self.toggle_expanded(key),
             Some((key, false)) => {
                 if self.local_disk
@@ -6507,7 +5419,7 @@ impl App {
     /// Read in a blocking worker: large transcripts must not stop terminal input.
     /// Reopening retries missing results and refreshes background output files.
     fn recover_tools(&mut self) {
-        if !self.local_disk || self.transcript.is_some() || self.tool_recovery_request.is_some() {
+        if !self.local_disk || self.reader.is_open() || self.tool_recovery_request.is_some() {
             return;
         }
         let Some(cwd) = self.thread_directory() else {
@@ -6532,7 +5444,7 @@ impl App {
                 .entry(id.clone())
                 .or_insert(crate::recovery::Recovery::Loading);
         }
-        thread.revision += 1;
+        thread.touch();
         let thread_id = thread.id().to_string();
         let request = uuid::Uuid::new_v4().to_string();
         self.tool_recovery_request = Some(request.clone());
@@ -6581,7 +5493,7 @@ impl App {
             }
             thread.recovered_tools.insert(id, payload);
         }
-        thread.revision += 1;
+        thread.touch();
     }
 
     fn open_work_level(&mut self, all: bool) {
@@ -6594,21 +5506,23 @@ impl App {
     }
 
     fn toggle_work_group(&mut self) {
-        let (height, _) = self.chat_viewport;
-        let offset = self.chat_offset();
+        let view = self.chat();
+        let (height, offset) = (view.height(), view.offset());
         let middle = offset + height / 2;
-        let key = self
+        let chat = view.layout();
+        let key = chat
             .region_at(middle)
             .filter(|(_, foldable)| *foldable)
             .map(|(key, _)| key)
             .or_else(|| {
-                self.work_ranges
+                chat.work_ranges()
                     .iter()
                     .rev()
                     .find(|region| region.first < offset + height)
-                    .map(|region| region.key.clone())
+                    .map(|region| region.key.as_str())
             })
-            .or_else(|| self.work_ranges.last().map(|region| region.key.clone()));
+            .or_else(|| chat.work_ranges().last().map(|region| region.key.as_str()))
+            .map(str::to_string);
         if let Some(key) = key {
             self.toggle_expanded(key);
         }
@@ -6782,44 +5696,45 @@ impl App {
     fn on_normal_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let prefix = self.take_prefix();
-        let (height, _) = self.chat_viewport;
+        let height = self.chat_view.height();
         if self.focus == Focus::Sidebar {
             // Anything that is not the answer is a no: the question stands at the foot of
             // the list until it has one.
             if let Some(url) = self.sidebar_unlinking.take() {
                 if matches!(key.code, KeyCode::Char('d') | KeyCode::Char('y')) {
                     self.unlink_pull_request(&url);
-                    self.sidebar_move(0);
                 }
                 return;
             }
-            let listing = self.sidebar_tab != SidebarTab::Threads;
+            let tab = self.sidebar_view.tab();
+            let listing = tab != sidebar_view::Tab::Threads;
             match key.code {
                 KeyCode::Char('H') => self.switch_sidebar_tab(-1),
                 KeyCode::Char('L') => self.switch_sidebar_tab(1),
                 KeyCode::Char('y') if listing && prefix.is_none() => self.sidebar_yank(),
                 KeyCode::Char('r') if listing => self.sidebar_reread(),
-                KeyCode::Char('c') if self.sidebar_tab == SidebarTab::PullRequests => {
-                    if let Some(SidebarRow::PullRequest { url, .. }) =
-                        self.sidebar_rows().get(self.sidebar_selected)
-                    {
-                        let url = url.clone();
+                KeyCode::Char('c') if tab == sidebar_view::Tab::PullRequests => {
+                    if let Some(SidebarRow::PullRequest { url, .. }) = self.sidebar_selected_row() {
                         self.checkout_pull_request(&url);
                     }
                 }
                 // Asked first: it takes the pull request off the thread for every client.
-                KeyCode::Char('d') if self.sidebar_tab == SidebarTab::PullRequests => {
-                    if let Some(SidebarRow::PullRequest { url, .. }) =
-                        self.sidebar_rows().get(self.sidebar_selected)
-                    {
-                        self.sidebar_unlinking = Some(url.clone());
+                KeyCode::Char('d') if tab == sidebar_view::Tab::PullRequests => {
+                    if let Some(SidebarRow::PullRequest { url, .. }) = self.sidebar_selected_row() {
+                        self.sidebar_unlinking = Some(url);
                     }
                 }
-                KeyCode::Char('j') | KeyCode::Down => self.sidebar_move(1),
-                KeyCode::Char('k') | KeyCode::Up => self.sidebar_move(-1),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let rows = self.sidebar_lent();
+                    self.sidebar_view.move_by(&rows, 1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    let rows = self.sidebar_lent();
+                    self.sidebar_view.move_by(&rows, -1);
+                }
                 KeyCode::Char('g') if prefix == Some('g') => {
-                    self.sidebar_selected = 0;
-                    self.sidebar_reveal = true;
+                    let rows = self.sidebar_lent();
+                    self.sidebar_view.top(&rows);
                 }
                 KeyCode::Char('s') if prefix == Some('g') => {
                     let id = self.sidebar_selected_thread();
@@ -6837,8 +5752,8 @@ impl App {
                 KeyCode::Char('W') if prefix == Some('g') => self.open_worktrees(),
                 KeyCode::Char('g') => self.pending_prefix = Some(('g', Instant::now())),
                 KeyCode::Char('G') => {
-                    self.sidebar_selected = self.sidebar_rows().len().saturating_sub(1);
-                    self.sidebar_reveal = true;
+                    let rows = self.sidebar_lent();
+                    self.sidebar_view.bottom(&rows);
                 }
                 KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char(' ') => self.sidebar_activate(),
                 KeyCode::Char('S') => self.show_settled = !self.show_settled,
@@ -6957,7 +5872,7 @@ impl App {
             }
             KeyCode::Esc => {
                 self.toast = None;
-                self.scroll = Scroll::Follow;
+                self.chat_view.follow();
                 self.composer.vim_cancel();
                 return;
             }
@@ -6980,16 +5895,6 @@ impl App {
                 }
             }
         }
-    }
-
-    fn sidebar_move(&mut self, delta: isize) {
-        let len = self.sidebar_rows().len();
-        if len == 0 {
-            return;
-        }
-        self.sidebar_selected =
-            (self.sidebar_selected as isize + delta).clamp(0, len as isize - 1) as usize;
-        self.sidebar_reveal = true;
     }
 
     // ── Mouse ──────────────────────────────────────────────────────────
@@ -7024,11 +5929,8 @@ impl App {
                     MOUSE_SCROLL_LINES as isize
                 };
                 if in_sidebar {
-                    let rows = self.sidebar_rows();
-                    let height = self.sidebar_inner.map_or(0, |r| r.height as usize);
-                    let max = self.sidebar_max_offset(&rows, height);
-                    self.sidebar_offset =
-                        (self.sidebar_offset as isize + delta).clamp(0, max as isize) as usize;
+                    let rows = self.sidebar_lent();
+                    self.sidebar_view.scroll(&rows, delta);
                 } else {
                     self.scroll_by(delta);
                 }
@@ -7056,14 +5958,14 @@ impl App {
                     return;
                 };
                 let rows = self.sidebar_rows();
-                let index = match self.sidebar_row_at(&rows, (mouse.row - inner.y) as usize) {
-                    Some(index) => index,
-                    None => return,
+                let lent = self.sidebar_view_rows(&rows);
+                let line = (mouse.row - inner.y) as usize;
+                let Some(index) = self.sidebar_view.select_at(&lent, line) else {
+                    return;
                 };
                 match rows.get(index) {
                     Some(SidebarRow::Thread { id, .. }) => {
                         let id = id.clone();
-                        self.sidebar_selected = index;
                         if self.current_thread_id.as_deref() != Some(id.as_str()) {
                             self.open_thread(&id);
                         }
@@ -7071,17 +5973,9 @@ impl App {
                             self.focus = Focus::Composer;
                         }
                     }
-                    Some(SidebarRow::Header { section, .. }) => {
-                        self.sidebar_selected = index;
-                        self.toggle_section(*section);
-                    }
+                    Some(SidebarRow::Header { section, .. }) => self.toggle_section(*section),
                     Some(SidebarRow::PullRequest { .. } | SidebarRow::Agent { .. }) => {
-                        let stay = self.focus == Focus::Sidebar;
-                        self.sidebar_selected = index;
                         self.sidebar_activate();
-                        if !stay {
-                            self.keep_sidebar_focus = None;
-                        }
                     }
                     Some(SidebarRow::Empty { .. }) | None => {}
                 }
@@ -7094,7 +5988,7 @@ impl App {
                     && matches!(self.mode, Mode::Normal | Mode::Insert) =>
             {
                 self.selection = None;
-                self.chat_visual = None;
+                self.chat_view.clear_visual();
                 self.focus = Focus::Composer;
                 if self.mode != Mode::Insert {
                     self.composer.checkpoint();
@@ -7133,13 +6027,13 @@ impl App {
                         let at = sel.anchor;
                         self.selection = None;
                         if self.chat_area.contains(at) {
-                            let line = self.chat_offset() + (at.y - self.chat_area.y) as usize;
+                            let row = (at.y - self.chat_area.y) as usize;
+                            let line = self.chat().line_at(row);
                             if self.thread.is_some() {
                                 self.composer.vim_cancel();
                                 self.focus = Focus::Chat;
-                                self.chat_visual = None;
-                                self.set_chat_cursor(line);
-                                self.chat_column = ui::chat_index(line, at.x - self.chat_area.x);
+                                let column = at.x - self.chat_area.x;
+                                self.chat().click(line, column);
                             }
                             // A link takes the click; folding would be a surprise.
                             if let Some(url) = self.link_at(at) {
@@ -7159,13 +6053,10 @@ impl App {
     }
 
     /// What a drag over the chat covers, the marks and indents it was drawn with left out.
-    fn chat_under(&self, from: Position, to: Position) -> Option<String> {
-        let offset = self.chat_offset();
-        let spot = |at: Position, past: usize| {
-            let line = offset + at.y.saturating_sub(self.chat_area.y) as usize;
-            (line, ui::chat_index(line, at.x - self.chat_area.x) + past)
-        };
-        ui::chat_span(spot(from, 0), spot(to, 1))
+    fn chat_under(&mut self, from: Position, to: Position) -> Option<String> {
+        let area = self.chat_area;
+        let cell = |at: Position| (at.y.saturating_sub(area.y) as usize, at.x - area.x);
+        self.chat().text_between(cell(from), cell(to))
     }
 
     /// Called by the event loop as it starts the frame after a selection resolved.
@@ -7304,7 +6195,7 @@ impl App {
                 // list. Leaving it is leaving the message, so it lands where the
                 // message was being written rather than at the chat or the list.
                 self.focus = Focus::Composer;
-                self.chat_visual = None;
+                self.chat_view.clear_visual();
             }
             KeyCode::Enter if alt || shift || ctrl => self.composer.newline(),
             KeyCode::Char('j') if ctrl => self.composer.newline(),
@@ -7320,8 +6211,8 @@ impl App {
                     self.composer.history_next();
                 }
             }
-            KeyCode::PageUp => self.scroll_by(-(self.chat_viewport.0 as isize)),
-            KeyCode::PageDown => self.scroll_by(self.chat_viewport.0 as isize),
+            KeyCode::PageUp => self.scroll_by(-(self.chat_view.height() as isize)),
+            KeyCode::PageDown => self.scroll_by(self.chat_view.height() as isize),
             KeyCode::Char('p') if ctrl => {
                 if !self.recall_queued() {
                     self.composer.history_prev();
@@ -7602,7 +6493,7 @@ impl App {
             self.notice_pull_request_sync();
         }
         if may_move {
-            self.follow_transcript();
+            self.follow_reading();
         }
     }
 
@@ -7638,6 +6529,7 @@ impl App {
                 {
                     open.sync_shell(thread);
                 }
+                let mut dropped = outbox::Step::default();
                 match &item {
                     // The first list is what is already there, so none of it is news.
                     ShellItem::Snapshot { snapshot } => {
@@ -7650,7 +6542,8 @@ impl App {
                     }
                     ShellItem::ThreadUpserted { thread, .. } => self.note_thread(thread),
                     ShellItem::ThreadRemoved { thread_id, .. } => {
-                        self.queued.remove(thread_id);
+                        // What was being written for it has nowhere to go.
+                        dropped = self.outbox.on_removed(thread_id);
                         self.marks.remove(thread_id);
                         self.statuses.remove(thread_id);
                         self.unseen.remove(thread_id);
@@ -7665,6 +6558,7 @@ impl App {
                     self.current_thread_id = None;
                     self.toast("thread was removed", false);
                 }
+                self.take_outbox_step(dropped);
                 if self.shell.synchronized {
                     self.open_where_asked();
                 }
@@ -7709,7 +6603,7 @@ impl App {
                 {
                     self.handle.refresh_thread(&thread_id);
                 }
-                self.check_rewind();
+                self.notice_open_thread();
                 self.reconcile_question();
                 self.sync_vcs_watch();
                 // A finished turn has usually changed the checkout, and the server's
@@ -7834,7 +6728,7 @@ fn prepend_page(thread: &mut ThreadState, snapshot: ThreadDetailSnapshot) {
             thread.before_cursor = None;
         }
     }
-    thread.revision += 1;
+    thread.touch();
 }
 
 pub fn approval_options(approval: &PendingApproval) -> Vec<ApprovalOption> {
@@ -7920,14 +6814,6 @@ fn count(text: &str, byte: u8) -> usize {
     text.bytes().filter(|b| *b == byte).count()
 }
 
-/// Where a visual selection in the chat began, and whether it takes whole lines.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChatAnchor {
-    pub line: usize,
-    pub column: usize,
-    pub whole_lines: bool,
-}
-
 /// A drag over the chat, in screen cells: `anchor` is where the button went down and
 /// `head` follows the pointer; either may come first in reading order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7946,69 +6832,6 @@ impl Selection {
             (self.head, self.anchor)
         }
     }
-}
-
-/// What kind of run a character belongs to, so a word motion stops where Vim's does:
-/// blank, word, or punctuation.
-fn word_class(ch: Option<char>) -> u8 {
-    match ch {
-        None => 0,
-        Some(ch) if ch.is_whitespace() => 0,
-        Some(ch) if ch.is_alphanumeric() || ch == '_' => 1,
-        Some(_) => 2,
-    }
-}
-
-/// Substring match; case-insensitive unless the query has an uppercase letter (smartcase).
-pub fn line_matches(line: &str, query: &str) -> bool {
-    if query.chars().any(char::is_uppercase) {
-        line.contains(query)
-    } else {
-        line.to_lowercase().contains(query)
-    }
-}
-
-/// Byte ranges of every match in `line`, with the same case rule as `line_matches`.
-pub fn match_ranges(line: &str, query: &str) -> Vec<(usize, usize)> {
-    if query.is_empty() {
-        return Vec::new();
-    }
-    let smart = !query.chars().any(char::is_uppercase);
-    let haystack = if smart {
-        line.to_lowercase()
-    } else {
-        line.to_string()
-    };
-    if haystack.len() != line.len() {
-        // Lowercasing changed byte lengths; fall back to char-wise matching.
-        let hay: Vec<char> = haystack.chars().collect();
-        let needle: Vec<char> = query.chars().collect();
-        let mut out = Vec::new();
-        let byte_offsets: Vec<usize> = line.char_indices().map(|(i, _)| i).collect();
-        let mut i = 0;
-        while i + needle.len() <= hay.len() {
-            if hay[i..i + needle.len()] == needle[..] {
-                let start = byte_offsets[i];
-                let end = byte_offsets
-                    .get(i + needle.len())
-                    .copied()
-                    .unwrap_or(line.len());
-                out.push((start, end));
-                i += needle.len();
-            } else {
-                i += 1;
-            }
-        }
-        return out;
-    }
-    let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(pos) = haystack[from..].find(query) {
-        let start = from + pos;
-        out.push((start, start + query.len()));
-        from = start + query.len().max(1);
-    }
-    out
 }
 
 /// A program that takes over the terminal while tria waits.
@@ -8192,19 +7015,39 @@ pub enum SidebarRow {
     },
 }
 
-/// What the sidebar lists: every thread, or the open thread's pull requests or subagents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SidebarTab {
-    Threads,
-    PullRequests,
-    Agents,
+/// Lines each row of the terminal, worktree, and subagent lists is drawn in.
+pub const POPUP_ROW_LINES: usize = 3;
+
+/// The rows of one of those lists, by what each one is.
+fn popup_rows(keys: impl Iterator<Item = String>) -> Vec<Row<String>> {
+    keys.map(|key| Row {
+        key,
+        height: POPUP_ROW_LINES,
+    })
+    .collect()
 }
 
-impl SidebarTab {
-    pub const ALL: [SidebarTab; 3] = [Self::Threads, Self::PullRequests, Self::Agents];
+/// What a sidebar row is, for the sidebar's view to find it again when the list has moved:
+/// the section a header heads, the thread, the pull request, the subagent. A tab with
+/// nothing to list says so in a row of its own, and there is only ever the one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarKey {
+    Section(Section),
+    Thread(Id),
+    PullRequest(String),
+    Agent(String),
+    Empty,
+}
 
-    fn index(self) -> usize {
-        Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
+impl SidebarRow {
+    pub fn key(&self) -> SidebarKey {
+        match self {
+            Self::Header { section, .. } => SidebarKey::Section(*section),
+            Self::Thread { id, .. } => SidebarKey::Thread(id.clone()),
+            Self::PullRequest { url, .. } => SidebarKey::PullRequest(url.clone()),
+            Self::Agent { id } => SidebarKey::Agent(id.clone()),
+            Self::Empty { .. } => SidebarKey::Empty,
+        }
     }
 }
 
@@ -8253,13 +7096,6 @@ fn write_picture(data: &str) -> Option<String> {
         std::fs::write(&path, &bytes).ok()?;
     }
     Some(path.to_string_lossy().into_owned())
-}
-
-/// The host a link is on.
-fn url_host(url: &str) -> Option<&str> {
-    let rest = url.split_once("://")?.1;
-    let host = rest.split(['/', '?', '#']).next()?;
-    (!host.is_empty()).then_some(host)
 }
 
 /// `gh`'s token for a host, run in `directory` where that is a directory here. A token is
@@ -8381,7 +7217,7 @@ fn apply(app: &mut App, event: AppEvent) {
             app.search_thread_contents();
             app.refresh_vcs_periodically();
             app.refresh_worktrees_periodically();
-            app.follow_transcript();
+            app.follow_reading();
             if app
                 .toast
                 .as_ref()
@@ -8391,16 +7227,8 @@ fn apply(app: &mut App, event: AppEvent) {
             }
         }
         AppEvent::Update(update) => app.on_update(*update),
-        AppEvent::ThreadCreated(thread_id) => app.on_thread_created(thread_id),
-        AppEvent::RewindRefused { thread_id, error } => app.on_rewind_refused(thread_id, error),
-        AppEvent::PlanThreadCreated(thread_id) => app.open_thread(&thread_id),
+        AppEvent::Outbox(answer) => app.with_outbox(|outbox, here| outbox.on_answer(answer, here)),
         AppEvent::ThreadSearch { query, result } => app.on_thread_search(query, result),
-        AppEvent::CreateRefused { thread_id, error } => app.on_create_refused(thread_id, error),
-        AppEvent::SendRefused {
-            thread_id,
-            text,
-            error,
-        } => app.on_send_refused(thread_id, text, error),
         AppEvent::UsageRead(read) => app.on_usage_read(read),
         AppEvent::WorktreeChecked {
             path,
@@ -8488,6 +7316,9 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
         // sync_update also ends the synchronized region when drawing returns an error.
         // A pending copy goes out inside the region too: tmux keeps an OSC 52 that
         // directly follows the end of one, but does not pass it on to the terminal.
+        // The sidebar is settled on the rows it is about to be drawn with, so a selection
+        // asked to be shown is shown in this frame and then left where the list moves it.
+        app.settle_sidebar();
         let drawn = std::io::stdout().sync_update(|_| -> std::io::Result<()> {
             app.flush_clipboard();
             if std::mem::take(&mut app.repaint) {
@@ -8495,8 +7326,9 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
             }
             terminal.draw(|frame| ui::draw(frame, &mut app)).map(|_| ())
         });
-        // Where a search said to go is a line of the chat, and there are only lines
-        // once the chat has been drawn.
+        // Where a search said to go is a line of the chat laid out at the size it is drawn,
+        // and a thread just opened is only drawn at its own size — its draft, its panels —
+        // once a frame has shown it.
         app.settle_jump();
         if let Err(err) = drawn.and_then(|result| result) {
             break Err(err.into());
@@ -8558,6 +7390,11 @@ mod tests {
 
     use super::*;
     use crate::model::{Project, VcsLocal, VcsWorkingTree};
+    use crate::outbox::tests::{planned_thread, rewindable_thread};
+    use crate::reader::tests::{
+        agent_progresses, open_detail, stacked_thread, thread_with_a_followable_agent,
+        transcript_saying,
+    };
 
     #[test]
     fn older_pages_keep_turn_completions_without_duplicates() {
@@ -8697,36 +7534,83 @@ mod tests {
         );
     }
 
+    /// The server's answer to the next command dispatched: refused, as a send is refused.
+    async fn refuse_the_next_command(
+        app: &mut App,
+        requests: &mut mpsc::UnboundedReceiver<crate::session::Request>,
+        sent: &mut mpsc::UnboundedReceiver<AppEvent>,
+    ) -> Value {
+        let (command, reply) = loop {
+            match asked(requests).await.expect("a command") {
+                crate::session::Request::Dispatch { command, reply } => break (command, reply),
+                _ => continue,
+            }
+        };
+        drop(reply);
+        let answer = tokio::time::timeout(Duration::from_millis(500), sent.recv())
+            .await
+            .expect("the refusal comes back")
+            .expect("an event");
+        apply(app, answer);
+        command
+    }
+
     /// A refused create used to leave the view on a thread that was never made and the
     /// message nowhere at all.
     #[tokio::test]
     async fn a_thread_the_server_refuses_gives_the_message_back() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         let project_id = project(&mut app);
         app.start_new_thread(&project_id);
         app.composer.set_text("the message");
         app.send_message();
-
-        let thread_id = app
-            .current_thread_id
-            .clone()
-            .expect("a thread was asked for");
+        assert!(app.current_thread_id.is_some(), "a thread was asked for");
         assert!(app.draft.is_none() && app.composer.text().is_empty());
+        app.mode = Mode::Normal;
+        app.focus = Focus::Chat;
 
-        app.on_create_refused(thread_id, "git worktree add failed".into());
-
+        let create = refuse_the_next_command(&mut app, &mut requests, &mut sent).await;
+        assert!(create.get("bootstrap").is_some(), "{create}");
         assert!(
             app.current_thread_id.is_none(),
             "still on a thread that is not there"
         );
         assert_eq!(app.draft.map(|d| d.project_id), Some(project_id));
         assert_eq!(app.composer.text(), "the message");
-        assert_eq!(
-            app.toast.map(|t| t.0),
-            Some("git worktree add failed".to_string())
-        );
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.focus, Focus::Composer);
+    }
+
+    /// What comes back to the history is not put there twice: a create refused after
+    /// another message went leaves the history as it was sent.
+    #[tokio::test]
+    async fn a_message_given_back_to_the_history_is_there_once() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let project_id = project(&mut app);
+        app.start_new_thread(&project_id);
+        app.composer.set_text("X");
+        app.send_message();
+        let mut thread = running_thread();
+        thread.detail.shell.id = "t2".into();
+        app.thread = Some(thread);
+        app.current_thread_id = Some("t2".into());
+        app.composer.set_text("Y");
+        app.send_message();
+
+        let create = refuse_the_next_command(&mut app, &mut requests, &mut sent).await;
+        assert_eq!(create["message"]["text"], "X");
+        let said = app.toast.as_ref().expect("it says so").0.clone();
+        assert!(said.contains("history"), "{said}");
+        app.composer.history_prev();
+        assert_eq!(app.composer.text(), "Y");
+        app.composer.history_prev();
+        assert_eq!(app.composer.text(), "X");
+        app.composer.history_prev();
+        assert_eq!(app.composer.text(), "X", "nothing before it");
     }
 
     fn shell_thread(id: &str, project: &str, worktree: Option<&str>) -> crate::model::ThreadShell {
@@ -9216,62 +8100,6 @@ mod tests {
         app.thread = None;
         app.reveal_directory();
         assert!(app.toast.unwrap().0.contains("no thread open"));
-    }
-
-    /// `gx` on a row with a picture opens the picture, which is the one thing on a chat
-    /// line that is really somewhere else: the terminal only ever drew a thumbnail.
-    #[test]
-    fn the_picture_under_the_cursor_is_the_one_that_opens() {
-        use crate::timeline::{Picture, Region};
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.work_ranges = vec![
-            Region {
-                first: 0,
-                end: 9,
-                key: "work-1".into(),
-                foldable: true,
-            },
-            Region {
-                first: 2,
-                end: 8,
-                key: "work-1/t1".into(),
-                foldable: true,
-            },
-        ];
-        app.chat_pictures = vec![("work-1/t1".into(), Picture::File("/tmp/shot.png".into()))];
-
-        // Anywhere in the row, including the lines the picture was drawn over.
-        app.chat_cursor = 5;
-        assert_eq!(
-            app.picture_at_cursor(),
-            Some(Picture::File("/tmp/shot.png".into()))
-        );
-        // The group around it is not the row, and has no picture of its own.
-        app.chat_cursor = 1;
-        assert_eq!(app.picture_at_cursor(), None);
-
-        // A picture a message drew belongs to no row at all: it answers for the caption
-        // and the lines under it, and `gx` opens it from any of them.
-        app.picture_ranges = vec![Region {
-            first: 20,
-            end: 26,
-            key: "msg:m1/0".into(),
-            foldable: false,
-        }];
-        app.chat_pictures
-            .push(("msg:m1/0".into(), Picture::File("/tmp/shown.png".into())));
-        for line in [20, 25] {
-            app.chat_cursor = line;
-            assert_eq!(
-                app.picture_at_cursor(),
-                Some(Picture::File("/tmp/shown.png".into())),
-                "line {line}"
-            );
-        }
-        app.chat_cursor = 26;
-        assert_eq!(app.picture_at_cursor(), None, "and no further");
     }
 
     /// A picture that came inside a transcript is not a file anywhere, so opening it
@@ -10044,9 +8872,11 @@ mod tests {
             .expect("the refusal comes back")
             .expect("an event");
         assert!(
-            matches!(&refusal, AppEvent::SendRefused { thread_id, text, .. }
-                if thread_id == "t1" && text == "the message"),
-            "the refusal carries the message it refused"
+            matches!(
+                &refusal,
+                AppEvent::Outbox(outbox::Answer { result: Err(_), .. })
+            ),
+            "the refusal comes back to the outbox"
         );
         apply(&mut app, refusal);
         assert_eq!(app.composer.text(), "the message");
@@ -10055,16 +8885,22 @@ mod tests {
         assert!(said.starts_with("not sent:"), "{said}");
     }
 
+    /// A subagent's transcript open over the thread's conversation.
     fn over_a_transcript(app: &mut App) {
-        app.transcript = Some(Transcript {
-            source: Reading::Subagent("agent-7".into()),
-            title: "look into it".into(),
-            subtitle: String::new(),
-            state: running_thread(),
-            truncated: false,
-            live: false,
-            restore: (Scroll::Follow, 0, Focus::Composer),
-        });
+        let agents = thread_with_a_followable_agent();
+        let thread = reader::Thread {
+            state: &agents,
+            branch: None,
+            directory: Some("/tmp"),
+        };
+        let _ = app
+            .reader
+            .open(&thread, Source::Subagent("a1".into()), Origin::Chat);
+        let answer = Ok(transcript_saying(&["Looking now."]));
+        let here = (ChatView::default().place(), Focus::Composer);
+        let _ = app
+            .reader
+            .on_transcript(&thread, "a1".into(), answer, here, Instant::now());
     }
 
     /// A message written over a subagent's transcript reads like a reply to it, and
@@ -10089,85 +8925,10 @@ mod tests {
         let command = sent_command(&mut requests).await.expect("sent once agreed");
         assert_eq!(
             command["message"]["text"],
-            "Sent looking at the transcript for subagent agent-7:\n\nwhy did it stop?"
+            "Sent looking at the transcript for subagent a1:\n\nwhy did it stop?"
         );
-        assert!(app.transcript.is_none(), "still reading the transcript");
+        assert!(!app.reader.is_open(), "still reading the transcript");
         assert!(app.composer.is_empty());
-    }
-
-    #[test]
-    fn a_link_names_its_host() {
-        assert_eq!(
-            url_host("https://github.com/o/r/pull/1"),
-            Some("github.com")
-        );
-        assert_eq!(
-            url_host("https://ghe.example.com?x"),
-            Some("ghe.example.com")
-        );
-        assert_eq!(url_host("not a link"), None);
-    }
-
-    /// A thread whose one subagent is still working.
-    fn thread_with_a_running_agent() -> ThreadState {
-        let started = json!({
-            "id": "task.started-1", "kind": "task.started", "tone": "info", "summary": "",
-            "createdAt": "2026-01-01T00:00:00Z",
-            "payload": {"taskId": "a1", "agentKind": "agent", "taskType": "local_agent",
-                "title": "Look into it"},
-        });
-        serde_json::from_value::<crate::model::ThreadDetailSnapshot>(json!({
-            "snapshotSequence": 0,
-            "thread": {"id": "t1", "projectId": "p", "title": "A thread",
-                "modelSelection": {"instanceId": "c", "model": "m"},
-                "messages": [], "activities": [started], "proposedPlans": []},
-        }))
-        .map(ThreadState::from_snapshot)
-        .unwrap()
-    }
-
-    /// A thread whose subagent `a1` is still working, beside a finished one whose output
-    /// file says where `a1`'s is being written.
-    fn thread_with_a_followable_agent() -> ThreadState {
-        let activity = |id: &str, kind: &str, at: &str, payload: Value| {
-            json!({"id": id, "kind": kind, "tone": "info", "summary": "", "createdAt": at,
-                "payload": payload})
-        };
-        let started = |task: &str, at: &str| {
-            json!({"taskId": task, "agentKind": "agent", "taskType": "local_agent",
-                "title": format!("Look into {task}"), "startedAt": at})
-        };
-        let mut thread = serde_json::from_value::<crate::model::ThreadDetailSnapshot>(json!({
-            "snapshotSequence": 0,
-            "thread": {"id": "t1", "projectId": "p", "title": "A thread",
-                "modelSelection": {"instanceId": "c", "model": "m"},
-                "session": {"status": "running"},
-                "messages": [], "proposedPlans": [], "activities": [
-                    activity("s0", "task.started", "2026-01-01T00:00:00Z", started("a0", "2026-01-01T00:00:00Z")),
-                    activity("c0", "task.completed", "2026-01-01T00:00:01Z",
-                        json!({"taskId": "a0", "status": "completed", "outputFile": "/tmp/tasks/a0.output"})),
-                    activity("s1", "task.started", "2026-01-01T00:00:02Z", started("a1", "2026-01-01T00:00:02Z")),
-                ]},
-        }))
-        .map(ThreadState::from_snapshot)
-        .unwrap();
-        thread.detail.shell.worktree_path = Some("/tmp".into());
-        thread
-    }
-
-    /// The agent does something: a progress activity arrives on the thread.
-    fn agent_progresses(app: &mut App, at: &str) {
-        let progress: crate::model::Activity = serde_json::from_value(json!({
-            "id": format!("p-{at}"), "kind": "task.progress", "tone": "info", "summary": "",
-            "createdAt": at, "payload": {"taskId": "a1", "detail": "Reading ws.ts", "lastToolName": "Read"},
-        }))
-        .unwrap();
-        app.thread
-            .as_mut()
-            .unwrap()
-            .detail
-            .activities
-            .push(progress);
     }
 
     /// The next transcript read asked for, answered with these replies.
@@ -10199,112 +8960,185 @@ mod tests {
         payload
     }
 
-    /// A running agent's transcript reads itself again when the agent does something, and
-    /// shows what was written without moving whoever is reading it.
+    /// The subagent roster opens a transcript in place of the conversation, with the keys
+    /// on it, and `q` goes back to the roster it came from.
     #[tokio::test]
-    async fn a_running_agents_transcript_follows_what_it_does() {
+    async fn the_roster_opens_a_transcript_and_q_goes_back_to_it() {
         let (handle, mut requests) = crate::session::Handle::detached();
         let (events, mut sent) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         app.thread = Some(thread_with_a_followable_agent());
         app.current_thread_id = Some("t1".into());
-        app.transcript_loading = Some("a1".into());
-        app.on_transcript("a1".into(), Ok(transcript_saying(&["Looking now."])));
-        app.transcript_read_at = Some(Instant::now());
-        app.mode = Mode::Insert;
         app.focus = Focus::Composer;
-
-        app.follow_transcript();
-        assert!(
-            asked_nothing(&mut requests).await,
-            "nothing has happened, and it is not due"
+        app.open_agents();
+        assert_eq!(app.mode, Mode::Agents);
+        let at = app.agent_cursor.selection(&app.agent_rows());
+        assert_eq!(
+            at.map(|at| app.subagents()[at].id.clone()).as_deref(),
+            Some("a1"),
+            "the one still working"
         );
 
-        agent_progresses(&mut app, "2026-01-01T00:00:05Z");
-        app.follow_transcript();
-        let payload = answer_the_read(
-            &mut app,
-            &mut requests,
-            &mut sent,
-            &["Looking now.", "Found it."],
-        )
-        .await;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let payload = answer_the_read(&mut app, &mut requests, &mut sent, &["Looking now."]).await;
         assert_eq!(payload["relativePath"], "/tmp/tasks/a1.output");
+        assert_eq!(app.reader.agent_id(), Some("a1"));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.focus, Focus::Chat);
+        assert!(drawn(&mut app).contains("Looking now."));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.reader.is_open());
+        assert_eq!(app.mode, Mode::Agents, "back to the roster");
+        assert_eq!(app.focus, Focus::Composer, "the conversation's own place");
+    }
+
+    /// Following a transcript is following the subagent it is of, wherever the roster's
+    /// selection has gone meanwhile.
+    #[tokio::test]
+    async fn following_leaves_the_rosters_selection_alone() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_with_a_followable_agent());
+        app.current_thread_id = Some("t1".into());
+        app.open_agents();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        answer_the_read(&mut app, &mut requests, &mut sent, &["Looking now."]).await;
+
+        let rows = app.agent_rows();
+        app.agent_cursor.top(&rows);
+        agent_progresses(app.thread.as_mut().unwrap(), "2026-01-01T00:00:05Z");
+        apply(&mut app, AppEvent::Tick);
+        let more = ["Looking now.", "Found it."];
+        let payload = answer_the_read(&mut app, &mut requests, &mut sent, &more).await;
+        assert_eq!(
+            payload["relativePath"], "/tmp/tasks/a1.output",
+            "a1 is followed"
+        );
         assert!(drawn(&mut app).contains("Found it."));
         assert_eq!(
-            app.mode,
-            Mode::Insert,
-            "whoever was writing is still writing"
-        );
-        assert_eq!(app.focus, Focus::Composer);
-        assert!(app.toast.is_none());
-
-        // A stretch of writing says nothing on the thread; the clock catches it.
-        app.transcript_read_at = Instant::now().checked_sub(TRANSCRIPT_POLL * 2);
-        app.follow_transcript();
-        let more = ["Looking now.", "Found it.", "Still writing."];
-        answer_the_read(&mut app, &mut requests, &mut sent, &more).await;
-        assert!(drawn(&mut app).contains("Still writing."));
-
-        // Finished, it is read once more for how it ended, and then left alone.
-        let done: crate::model::Activity = serde_json::from_value(json!({
-            "id": "done", "kind": "task.completed", "tone": "info", "summary": "",
-            "createdAt": "2026-01-01T00:00:09Z",
-            "payload": {"taskId": "a1", "status": "completed", "summary": "Found it in ws.ts"},
-        }))
-        .unwrap();
-        app.thread.as_mut().unwrap().detail.activities.push(done);
-        app.follow_transcript();
-        let last = ["Looking now.", "Found it.", "Done."];
-        answer_the_read(&mut app, &mut requests, &mut sent, &last).await;
-        assert!(!app.transcript.as_ref().unwrap().live);
-        app.transcript_read_at = Instant::now().checked_sub(TRANSCRIPT_POLL * 2);
-        app.follow_transcript();
-        assert!(
-            asked_nothing(&mut requests).await,
-            "a finished run is not read again"
+            app.agent_cursor.selection(&app.agent_rows()),
+            Some(0),
+            "the roster's row stayed where it was put"
         );
     }
 
-    /// Put away, a transcript is not brought back by a read that was already on its way.
+    /// A terminal of the open thread's, as the server lists it.
+    fn terminal(id: &str, status: &str) -> crate::model::TerminalSummary {
+        serde_json::from_value(json!({
+            "threadId": "t1", "terminalId": id, "cwd": "/src/p", "status": status,
+            "label": format!("shell {id}"),
+        }))
+        .expect("a terminal the server could list")
+    }
+
+    /// The open thread's terminal list up, with the keys on it.
+    fn terminals_up(app: &mut App, terminals: Vec<crate::model::TerminalSummary>) {
+        app.thread = Some(stacked_thread());
+        app.current_thread_id = Some("t1".into());
+        app.terminals = terminals;
+        app.open_terminals();
+        assert_eq!(app.mode, Mode::Terminals);
+    }
+
+    /// The live terminals are listed first, so one exiting moves down the list; `x` still
+    /// closes the terminal that is marked, not the one that slid under where it was.
     #[tokio::test]
-    async fn a_put_away_transcript_stays_away() {
+    async fn x_closes_the_terminal_marked_after_the_list_resorts() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let running = |id| terminal(id, "running");
+        terminals_up(&mut app, vec![running("a"), running("b"), running("c")]);
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.terminals[0] = terminal("a", "exited");
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let payload = loop {
+            match asked(&mut requests).await.expect("a terminal is closed") {
+                crate::session::Request::Call { tag, payload, .. } if tag == "terminal.close" => {
+                    break payload;
+                }
+                _ => continue,
+            }
+        };
+        assert_eq!(payload["terminalId"], "b");
+    }
+
+    /// A list that shrinks under the selection leaves it on the last row, which is marked,
+    /// and `Enter` attaches to that rather than saying nothing is selected.
+    #[tokio::test]
+    async fn enter_attaches_the_terminal_marked_after_the_list_shrinks() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let running = |id| terminal(id, "running");
+        terminals_up(&mut app, vec![running("a"), running("b"), running("c")]);
+        app.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        app.terminals.pop();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::TerminalPane, "attached to b");
+    }
+
+    /// More terminals than the popup is tall scroll to keep the one selected on screen.
+    #[tokio::test]
+    async fn a_long_terminal_list_follows_the_selection() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let many = (0..12).map(|n| terminal(&format!("t{n:02}"), "running"));
+        terminals_up(&mut app, many.collect());
+        app.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        let screen = drawn(&mut app);
+        assert!(screen.contains("shell t11"), "{screen}");
+        assert!(screen.contains("above"), "{screen}");
+    }
+
+    /// The followable agent's thread with more subagents started after it, `a2` onwards.
+    fn with_more_agents(count: usize) -> ThreadState {
+        let mut thread = thread_with_a_followable_agent();
+        for n in 2..2 + count {
+            let at = format!("2026-01-01T00:00:{:02}Z", 10 + n);
+            let started: crate::model::Activity = serde_json::from_value(json!({
+                "id": format!("s{n}"), "kind": "task.started", "tone": "info", "summary": "",
+                "createdAt": at, "payload": {"taskId": format!("a{n}"), "agentKind": "agent",
+                "taskType": "local_agent", "title": format!("Look into a{n}"), "startedAt": at},
+            }))
+            .unwrap();
+            thread.detail.activities.push(started);
+        }
+        thread
+    }
+
+    /// More subagents than the roster is tall scroll to keep the one selected on screen.
+    #[tokio::test]
+    async fn a_long_roster_follows_the_selection() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(with_more_agents(12));
+        app.current_thread_id = Some("t1".into());
+        app.open_agents();
+        app.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        let screen = drawn(&mut app);
+        assert!(screen.contains("Look into a13"), "{screen}");
+    }
+
+    /// A roster that shrinks under the selection leaves it on the last row, and `Enter`
+    /// reads that one.
+    #[tokio::test]
+    async fn enter_reads_the_subagent_marked_after_the_roster_shrinks() {
         let (handle, mut requests) = crate::session::Handle::detached();
         let (events, mut sent) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
-        app.thread = Some(thread_with_a_followable_agent());
+        app.thread = Some(with_more_agents(1));
         app.current_thread_id = Some("t1".into());
-        app.transcript_loading = Some("a1".into());
-        app.on_transcript("a1".into(), Ok(transcript_saying(&["Looking now."])));
-        agent_progresses(&mut app, "2026-01-01T00:00:05Z");
-        app.follow_transcript();
-        app.leave_transcript();
-        answer_the_read(
-            &mut app,
-            &mut requests,
-            &mut sent,
-            &["Looking now.", "Found it."],
-        )
-        .await;
-        assert!(app.transcript.is_none());
-    }
-
-    fn transcript_saying(replies: &[&str]) -> TranscriptFile {
-        let mut contents = String::from(
-            r#"{"type":"user","uuid":"u1","timestamp":"1","message":{"role":"user","content":"Look into it"}}"#,
-        );
-        for (n, reply) in replies.iter().enumerate() {
-            contents.push('\n');
-            contents.push_str(
-                &json!({"type": "assistant", "uuid": format!("a{n}"), "timestamp": format!("{}", n + 2),
-                    "message": {"role": "assistant", "content": [{"type": "text", "text": reply}]}})
-                .to_string(),
-            );
-        }
-        TranscriptFile {
-            contents,
-            truncated: false,
-        }
+        app.open_agents();
+        app.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        app.thread.as_mut().unwrap().detail.activities.pop();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let payload = answer_the_read(&mut app, &mut requests, &mut sent, &["Looking now."]).await;
+        assert_eq!(payload["relativePath"], "/tmp/tasks/a1.output");
     }
 
     fn drawn(app: &mut App) -> String {
@@ -10320,31 +9154,6 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    /// `r` on an agent still working reads what it has written since, and that is what
-    /// the view then shows — not what was drawn the first time.
-    #[tokio::test]
-    async fn reading_a_running_agent_again_shows_what_it_has_written_since() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(thread_with_a_running_agent());
-        app.current_thread_id = Some("t1".into());
-
-        app.transcript_loading = Some("a1".into());
-        app.on_transcript("a1".into(), Ok(transcript_saying(&["Looking now."])));
-        assert!(drawn(&mut app).contains("Looking now."));
-
-        app.transcript_loading = Some("a1".into());
-        app.on_transcript(
-            "a1".into(),
-            Ok(transcript_saying(&["Looking now.", "Found it in ws.ts."])),
-        );
-        assert!(
-            drawn(&mut app).contains("Found it in ws.ts."),
-            "the second read is on the screen"
-        );
     }
 
     /// With a selection up in the composer, `gg` grows it to the top rather than being
@@ -10365,20 +9174,6 @@ mod tests {
         assert!(app.composer.vim_busy(), "still selecting");
         app.on_key(key('y'));
         assert!(!app.composer.vim_busy());
-    }
-
-    fn stacked_thread() -> ThreadState {
-        let mut thread = running_thread();
-        let pr = |number: u64, head: &str, base: &str| {
-            json!({"host":"github.com","repository":"o/r","number":number,
-                "url":format!("https://github.com/o/r/pull/{number}"),"source":"agent",
-                "linkedAt":"2026-01-01T00:00:00.000Z",
-                "snapshot":{"state":"open","title":format!("layer {number}"),
-                    "headBranch":head,"baseBranch":base}})
-        };
-        thread.detail.shell.pull_requests =
-            serde_json::from_value(json!([pr(2, "b", "a"), pr(1, "a", "main")])).unwrap();
-        thread
     }
 
     /// The picker lists a stack bottom to top, each layer above the first marked as
@@ -10412,7 +9207,7 @@ mod tests {
     /// identity, and what comes back opens in place of the conversation. A message written
     /// over it says which pull request it was written against, and `q` puts it away.
     #[tokio::test]
-    async fn enter_reads_a_pull_request_in_place_of_the_chat() {
+    async fn a_pull_request_is_read_in_place_of_the_chat_and_q_puts_it_away() {
         let (handle, mut requests) = crate::session::Handle::detached();
         let (events, mut sent) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
@@ -10440,20 +9235,20 @@ mod tests {
             json!({"projectId": project, "host": "github.com", "repository": "o/r", "number": 1});
         assert_eq!(payload, identity);
         assert_eq!(activity, identity);
-        let _ = reply.send(Ok(json!({
-            "repository": "o/r", "number": 1, "title": "layer 1", "body": "Why.",
-            "url": "https://github.com/o/r/pull/1", "state": "open",
-            "headBranch": "a", "baseBranch": "main",
-        })));
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.0.as_str()),
+            Some("reading #1…")
+        );
+        let _ = reply.send(Ok(open_detail("layer 1")));
         let event = tokio::time::timeout(Duration::from_millis(500), sent.recv())
             .await
             .expect("the detail comes back")
             .expect("an event");
         apply(&mut app, event);
-        let open = app.transcript.as_ref().expect("it is open");
-        assert_eq!(open.title, "o/r#1");
-        assert_eq!(open.pull_request().map(|d| d.number), Some(1));
+        assert_eq!(app.reader.pull_request().map(|d| d.number), Some(1));
         assert_eq!(app.focus, Focus::Chat);
+        assert!(app.toast.is_none());
+        assert!(drawn(&mut app).contains("o/r#1"));
 
         app.mode = Mode::Insert;
         app.composer.set_text("is this ready?");
@@ -10464,86 +9259,57 @@ mod tests {
             command["message"]["text"],
             "Sent looking at pull request o/r#1 (https://github.com/o/r/pull/1):\n\nis this ready?"
         );
-    }
+        assert!(!app.reader.is_open(), "the message joins the conversation");
 
-    /// A thread with a pull request open in place of its conversation.
-    fn reading_a_pull_request(app: &mut App) {
-        app.thread = Some(stacked_thread());
-        app.current_thread_id = Some("t1".into());
-        app.pull_request_loading = Some("https://github.com/o/r/pull/1".into());
+        app.read_pull_request("https://github.com/o/r/pull/1");
         app.on_pull_request(
             "https://github.com/o/r/pull/1".into(),
             Ok(open_detail("layer 1")),
         );
+        assert!(app.reader.is_open());
+        app.mode = Mode::Normal;
+        app.focus = Focus::Chat;
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.reader.is_open());
+        assert_eq!(app.mode, Mode::Normal, "not the subagent roster");
     }
 
-    fn open_detail(title: &str) -> Value {
-        json!({
-            "repository": "o/r", "number": 1, "title": title,
-            "url": "https://github.com/o/r/pull/1", "state": "open",
-            "headBranch": "a", "baseBranch": "main",
-        })
+    /// A thread with a pull request open in place of its conversation, read without
+    /// anything asked of the server.
+    fn reading_a_pull_request(app: &mut App) {
+        app.thread = Some(stacked_thread());
+        app.current_thread_id = Some("t1".into());
+        showing(app, open_detail("layer 1"));
     }
 
-    /// The calls asked for, by name, and what with.
-    async fn calls(
-        requests: &mut mpsc::UnboundedReceiver<crate::session::Request>,
-        how_many: usize,
-    ) -> Vec<(String, Value)> {
-        let mut calls = Vec::new();
-        while calls.len() < how_many {
-            match asked(requests).await {
-                Some(crate::session::Request::Call {
-                    tag,
-                    payload,
-                    reply,
-                }) => {
-                    // Answered, so a read waiting on this one goes on to the next.
-                    let _ = reply.send(Ok(Value::Null));
-                    calls.push((tag, payload));
-                }
-                Some(_) => continue,
-                None => break,
-            }
-        }
-        calls
+    /// Pull request #1 opened with this detail, as though read.
+    fn showing(app: &mut App, detail: Value) {
+        let url = "https://github.com/o/r/pull/1";
+        let thread = reader::Thread {
+            state: app.thread.as_ref().unwrap(),
+            branch: None,
+            directory: None,
+        };
+        let here = (app.chat_view.place(), app.focus);
+        let _ = app
+            .reader
+            .open(&thread, Source::PullRequest(url.into()), Origin::Chat);
+        let _ = app
+            .reader
+            .on_pull_request(&thread, url.into(), Ok(detail), here);
     }
 
-    /// The first count after connecting is where the server stands; a change is a turn
-    /// that ended, and the pull request open is read again, past the server's copy of it,
-    /// without a word.
+    /// News of the pull request open, from the server's own sync, reads it again past the
+    /// server's copy, and what comes back is shown under whoever is writing without a word.
     #[tokio::test]
-    async fn a_pull_request_is_read_again_when_the_server_says_so() {
+    async fn news_from_the_sync_reads_it_again_quietly() {
         let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
+        let (events, mut sent) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         reading_a_pull_request(&mut app);
-        app.toast = None;
-
-        app.on_update(crate::session::Update::PullRequestsRefreshed(4));
-        assert!(
-            asked_nothing(&mut requests).await,
-            "where it stands is not a change"
-        );
-
-        app.on_update(crate::session::Update::PullRequestsRefreshed(5));
-        let calls = calls(&mut requests, 3).await;
-        let tags: Vec<&str> = calls.iter().map(|(tag, _)| tag.as_str()).collect();
-        assert_eq!(tags[0], "pullRequests.invalidate", "past the server's copy");
-        assert_eq!(calls[0].1["reference"]["number"], 1);
-        assert!(tags.contains(&"pullRequests.detail") && tags.contains(&"pullRequests.activity"));
-        assert!(app.toast.is_none(), "without a word");
-    }
-
-    /// The server's own sync bringing news of the pull request open is a reason to read it
-    /// again; news of anything else is not.
-    #[tokio::test]
-    async fn news_from_the_sync_reads_it_again() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        reading_a_pull_request(&mut app);
-        let _ = calls(&mut requests, 2).await;
+        app.mode = Mode::Insert;
+        app.focus = Focus::Composer;
+        app.toast("writing", false);
 
         app.notice_pull_request_sync();
         assert!(asked_nothing(&mut requests).await, "nothing new yet");
@@ -10556,80 +9322,45 @@ mod tests {
             .unwrap();
         link.snapshot.as_mut().unwrap().checks_state = Some("failing".into());
         app.notice_pull_request_sync();
-        let tags: Vec<String> = calls(&mut requests, 3)
-            .await
-            .into_iter()
-            .map(|(t, _)| t)
-            .collect();
-        assert!(
-            tags.contains(&"pullRequests.detail".to_string()),
-            "{tags:?}"
+        let mut tags = Vec::new();
+        let reply = loop {
+            match asked(&mut requests).await.expect("it is read again") {
+                crate::session::Request::Call { tag, reply, .. } => {
+                    tags.push(tag.clone());
+                    match tag.as_str() {
+                        "pullRequests.detail" => break reply,
+                        _ => {
+                            let _ = reply.send(Ok(Value::Null));
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        };
+        assert_eq!(tags[0], "pullRequests.invalidate", "past the server's copy");
+        let _ = reply.send(Ok(open_detail("checks failing")));
+        loop {
+            let event = tokio::time::timeout(Duration::from_millis(500), sent.recv())
+                .await
+                .expect("it comes back")
+                .expect("an event");
+            let detail = matches!(event, AppEvent::PullRequest { .. });
+            apply(&mut app, event);
+            if detail {
+                break;
+            }
+        }
+        assert_eq!(
+            app.reader.pull_request().map(|d| d.title.as_str()),
+            Some("checks failing")
         );
-    }
-
-    /// Brought up to date while somebody is writing, it leaves them writing; one that
-    /// comes back after the view was put away does not bring it back.
-    #[tokio::test]
-    async fn a_quiet_read_disturbs_nobody() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        reading_a_pull_request(&mut app);
-        app.mode = Mode::Insert;
-        app.focus = Focus::Composer;
-        app.refresh_open_pull_request();
-        app.on_pull_request(
-            "https://github.com/o/r/pull/1".into(),
-            Ok(open_detail("renamed")),
+        assert_eq!(
+            app.mode,
+            Mode::Insert,
+            "whoever was writing is still writing"
         );
-        assert_eq!(app.mode, Mode::Insert);
         assert_eq!(app.focus, Focus::Composer);
-        assert_eq!(
-            app.transcript
-                .as_ref()
-                .and_then(|t| t.pull_request())
-                .map(|d| d.title.as_str()),
-            Some("renamed")
-        );
-
-        app.refresh_open_pull_request();
-        app.leave_transcript();
-        app.on_pull_request(
-            "https://github.com/o/r/pull/1".into(),
-            Ok(open_detail("late")),
-        );
-        assert!(app.transcript.is_none(), "put away, it stays away");
-    }
-
-    /// `]` reads the layer above, and the bottom of a stack says so rather than moving.
-    #[tokio::test]
-    async fn brackets_move_through_a_stack() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        reading_a_pull_request(&mut app);
-        let _ = calls(&mut requests, 2).await;
-        assert_eq!(
-            app.pull_request_stack()
-                .map(|(layers, at)| (layers.len(), at)),
-            Some((2, 0))
-        );
-
-        app.on_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
-        assert!(asked_nothing(&mut requests).await);
-        assert_eq!(
-            app.toast.as_ref().map(|t| t.0.as_str()),
-            Some("already the bottom of the stack")
-        );
-
-        app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
-        let asked = calls(&mut requests, 2).await;
-        assert!(
-            asked
-                .iter()
-                .any(|(tag, payload)| tag == "pullRequests.detail" && payload["number"] == 2),
-            "{asked:?}"
-        );
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("writing"));
     }
 
     /// `L` lists the repository's labels, the ones on it first; `Enter` puts one on and
@@ -10641,22 +9372,19 @@ mod tests {
         let mut app = App::new(handle, events);
         app.thread = Some(stacked_thread());
         app.current_thread_id = Some("t1".into());
-        let url = "https://github.com/o/r/pull/1".to_string();
         let mut editable = open_detail("layer 1");
         editable["capabilities"] = json!({"labels": true});
 
         // Not until the host says it can.
-        app.pull_request_loading = Some(url.clone());
-        app.on_pull_request(url.clone(), Ok(open_detail("layer 1")));
+        showing(&mut app, open_detail("layer 1"));
+        app.focus = Focus::Chat;
         app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
         assert_eq!(
             app.toast.as_ref().map(|t| t.0.as_str()),
             Some("its labels cannot be changed from here")
         );
 
-        app.pull_request_loading = Some(url.clone());
-        app.on_pull_request(url.clone(), Ok(editable));
-        let _ = calls(&mut requests, 2).await;
+        showing(&mut app, editable);
         app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
         let reply = loop {
             match asked(&mut requests)
@@ -10730,83 +9458,44 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
     }
 
-    /// `H` and `L` go through the tabs, and each is where it was left.
+    /// `H` and `L` go round the tabs, each where it was left; and the pull requests and
+    /// subagents listed are the open thread's, so another thread's lists start at their top
+    /// while the tab stays on them.
     #[tokio::test]
-    async fn the_sidebar_has_tabs_that_keep_their_place() {
+    async fn the_tabs_keep_their_place_and_another_thread_starts_them_over() {
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
         sidebar_on_pull_requests(&mut app);
-        assert_eq!(app.sidebar_tab, SidebarTab::PullRequests);
-        let rows = app.sidebar_rows();
-        assert!(
-            matches!(&rows[0], SidebarRow::PullRequest { above: false, url } if url.ends_with("/1"))
-        );
-        assert!(
-            matches!(&rows[1], SidebarRow::PullRequest { above: true, url } if url.ends_with("/2"))
-        );
-        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert_eq!(app.sidebar_selected, 1);
+        assert_eq!(app.sidebar_view.tab(), sidebar_view::Tab::PullRequests);
+        app.on_key(key('j'));
+        let second = |app: &App| {
+            matches!(
+                app.sidebar_selected_row(),
+                Some(SidebarRow::PullRequest { above: true, url }) if url.ends_with("/2")
+            )
+        };
+        assert!(second(&app));
 
-        app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
-        assert_eq!(app.sidebar_tab, SidebarTab::Agents);
-        assert!(matches!(app.sidebar_rows()[0], SidebarRow::Empty { .. }));
-        app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
-        assert_eq!(app.sidebar_selected, 1, "back where it was left");
-        app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
-        assert_eq!(app.sidebar_tab, SidebarTab::Threads);
-    }
+        app.on_key(key('L'));
+        assert_eq!(app.sidebar_view.tab(), sidebar_view::Tab::Agents);
+        app.on_key(key('L'));
+        assert_eq!(app.sidebar_view.tab(), sidebar_view::Tab::Threads, "round");
+        app.on_key(key('H'));
+        app.on_key(key('H'));
+        assert!(second(&app), "back where it was left");
 
-    /// `Enter` on a pull request reads it in place of the conversation and leaves the keys
-    /// in the sidebar, so the next one is `j` and `Enter` away.
-    #[tokio::test]
-    async fn enter_in_the_sidebar_reads_and_stays() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        sidebar_on_pull_requests(&mut app);
-        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let asked = calls(&mut requests, 2).await;
-        assert!(
-            asked
-                .iter()
-                .any(|(tag, p)| tag == "pullRequests.detail" && p["number"] == 2)
-        );
-        let mut second = open_detail("layer 2");
-        second["number"] = json!(2);
-        second["url"] = json!("https://github.com/o/r/pull/2");
-        app.on_pull_request("https://github.com/o/r/pull/2".into(), Ok(second));
-        assert!(
-            app.transcript
-                .as_ref()
-                .and_then(|t| t.pull_request())
-                .is_some()
-        );
-        assert_eq!(app.focus, Focus::Sidebar, "the keys stayed");
-
-        // Read from anywhere else, it takes the keys to what is read, as before.
-        app.pull_request_loading = Some("https://github.com/o/r/pull/1".into());
-        app.on_pull_request(
-            "https://github.com/o/r/pull/1".into(),
-            Ok(open_detail("layer 1")),
-        );
-        assert_eq!(app.focus, Focus::Chat);
-    }
-
-    /// The pull requests listed are the open thread's, so another thread's list starts at
-    /// its top, and the threads tab still follows the thread that is open.
-    #[tokio::test]
-    async fn another_thread_starts_its_list_at_the_top() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        sidebar_on_pull_requests(&mut app);
-        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert_eq!(app.sidebar_selected, 1);
         app.open_thread("t2");
-        assert_eq!(app.sidebar_selected, 0);
-        assert_eq!(app.sidebar_tab, SidebarTab::PullRequests, "the tab stays");
+        assert_eq!(
+            app.sidebar_view.tab(),
+            sidebar_view::Tab::PullRequests,
+            "the tab stays"
+        );
+        let rows = app.sidebar_lent();
+        assert_eq!(app.sidebar_view.selection(&rows), Some(0), "at the top");
+        app.on_key(key('L'));
+        assert_eq!(app.sidebar_view.selection(&app.sidebar_lent()), Some(0));
     }
 
     /// `d` asks before unlinking, and only the answer does it.
@@ -10821,13 +9510,83 @@ mod tests {
         assert!(app.sidebar_unlinking.is_some());
         app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert!(sent_no_command(&mut requests).await, "a no");
-        assert_eq!(app.sidebar_selected, 0, "and the no is all the key did");
+        let rows = app.sidebar_lent();
+        assert_eq!(
+            app.sidebar_view.selection(&rows),
+            Some(0),
+            "and the no is all the key did"
+        );
 
         app.on_key(d);
         app.on_key(d);
         let command = sent_command(&mut requests).await.expect("unlinked");
         assert_eq!(command["type"], "thread.pull-request.unlink");
         assert_eq!(command["number"], 1);
+    }
+
+    /// A thread in the list, made when it says.
+    fn made(id: &str, at: &str) -> serde_json::Value {
+        let mut thread = listed(id, None);
+        thread["createdAt"] = json!(at);
+        thread
+    }
+
+    /// The server telling of a thread, as the `sequence`th thing it has said.
+    fn told(app: &mut App, sequence: u64, thread: serde_json::Value) {
+        app.on_update(crate::session::Update::Shell(
+            crate::model::ShellItem::ThreadUpserted {
+                sequence,
+                thread: serde_json::from_value(thread).expect("a thread the server could send"),
+            },
+        ));
+    }
+
+    /// The list moving under the selection, as it does when a thread is started, does
+    /// not move what `gs` settles: it is the thread that is marked.
+    #[tokio::test]
+    async fn gs_settles_the_thread_marked_after_the_list_moves() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        told(&mut app, 1, made("a", "2026-01-01T00:00:01Z"));
+        told(&mut app, 2, made("b", "2026-01-01T00:00:02Z"));
+        app.sidebar_visible = true;
+        app.focus = Focus::Sidebar;
+        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.on_key(j);
+        app.on_key(j);
+        assert!(drawn(&mut app).contains(" a "), "a is on the screen");
+        // Newer work goes to the top, over the thread that is marked.
+        told(&mut app, 3, made("c", "2026-01-01T00:00:03Z"));
+        let g = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        app.on_key(g('g'));
+        app.on_key(g('s'));
+        let command = sent_command(&mut requests).await.expect("settled");
+        assert_eq!(command["type"], "thread.settle");
+        assert_eq!(command["threadId"], "a");
+    }
+
+    /// A list that shrinks under the selection leaves it on the row that is marked, and
+    /// that is the row `Enter` acts on.
+    #[tokio::test]
+    async fn enter_acts_on_the_row_marked_after_the_list_shrinks() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        told(&mut app, 1, made("a", "2026-01-01T00:00:01Z"));
+        let mut settled = made("b", "2026-01-01T00:00:02Z");
+        settled["settledAt"] = json!("2026-01-02T00:00:00Z");
+        told(&mut app, 2, settled);
+        app.show_settled = true;
+        app.sidebar_visible = true;
+        app.focus = Focus::Sidebar;
+        // Active, a, Settled, b: the settled thread at the foot.
+        app.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
+        assert!(!app.show_settled);
+        // The settled pile's header is the last row now, and is the one marked.
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.show_settled, "Enter opened the pile it was on");
     }
 
     /// The tabs are the sidebar's title, with the counts of what the open thread has, and
@@ -10849,7 +9608,7 @@ mod tests {
         let (from, _, _) = *app
             .sidebar_tab_spans
             .iter()
-            .find(|(_, _, tab)| *tab == SidebarTab::PullRequests)
+            .find(|(_, _, tab)| *tab == sidebar_view::Tab::PullRequests)
             .expect("the PRs tab was drawn");
         let row = app.sidebar_inner.expect("the sidebar was drawn").y - 1;
         app.on_mouse(MouseEvent {
@@ -10858,7 +9617,7 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(app.sidebar_tab, SidebarTab::PullRequests);
+        assert_eq!(app.sidebar_view.tab(), sidebar_view::Tab::PullRequests);
         let screen = drawn(&mut app);
         assert!(
             screen.contains("#1 layer 1") && screen.contains("↳ #2 layer 2"),
@@ -10877,7 +9636,6 @@ mod tests {
         let project_id = project(&mut app);
         reading_a_pull_request(&mut app);
         app.thread.as_mut().unwrap().detail.shell.project_id = project_id;
-        let _ = calls(&mut requests, 2).await;
 
         app.run_command("checkout");
         let (payload, reply) = loop {
@@ -10922,9 +9680,12 @@ mod tests {
 
         app.composer.set_text("review this");
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let create = sent_command(&mut requests)
-            .await
-            .expect("the thread is made");
+        let (create, reply) = loop {
+            match asked(&mut requests).await.expect("the thread is made") {
+                crate::session::Request::Dispatch { command, reply } => break (command, reply),
+                _ => continue,
+            }
+        };
         assert_eq!(
             create["threadId"],
             thread_id.as_str(),
@@ -10940,7 +9701,12 @@ mod tests {
             "no second worktree"
         );
 
-        app.on_thread_created(thread_id.clone());
+        let _ = reply.send(Ok(1));
+        let made = tokio::time::timeout(Duration::from_millis(500), sent.recv())
+            .await
+            .expect("it comes back")
+            .expect("an event");
+        apply(&mut app, made);
         let link = sent_command(&mut requests)
             .await
             .expect("the pull request is linked");
@@ -10960,30 +9726,8 @@ mod tests {
         let project_id = project(&mut app);
         reading_a_pull_request(&mut app);
         app.start_new_thread(&project_id);
-        assert!(app.transcript.is_none());
+        assert!(!app.reader.is_open());
         assert!(app.draft.is_some());
-    }
-
-    #[tokio::test]
-    async fn q_puts_a_pull_request_away() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(stacked_thread());
-        app.current_thread_id = Some("t1".into());
-        app.pull_request_loading = Some("https://github.com/o/r/pull/1".into());
-        app.on_pull_request(
-            "https://github.com/o/r/pull/1".into(),
-            Ok(json!({
-                "repository": "o/r", "number": 1, "title": "layer 1",
-                "url": "https://github.com/o/r/pull/1", "state": "open",
-                "headBranch": "a", "baseBranch": "main",
-            })),
-        );
-        assert!(app.transcript.is_some());
-        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-        assert!(app.transcript.is_none());
-        assert_eq!(app.mode, Mode::Normal, "not the subagent roster");
     }
 
     /// Unlinking asks first, and only the answer sends it.
@@ -11039,7 +9783,7 @@ mod tests {
         assert_eq!(app.confirm_transcript_send, None);
         assert_eq!(app.composer.text(), "not for the main agent");
         assert_eq!(app.queued_message(), None);
-        assert!(app.transcript.is_some());
+        assert!(app.reader.is_open());
         assert!(sent_no_command(&mut requests).await);
     }
 
@@ -11066,17 +9810,6 @@ mod tests {
             "sent into the running turn"
         );
 
-        // A list entry from before the turn began says nothing about this one.
-        upsert(
-            &mut app,
-            listed("t1", Some(("an-earlier-turn", "completed"))),
-        );
-        upsert(&mut app, listed("t1", Some(("turn", "running"))));
-        assert!(
-            sent_no_command(&mut requests).await,
-            "sent before the turn ended"
-        );
-
         upsert(&mut app, listed("t1", Some(("turn", "completed"))));
         let command = sent_command(&mut requests)
             .await
@@ -11084,52 +9817,6 @@ mod tests {
         assert_eq!(command["type"], "thread.turn.start");
         assert_eq!(command["message"]["text"], "first\n\nsecond");
         assert_eq!(app.queued_message(), None);
-    }
-
-    /// A queued message is still tria's, so it can be taken back to change or drop.
-    #[tokio::test]
-    async fn up_takes_a_queued_message_back() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(running_thread());
-        app.current_thread_id = Some("t1".into());
-        app.mode = Mode::Insert;
-        app.focus = Focus::Composer;
-
-        app.composer.set_text("not yet");
-        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.composer.text(), "not yet");
-        assert_eq!(app.queued_message(), None);
-
-        upsert(&mut app, listed("t1", Some(("turn", "completed"))));
-        assert!(
-            sent_no_command(&mut requests).await,
-            "a recalled message went out"
-        );
-    }
-
-    /// A turn stopped part way is not the one the message was written to follow, so the
-    /// message comes back rather than going out behind it.
-    #[tokio::test]
-    async fn a_queued_message_comes_back_when_the_turn_is_interrupted() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(running_thread());
-        app.current_thread_id = Some("t1".into());
-        app.mode = Mode::Insert;
-        app.focus = Focus::Composer;
-
-        app.composer.set_text("after that");
-        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        upsert(&mut app, listed("t1", Some(("turn", "interrupted"))));
-
-        assert!(sent_no_command(&mut requests).await);
-        assert_eq!(app.composer.text(), "after that");
-        assert_eq!(app.queued_message(), None);
-        assert!(app.toast.as_ref().unwrap().0.contains("interrupted"));
     }
 
     /// With no turn running there is nothing to wait for.
@@ -11228,8 +9915,8 @@ mod tests {
         assert_eq!(picker.hit(1).map(|h| h.thread_id.as_str()), Some("t2"));
     }
 
-    /// Opening a match goes to the line that has it, and leaves the query as the chat's
-    /// search for `n` to go on with.
+    /// Opening a match goes to the line that has it, not to the top of the message it
+    /// is in, and leaves the query as the chat's search for `n` to go on with.
     #[test]
     fn a_match_opens_where_it_was_said() {
         let (handle, _requests) = crate::session::Handle::detached();
@@ -11237,19 +9924,7 @@ mod tests {
         let mut app = App::new(handle, events);
         app.thread = Some(rewindable_thread());
         app.current_thread_id = Some("t1".into());
-        app.chat_viewport = (10, 40);
-        app.block_ranges = (0..8)
-            .map(|i| {
-                (
-                    i * 5,
-                    i * 5 + 5,
-                    format!(
-                        "msg:{}",
-                        ["u1", "a1", "u2", "a2", "u3", "a3", "u4", "a4"][i]
-                    ),
-                )
-            })
-            .collect();
+        app.chat_view.resize(60, 10);
         // `u3` says "u3" and was sent at 10:05.
         app.jump = Some(Jump {
             thread_id: "t1".into(),
@@ -11259,9 +9934,256 @@ mod tests {
         });
         app.settle_jump();
         assert!(app.jump.is_none());
-        assert_eq!(app.chat_cursor, 20);
+        let view = app.chat();
+        let (start, _) = view.layout().block_lines("msg:u3").unwrap();
+        // The message's first row names who said it; what they said is under it.
+        assert_eq!(view.cursor(), start + 1);
+        assert_eq!(view.layout().row(view.cursor()).trim(), "u3");
+        assert_eq!(view.search().map(|s| s.query.as_str()), Some("u3"));
         assert_eq!(app.focus, Focus::Chat);
-        assert_eq!(app.search.as_ref().map(|s| s.query.as_str()), Some("u3"));
+    }
+
+    /// A question, the calls made answering it, and the answer.
+    fn thread_at_work() -> ThreadState {
+        let call = |id: &str, at: &str| {
+            json!({"id": id, "kind": "tool.completed", "tone": "tool", "summary": "Read",
+                "createdAt": format!("2026-01-01T10:00:{at}Z"),
+                "payload": {"toolCallId": id, "status": "completed", "title": "Read",
+                    "detail": format!("Read: /src/{id}.rs")}})
+        };
+        let snapshot: ThreadDetailSnapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p", "title": "Test",
+                "modelSelection": {"instanceId": "instance", "model": "a-model"},
+                "messages": [
+                    {"id": "u1", "role": "user", "text": "look around",
+                        "createdAt": "2026-01-01T10:00:00Z"},
+                    {"id": "a1", "role": "assistant", "text": "found it",
+                        "createdAt": "2026-01-01T10:00:09Z"},
+                ],
+                "activities": [call("c1", "01"), call("c2", "02"), call("c3", "03")]
+            }
+        }))
+        .expect("a thread the server could have sent");
+        ThreadState::from_snapshot(snapshot)
+    }
+
+    /// Keys come in batches, and the screen is drawn after the batch. A motion that
+    /// follows a fold in the same batch moves through the chat as the fold left it, not
+    /// as the last frame showed it.
+    #[test]
+    fn a_motion_after_a_fold_in_the_same_batch_lands_on_the_new_layout() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_at_work());
+        app.current_thread_id = Some("t1".into());
+        drawn(&mut app);
+        app.focus = Focus::Chat;
+        app.chat().top();
+
+        for key in ['z', 'R', '}'] {
+            app.on_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        let view = app.chat();
+        let answer = view.layout().message_starts()[1];
+        assert!(answer > 3, "the calls are open above the answer");
+        assert_eq!(view.cursor(), answer);
+    }
+
+    /// A count typed in the chat goes with the motion after it.
+    #[test]
+    fn a_count_typed_in_the_chat_moves_as_many_lines() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(rewindable_thread());
+        app.current_thread_id = Some("t1".into());
+        drawn(&mut app);
+        app.focus = Focus::Chat;
+        typed(&mut app, "gg3j");
+        assert_eq!(app.chat_view.cursor(), 3);
+        typed(&mut app, "k");
+        assert_eq!(app.chat_view.cursor(), 2, "and only with that one");
+    }
+
+    /// A search typed at the command line goes to its match, and `n` goes on with it,
+    /// saying so when it comes round the end.
+    #[test]
+    fn a_search_typed_at_the_command_line_is_the_one_n_goes_on_with() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(rewindable_thread());
+        app.current_thread_id = Some("t1".into());
+        drawn(&mut app);
+        app.focus = Focus::Chat;
+        typed(&mut app, "gg/u3");
+        app.on_key(plain(KeyCode::Enter));
+        let view = app.chat();
+        assert_eq!(view.layout().row(view.cursor()).trim(), "u3");
+        let found = view.cursor();
+        assert!(app.toast.is_none());
+
+        typed(&mut app, "n");
+        assert_eq!(app.chat_view.cursor(), found, "the one match, round again");
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.0.as_str()),
+            Some("search hit BOTTOM, continuing at TOP")
+        );
+        typed(&mut app, "/nowhere");
+        app.on_key(plain(KeyCode::Enter));
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.0.as_str()),
+            Some("pattern not found: nowhere")
+        );
+    }
+
+    /// Something read over the conversation opens at its top, and putting it away puts
+    /// the conversation back where it was being read, with the keys where they were.
+    #[tokio::test]
+    async fn leaving_a_reading_puts_the_conversation_back_where_it_was() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let mut thread = stacked_thread();
+        thread.detail.messages = rewindable_thread().detail.messages;
+        app.thread = Some(thread);
+        app.current_thread_id = Some("t1".into());
+        drawn(&mut app);
+        app.focus = Focus::Chat;
+        typed(&mut app, "gg5j");
+        let kept = app.chat_view.place();
+
+        let url = "https://github.com/o/r/pull/1";
+        app.read_pull_request(url);
+        app.on_pull_request(url.into(), Ok(open_detail("layer 1")));
+        assert!(app.reader.is_open());
+        assert_eq!(app.chat_view.cursor(), 0, "what is read opens at its top");
+        typed(&mut app, "3j");
+
+        typed(&mut app, "q");
+        assert!(!app.reader.is_open());
+        assert_eq!(app.chat_view.place(), kept);
+        assert_eq!(app.focus, Focus::Chat);
+    }
+
+    /// Scrolling to the top of a reading asks for nothing: the top is the reading's, not
+    /// the older turns of the thread underneath.
+    #[tokio::test]
+    async fn the_top_of_a_reading_asks_for_no_older_turns() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        reading_a_pull_request(&mut app);
+        let thread = app.thread.as_mut().unwrap();
+        thread.has_more = true;
+        thread.before_cursor = Some("page-1".into());
+        drawn(&mut app);
+        app.mode = Mode::Normal;
+        app.focus = Focus::Chat;
+        typed(&mut app, "G");
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        typed(&mut app, "gg");
+        assert_eq!(app.chat_view.offset(), 0, "at the top");
+        while let Some(request) = asked(&mut requests).await {
+            assert!(
+                !matches!(request, crate::session::Request::LoadOlder { .. }),
+                "asked for older turns"
+            );
+        }
+    }
+
+    /// The spinner turns while a thread works, and nothing laid out in the chat draws
+    /// it, so the chat is not laid out again for it.
+    #[tokio::test]
+    async fn the_chat_is_not_laid_out_again_as_the_spinner_turns() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+        app.current_thread_id = Some("t1".into());
+        drawn(&mut app);
+        let builds = app.chat_view.layout().builds();
+        for _ in 0..8 {
+            apply(&mut app, AppEvent::Tick);
+            drawn(&mut app);
+        }
+        assert!(app.spinner >= 8, "the spinner turned");
+        assert_eq!(app.chat_view.layout().builds(), builds);
+
+        // What the thread says is another matter.
+        app.thread.as_mut().unwrap().touch();
+        drawn(&mut app);
+        assert_eq!(app.chat_view.layout().builds(), builds + 1);
+    }
+
+    /// A pull request says how long ago each review was, which moves on with the clock
+    /// and nothing else, so it is laid out again when the minute turns. A thread is not.
+    #[test]
+    fn a_pull_request_is_laid_out_again_when_the_minute_turns() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(stacked_thread());
+        let key = |app: &App, minute| {
+            chat_view::Key::of(&app.reader, app.thread.as_ref(), &app.expanded, 0, minute)
+        };
+        assert_eq!(key(&app, 1), key(&app, 2), "a thread keeps no time");
+
+        showing(&mut app, open_detail("layer 1"));
+        assert!(key(&app, 1).is_some());
+        assert_ne!(key(&app, 1), key(&app, 2));
+    }
+
+    /// A search can open a thread whose chat is not the height the last one's was: its
+    /// draft takes more of the screen, or a question does. The match is gone to once a
+    /// frame has shown the thread, so it is in view at the height the thread is drawn at.
+    #[test]
+    fn a_match_in_a_thread_drawn_shorter_is_in_view() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let mut before = rewindable_thread();
+        before.detail.shell.id = "t0".into();
+        app.thread = Some(before);
+        app.current_thread_id = Some("t0".into());
+        drawn(&mut app);
+        let tall = app.chat_view.height();
+
+        // The search opens `t1`, whose draft is six lines long.
+        app.thread = Some(rewindable_thread());
+        app.current_thread_id = Some("t1".into());
+        app.composer.set_text("one\ntwo\nthree\nfour\nfive\nsix");
+        app.jump = Some(Jump {
+            thread_id: "t1".into(),
+            created_at: Some("2026-01-01T10:09:00Z".into()),
+            query: "a4".into(),
+            asked_before: None,
+        });
+        // As the event loop goes: the frame, then the jump.
+        drawn(&mut app);
+        app.settle_jump();
+        assert!(app.jump.is_none());
+        let height = app.chat_view.height();
+        assert!(height < tall, "the draft takes rows from the chat");
+        let view = app.chat();
+        let (offset, cursor) = (view.offset(), view.cursor());
+        assert!(
+            (offset..offset + height).contains(&cursor),
+            "{cursor} is not in {offset}..{}",
+            offset + height
+        );
+        assert_eq!(view.layout().row(cursor).trim(), "a4");
+        drawn(&mut app);
+        assert_eq!(
+            app.chat_view.cursor(),
+            cursor,
+            "and the frame leaves it there"
+        );
     }
 
     /// A match older than what is loaded has the older turns asked for, once.
@@ -11362,57 +10284,6 @@ mod tests {
         assert!(app.completion.is_some());
     }
 
-    /// A thread in plan mode on a worktree, with a plan waiting and an older one built.
-    fn planned_thread() -> ThreadState {
-        let snapshot: ThreadDetailSnapshot = serde_json::from_value(json!({
-            "snapshotSequence": 1,
-            "thread": {
-                "id": "t1", "projectId": "p", "title": "Test",
-                "modelSelection": {"instanceId": "instance", "model": "a-model"},
-                "runtimeMode": "full-access", "interactionMode": "plan",
-                "branch": "tria/abc", "worktreePath": "/worktrees/p-1",
-                "latestTurn": {"turnId": "turn", "state": "completed"},
-                "hasActionableProposedPlan": true,
-                "messages": [], "activities": [],
-                "proposedPlans": [
-                    {"id": "old", "planMarkdown": "# Old", "implementedAt": "2026-01-01T09:00:00Z",
-                        "createdAt": "2026-01-01T08:00:00Z"},
-                    {"id": "plan", "planMarkdown": "\n# Add a queue\n\n1. do it\n",
-                        "createdAt": "2026-01-01T10:00:00Z"},
-                ]
-            }
-        }))
-        .expect("a plan the server could have sent");
-        ThreadState::from_snapshot(snapshot)
-    }
-
-    /// `:implement` sends the plan back out of plan mode, naming it, so the server can
-    /// mark it built.
-    #[tokio::test]
-    async fn implement_builds_the_waiting_plan_here() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(planned_thread());
-        app.current_thread_id = Some("t1".into());
-
-        app.run_command("implement");
-        let command = sent_command(&mut requests)
-            .await
-            .expect("the plan was sent");
-        assert_eq!(command["type"], "thread.turn.start");
-        assert_eq!(command["threadId"], "t1");
-        assert_eq!(command["interactionMode"], "default");
-        assert_eq!(
-            command["message"]["text"],
-            "PLEASE IMPLEMENT THIS PLAN:\n# Add a queue\n\n1. do it"
-        );
-        assert_eq!(
-            command["sourceProposedPlan"],
-            json!({"threadId": "t1", "planId": "plan"})
-        );
-    }
-
     /// `:implement new` makes a thread where this one works, named for the plan, and
     /// moves there only once the server has made it.
     #[tokio::test]
@@ -11450,7 +10321,7 @@ mod tests {
             .await
             .ok()
             .flatten();
-        let Some(event @ AppEvent::PlanThreadCreated(_)) = made else {
+        let Some(event @ AppEvent::Outbox(_)) = made else {
             panic!("no word the thread was made");
         };
         apply(&mut app, event);
@@ -11459,58 +10330,6 @@ mod tests {
             command["threadId"].as_str(),
             "not moved to the new thread"
         );
-    }
-
-    /// A built plan is not built again.
-    #[test]
-    fn implement_wants_a_plan_nobody_has_built() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        let mut thread = planned_thread();
-        thread.detail.proposed_plans.retain(|p| p.id == "old");
-        app.thread = Some(thread);
-        app.current_thread_id = Some("t1".into());
-        app.run_command("implement");
-        assert!(app.toast.as_ref().unwrap().0.contains("no plan"));
-    }
-
-    /// Three finished turns, the second of them steered: `u3` arrived while it ran.
-    fn rewindable_thread() -> ThreadState {
-        let message = |id: &str, role: &str, turn: Option<&str>, at: &str| {
-            json!({"id": id, "role": role, "text": id, "turnId": turn,
-                "createdAt": format!("2026-01-01T10:{at}:00Z")})
-        };
-        let checkpoint = |turn: &str, count: u32, at: &str| {
-            json!({"turnId": turn, "checkpointTurnCount": count,
-                "completedAt": format!("2026-01-01T10:{at}:00Z")})
-        };
-        let snapshot: ThreadDetailSnapshot = serde_json::from_value(json!({
-            "snapshotSequence": 1,
-            "thread": {
-                "id": "t1", "projectId": "p", "title": "Test",
-                "modelSelection": {"instanceId": "instance", "model": "a-model"},
-                "latestTurn": {"turnId": "three", "state": "completed"},
-                "messages": [
-                    message("u1", "user", None, "00"),
-                    message("a1", "assistant", Some("one"), "01"),
-                    message("u2", "user", None, "03"),
-                    message("a2", "assistant", Some("two"), "04"),
-                    message("u3", "user", None, "05"),
-                    message("a3", "assistant", Some("two"), "06"),
-                    message("u4", "user", None, "08"),
-                    message("a4", "assistant", Some("three"), "09"),
-                ],
-                "checkpoints": [
-                    checkpoint("one", 1, "02"),
-                    checkpoint("two", 2, "07"),
-                    checkpoint("three", 3, "10"),
-                ],
-                "activities": []
-            }
-        }))
-        .expect("a thread the server could have sent");
-        ThreadState::from_snapshot(snapshot)
     }
 
     /// A steer is part of the turn it joined, so rewinding to it or to the prompt it
@@ -11552,6 +10371,12 @@ mod tests {
 
         app.ask_rewind(Some("u3"));
         assert!(app.rewind_ask.is_some(), "it asks first");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            sent_no_command(&mut requests).await,
+            "rewound without a yes"
+        );
+        app.ask_rewind(Some("u3"));
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let command = sent_command(&mut requests)
             .await
@@ -11571,7 +10396,7 @@ mod tests {
             .detail
             .messages
             .retain(|m| m.id == "u1" || m.id == "a1");
-        app.check_rewind();
+        app.notice_open_thread();
         assert!(!app.is_rewinding());
         assert_eq!(app.composer.text(), "half written\n\nu2\n\nu3");
         assert_eq!(app.mode, Mode::Insert);
@@ -11598,37 +10423,6 @@ mod tests {
             .expect("a rewind was sent");
         assert_eq!(command["type"], "thread.checkpoint.revert");
         assert_eq!(command["turnCount"], 2);
-    }
-
-    /// The server takes the command before it does the work, and says it could not
-    /// in the thread. That is where the reason is read from.
-    #[tokio::test]
-    async fn a_rewind_the_server_could_not_do_says_why() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(rewindable_thread());
-        app.current_thread_id = Some("t1".into());
-        app.ask_rewind(None);
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        let failed: crate::model::Event = serde_json::from_value(json!({
-            "sequence": 2, "type": "thread.activity-appended",
-            "payload": {"threadId": "t1", "activity": {"id": "f1", "kind": "checkpoint.revert.failed",
-                "summary": "Checkpoint revert failed", "payload": {"detail": "no checkpoint"},
-                "turnId": null, "createdAt": ""}}
-        }))
-        .unwrap();
-        app.on_update(crate::session::Update::Thread {
-            thread_id: "t1".into(),
-            item: ThreadItem::Event { event: failed },
-        });
-        assert!(!app.is_rewinding());
-        assert_eq!(app.toast.as_ref().unwrap().0, "not rewound: no checkpoint");
-        assert!(
-            app.composer.is_empty(),
-            "nothing went, so nothing comes back"
-        );
     }
 
     /// Not while a turn runs, and not where the provider cannot drop turns.
@@ -11683,31 +10477,49 @@ mod tests {
         assert!(refreshed, "the thread was not asked for again");
     }
 
-    /// Where the composer is not free, putting the message back would write over
-    /// something else somebody typed. It goes to the thread it was meant for if that
-    /// draft is free, and otherwise it stays in the history and the toast says so.
-    #[test]
-    fn a_refused_message_does_not_write_over_what_took_its_place() {
+    /// A thread the server removes takes what was being written for it along: its parked
+    /// draft, and what it had queued, which is said out loud and left in the history.
+    #[tokio::test]
+    async fn a_removed_thread_takes_what_was_written_for_it() {
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         app.thread = Some(running_thread());
         app.current_thread_id = Some("t1".into());
+        app.mode = Mode::Insert;
+        app.composer.set_text("after that");
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.composer.set_text("half written");
+        app.open_thread("t2");
+        assert!(app.outbox.parked("t1").is_some());
 
-        // Something written since: the composer is left alone.
-        app.composer.set_text("the next one");
-        app.on_send_refused("t1".into(), "the message".into(), "refused".into());
-        assert_eq!(app.composer.text(), "the next one");
-        assert!(app.toast.as_ref().unwrap().0.contains("history"));
+        app.on_update(Update::Shell(ShellItem::ThreadRemoved {
+            sequence: 1,
+            thread_id: "t1".into(),
+        }));
+        assert!(app.outbox.parked("t1").is_none(), "a draft for nothing");
+        let said = app.toast.as_ref().expect("it says so").0.clone();
+        assert!(said.contains("queued message was dropped"), "{said}");
+        app.composer.history_prev();
+        assert_eq!(app.composer.text(), "after that");
+    }
 
-        // Somewhere else entirely: it waits in the thread it was written in.
-        app.current_thread_id = Some("t2".into());
-        app.on_send_refused("t1".into(), "the message".into(), "refused".into());
-        assert_eq!(
-            app.drafts.get("t1").map(String::as_str),
-            Some("the message")
-        );
-        assert_eq!(app.composer.text(), "the next one");
+    /// What is half written in one thread waits there while another is open, and is
+    /// there again on the way back.
+    #[test]
+    fn a_draft_waits_in_its_thread_while_another_is_open() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.open_thread("t1");
+        app.composer.set_text("half written");
+        app.open_thread("t2");
+        assert!(app.composer.is_empty(), "t2 has nothing of its own");
+        app.composer.set_text("   ");
+        app.open_thread("t1");
+        assert_eq!(app.composer.text(), "half written");
+        app.open_thread("t2");
+        assert!(app.composer.is_empty(), "blanks came back for t2");
     }
 
     /// The app keeps a handful of letters the composer's Vim has no use for, but a key
@@ -11884,9 +10696,49 @@ mod tests {
         };
         let path = worktree.path.clone();
         app.worktrees = vec![worktree];
-        app.worktree_selected = 0;
+        app.worktree_cursor = ListCursor::default();
         app.mode = Mode::Worktrees;
         path
+    }
+
+    /// Two threads can work in the one worktree — a plan implemented in its own thread,
+    /// a pull request checked out where it was — and the list has a row for each, so `j`
+    /// goes through both and `Enter` opens the one it is on.
+    #[tokio::test]
+    async fn j_goes_through_threads_that_share_a_worktree() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let shared = holding(&mut app, Some(false));
+        let other = |id: &str, path: &str| ThreadWorktree {
+            thread_id: id.into(),
+            title: format!("thread {id}"),
+            project: "p".into(),
+            project_cwd: "/src/p".into(),
+            path: path.into(),
+            branch: None,
+            settled: true,
+            running: false,
+            changes: Some(false),
+            files: Vec::new(),
+        };
+        app.worktrees = vec![
+            other("a", "/worktrees/p/a"),
+            other("t1", &shared),
+            other("t2", &shared),
+            other("z", "/worktrees/p/z"),
+        ];
+        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        for at in 1..4 {
+            app.on_key(j);
+            assert_eq!(
+                app.worktree_cursor.selection(&app.worktree_rows()),
+                Some(at)
+            );
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.current_thread_id.as_deref(), Some("t2"));
     }
 
     /// A worktree on its way out says so until the server answers, whichever way, and
@@ -12227,16 +11079,6 @@ mod tests {
     }
 
     use super::{split_args, tmux_session_name, window_args};
-
-    #[test]
-    fn search_matching_is_smartcase() {
-        use super::{line_matches, match_ranges};
-        assert!(line_matches("Nx cache", "nx"));
-        assert!(!line_matches("nx cache", "Nx"));
-        assert_eq!(match_ranges("a nx b NX", "nx"), vec![(2, 4), (7, 9)]);
-        assert_eq!(match_ranges("ÄÖ nx", "nx"), vec![(5, 7)]);
-        assert!(match_ranges("abc", "").is_empty());
-    }
 
     #[test]
     fn session_name_is_the_directory_basename() {

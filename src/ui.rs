@@ -1,7 +1,6 @@
 //! Rendering. Layout: optional thread sidebar, header, chat, approval panel,
 //! composer, status line. Overlays: picker and help.
 
-use std::collections::HashSet;
 use std::num::NonZeroU16;
 
 use ratatui::{
@@ -16,16 +15,15 @@ use ratatui_image::sliced::SignedPosition;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{
-        App, Checkout, Focus, Mode, PickerKind, Scroll, Section, SidebarRow, SidebarTab,
-        approval_options,
-    },
+    app::{App, Checkout, Focus, Mode, PickerKind, Section, SidebarRow, approval_options},
     config::SidebarLayout,
+    list_cursor::{ListCursor, Row},
     model::ThreadStatus,
     picture,
+    reader::{Badge, Source},
     session::Status,
+    sidebar_view::Tab,
     subagent,
-    timeline::{self, Block as ChatBlock, BlockKey},
 };
 
 const SIDEBAR_WIDTH: u16 = 34;
@@ -51,37 +49,6 @@ const SELECTED: Color = Color::Indexed(238);
 const MOST_ICON_PIXELS: u32 = 64;
 const COMPOSER_MAX_ROWS: u16 = 8;
 
-/// Cached rendered chat blocks with their wrapped heights.
-#[derive(Default)]
-pub struct ChatCache {
-    key: Option<(String, u64, u16, u16, u64, u8, usize)>,
-    blocks: Vec<CachedBlock>,
-    total: usize,
-    /// Every content line as displayed, filled on demand for search.
-    lines: Option<Vec<String>>,
-}
-
-pub struct CachedBlock {
-    block: ChatBlock,
-    /// The block's text broken into the rows it is drawn as.
-    wrapped: timeline::Wrapped,
-    /// Toggle regions in wrapped content lines relative to the block start.
-    rows: Vec<timeline::Region>,
-    exports: Vec<(String, String)>,
-    /// Images in wrapped content lines relative to the block start.
-    images: Vec<timeline::Placed>,
-}
-
-impl CachedBlock {
-    fn height(&self) -> usize {
-        self.wrapped.lines.len()
-    }
-}
-
-thread_local! {
-    static CACHE: std::cell::RefCell<ChatCache> = std::cell::RefCell::new(ChatCache::default());
-}
-
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let show_sidebar = app.sidebar_visible && area.width >= MIN_WIDTH_FOR_SIDEBAR;
@@ -97,6 +64,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_sidebar(frame, app, sidebar_area);
     } else {
         app.sidebar_inner = None;
+        app.sidebar_view.resize(0);
     }
 
     let pending = app
@@ -116,7 +84,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     let question_rows = user_input
         .as_ref()
-        .map(|q| question_panel_rows(app, q, main_area.width))
+        .map(|q| question_panel_rows(app, q, main_area.width, main_area.height))
         .unwrap_or(0);
     let composer_rows = app
         .composer
@@ -245,67 +213,39 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
     {
         return;
     }
-    let offset = app.chat_offset();
-    let (cursor, column) = app.chat_spot();
-    let row = |line: usize| {
-        (line >= offset)
-            .then(|| chat.y + (line - offset) as u16)
-            .filter(|y| *y < chat.y + chat.height)
-    };
+    let view = &app.chat_view;
     let buffer = frame.buffer_mut();
-    let paint = |buffer: &mut ratatui::buffer::Buffer, line, from: u16, to: u16, style| {
-        let Some(y) = row(line) else { return };
+    let paint = |buffer: &mut ratatui::buffer::Buffer, row: usize, from: u16, to: u16, style| {
+        let y = chat.y + row as u16;
         for x in from.max(chat.x)..to.min(chat.x + chat.width) {
             if let Some(cell) = buffer.cell_mut(Position::new(x, y)) {
                 cell.set_style(style);
             }
         }
     };
+    let cursor = view.cursor_cell();
     // The line being read is tinted rather than filled, so the conversation keeps the
     // colours it is written in and the cursor is still easy to find on a wide screen.
-    paint(
-        buffer,
-        cursor,
-        chat.x,
-        chat.x + chat.width,
-        Style::default().bg(Color::Indexed(236)),
-    );
-    if let Some(anchor) = app.chat_visual {
-        let style = Style::default().bg(Color::Blue).fg(Color::White);
-        let head = (anchor.line, anchor.column.min(chat_len(anchor.line)));
-        let spot = (cursor, column);
-        let (first, last) = if head <= spot {
-            (head, spot)
-        } else {
-            (spot, head)
-        };
-        for line in first.0..=last.0 {
-            let (from, to) = if anchor.whole_lines {
-                (0, chat.width)
-            } else {
-                let from = if line == first.0 {
-                    chat_column(line, first.1)
-                } else {
-                    0
-                };
-                let to = if line == last.0 {
-                    chat_column(line, last.1 + 1)
-                } else {
-                    chat_column(line, chat_len(line))
-                };
-                // An empty line still shows that it is in the selection.
-                (from, to.max(from + 1))
-            };
-            paint(buffer, line, chat.x + from, chat.x + to, style);
-        }
+    if let Some((row, _)) = cursor {
+        paint(
+            buffer,
+            row,
+            chat.x,
+            chat.x + chat.width,
+            Style::default().bg(Color::Indexed(236)),
+        );
+    }
+    let style = Style::default().bg(Color::Blue).fg(Color::White);
+    for (row, from, to) in view.selection(chat.width) {
+        paint(buffer, row, chat.x + from, chat.x + to, style);
     }
     // The cursor is a block on the character under it, as the composer's is, drawn as
     // whichever way round that cell is not so it shows on the tinted line and inside a
     // selection alike.
-    if let Some(y) = row(cursor) {
-        let x = chat.x + chat_column(cursor, column);
+    if let Some((row, column)) = cursor {
+        let x = chat.x + column;
         if x < chat.x + chat.width
-            && let Some(cell) = buffer.cell_mut(Position::new(x, y))
+            && let Some(cell) = buffer.cell_mut(Position::new(x, chat.y + row as u16))
         {
             let style = if cell.style().add_modifier.contains(Modifier::REVERSED) {
                 Style::default().remove_modifier(Modifier::REVERSED)
@@ -315,51 +255,6 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
             cell.set_style(style);
         }
     }
-}
-
-/// Plain text of a block or tool row by export key.
-pub fn chat_export(key: &str) -> Option<String> {
-    CACHE.with(|cache| {
-        cache
-            .borrow()
-            .blocks
-            .iter()
-            .flat_map(|b| b.exports.iter())
-            .find(|(k, _)| k == key)
-            .map(|(_, text)| text.clone())
-    })
-}
-
-/// Plain text of the whole conversation as currently loaded.
-pub fn chat_export_all() -> String {
-    CACHE.with(|cache| {
-        cache
-            .borrow()
-            .blocks
-            .iter()
-            .filter_map(|b| b.exports.first().map(|(_, text)| text.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n")
-    })
-}
-
-/// Every content line of the chat as displayed, marks and indents and all, kept from one
-/// rebuild to the next for search to read.
-pub fn chat_lines() -> Vec<String> {
-    CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.lines.is_none() {
-            let mut lines = Vec::with_capacity(cache.total);
-            for cached in &cache.blocks {
-                lines.extend(cached.wrapped.lines.iter().map(|line| {
-                    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                    text.trim_end().to_string()
-                }));
-            }
-            cache.lines = Some(lines);
-        }
-        cache.lines.clone().unwrap_or_default()
-    })
 }
 
 /// Paint search matches on the visible chat rows, reading the drawn cells so highlights land
@@ -439,7 +334,7 @@ fn apply_links(frame: &mut Frame, app: &mut App, chat: Rect) {
 }
 
 fn apply_search_highlights(frame: &mut Frame, app: &App, chat: Rect) {
-    let query = match (&app.search_input, &app.search) {
+    let query = match (&app.search_input, app.chat_view.search()) {
         (Some(input), _) if app.mode == Mode::Search => input.query.text(),
         (_, Some(search)) if app.focus == Focus::Chat => search.query.clone(),
         _ => return,
@@ -461,7 +356,7 @@ fn apply_search_highlights(frame: &mut Frame, app: &App, chat: Rect) {
                 text.push_str(symbol);
             }
         }
-        for (from, to) in crate::app::match_ranges(&text, query) {
+        for (from, to) in crate::chat_view::match_ranges(&text, query) {
             for &(byte, x) in &starts {
                 if byte >= from
                     && byte < to
@@ -472,103 +367,6 @@ fn apply_search_highlights(frame: &mut Frame, app: &App, chat: Rect) {
             }
         }
     }
-}
-
-/// The chat text from one point to another, each a content line and a character on it,
-/// the end exclusive. What comes back is what was written rather than what was drawn: the
-/// marks and indents the chat decorates its lines with are left out, and a line broken
-/// over several rows comes back as the one line it was, spaces and all.
-pub fn chat_span(start: (usize, usize), end: (usize, usize)) -> Option<String> {
-    CACHE.with(|cache| {
-        let cache = cache.borrow();
-        // The pieces to take, each a byte range of one line of one block. Rows of the
-        // same line join into one piece, which puts back the space a break swallowed.
-        let mut pieces: Vec<(usize, usize, usize, usize)> = Vec::new();
-        let mut y = 0usize;
-        for (index, cached) in cache.blocks.iter().enumerate() {
-            let block_start = y;
-            y += cached.height();
-            if y <= start.0 || block_start > end.0 {
-                continue;
-            }
-            for (row, at) in cached.wrapped.rows.iter().enumerate() {
-                let line = block_start + row;
-                if line < start.0 || line > end.0 {
-                    continue;
-                }
-                let from = if line == start.0 {
-                    cached.wrapped.byte(row, start.1)
-                } else {
-                    at.start
-                };
-                let to = if line == end.0 {
-                    cached.wrapped.byte(row, end.1)
-                } else {
-                    at.end
-                };
-                match pieces.last_mut() {
-                    Some(last) if (last.0, last.1) == (index, at.line) => last.3 = to.max(last.3),
-                    _ => pieces.push((index, at.line, from, to)),
-                }
-            }
-        }
-        if pieces.is_empty() {
-            return None;
-        }
-        Some(
-            pieces
-                .iter()
-                .map(|&(block, line, from, to)| {
-                    &cache.blocks[block].wrapped.texts[line][from..to.max(from)]
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-    })
-}
-
-/// The block a content line belongs to, and which of its rows the line is.
-fn locate(cache: &ChatCache, line: usize) -> Option<(&CachedBlock, usize)> {
-    let mut y = 0usize;
-    for cached in &cache.blocks {
-        if line < y + cached.height() {
-            return Some((cached, line - y));
-        }
-        y += cached.height();
-    }
-    None
-}
-
-/// The character of a content line drawn at a column of the chat, for a click or a drag.
-pub fn chat_index(line: usize, column: u16) -> usize {
-    CACHE.with(|cache| {
-        let cache = cache.borrow();
-        locate(&cache, line).map_or(0, |(block, row)| block.wrapped.index(row, column))
-    })
-}
-
-/// Where a character of a content line is drawn, as a column of the chat.
-pub fn chat_column(line: usize, index: usize) -> u16 {
-    CACHE.with(|cache| {
-        let cache = cache.borrow();
-        locate(&cache, line).map_or(0, |(block, row)| block.wrapped.column(row, index))
-    })
-}
-
-/// What a content line says, without the decoration it is drawn with.
-pub fn chat_row(line: usize) -> String {
-    CACHE.with(|cache| {
-        let cache = cache.borrow();
-        locate(&cache, line).map_or(String::new(), |(block, row)| block.wrapped.text(row).into())
-    })
-}
-
-/// How many characters a content line can be addressed by, its decoration not counted.
-pub fn chat_len(line: usize) -> usize {
-    CACHE.with(|cache| {
-        let cache = cache.borrow();
-        locate(&cache, line).map_or(0, |(block, row)| block.wrapped.len(row))
-    })
 }
 
 /// Highlight the drag over the chat cells it covers.
@@ -700,12 +498,12 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut title: Vec<Span> = vec![Span::raw(" ")];
     let mut spans = Vec::new();
     let mut at = area.x + 1;
-    for (index, tab) in SidebarTab::ALL.iter().enumerate() {
+    for (index, tab) in Tab::ALL.iter().enumerate() {
         if index > 0 {
             title.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
             at += 3;
         }
-        let style = if *tab == app.sidebar_tab {
+        let style = if *tab == app.sidebar_view.tab() {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
@@ -713,15 +511,15 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(Color::DarkGray)
         };
         let mut parts = match tab {
-            SidebarTab::Threads => vec![Span::styled("threads".to_string(), style)],
-            SidebarTab::PullRequests => vec![Span::styled(counted("PRs", layers.len()), style)],
-            SidebarTab::Agents => vec![Span::styled(counted("agents", agents.len()), style)],
+            Tab::Threads => vec![Span::styled("threads".to_string(), style)],
+            Tab::PullRequests => vec![Span::styled(counted("PRs", layers.len()), style)],
+            Tab::Agents => vec![Span::styled(counted("agents", agents.len()), style)],
         };
         match tab {
-            SidebarTab::PullRequests if failing => {
+            Tab::PullRequests if failing => {
                 parts.push(Span::styled(" ✗", Style::default().fg(Color::Red)))
             }
-            SidebarTab::Agents if working => parts.push(Span::styled(
+            Tab::Agents if working => parts.push(Span::styled(
                 format!(" {}", app.spinner_frame()),
                 Style::default().fg(Color::Cyan),
             )),
@@ -754,36 +552,23 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     app.sidebar_inner = Some(inner);
+    app.sidebar_view.resize(inner.height);
 
     let rows = app.sidebar_rows();
-    let reading_url = app
-        .transcript
-        .as_ref()
-        .and_then(|t| t.pull_request())
-        .map(|d| d.url.clone());
-    let reading_agent = app
-        .transcript
-        .as_ref()
-        .and_then(|t| t.agent_id())
-        .map(str::to_string);
+    let lent = app.sidebar_view_rows(&rows);
+    let offset = app.sidebar_view.offset(&lent);
+    let reading_url = app.reader.pull_request().map(|d| d.url.clone());
+    let reading_agent = app.reader.agent_id().map(str::to_string);
     let width = inner.width as usize;
     let dim = Style::default().fg(Color::DarkGray);
     let two_line = app.sidebar_layout == SidebarLayout::TwoLine;
     // Selection is drawn by hand so the wheel can scroll the list without the
-    // selected row dragging the viewport back.
-    let selected = if rows.is_empty() {
-        None
-    } else if focused {
-        Some(app.sidebar_selected.min(rows.len() - 1))
+    // selected row dragging the viewport back. Unfocused, the mark is on what is open:
+    // the thread, or the pull request or subagent being read in place of it.
+    let selected = if focused {
+        app.sidebar_view.selection(&lent)
     } else {
-        // Unfocused, the mark is on what is open: the thread, or the pull request or
-        // subagent being read in place of it.
-        rows.iter().position(|row| match row {
-            SidebarRow::Thread { id, .. } => Some(id) == app.current_thread_id.as_ref(),
-            SidebarRow::PullRequest { url, .. } => Some(url) == reading_url.as_ref(),
-            SidebarRow::Agent { id } => Some(id) == reading_agent.as_ref(),
-            _ => false,
-        })
+        app.sidebar_open_row(&rows)
     };
     // Which list has the keys is the border's to say, so the mark is the same either
     // way: it is answering which row, not which pane.
@@ -889,34 +674,8 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 let Some(agent) = agents.iter().find(|agent| &agent.id == id) else {
                     return ListItem::new(Line::from(""));
                 };
-                let (glyph, glyph_style) = match agent.status {
-                    subagent::Status::Pending
-                    | subagent::Status::Running
-                    | subagent::Status::Waiting => {
-                        (app.spinner_frame(), Style::default().fg(Color::Cyan))
-                    }
-                    subagent::Status::Idle => ("○", dim),
-                    subagent::Status::Completed => ("✓", Style::default().fg(Color::Green)),
-                    subagent::Status::Failed => ("✗", Style::default().fg(Color::Red)),
-                    subagent::Status::Cancelled | subagent::Status::Interrupted => {
-                        ("·", Style::default().fg(Color::Yellow))
-                    }
-                };
-                let now = crate::commands::now_iso();
-                let elapsed = agent
-                    .started_at
-                    .as_deref()
-                    .map(|started| {
-                        elapsed_label(
-                            started,
-                            agent
-                                .completed_at
-                                .as_deref()
-                                .filter(|_| !agent.status.is_active())
-                                .unwrap_or(&now),
-                        )
-                    })
-                    .unwrap_or_default();
+                let (glyph, glyph_style) = subagent_glyph(app, agent.status);
+                let elapsed = subagent_elapsed(agent, &crate::commands::now_iso());
                 let mut title_style = Style::default();
                 if Some(id) == reading_agent.as_ref() {
                     title_style = title_style.add_modifier(Modifier::BOLD);
@@ -933,14 +692,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 if !two_line {
                     return ListItem::new(first);
                 }
-                let activity = agent
-                    .activity()
-                    .unwrap_or_else(|| agent.status.label().to_string());
-                let style = if agent.status == subagent::Status::Failed {
-                    Style::default().fg(Color::Red)
-                } else {
-                    dim
-                };
+                let (activity, style) = subagent_activity(agent);
                 ListItem::new(vec![
                     first,
                     Line::from(Span::styled(
@@ -1060,20 +812,11 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let height = inner.height as usize;
-    let max_offset = app.sidebar_max_offset(&rows, height);
-    app.sidebar_offset = app.sidebar_offset.min(max_offset);
-    if app.sidebar_reveal {
-        app.sidebar_reveal = false;
-        if let Some(sel) = selected {
-            app.sidebar_offset = app.sidebar_offset_showing(&rows, sel, height);
-        }
-    }
-    let mut state = ListState::default().with_offset(app.sidebar_offset);
+    let mut state = ListState::default().with_offset(offset);
     let list = List::new(items);
     frame.render_stateful_widget(list, inner, &mut state);
     if two_line {
-        draw_sidebar_icons(frame, app, inner, &rows);
+        draw_sidebar_icons(frame, app, inner, &rows[offset.min(rows.len())..]);
     }
 }
 
@@ -1136,9 +879,10 @@ fn draw_drawn_icon(frame: &mut Frame, name: &str, colour: Option<&str>, area: Re
     false
 }
 
+/// The icons of `rows`, the rows in view from the top of the list down.
 fn draw_sidebar_icons(frame: &mut Frame, app: &App, inner: Rect, rows: &[SidebarRow]) {
     let mut line = 0usize;
-    for row in rows.iter().skip(app.sidebar_offset) {
+    for row in rows {
         let height = app.sidebar_row_height(row);
         if line >= inner.height as usize {
             break;
@@ -1187,44 +931,30 @@ fn checks_glyph(checks: Option<&str>) -> Option<(&'static str, Color)> {
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
-    // While a transcript is open the header names what is being read, since the chat
-    // below it is no longer the thread's own conversation.
-    if let Some(transcript) = &app.transcript {
+    // While something is read in place of the conversation the header names it, since the
+    // chat below it is no longer the thread's own conversation.
+    if let Some(header) = app.reader.header() {
         spans.push(Span::styled("⤷ ", Style::default().fg(Color::Magenta)));
         spans.push(Span::styled(
-            transcript.title.clone(),
+            header.title,
             Style::default().add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            format!("  {}", transcript.subtitle),
+            format!("  {}", header.subtitle),
             Style::default().fg(Color::DarkGray),
         ));
-        if transcript.truncated {
+        for badge in header.badges {
+            let color = match badge {
+                Badge::Truncated => Color::Yellow,
+                Badge::Working => Color::Cyan,
+            };
             spans.push(Span::styled(
-                "  cut at 1 MB",
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-        // A run still going has written more since this was read, and nothing tells us.
-        if transcript.live {
-            spans.push(Span::styled(
-                "  still working",
-                Style::default().fg(Color::Cyan),
+                format!("  {}", badge.text()),
+                Style::default().fg(color),
             ));
         }
         spans.push(Span::styled(
-            if transcript
-                .pull_request()
-                .is_some_and(|d| d.labels_editable())
-            {
-                "  r re-reads · gx opens · L labels · q back"
-            } else if transcript.pull_request().is_some() {
-                "  r re-reads · gx opens · q back"
-            } else if transcript.live {
-                "  r re-reads · q back"
-            } else {
-                "  q back"
-            },
+            format!("  {}", header.hint),
             Style::default().fg(Color::DarkGray),
         ));
         let width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -1425,14 +1155,10 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         height: area.height,
     };
     app.chat_area = inner;
+    app.chat_view.resize(inner.width, inner.height);
     // A subagent's transcript, or a pull request, is read in place of the conversation,
     // through the same chat: scrolled, searched, and yanked like it.
-    let open = app
-        .transcript
-        .as_ref()
-        .map(|transcript| &transcript.state)
-        .or(app.thread.as_ref());
-    let Some(thread) = open else {
+    if app.reader.conversation().or(app.thread.as_ref()).is_none() {
         let text = if app.draft.is_some() {
             "Type your first message below and press Enter."
         } else if app.current_thread_id.is_some() {
@@ -1451,215 +1177,45 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
             inner,
         );
-        app.chat_viewport = (inner.height as usize, 0);
         return;
-    };
+    }
 
-    // Owned, and read before the drawing below takes hold of the app.
-    let stack = app.pull_request_stack();
-    let expanded_hash = hash_set(&app.expanded);
-    let key = (
-        thread.id().to_string(),
-        thread.revision,
-        inner.width,
-        inner.height,
-        expanded_hash,
-        app.open_levels,
-        app.spinner % 8,
-    );
-    CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let needs_rebuild = match &cache.key {
-            Some(existing) => {
-                existing.0 != key.0
-                    || existing.1 != key.1
-                    || existing.2 != key.2
-                    || existing.3 != key.3
-                    || existing.4 != key.4
-                    || existing.5 != key.5
-                    || (thread.is_running() && existing.6 != key.6)
-            }
-            None => true,
+    let view = app.chat();
+    let mut y = inner.y;
+    for shown in view.shown() {
+        let rect = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: shown.lines.len() as u16,
         };
-        if needs_rebuild {
-            // A pull request is drawn by its own module, already styled; everything after
-            // this treats its blocks like any others.
-            let blocks = match app.transcript.as_ref().and_then(|t| t.pull_request()) {
-                Some(detail) => crate::pull_request::blocks(
-                    detail,
-                    &crate::pull_request::Context {
-                        activity: app.pull_request_activity.get(&detail.url),
-                        stack: stack.as_ref().map(|(layers, at)| (layers.as_slice(), *at)),
-                        expanded: &app.expanded,
-                        open_levels: app.open_levels,
-                        size: (inner.width, inner.height),
-                        images: &app.pull_request_images,
-                        now: &crate::commands::now_iso(),
-                    },
-                ),
-                None => timeline::build(
-                    thread,
-                    &app.expanded,
-                    app.open_levels,
-                    inner.width,
-                    inner.height,
-                ),
-            };
-            let mut total = 0usize;
-            let blocks: Vec<CachedBlock> = blocks
-                .into_iter()
-                .map(|mut block| {
-                    let exports = std::mem::take(&mut block.exports);
-                    let wrapped = timeline::wrap(&block.text, inner.width);
-                    total += wrapped.lines.len();
-                    // Where each line of the text starts turns text-line row ranges into
-                    // content lines, and says where an image's reserved lines landed.
-                    let (rows, images) = if block.rows.is_empty() {
-                        (Vec::new(), Vec::new())
-                    } else {
-                        let starts = &wrapped.starts;
-                        let rows = block
-                            .rows
-                            .iter()
-                            .map(|region| timeline::Region {
-                                first: starts[region.first],
-                                end: starts[region.end.min(starts.len() - 1)],
-                                ..region.clone()
-                            })
-                            .collect();
-                        let images = block
-                            .images
-                            .iter()
-                            .map(|placed| timeline::Placed {
-                                line: starts[placed.line.min(starts.len() - 1)],
-                                ..placed.clone()
-                            })
-                            .collect();
-                        (rows, images)
-                    };
-                    CachedBlock {
-                        block,
-                        wrapped,
-                        rows,
-                        exports,
-                        images,
-                    }
-                })
-                .collect();
-            cache.blocks = blocks;
-            cache.total = total;
-            cache.key = Some(key);
-            cache.lines = None;
-        }
-
-        let height = inner.height as usize;
-        let max_offset = cache.total.saturating_sub(height);
-        let offset = match app.scroll {
-            Scroll::Follow => max_offset,
-            Scroll::Offset(o) => o.min(max_offset),
-        };
-        app.chat_viewport = (height, cache.total);
-        app.work_ranges.clear();
-        app.picture_ranges.clear();
-        app.chat_pictures.clear();
-        app.block_ranges.clear();
-        app.message_starts.clear();
-        if app.focus == Focus::Chat {
-            app.chat_cursor = if app.scroll == Scroll::Follow {
-                cache.total.saturating_sub(1)
-            } else {
-                app.chat_cursor.min(cache.total.saturating_sub(1))
-            };
-        }
-
-        let mut y = 0usize;
-        let mut cursor = inner.y;
-        let bottom = inner.y + inner.height;
-        for cached in &cache.blocks {
-            let CachedBlock {
-                block,
-                wrapped,
-                rows,
-                exports,
-                images,
-            } = cached;
-            let start = y;
-            let end = y + cached.height();
-            y = end;
-            if matches!(block.key, BlockKey::Message(_) | BlockKey::Section(_)) {
-                app.message_starts.push(start);
-            }
-            if let Some((key, _)) = exports.first() {
-                app.block_ranges.push((start, end, key.clone()));
-            }
-            app.chat_pictures.extend(block.pictures.iter().cloned());
-            if matches!(block.key, BlockKey::Message(_)) {
-                app.picture_ranges
-                    .extend(rows.iter().map(|region| timeline::Region {
-                        first: start + region.first,
-                        end: start + region.end,
-                        ..region.clone()
-                    }));
-            }
-            if let BlockKey::Section(_) = &block.key {
-                app.work_ranges
-                    .extend(rows.iter().map(|region| timeline::Region {
-                        first: start + region.first,
-                        end: start + region.end,
-                        ..region.clone()
-                    }));
-            }
-            if let BlockKey::Work(key) = &block.key {
-                app.work_ranges.push(timeline::Region {
-                    first: start,
-                    end,
-                    key: key.clone(),
-                    foldable: true,
-                });
-                for region in rows {
-                    app.work_ranges.push(timeline::Region {
-                        first: start + region.first,
-                        end: start + region.end,
-                        ..region.clone()
-                    });
-                }
-            }
-            if end <= offset {
+        // Already broken to the width, so the widget is only placing the rows.
+        frame.render_widget(Paragraph::new(Text::from(shown.lines.to_vec())), rect);
+        // Over the blank lines the block left for them, and clipped to what of the
+        // block is on the screen: an image scrolls like the text it sits in. Each is
+        // placed again first, which costs nothing while the drawing cache still has it
+        // and puts it back where the cache let it go, with nothing laid out again.
+        for placed in shown.images {
+            if picture::place(&placed.key, placed.picture.source(), placed.room).is_none() {
                 continue;
             }
-            if cursor >= bottom {
-                break;
-            }
-            let skip = offset.saturating_sub(start);
-            let visible = (cached.height() - skip).min((bottom - cursor) as usize);
-            let rect = Rect {
-                x: inner.x,
-                y: cursor,
-                width: inner.width,
-                height: visible as u16,
-            };
-            // Already broken to the width, so the widget is only placing the rows.
-            frame.render_widget(
-                Paragraph::new(Text::from(wrapped.lines[skip..skip + visible].to_vec())),
+            picture::draw(
+                frame,
+                &placed.key,
                 rect,
+                SignedPosition::from((
+                    placed.indent as i16,
+                    placed.line as i16 - shown.skip as i16,
+                )),
             );
-            // Over the blank lines the block left for them, and clipped to what of the
-            // block is on the screen: an image scrolls like the text it sits in.
-            for placed in images {
-                picture::draw(
-                    frame,
-                    &placed.key,
-                    rect,
-                    SignedPosition::from((placed.indent as i16, placed.line as i16 - skip as i16)),
-                );
-            }
-            cursor += visible as u16;
         }
+        y += rect.height;
+    }
 
-        if cache.total > height {
-            draw_scrollbar(frame, area, offset, cache.total, height);
-        }
-    });
+    let (total, height) = (view.total(), view.height());
+    if total > height {
+        draw_scrollbar(frame, area, view.offset(), total, height);
+    }
 }
 
 fn draw_scrollbar(frame: &mut Frame, area: Rect, offset: usize, total: usize, height: usize) {
@@ -1752,63 +1308,91 @@ fn draw_approval(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn question_panel_rows(app: &App, pending: &crate::state::PendingUserInput, width: u16) -> u16 {
-    let index = app
-        .question
-        .as_ref()
-        .filter(|d| d.request_id == pending.request_id)
-        .map(|d| d.index)
-        .unwrap_or(0);
-    let Some(question) = pending.questions.get(index) else {
-        return 0;
-    };
-    let text_rows = Paragraph::new(question.text.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(width.saturating_sub(4)) as u16;
-    // border + question text + options + custom line + hint line
-    (1 + text_rows + question.options.len() as u16 + 2).min(16)
-}
-
-fn draw_question(
-    frame: &mut Frame,
+fn question_panel_rows(
     app: &App,
     pending: &crate::state::PendingUserInput,
-    area: Rect,
-) {
+    width: u16,
+    height: u16,
+) -> u16 {
+    let Some(panel) = question_panel(app, pending, width) else {
+        return 0;
+    };
+    // The border, then every row the panel wraps to, up to half the screen so the chat
+    // is still there to check an answer against.
+    (1 + panel.lines.len() as u16).min(16.max(height / 2))
+}
+
+/// The question panel as it is drawn: its title, and each row it wraps to at `width`.
+struct QuestionPanel {
+    title: String,
+    accent: Style,
+    lines: Vec<Line<'static>>,
+    /// The row of the custom answer's field, and the cursor's column in what it shows,
+    /// while it is being written.
+    field_cursor: Option<(u16, u16)>,
+}
+
+/// `body` wrapped to what is left of `width` after `prefix`, the rows after the first
+/// starting under the first rather than under the prefix, and each row in `style`
+/// across the whole width.
+fn hang(
+    prefix: Vec<Span<'static>>,
+    body: Vec<Span<'static>>,
+    width: u16,
+    style: Style,
+) -> Vec<Line<'static>> {
+    let indent: usize = prefix.iter().map(|span| span.width()).sum();
+    let room = (width as usize).saturating_sub(indent).max(1) as u16;
+    let wrapped = crate::timeline::wrap(&Text::from(Line::from(body)), room);
+    let mut prefix = Some(prefix);
+    wrapped
+        .lines
+        .into_iter()
+        .map(|row| {
+            let mut spans = prefix
+                .take()
+                .unwrap_or_else(|| vec![Span::raw(" ".repeat(indent))]);
+            spans.extend(row.spans);
+            let used: usize = spans.iter().map(|span| span.width()).sum();
+            spans.push(Span::raw(" ".repeat((width as usize).saturating_sub(used))));
+            Line::from(spans).style(style)
+        })
+        .collect()
+}
+
+fn question_panel(
+    app: &App,
+    pending: &crate::state::PendingUserInput,
+    width: u16,
+) -> Option<QuestionPanel> {
     let active = matches!(app.mode, Mode::Question | Mode::QuestionCustom);
     let draft = app
         .question
         .as_ref()
         .filter(|d| d.request_id == pending.request_id);
     let index = draft.map(|d| d.index).unwrap_or(0);
-    let Some(question) = pending.questions.get(index) else {
-        return;
-    };
+    let question = pending.questions.get(index)?;
     let accent = if active {
         Style::default().fg(Color::Magenta)
     } else {
         Style::default().fg(Color::Yellow)
     };
+    let dim = Style::default().fg(Color::DarkGray);
 
     let mut title = format!(" {} ", question.header);
     if pending.questions.len() > 1 {
         title.push_str(&format!("· {}/{} ", index + 1, pending.questions.len()));
     }
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(accent)
-        .title(Line::from(Span::styled(
-            title,
-            accent.add_modifier(Modifier::BOLD),
-        )));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        format!("  {}", question.text),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
+    let mut lines: Vec<Line<'static>> = hang(
+        vec![Span::raw("  ")],
+        vec![Span::styled(
+            question.text.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )],
+        width,
+        Style::default(),
+    );
     let selected = draft
         .map(|d| d.current_answer().selected.clone())
         .unwrap_or_default();
@@ -1824,58 +1408,31 @@ fn draw_question(
             (false, true) => "(•)",
             (false, false) => "( )",
         };
+        // The option under the keys is tinted the way the chat's cursor line is, which
+        // everything on it, the dim description too, can still be read over.
         let row_style = if active && highlight == i {
-            Style::default().bg(Color::DarkGray)
+            Style::default().bg(Color::Indexed(236))
         } else {
             Style::default()
         };
-        let mut spans = vec![
+        let prefix = vec![
             Span::styled(format!("  {} ", i + 1), accent.add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!("{marker} "),
-                if is_selected {
-                    accent
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                },
-            ),
-            Span::styled(option.label.clone(), row_style),
+            Span::styled(format!("{marker} "), if is_selected { accent } else { dim }),
         ];
+        let mut body = vec![Span::raw(option.label.clone())];
         if !option.description.is_empty() {
-            spans.push(Span::styled(
-                format!(
-                    "  {}",
-                    fit(
-                        &option.description,
-                        inner
-                            .width
-                            .saturating_sub(option.label.chars().count() as u16 + 12)
-                            as usize
-                    )
-                ),
-                Style::default().fg(Color::DarkGray),
-            ));
+            body.push(Span::styled(format!("  {}", option.description), dim));
         }
-        lines.push(Line::from(spans).style(row_style));
+        lines.extend(hang(prefix, body, width, row_style));
     }
     // The field is one row of the panel, so a long answer scrolls inside it rather than
     // wrapping and pushing the hint off the bottom. `  c > ` takes the first six columns.
-    let field_width = inner.width.saturating_sub(6) as usize;
+    let field_width = width.saturating_sub(6) as usize;
     let mut field_cursor = None;
     if question.allow_custom {
         if app.mode == Mode::QuestionCustom {
             let (visible, cursor) = app.custom_answer.line_window(field_width);
-            // The rows above the field are however many the question text and the
-            // options wrapped to, which is not one apiece.
-            let row: u16 = lines
-                .iter()
-                .map(|line| {
-                    Paragraph::new(line.clone())
-                        .wrap(Wrap { trim: false })
-                        .line_count(inner.width) as u16
-                })
-                .sum();
-            field_cursor = Some((row, cursor as u16));
+            field_cursor = Some((lines.len() as u16, cursor as u16));
             lines.push(Line::from(vec![
                 Span::styled("  c ", accent.add_modifier(Modifier::BOLD)),
                 Span::styled("> ", accent),
@@ -1890,15 +1447,15 @@ fn draw_question(
         } else {
             lines.push(Line::from(vec![
                 Span::styled("  c ", accent.add_modifier(Modifier::BOLD)),
-                Span::styled("( ) ", Style::default().fg(Color::DarkGray)),
-                Span::styled("type a custom answer", Style::default().fg(Color::DarkGray)),
+                Span::styled("( ) ", dim),
+                Span::styled("type a custom answer", dim),
             ]));
         }
     }
     let hint = if !active {
-        "  a or Enter to answer".to_string()
+        "a or Enter to answer".to_string()
     } else if app.mode == Mode::QuestionCustom {
-        "  Enter confirm · Esc back".to_string()
+        "Enter confirm · Esc back".to_string()
     } else {
         let mut parts = vec![if question.multi_select {
             "digits/Space toggle · Enter next"
@@ -1915,15 +1472,44 @@ fn draw_question(
             parts.push("d dismiss");
         }
         parts.push("Esc leave");
-        format!("  {}", parts.join(" · "))
+        parts.join(" · ")
     };
-    lines.push(Line::from(Span::styled(
-        hint,
-        Style::default().fg(Color::DarkGray),
-    )));
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    lines.extend(hang(
+        vec![Span::raw("  ")],
+        vec![Span::styled(hint, dim)],
+        width,
+        Style::default(),
+    ));
+    Some(QuestionPanel {
+        title,
+        accent,
+        lines,
+        field_cursor,
+    })
+}
 
-    if let Some((row, cursor)) = field_cursor
+fn draw_question(
+    frame: &mut Frame,
+    app: &App,
+    pending: &crate::state::PendingUserInput,
+    area: Rect,
+) {
+    let Some(panel) = question_panel(app, pending, area.width) else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(panel.accent)
+        .title(Line::from(Span::styled(
+            panel.title,
+            panel.accent.add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // Already wrapped, one line a row, so the rows drawn are the rows counted.
+    frame.render_widget(Paragraph::new(panel.lines), inner);
+
+    if let Some((row, cursor)) = panel.field_cursor
         && row < inner.height
     {
         frame.set_cursor_position((
@@ -1984,11 +1570,7 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
             crate::app::TranscriptSend::Now => "Enter",
             crate::app::TranscriptSend::Queued => "Ctrl-s",
         };
-        let noun = app
-            .transcript
-            .as_ref()
-            .map(|t| t.noun())
-            .unwrap_or("what is open");
+        let noun = app.reader.noun().unwrap_or("what is open");
         block = block.title_bottom(Line::from(Span::styled(
             format!(
                 " this goes to the main agent, with context about {noun} · {key} or y sends · anything else keeps writing "
@@ -2245,11 +1827,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             " VISUAL ",
             Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
         ),
-        (_, Focus::Chat) if app.chat_visual.is_some_and(|a| a.whole_lines) => (
+        (_, Focus::Chat) if app.chat_view.visual().is_some_and(|a| a.whole_lines) => (
             " VISUAL LINE ",
             Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
         ),
-        (_, Focus::Chat) if app.chat_visual.is_some() => (
+        (_, Focus::Chat) if app.chat_view.visual().is_some() => (
             " VISUAL ",
             Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
         ),
@@ -2711,7 +2293,7 @@ fn vt_color(color: vt100::Color, fallback: Color) -> Color {
 
 /// The thread's terminal sessions, with close and restart. These are real shells on the
 /// server, shared with the desktop app.
-fn draw_worktrees(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_worktrees(frame: &mut Frame, app: &mut App, area: Rect) {
     let worktrees = &app.worktrees;
     let width = 88.min(area.width);
     let inner_width = width.saturating_sub(4) as usize;
@@ -2719,16 +2301,15 @@ fn draw_worktrees(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Three lines each, and there can be a great many: show the ones around the cursor
     // rather than a list that runs off the bottom of the screen.
-    let selection = app.worktree_selected.min(worktrees.len().saturating_sub(1));
-    let room = (area.height.saturating_sub(6) / 3).max(1) as usize;
-    let first = selection
-        .saturating_sub(room.saturating_sub(1))
-        .min(worktrees.len().saturating_sub(room.min(worktrees.len())));
-    if first > 0 {
-        lines.push(Line::from(Span::styled(format!("   ⋯ {first} above"), dim)));
-    }
-    for (index, worktree) in worktrees.iter().enumerate().skip(first).take(room) {
-        let selected = index == selection;
+    let (selection, view) = popup_view(&app.worktree_cursor, &app.worktree_rows(), area);
+    lines.extend(above(view.start));
+    for (index, worktree) in worktrees
+        .iter()
+        .enumerate()
+        .skip(view.start)
+        .take(view.len())
+    {
+        let selected = Some(index) == selection;
         let removing = app.removing.contains(&worktree.path);
         // What it is waiting for, which is what says whether it can go.
         let (glyph, glyph_style) = if removing {
@@ -2783,10 +2364,7 @@ fn draw_worktrees(frame: &mut Frame, app: &App, area: Rect) {
             dim,
         )));
     }
-    let below = worktrees.len().saturating_sub(first + room);
-    if below > 0 {
-        lines.push(Line::from(Span::styled(format!("   ⋯ {below} below"), dim)));
-    }
+    lines.extend(below(worktrees.len() - view.end));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  j k select · Enter open the thread · x remove · X remove anyway · Esc",
@@ -2818,7 +2396,14 @@ fn draw_worktrees(frame: &mut Frame, app: &App, area: Rect) {
 /// else in that list is recoverable — a removed worktree leaves its branch behind — and
 /// this is the one thing that is not, so it shows the work it would take rather than
 /// asking about it in the abstract.
-fn draw_worktree_confirm(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_worktree_confirm(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Room for the rest of the box: the border, the title, the path, the branch, the
+    // blank, the count, the line saying how many are below, the blank, and the hint. The
+    // keys are told it, so they scroll no further than it shows.
+    let room = (area.height.saturating_sub(10)).max(1) as usize;
+    if let Some(confirm) = app.worktree_confirm.as_mut() {
+        confirm.room = room;
+    }
     let Some((confirm, worktree)) = app.confirming_worktree() else {
         return;
     };
@@ -2879,11 +2464,7 @@ fn draw_worktree_confirm(frame: &mut Frame, app: &App, area: Rect) {
             dim,
         ))),
     }
-    // Room for the rest of the box: the border, the title, the path, the branch, the
-    // blank, the count, the line saying how many are below, the blank, and the hint.
-    let room = (area.height.saturating_sub(10)).max(1) as usize;
-    let first = confirm.offset.min(files.len().saturating_sub(1));
-    let first = first.min(files.len().saturating_sub(room.min(files.len())));
+    let first = confirm.offset.min(confirm.last(files.len()));
     for file in files.iter().skip(first).take(room) {
         // No label on a file with no line counts: an untracked one and a file whose
         // mode alone changed both come through with none, and saying which would be
@@ -2959,8 +2540,15 @@ fn draw_terminals(frame: &mut Frame, app: &App, area: Rect) {
             dim,
         )));
     }
-    for (index, terminal) in terminals.iter().enumerate() {
-        let selected = index == app.terminal_selected.min(terminals.len() - 1);
+    let (selection, view) = popup_view_or_whole(&app.terminal_cursor, &app.terminal_rows(), area);
+    lines.extend(above(view.start));
+    for (index, terminal) in terminals
+        .iter()
+        .enumerate()
+        .skip(view.start)
+        .take(view.len())
+    {
+        let selected = Some(index) == selection;
         let (glyph, glyph_style) = match terminal.status.as_str() {
             _ if terminal.has_running_subprocess => {
                 (app.spinner_frame(), Style::default().fg(Color::Cyan))
@@ -3003,6 +2591,7 @@ fn draw_terminals(frame: &mut Frame, app: &App, area: Rect) {
             dim,
         )));
     }
+    lines.extend(below(terminals.len() - view.end));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  j k select · Enter attach · c new · x close · r restart · Esc",
@@ -3041,32 +2630,12 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
             dim,
         )));
     }
-    let selected_index = app.agent_selected.min(agents.len().saturating_sub(1));
-    for (index, agent) in agents.iter().enumerate() {
-        let selected = index == selected_index;
-        let (glyph, glyph_style) = match agent.status {
-            subagent::Status::Pending | subagent::Status::Running | subagent::Status::Waiting => {
-                (app.spinner_frame(), Style::default().fg(Color::Cyan))
-            }
-            subagent::Status::Idle => ("○", dim),
-            subagent::Status::Completed => ("✓", Style::default().fg(Color::Green)),
-            subagent::Status::Failed => ("✗", Style::default().fg(Color::Red)),
-            subagent::Status::Cancelled | subagent::Status::Interrupted => {
-                ("·", Style::default().fg(Color::Yellow))
-            }
-        };
-        // A running subagent is timed from its start; a settled one kept the time it took.
-        let elapsed = agent.started_at.as_deref().map(|started| {
-            elapsed_label(
-                started,
-                agent
-                    .completed_at
-                    .as_deref()
-                    .filter(|_| !agent.status.is_active())
-                    .unwrap_or(&now),
-            )
-        });
-        let elapsed = elapsed.unwrap_or_default();
+    let (selection, view) = popup_view_or_whole(&app.agent_cursor, &app.agent_rows(), area);
+    lines.extend(above(view.start));
+    for (index, agent) in agents.iter().enumerate().skip(view.start).take(view.len()) {
+        let selected = Some(index) == selection;
+        let (glyph, glyph_style) = subagent_glyph(app, agent.status);
+        let elapsed = subagent_elapsed(agent, &now);
         let role = agent
             .role
             .as_deref()
@@ -3093,16 +2662,10 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(role, dim),
             Span::styled(format!("  {elapsed}"), dim),
         ]));
-        let activity = agent
-            .activity()
-            .unwrap_or_else(|| agent.status.label().to_string());
+        let (activity, activity_style) = subagent_activity(agent);
         lines.push(Line::from(Span::styled(
             format!("      {}", fit(&activity, inner_width.saturating_sub(6))),
-            if agent.status == subagent::Status::Failed {
-                Style::default().fg(Color::Red)
-            } else {
-                dim
-            },
+            activity_style,
         )));
         let mut facts: Vec<String> = Vec::new();
         if let Some(model) = agent.model_label() {
@@ -3118,10 +2681,14 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
         if agent.activations > 1 {
             facts.push(format!("run {}", agent.activations));
         }
-        if app.transcript_path(agent).is_none() {
+        let path = app
+            .thread
+            .as_ref()
+            .and_then(|thread| crate::reader::transcript_path(thread, agent));
+        if path.is_none() {
             facts.push("no transcript".to_string());
         }
-        if app.transcript_loading.as_deref() == Some(agent.id.as_str()) {
+        if app.reader.is_loading(&Source::Subagent(agent.id.clone())) {
             facts.push("reading…".to_string());
         }
         lines.push(Line::from(Span::styled(
@@ -3132,6 +2699,7 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
             dim,
         )));
     }
+    lines.extend(below(agents.len() - view.end));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  j k select · Enter read the transcript · y yank the report · Esc",
@@ -3161,6 +2729,87 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     frame.render_widget(Paragraph::new(text), inner);
+}
+
+/// How a subagent is doing, as the glyph beside it, in the roster and the sidebar alike.
+fn subagent_glyph(app: &App, status: subagent::Status) -> (&'static str, Style) {
+    match status {
+        subagent::Status::Pending | subagent::Status::Running | subagent::Status::Waiting => {
+            (app.spinner_frame(), Style::default().fg(Color::Cyan))
+        }
+        subagent::Status::Idle => ("○", Style::default().fg(Color::DarkGray)),
+        subagent::Status::Completed => ("✓", Style::default().fg(Color::Green)),
+        subagent::Status::Failed => ("✗", Style::default().fg(Color::Red)),
+        subagent::Status::Cancelled | subagent::Status::Interrupted => {
+            ("·", Style::default().fg(Color::Yellow))
+        }
+    }
+}
+
+/// How long a subagent has been at it: a running one is timed from its start, and a
+/// settled one kept the time it took. Nothing for one that has not said when it started.
+fn subagent_elapsed(agent: &subagent::Subagent, now: &str) -> String {
+    let Some(started) = agent.started_at.as_deref() else {
+        return String::new();
+    };
+    let end = agent
+        .completed_at
+        .as_deref()
+        .filter(|_| !agent.status.is_active())
+        .unwrap_or(now);
+    elapsed_label(started, end)
+}
+
+/// The line under a subagent's title: what it is doing, or how it came out, and in red
+/// when that was a failure.
+fn subagent_activity(agent: &subagent::Subagent) -> (String, Style) {
+    let activity = agent
+        .activity()
+        .unwrap_or_else(|| agent.status.label().to_string());
+    let style = if agent.status == subagent::Status::Failed {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    (activity, style)
+}
+
+/// Which rows of one of the lists over the screen are in view, and which of them is
+/// selected. As many as the screen has room for under the list's border, the blank and
+/// the hint under it, and the lines saying what is above and below.
+fn popup_view(
+    cursor: &ListCursor<String>,
+    rows: &[Row<String>],
+    area: Rect,
+) -> (Option<usize>, std::ops::Range<usize>) {
+    let lines = area.height.saturating_sub(6) as usize;
+    (cursor.selection(rows), cursor.window(rows, lines))
+}
+
+/// The same for a list drawn whole when it fits under its border, the blank and the hint,
+/// with no lines about the rest since there is none; only a list that does not is windowed.
+fn popup_view_or_whole(
+    cursor: &ListCursor<String>,
+    rows: &[Row<String>],
+    area: Rect,
+) -> (Option<usize>, std::ops::Range<usize>) {
+    let lines: usize = rows.iter().map(|row| row.height).sum();
+    if lines <= area.height.saturating_sub(4) as usize {
+        return (cursor.selection(rows), 0..rows.len());
+    }
+    popup_view(cursor, rows, area)
+}
+
+/// The line saying how many rows of a list are above the ones in view, when any are.
+fn above(count: usize) -> Option<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    (count > 0).then(|| Line::from(Span::styled(format!("   ⋯ {count} above"), dim)))
+}
+
+/// The line saying how many rows of a list are below the ones in view, when any are.
+fn below(count: usize) -> Option<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    (count > 0).then(|| Line::from(Span::styled(format!("   ⋯ {count} below"), dim)))
 }
 
 /// Token counts as the desktop writes them: `840`, `73.4k`, `1.2M`.
@@ -3700,15 +3349,6 @@ fn fit(text: &str, max: usize) -> String {
     }
 }
 
-fn hash_set(set: &HashSet<String>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut keys: Vec<&String> = set.iter().collect();
-    keys.sort();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    keys.hash(&mut hasher);
-    hasher.finish()
-}
-
 #[cfg(test)]
 mod tests {
     use base64::Engine;
@@ -3738,7 +3378,7 @@ mod tests {
         }
     }
 
-    fn drawn(width: u16, height: u16, app: &App) -> String {
+    fn drawn(width: u16, height: u16, app: &mut App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| draw_worktrees(frame, app, frame.area()))
@@ -3763,7 +3403,7 @@ mod tests {
         let mut app = App::new(handle, events);
         app.worktrees = vec![worktree(1), worktree(2)];
         app.removing.insert(worktree(1).path);
-        let drawn = drawn(88, 20, &app);
+        let drawn = drawn(88, 20, &mut app);
         let lines: Vec<&str> = drawn.lines().collect();
         let first = lines
             .iter()
@@ -3791,7 +3431,7 @@ mod tests {
             .collect();
         let path = worktree.path.clone();
         app.worktrees = vec![worktree];
-        app.worktree_confirm = Some(crate::app::WorktreeConfirm { path, offset: 0 });
+        app.worktree_confirm = Some(crate::app::WorktreeConfirm::new(path));
     }
 
     /// Removing a worktree is ordinarily safe — the branch stays — and git refuses one
@@ -3807,7 +3447,7 @@ mod tests {
             &mut app,
             &[("notes.md", 0, 0), ("src/lib.rs", 12, 3), ("out/", 0, 0)],
         );
-        let drawn = drawn(90, 24, &app);
+        let drawn = drawn(90, 24, &mut app);
 
         assert!(drawn.contains("remove this worktree"), "{drawn}");
         assert!(
@@ -3824,7 +3464,8 @@ mod tests {
         assert!(drawn.contains("Esc"), "{drawn}");
     }
 
-    /// The list can be longer than the box, so it moves.
+    /// The list can be longer than the box, so it moves, and no further down than the box
+    /// has room to show: at its foot, `k` moves it at once.
     #[test]
     fn a_long_list_of_losses_can_be_read_through() {
         let (handle, _requests) = crate::session::Handle::detached();
@@ -3836,14 +3477,52 @@ mod tests {
             many.iter().map(|(p, i, d)| (p.as_str(), *i, *d)).collect();
         dirty(&mut app, &many);
 
-        let top = drawn(90, 24, &app);
+        let top = drawn(90, 24, &mut app);
         assert!(top.contains("file-0.txt"), "{top}");
         assert!(top.contains("more"), "it says there are more: {top}");
 
-        app.worktree_confirm.as_mut().unwrap().offset = 39;
-        let bottom = drawn(90, 24, &app);
+        app.mode = crate::app::Mode::Worktrees;
+        let key = |c| {
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            )
+        };
+        app.on_key(key('G'));
+        let bottom = drawn(90, 24, &mut app);
         assert!(bottom.contains("file-39.txt"), "{bottom}");
-        assert!(!bottom.contains("file-0.txt"), "{bottom}");
+        assert!(!bottom.contains("file-25.txt"), "{bottom}");
+        app.on_key(key('k'));
+        let up = drawn(90, 24, &mut app);
+        assert!(up.contains("file-25.txt"), "{up}");
+    }
+
+    /// A box made taller after `G` scrolled its list shows more of it, and `k` still
+    /// moves the list at once from there.
+    #[test]
+    fn k_moves_a_list_of_losses_made_taller_at_once() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let many: Vec<(String, u32, u32)> =
+            (0..40).map(|n| (format!("file-{n}.txt"), 0, 0)).collect();
+        let many: Vec<(&str, u32, u32)> =
+            many.iter().map(|(p, i, d)| (p.as_str(), *i, *d)).collect();
+        dirty(&mut app, &many);
+        app.mode = crate::app::Mode::Worktrees;
+        let key = |c| {
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            )
+        };
+        drawn(90, 24, &mut app);
+        app.on_key(key('G'));
+        drawn(90, 24, &mut app);
+        drawn(90, 40, &mut app);
+        app.on_key(key('k'));
+        let up = drawn(90, 40, &mut app);
+        assert!(up.contains("file-9.txt"), "{up}");
     }
 
     fn status_line(app: &App) -> String {
@@ -4046,6 +3725,35 @@ mod tests {
         assert!(!row.contains("a=T"), "{row}");
     }
 
+    /// Terminals that all fit are drawn whole, as they were before the list could scroll:
+    /// the room kept for saying what is above and below is only taken when something is.
+    #[test]
+    fn terminals_that_fit_are_drawn_whole() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.current_thread_id = Some("t1".into());
+        app.terminals = (0..7)
+            .map(|n| {
+                serde_json::from_value(json!({
+                    "threadId": "t1", "terminalId": format!("t{n}"), "cwd": "/src/p",
+                    "status": "running", "label": format!("shell t{n}"),
+                }))
+                .unwrap()
+            })
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(80, 25)).unwrap();
+        terminal
+            .draw(|frame| draw_terminals(frame, &app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let screen: String = (0..25)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(screen.contains("shell t6"), "{screen}");
+        assert!(!screen.contains("⋯"), "{screen}");
+    }
+
     /// More worktrees than there are rows for is the case worth drawing: the cursor has
     /// to stay on the screen, and what is not on it has to be said rather than dropped.
     #[test]
@@ -4054,17 +3762,24 @@ mod tests {
         let (events, _events) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         app.worktrees = (0..20).map(worktree).collect();
-        app.worktree_selected = 19;
+        app.mode = crate::app::Mode::Worktrees;
+        let key = |c| {
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            )
+        };
+        app.on_key(key('G'));
 
-        let screen = drawn(100, 24, &app);
+        let screen = drawn(100, 24, &mut app);
         assert!(screen.contains("thread number 19"), "{screen}");
         assert!(!screen.contains("thread number 0 "), "{screen}");
         assert!(screen.contains("above"), "{screen}");
         assert!(screen.contains("worktrees (20, 20 settled)"), "{screen}");
 
         // From the top, the other end is the one summarised.
-        app.worktree_selected = 0;
-        let screen = drawn(100, 24, &app);
+        app.on_key(key('g'));
+        let screen = drawn(100, 24, &mut app);
         assert!(screen.contains("thread number 0"), "{screen}");
         assert!(screen.contains("below"), "{screen}");
     }
@@ -4121,16 +3836,17 @@ mod tests {
 
         let buffer = screen(60, &mut app);
         let region = app
-            .picture_ranges
+            .chat_view
+            .layout()
+            .picture_ranges()
             .first()
             .cloned()
             .expect("the message has a picture");
         assert_eq!(
-            app.chat_pictures,
-            [(
-                region.key.clone(),
-                crate::timeline::Picture::File(path.to_string_lossy().into_owned())
-            )],
+            app.chat_view.layout().picture_at(region.first),
+            Some(&crate::timeline::Picture::File(
+                path.to_string_lossy().into_owned()
+            )),
             "and `gx` opens the file itself"
         );
         // Half-blocks are colour rather than glyphs, so a drawn row is a painted one.
@@ -4142,11 +3858,51 @@ mod tests {
                     .is_some_and(|bg| bg != Color::Reset)
             })
         };
-        let top = app.chat_area.y + (region.first + 1 - app.chat_offset()) as u16;
+        let top = app.chat_area.y + (region.first + 1 - app.chat_view.offset()) as u16;
         assert!(painted(top), "the picture starts under its caption");
         assert!(
-            painted(app.chat_area.y + (region.end - 1 - app.chat_offset()) as u16),
+            painted(app.chat_area.y + (region.end - 1 - app.chat_view.offset()) as u16),
             "and runs to the end of the lines it was given"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The drawing cache lets pictures go: the screen is handed to another program and
+    /// back, or other pictures push them out. Nothing about the thread changed, so the
+    /// chat is not laid out again, and the picture is drawn all the same.
+    #[test]
+    fn a_picture_the_drawing_cache_let_go_is_still_drawn() {
+        crate::picture::draw_in_halfblocks();
+        let path = std::env::temp_dir().join("tria-a-forgotten-picture.png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(crate::picture::test_png(120, 60))
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_answering(&format!(
+            "Here it is.\n\n![the viewer serving a run]({})\n",
+            path.display()
+        )));
+        screen(60, &mut app);
+        let builds = app.chat_view.layout().builds();
+        let region = app.chat_view.layout().picture_ranges()[0].clone();
+        let y = app.chat_area.y + (region.first + 1 - app.chat_view.offset()) as u16;
+
+        crate::picture::forget();
+        let buffer = screen(60, &mut app);
+        assert_eq!(
+            app.chat_view.layout().builds(),
+            builds,
+            "nothing was laid out again"
+        );
+        assert!(
+            (0..buffer.area.width).any(|x| buffer[(x, y)]
+                .style()
+                .bg
+                .is_some_and(|bg| bg != Color::Reset)),
+            "the picture is drawn under its caption"
         );
         std::fs::remove_file(&path).unwrap();
     }
@@ -4379,6 +4135,91 @@ mod tests {
         );
     }
 
+    /// A question whose first option says a lot, being answered with that option marked.
+    fn answering_a_long_option() -> App {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let snapshot: crate::model::ThreadDetailSnapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p", "title": "Test",
+                "modelSelection": {"instanceId": "instance", "model": "a-model"},
+                "runtimeMode": "full-access", "latestTurn": null, "session": null,
+                "messages": [], "activities": [{
+                    "id": "a1", "kind": "user-input.requested",
+                    "payload": {"requestId": "r1", "questions": [{
+                        "id": "q1", "header": "Pick", "question": "Which one?",
+                        "options": [
+                            {"label": "Keep the cache",
+                             "description": "hold on to what was built last time and only rebuild what changed since then, which is quicker"},
+                            {"label": "Start over", "description": "build it all"},
+                        ]
+                    }]}
+                }]
+            }
+        }))
+        .unwrap();
+        app.thread = Some(crate::state::ThreadState::from_snapshot(snapshot));
+        let pending = app.thread.as_ref().unwrap().pending_user_input().unwrap();
+        app.question = Some(crate::question::QuestionDraft::new(&pending));
+        app.mode = Mode::Question;
+        app
+    }
+
+    /// A long option wraps under itself rather than being cut short, and every row of
+    /// it is drawn.
+    #[test]
+    fn a_long_option_wraps_under_itself() {
+        let mut app = answering_a_long_option();
+        let drawn = chat(60, &mut app);
+        assert!(!drawn.contains('…'), "nothing cut short:\n{drawn}");
+        for word in ["quicker", "Start over", "build it all", "Esc leave"] {
+            assert!(drawn.contains(word), "{word} is drawn:\n{drawn}");
+        }
+        // The rows after the first start under the option's words, not under its number.
+        let first = drawn
+            .lines()
+            .position(|l| l.contains("Keep the cache"))
+            .unwrap();
+        let at = drawn.lines().nth(first).unwrap().find("Keep").unwrap();
+        let next = drawn.lines().nth(first + 1).unwrap();
+        assert_eq!(
+            next.len() - next.trim_start().len(),
+            at,
+            "hangs under it:\n{drawn}"
+        );
+    }
+
+    /// Everything on the option marked is written in a colour of its own, not the one it
+    /// is marked with.
+    #[test]
+    fn the_option_marked_can_be_read() {
+        let mut app = answering_a_long_option();
+        let buffer = screen(60, &mut app);
+        let area = buffer.area;
+        let row = (0..area.height)
+            .find(|&y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("Keep the cache")
+            })
+            .unwrap();
+        for x in 0..area.width {
+            let cell = &buffer[(x, row)];
+            if cell.symbol().trim().is_empty() {
+                continue;
+            }
+            assert_ne!(
+                cell.fg,
+                cell.bg,
+                "{:?} at {x} is written in its background",
+                cell.symbol()
+            );
+        }
+    }
+
     fn screen(width: u16, app: &mut App) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
@@ -4449,29 +4290,6 @@ mod tests {
         );
     }
 
-    /// What is taken out of the chat is what was written into it, not what was drawn: no
-    /// marks, and a message broken over rows comes back as the one line it was.
-    #[test]
-    fn what_is_yanked_is_the_message_and_not_its_decoration() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        let said = "one two three four five six seven eight";
-        app.thread = Some(thread_saying(said));
-        chat(30, &mut app);
-
-        let start = app.message_starts.first().copied().unwrap();
-        // The label is the block's first row; the message itself starts under it and
-        // runs over the two rows it was broken into.
-        let text = chat_span((start + 1, 0), (start + 2, usize::MAX)).unwrap();
-        assert_eq!(text, said);
-        // And a piece of a row is only that piece.
-        assert_eq!(
-            chat_span((start + 1, 4), (start + 1, 7)),
-            Some("two".into())
-        );
-    }
-
     #[tokio::test]
     async fn a_pane_that_did_not_start_shows_why_and_how_to_close_it() {
         let (handle, _requests) = crate::session::Handle::detached();
@@ -4488,6 +4306,16 @@ mod tests {
         assert!(text.contains("Esc closes"), "{text}");
     }
 
+    /// Put the chat cursor on a character of a line, the way the keys do.
+    fn put_cursor(app: &mut App, line: usize, column: usize) {
+        let view = app.chat();
+        view.set_cursor(line);
+        view.line_start();
+        for _ in 0..column {
+            view.right();
+        }
+    }
+
     #[test]
     fn insert_mode_does_not_leave_a_second_cursor_in_the_chat() {
         let (handle, _requests) = crate::session::Handle::detached();
@@ -4496,11 +4324,12 @@ mod tests {
         app.thread = Some(thread_saying("read this"));
         app.focus = Focus::Chat;
         app.mode = Mode::Insert;
-        app.scroll = Scroll::Offset(0);
+        // The first frame is what tells the chat how big it is.
         chat(50, &mut app);
-        app.chat_cursor = app.message_starts[0] + 1;
+        let line = app.chat().layout().message_starts()[0] + 1;
+        put_cursor(&mut app, line, 0);
         let buffer = screen(50, &mut app);
-        let y = app.chat_area.y + (app.chat_cursor - app.chat_offset()) as u16;
+        let y = app.chat_area.y + (line - app.chat_view.offset()) as u16;
         for x in app.chat_area.x..app.chat_area.right() {
             assert_ne!(buffer[(x, y)].style().bg, Some(Color::Indexed(236)));
             assert!(
@@ -4529,35 +4358,29 @@ mod tests {
         chat(30, &mut app);
 
         // "two" on the first row of the message.
-        let line = app.message_starts.first().copied().unwrap() + 1;
         app.focus = crate::app::Focus::Chat;
-        // Following new output keeps the cursor on the last line; this is a reader
-        // looking at something further up.
-        app.scroll = crate::app::Scroll::Offset(0);
-        app.chat_cursor = line;
-        app.chat_column = 6;
-        app.chat_visual = Some(crate::app::ChatAnchor {
-            line,
-            column: 4,
-            whole_lines: false,
-        });
+        let line = app.chat().layout().message_starts()[0] + 1;
+        put_cursor(&mut app, line, 4);
+        let view = app.chat();
+        view.toggle_visual(false);
+        view.right();
+        view.right();
         let buffer = screen(30, &mut app);
 
-        let y = app.chat_area.y + (line - app.chat_offset()) as u16;
+        let y = app.chat_area.y + (line - app.chat_view.offset()) as u16;
         let marked: String = (0..buffer.area.width)
             .filter(|x| buffer[(*x, y)].style().bg == Some(Color::Blue))
             .map(|x| buffer[(x, y)].symbol())
             .collect();
         assert_eq!(marked, "two");
         // And the cursor, at the far end of it, is turned the other way round again.
-        let x = app.chat_area.x + chat_column(line, 6);
+        let x = app.chat_area.x + app.chat_view.layout().column(line, 6);
         assert!(
             buffer[(x, y)]
                 .style()
                 .add_modifier
                 .contains(Modifier::REVERSED)
         );
-        assert_eq!(chat_span((line, 4), (line, 7)), Some("two".into()));
     }
 
     /// The line being read is tinted and the cursor is the one character on it, so the
@@ -4570,14 +4393,12 @@ mod tests {
         app.thread = Some(thread_saying("one two three four five six seven eight"));
         chat(30, &mut app);
 
-        let line = app.message_starts.first().copied().unwrap() + 1;
         app.focus = crate::app::Focus::Chat;
-        app.scroll = crate::app::Scroll::Offset(0);
-        app.chat_cursor = line;
-        app.chat_column = 4;
+        let line = app.chat().layout().message_starts()[0] + 1;
+        put_cursor(&mut app, line, 4);
         let buffer = screen(30, &mut app);
 
-        let y = app.chat_area.y + (line - app.chat_offset()) as u16;
+        let y = app.chat_area.y + (line - app.chat_view.offset()) as u16;
         let marked: Vec<u16> = (0..buffer.area.width)
             .filter(|x| {
                 buffer[(*x, y)]
@@ -4586,7 +4407,10 @@ mod tests {
                     .contains(Modifier::REVERSED)
             })
             .collect();
-        assert_eq!(marked, vec![app.chat_area.x + chat_column(line, 4)]);
+        assert_eq!(
+            marked,
+            vec![app.chat_area.x + app.chat_view.layout().column(line, 4)]
+        );
 
         // The line carries the tint from edge to edge, and no other line does.
         let tint = |y: u16| {
@@ -4918,8 +4742,11 @@ mod tests {
         app.sidebar_layout = SidebarLayout::TwoLine;
         with_threads(&mut app);
         app.focus = crate::app::Focus::Sidebar;
-        // The header is row zero, so the first thread is row one.
-        app.sidebar_selected = 1;
+        // The header is row zero, so the first thread is one down.
+        app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         let buffer = screen(100, &mut app);
 
         // Up to the icon, which is a picture and paints over the row it is on, and short
@@ -5080,9 +4907,9 @@ mod tests {
         let (events, _events) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         app.worktrees = vec![worktree(1)];
-        drawn(24, 4, &app);
+        drawn(24, 4, &mut app);
         app.worktrees.clear();
-        drawn(24, 4, &app);
+        drawn(24, 4, &mut app);
     }
 
     /// The escape sequences a backend writes to turn `before` into `after`.
@@ -5334,11 +5161,6 @@ mod redraw {
                     crossterm::event::KeyCode::Char('y'),
                     crossterm::event::KeyModifiers::CONTROL,
                 ));
-                // The chat is drawn from a cache the thread's revision keys, and only a
-                // change to the thread bumps it. A scroll is not one.
-                if let Some(thread) = app.thread.as_mut() {
-                    thread.revision += 1;
-                }
             }
         }
         terminal.backend_mut().flush().unwrap();
