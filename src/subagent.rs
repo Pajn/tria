@@ -133,6 +133,12 @@ impl Subagent {
             .map(str::to_string)
     }
 
+    /// What it reported back, to be yanked: the report, or the error it ended on. Nothing
+    /// while it has not reported.
+    pub fn report(&self) -> Option<&str> {
+        self.result.as_deref().or(self.error.as_deref())
+    }
+
     /// `opus-5 · high`, with the vendor prefix and date suffix off the model id.
     pub fn model_label(&self) -> Option<String> {
         let model = self.model.as_deref()?;

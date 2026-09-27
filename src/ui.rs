@@ -17,6 +17,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     app::{App, Checkout, Focus, Mode, PickerKind, Section, SidebarRow, approval_options},
     config::SidebarLayout,
+    list_cursor::{ListCursor, Row},
     model::ThreadStatus,
     picture,
     reader::{Badge, Source},
@@ -673,34 +674,8 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 let Some(agent) = agents.iter().find(|agent| &agent.id == id) else {
                     return ListItem::new(Line::from(""));
                 };
-                let (glyph, glyph_style) = match agent.status {
-                    subagent::Status::Pending
-                    | subagent::Status::Running
-                    | subagent::Status::Waiting => {
-                        (app.spinner_frame(), Style::default().fg(Color::Cyan))
-                    }
-                    subagent::Status::Idle => ("○", dim),
-                    subagent::Status::Completed => ("✓", Style::default().fg(Color::Green)),
-                    subagent::Status::Failed => ("✗", Style::default().fg(Color::Red)),
-                    subagent::Status::Cancelled | subagent::Status::Interrupted => {
-                        ("·", Style::default().fg(Color::Yellow))
-                    }
-                };
-                let now = crate::commands::now_iso();
-                let elapsed = agent
-                    .started_at
-                    .as_deref()
-                    .map(|started| {
-                        elapsed_label(
-                            started,
-                            agent
-                                .completed_at
-                                .as_deref()
-                                .filter(|_| !agent.status.is_active())
-                                .unwrap_or(&now),
-                        )
-                    })
-                    .unwrap_or_default();
+                let (glyph, glyph_style) = subagent_glyph(app, agent.status);
+                let elapsed = subagent_elapsed(agent, &crate::commands::now_iso());
                 let mut title_style = Style::default();
                 if Some(id) == reading_agent.as_ref() {
                     title_style = title_style.add_modifier(Modifier::BOLD);
@@ -717,14 +692,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 if !two_line {
                     return ListItem::new(first);
                 }
-                let activity = agent
-                    .activity()
-                    .unwrap_or_else(|| agent.status.label().to_string());
-                let style = if agent.status == subagent::Status::Failed {
-                    Style::default().fg(Color::Red)
-                } else {
-                    dim
-                };
+                let (activity, style) = subagent_activity(agent);
                 ListItem::new(vec![
                     first,
                     Line::from(Span::styled(
@@ -2295,7 +2263,7 @@ fn vt_color(color: vt100::Color, fallback: Color) -> Color {
 
 /// The thread's terminal sessions, with close and restart. These are real shells on the
 /// server, shared with the desktop app.
-fn draw_worktrees(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_worktrees(frame: &mut Frame, app: &mut App, area: Rect) {
     let worktrees = &app.worktrees;
     let width = 88.min(area.width);
     let inner_width = width.saturating_sub(4) as usize;
@@ -2303,16 +2271,15 @@ fn draw_worktrees(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Three lines each, and there can be a great many: show the ones around the cursor
     // rather than a list that runs off the bottom of the screen.
-    let selection = app.worktree_selected.min(worktrees.len().saturating_sub(1));
-    let room = (area.height.saturating_sub(6) / 3).max(1) as usize;
-    let first = selection
-        .saturating_sub(room.saturating_sub(1))
-        .min(worktrees.len().saturating_sub(room.min(worktrees.len())));
-    if first > 0 {
-        lines.push(Line::from(Span::styled(format!("   ⋯ {first} above"), dim)));
-    }
-    for (index, worktree) in worktrees.iter().enumerate().skip(first).take(room) {
-        let selected = index == selection;
+    let (selection, view) = popup_view(&app.worktree_cursor, &app.worktree_rows(), area);
+    lines.extend(above(view.start));
+    for (index, worktree) in worktrees
+        .iter()
+        .enumerate()
+        .skip(view.start)
+        .take(view.len())
+    {
+        let selected = Some(index) == selection;
         let removing = app.removing.contains(&worktree.path);
         // What it is waiting for, which is what says whether it can go.
         let (glyph, glyph_style) = if removing {
@@ -2367,10 +2334,7 @@ fn draw_worktrees(frame: &mut Frame, app: &App, area: Rect) {
             dim,
         )));
     }
-    let below = worktrees.len().saturating_sub(first + room);
-    if below > 0 {
-        lines.push(Line::from(Span::styled(format!("   ⋯ {below} below"), dim)));
-    }
+    lines.extend(below(worktrees.len() - view.end));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  j k select · Enter open the thread · x remove · X remove anyway · Esc",
@@ -2402,7 +2366,14 @@ fn draw_worktrees(frame: &mut Frame, app: &App, area: Rect) {
 /// else in that list is recoverable — a removed worktree leaves its branch behind — and
 /// this is the one thing that is not, so it shows the work it would take rather than
 /// asking about it in the abstract.
-fn draw_worktree_confirm(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_worktree_confirm(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Room for the rest of the box: the border, the title, the path, the branch, the
+    // blank, the count, the line saying how many are below, the blank, and the hint. The
+    // keys are told it, so they scroll no further than it shows.
+    let room = (area.height.saturating_sub(10)).max(1) as usize;
+    if let Some(confirm) = app.worktree_confirm.as_mut() {
+        confirm.room = room;
+    }
     let Some((confirm, worktree)) = app.confirming_worktree() else {
         return;
     };
@@ -2463,11 +2434,7 @@ fn draw_worktree_confirm(frame: &mut Frame, app: &App, area: Rect) {
             dim,
         ))),
     }
-    // Room for the rest of the box: the border, the title, the path, the branch, the
-    // blank, the count, the line saying how many are below, the blank, and the hint.
-    let room = (area.height.saturating_sub(10)).max(1) as usize;
-    let first = confirm.offset.min(files.len().saturating_sub(1));
-    let first = first.min(files.len().saturating_sub(room.min(files.len())));
+    let first = confirm.offset.min(confirm.last(files.len()));
     for file in files.iter().skip(first).take(room) {
         // No label on a file with no line counts: an untracked one and a file whose
         // mode alone changed both come through with none, and saying which would be
@@ -2543,8 +2510,15 @@ fn draw_terminals(frame: &mut Frame, app: &App, area: Rect) {
             dim,
         )));
     }
-    for (index, terminal) in terminals.iter().enumerate() {
-        let selected = index == app.terminal_selected.min(terminals.len() - 1);
+    let (selection, view) = popup_view_or_whole(&app.terminal_cursor, &app.terminal_rows(), area);
+    lines.extend(above(view.start));
+    for (index, terminal) in terminals
+        .iter()
+        .enumerate()
+        .skip(view.start)
+        .take(view.len())
+    {
+        let selected = Some(index) == selection;
         let (glyph, glyph_style) = match terminal.status.as_str() {
             _ if terminal.has_running_subprocess => {
                 (app.spinner_frame(), Style::default().fg(Color::Cyan))
@@ -2587,6 +2561,7 @@ fn draw_terminals(frame: &mut Frame, app: &App, area: Rect) {
             dim,
         )));
     }
+    lines.extend(below(terminals.len() - view.end));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  j k select · Enter attach · c new · x close · r restart · Esc",
@@ -2625,32 +2600,12 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
             dim,
         )));
     }
-    let selected_index = app.agent_selected.min(agents.len().saturating_sub(1));
-    for (index, agent) in agents.iter().enumerate() {
-        let selected = index == selected_index;
-        let (glyph, glyph_style) = match agent.status {
-            subagent::Status::Pending | subagent::Status::Running | subagent::Status::Waiting => {
-                (app.spinner_frame(), Style::default().fg(Color::Cyan))
-            }
-            subagent::Status::Idle => ("○", dim),
-            subagent::Status::Completed => ("✓", Style::default().fg(Color::Green)),
-            subagent::Status::Failed => ("✗", Style::default().fg(Color::Red)),
-            subagent::Status::Cancelled | subagent::Status::Interrupted => {
-                ("·", Style::default().fg(Color::Yellow))
-            }
-        };
-        // A running subagent is timed from its start; a settled one kept the time it took.
-        let elapsed = agent.started_at.as_deref().map(|started| {
-            elapsed_label(
-                started,
-                agent
-                    .completed_at
-                    .as_deref()
-                    .filter(|_| !agent.status.is_active())
-                    .unwrap_or(&now),
-            )
-        });
-        let elapsed = elapsed.unwrap_or_default();
+    let (selection, view) = popup_view_or_whole(&app.agent_cursor, &app.agent_rows(), area);
+    lines.extend(above(view.start));
+    for (index, agent) in agents.iter().enumerate().skip(view.start).take(view.len()) {
+        let selected = Some(index) == selection;
+        let (glyph, glyph_style) = subagent_glyph(app, agent.status);
+        let elapsed = subagent_elapsed(agent, &now);
         let role = agent
             .role
             .as_deref()
@@ -2677,16 +2632,10 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(role, dim),
             Span::styled(format!("  {elapsed}"), dim),
         ]));
-        let activity = agent
-            .activity()
-            .unwrap_or_else(|| agent.status.label().to_string());
+        let (activity, activity_style) = subagent_activity(agent);
         lines.push(Line::from(Span::styled(
             format!("      {}", fit(&activity, inner_width.saturating_sub(6))),
-            if agent.status == subagent::Status::Failed {
-                Style::default().fg(Color::Red)
-            } else {
-                dim
-            },
+            activity_style,
         )));
         let mut facts: Vec<String> = Vec::new();
         if let Some(model) = agent.model_label() {
@@ -2720,6 +2669,7 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
             dim,
         )));
     }
+    lines.extend(below(agents.len() - view.end));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  j k select · Enter read the transcript · y yank the report · Esc",
@@ -2749,6 +2699,87 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     frame.render_widget(Paragraph::new(text), inner);
+}
+
+/// How a subagent is doing, as the glyph beside it, in the roster and the sidebar alike.
+fn subagent_glyph(app: &App, status: subagent::Status) -> (&'static str, Style) {
+    match status {
+        subagent::Status::Pending | subagent::Status::Running | subagent::Status::Waiting => {
+            (app.spinner_frame(), Style::default().fg(Color::Cyan))
+        }
+        subagent::Status::Idle => ("○", Style::default().fg(Color::DarkGray)),
+        subagent::Status::Completed => ("✓", Style::default().fg(Color::Green)),
+        subagent::Status::Failed => ("✗", Style::default().fg(Color::Red)),
+        subagent::Status::Cancelled | subagent::Status::Interrupted => {
+            ("·", Style::default().fg(Color::Yellow))
+        }
+    }
+}
+
+/// How long a subagent has been at it: a running one is timed from its start, and a
+/// settled one kept the time it took. Nothing for one that has not said when it started.
+fn subagent_elapsed(agent: &subagent::Subagent, now: &str) -> String {
+    let Some(started) = agent.started_at.as_deref() else {
+        return String::new();
+    };
+    let end = agent
+        .completed_at
+        .as_deref()
+        .filter(|_| !agent.status.is_active())
+        .unwrap_or(now);
+    elapsed_label(started, end)
+}
+
+/// The line under a subagent's title: what it is doing, or how it came out, and in red
+/// when that was a failure.
+fn subagent_activity(agent: &subagent::Subagent) -> (String, Style) {
+    let activity = agent
+        .activity()
+        .unwrap_or_else(|| agent.status.label().to_string());
+    let style = if agent.status == subagent::Status::Failed {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    (activity, style)
+}
+
+/// Which rows of one of the lists over the screen are in view, and which of them is
+/// selected. As many as the screen has room for under the list's border, the blank and
+/// the hint under it, and the lines saying what is above and below.
+fn popup_view(
+    cursor: &ListCursor<String>,
+    rows: &[Row<String>],
+    area: Rect,
+) -> (Option<usize>, std::ops::Range<usize>) {
+    let lines = area.height.saturating_sub(6) as usize;
+    (cursor.selection(rows), cursor.window(rows, lines))
+}
+
+/// The same for a list drawn whole when it fits under its border, the blank and the hint,
+/// with no lines about the rest since there is none; only a list that does not is windowed.
+fn popup_view_or_whole(
+    cursor: &ListCursor<String>,
+    rows: &[Row<String>],
+    area: Rect,
+) -> (Option<usize>, std::ops::Range<usize>) {
+    let lines: usize = rows.iter().map(|row| row.height).sum();
+    if lines <= area.height.saturating_sub(4) as usize {
+        return (cursor.selection(rows), 0..rows.len());
+    }
+    popup_view(cursor, rows, area)
+}
+
+/// The line saying how many rows of a list are above the ones in view, when any are.
+fn above(count: usize) -> Option<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    (count > 0).then(|| Line::from(Span::styled(format!("   ⋯ {count} above"), dim)))
+}
+
+/// The line saying how many rows of a list are below the ones in view, when any are.
+fn below(count: usize) -> Option<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    (count > 0).then(|| Line::from(Span::styled(format!("   ⋯ {count} below"), dim)))
 }
 
 /// Token counts as the desktop writes them: `840`, `73.4k`, `1.2M`.
@@ -3317,7 +3348,7 @@ mod tests {
         }
     }
 
-    fn drawn(width: u16, height: u16, app: &App) -> String {
+    fn drawn(width: u16, height: u16, app: &mut App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| draw_worktrees(frame, app, frame.area()))
@@ -3342,7 +3373,7 @@ mod tests {
         let mut app = App::new(handle, events);
         app.worktrees = vec![worktree(1), worktree(2)];
         app.removing.insert(worktree(1).path);
-        let drawn = drawn(88, 20, &app);
+        let drawn = drawn(88, 20, &mut app);
         let lines: Vec<&str> = drawn.lines().collect();
         let first = lines
             .iter()
@@ -3370,7 +3401,7 @@ mod tests {
             .collect();
         let path = worktree.path.clone();
         app.worktrees = vec![worktree];
-        app.worktree_confirm = Some(crate::app::WorktreeConfirm { path, offset: 0 });
+        app.worktree_confirm = Some(crate::app::WorktreeConfirm::new(path));
     }
 
     /// Removing a worktree is ordinarily safe — the branch stays — and git refuses one
@@ -3386,7 +3417,7 @@ mod tests {
             &mut app,
             &[("notes.md", 0, 0), ("src/lib.rs", 12, 3), ("out/", 0, 0)],
         );
-        let drawn = drawn(90, 24, &app);
+        let drawn = drawn(90, 24, &mut app);
 
         assert!(drawn.contains("remove this worktree"), "{drawn}");
         assert!(
@@ -3403,7 +3434,8 @@ mod tests {
         assert!(drawn.contains("Esc"), "{drawn}");
     }
 
-    /// The list can be longer than the box, so it moves.
+    /// The list can be longer than the box, so it moves, and no further down than the box
+    /// has room to show: at its foot, `k` moves it at once.
     #[test]
     fn a_long_list_of_losses_can_be_read_through() {
         let (handle, _requests) = crate::session::Handle::detached();
@@ -3415,14 +3447,52 @@ mod tests {
             many.iter().map(|(p, i, d)| (p.as_str(), *i, *d)).collect();
         dirty(&mut app, &many);
 
-        let top = drawn(90, 24, &app);
+        let top = drawn(90, 24, &mut app);
         assert!(top.contains("file-0.txt"), "{top}");
         assert!(top.contains("more"), "it says there are more: {top}");
 
-        app.worktree_confirm.as_mut().unwrap().offset = 39;
-        let bottom = drawn(90, 24, &app);
+        app.mode = crate::app::Mode::Worktrees;
+        let key = |c| {
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            )
+        };
+        app.on_key(key('G'));
+        let bottom = drawn(90, 24, &mut app);
         assert!(bottom.contains("file-39.txt"), "{bottom}");
-        assert!(!bottom.contains("file-0.txt"), "{bottom}");
+        assert!(!bottom.contains("file-25.txt"), "{bottom}");
+        app.on_key(key('k'));
+        let up = drawn(90, 24, &mut app);
+        assert!(up.contains("file-25.txt"), "{up}");
+    }
+
+    /// A box made taller after `G` scrolled its list shows more of it, and `k` still
+    /// moves the list at once from there.
+    #[test]
+    fn k_moves_a_list_of_losses_made_taller_at_once() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let many: Vec<(String, u32, u32)> =
+            (0..40).map(|n| (format!("file-{n}.txt"), 0, 0)).collect();
+        let many: Vec<(&str, u32, u32)> =
+            many.iter().map(|(p, i, d)| (p.as_str(), *i, *d)).collect();
+        dirty(&mut app, &many);
+        app.mode = crate::app::Mode::Worktrees;
+        let key = |c| {
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            )
+        };
+        drawn(90, 24, &mut app);
+        app.on_key(key('G'));
+        drawn(90, 24, &mut app);
+        drawn(90, 40, &mut app);
+        app.on_key(key('k'));
+        let up = drawn(90, 40, &mut app);
+        assert!(up.contains("file-9.txt"), "{up}");
     }
 
     fn status_line(app: &App) -> String {
@@ -3625,6 +3695,35 @@ mod tests {
         assert!(!row.contains("a=T"), "{row}");
     }
 
+    /// Terminals that all fit are drawn whole, as they were before the list could scroll:
+    /// the room kept for saying what is above and below is only taken when something is.
+    #[test]
+    fn terminals_that_fit_are_drawn_whole() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.current_thread_id = Some("t1".into());
+        app.terminals = (0..7)
+            .map(|n| {
+                serde_json::from_value(json!({
+                    "threadId": "t1", "terminalId": format!("t{n}"), "cwd": "/src/p",
+                    "status": "running", "label": format!("shell t{n}"),
+                }))
+                .unwrap()
+            })
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(80, 25)).unwrap();
+        terminal
+            .draw(|frame| draw_terminals(frame, &app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let screen: String = (0..25)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(screen.contains("shell t6"), "{screen}");
+        assert!(!screen.contains("⋯"), "{screen}");
+    }
+
     /// More worktrees than there are rows for is the case worth drawing: the cursor has
     /// to stay on the screen, and what is not on it has to be said rather than dropped.
     #[test]
@@ -3633,17 +3732,24 @@ mod tests {
         let (events, _events) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         app.worktrees = (0..20).map(worktree).collect();
-        app.worktree_selected = 19;
+        app.mode = crate::app::Mode::Worktrees;
+        let key = |c| {
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            )
+        };
+        app.on_key(key('G'));
 
-        let screen = drawn(100, 24, &app);
+        let screen = drawn(100, 24, &mut app);
         assert!(screen.contains("thread number 19"), "{screen}");
         assert!(!screen.contains("thread number 0 "), "{screen}");
         assert!(screen.contains("above"), "{screen}");
         assert!(screen.contains("worktrees (20, 20 settled)"), "{screen}");
 
         // From the top, the other end is the one summarised.
-        app.worktree_selected = 0;
-        let screen = drawn(100, 24, &app);
+        app.on_key(key('g'));
+        let screen = drawn(100, 24, &mut app);
         assert!(screen.contains("thread number 0"), "{screen}");
         assert!(screen.contains("below"), "{screen}");
     }
@@ -4686,9 +4792,9 @@ mod tests {
         let (events, _events) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         app.worktrees = vec![worktree(1)];
-        drawn(24, 4, &app);
+        drawn(24, 4, &mut app);
         app.worktrees.clear();
-        drawn(24, 4, &app);
+        drawn(24, 4, &mut app);
     }
 
     /// The escape sequences a backend writes to turn `before` into `after`.

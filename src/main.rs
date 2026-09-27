@@ -7,6 +7,7 @@ mod composer;
 mod config;
 mod discovery;
 mod kitty;
+mod list_cursor;
 mod lucide;
 mod model;
 mod notify;

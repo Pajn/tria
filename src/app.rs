@@ -21,6 +21,7 @@ use crate::{
     chat_view::{self, ChatView, Hit, Search},
     commands,
     composer::Composer,
+    list_cursor::{ListCursor, Row},
     model::{Id, ModelSelection, ServerConfig, ShellItem, ThreadDetailSnapshot, ThreadItem},
     picture,
     question::QuestionDraft,
@@ -446,7 +447,26 @@ pub struct ThreadWorktree {
 pub struct WorktreeConfirm {
     /// The worktree, looked up again each frame so what is listed stays the live list.
     pub path: String,
+    /// The first of its files in view.
     pub offset: usize,
+    /// How many files the box has room for, told by the frame that draws it: the list is
+    /// scrolled no further than leaves it full.
+    pub room: usize,
+}
+
+impl WorktreeConfirm {
+    pub fn new(path: String) -> Self {
+        Self {
+            path,
+            offset: 0,
+            room: 0,
+        }
+    }
+
+    /// The furthest a list of `files` can be scrolled: the first of the last boxful.
+    pub fn last(&self, files: usize) -> usize {
+        files.saturating_sub(self.room.max(1))
+    }
 }
 
 /// A thread being composed that does not exist on the server yet.
@@ -685,10 +705,10 @@ pub struct App {
     rewinding: Option<PendingRewind>,
     /// Every terminal session the server knows about, across threads.
     pub terminals: Vec<crate::model::TerminalSummary>,
-    /// Selection in the terminal panel.
-    pub terminal_selected: usize,
-    /// Selection in the subagent roster.
-    pub agent_selected: usize,
+    /// The cursor in the terminal panel, on a terminal by its id.
+    pub terminal_cursor: ListCursor<String>,
+    /// The cursor in the subagent roster, on a subagent by its id.
+    pub agent_cursor: ListCursor<String>,
     /// What is read in place of the thread's conversation, and the reads on their way.
     pub reader: Reader<Restore>,
     /// Pull requests to put on threads being made, by the thread they go on.
@@ -743,7 +763,9 @@ pub struct App {
     /// to. There is no sending to a subagent, so it goes to the main agent, and the
     /// transcript on screen makes it easy to think otherwise.
     pub confirm_transcript_send: Option<TranscriptSend>,
-    pub worktree_selected: usize,
+    /// The cursor in the worktree list, on a row by the thread it is of: two threads can
+    /// work in the one worktree, and each has its row.
+    pub worktree_cursor: ListCursor<String>,
     /// The worktrees that are still on the disk, so the sidebar can mark the threads
     /// holding one without asking the disk about every row it draws.
     live_worktrees: HashSet<String>,
@@ -834,8 +856,8 @@ impl App {
             favicons: HashMap::new(),
             search_input: None,
             terminals: Vec::new(),
-            terminal_selected: 0,
-            agent_selected: 0,
+            terminal_cursor: ListCursor::default(),
+            agent_cursor: ListCursor::default(),
             reader: Reader::default(),
             pending_links: HashMap::new(),
             labels_applied: HashSet::new(),
@@ -859,7 +881,7 @@ impl App {
             worktree_confirm: None,
             confirm_stop_session: false,
             confirm_transcript_send: None,
-            worktree_selected: 0,
+            worktree_cursor: ListCursor::default(),
             live_worktrees: HashSet::new(),
             removing: HashSet::new(),
             worktrees_checked: None,
@@ -1128,14 +1150,14 @@ impl App {
                 self.toast(format!("copied {url}"), false);
             }
             Some(SidebarRow::Agent { id }) => {
-                let report = self
-                    .subagents()
-                    .into_iter()
+                let agents = self.subagents();
+                let report = agents
+                    .iter()
                     .find(|agent| &agent.id == id)
-                    .and_then(|agent| agent.result.or(agent.error));
+                    .and_then(|agent| agent.report());
                 match report {
                     Some(report) => {
-                        copy_to_clipboard(&report);
+                        copy_to_clipboard(report);
                         self.toast("yanked the report", false);
                     }
                     None => self.toast("it has not reported back yet", false),
@@ -2544,17 +2566,14 @@ impl App {
     }
 
     fn on_terminals_key(&mut self, key: KeyEvent) {
-        let count = self.thread_terminals().len();
+        let rows = self.terminal_rows();
+        let cursor = &mut self.terminal_cursor;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.terminal_selected = (self.terminal_selected + 1).min(count.saturating_sub(1));
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.terminal_selected = self.terminal_selected.saturating_sub(1);
-            }
-            KeyCode::Char('g') => self.terminal_selected = 0,
-            KeyCode::Char('G') => self.terminal_selected = count.saturating_sub(1),
+            KeyCode::Char('j') | KeyCode::Down => cursor.move_by(&rows, 1),
+            KeyCode::Char('k') | KeyCode::Up => cursor.move_by(&rows, -1),
+            KeyCode::Char('g') => cursor.top(&rows),
+            KeyCode::Char('G') => cursor.bottom(&rows),
             KeyCode::Char('x') | KeyCode::Char('d') => self.close_terminal(),
             KeyCode::Char('r') => self.restart_terminal(),
             KeyCode::Char('c') => self.new_terminal(),
@@ -2601,19 +2620,31 @@ impl App {
         list
     }
 
+    /// The open thread's terminals as the panel's cursor is lent them.
+    pub fn terminal_rows(&self) -> Vec<Row<String>> {
+        let terminals = self.thread_terminals();
+        popup_rows(terminals.iter().map(|t| t.terminal_id.clone()))
+    }
+
     fn open_terminals(&mut self) {
         if self.thread.is_none() {
             self.toast("no thread open", true);
             return;
         }
-        self.terminal_selected = 0;
+        self.terminal_cursor = ListCursor::default();
         self.mode = Mode::Terminals;
     }
 
+    /// The terminal under the panel's cursor, wherever the list has moved it to.
+    fn cursor_terminal(&self) -> Option<crate::model::TerminalSummary> {
+        let terminals = self.thread_terminals();
+        let at = self.terminal_cursor.selection(&self.terminal_rows())?;
+        terminals.get(at).map(|t| (*t).clone())
+    }
+
     fn selected_terminal(&self) -> Option<(String, String, String)> {
-        self.thread_terminals()
-            .get(self.terminal_selected)
-            .map(|t| (t.thread_id.clone(), t.terminal_id.clone(), t.cwd.clone()))
+        self.cursor_terminal()
+            .map(|t| (t.thread_id, t.terminal_id, t.cwd))
     }
 
     /// Close the selected terminal. The server kills whatever is running in it.
@@ -2684,11 +2715,7 @@ impl App {
 
     /// Attach to the selected terminal and hand the keyboard to it.
     fn attach_terminal(&mut self) {
-        let Some(terminal) = self
-            .thread_terminals()
-            .get(self.terminal_selected)
-            .map(|t| (*t).clone())
-        else {
+        let Some(terminal) = self.cursor_terminal() else {
             self.toast("no terminal selected", true);
             return;
         };
@@ -3286,7 +3313,7 @@ impl App {
 
     fn open_worktrees(&mut self) {
         self.worktrees = self.collect_worktrees();
-        self.worktree_selected = 0;
+        self.worktree_cursor = ListCursor::default();
         if self.worktrees.is_empty() {
             self.toast("no thread has a worktree of its own", false);
             return;
@@ -3326,21 +3353,18 @@ impl App {
         if self.worktree_confirm.is_some() {
             return self.on_worktree_confirm_key(key);
         }
-        let count = self.worktrees.len();
+        let rows = self.worktree_rows();
+        let cursor = &mut self.worktree_cursor;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.worktree_selected = (self.worktree_selected + 1).min(count.saturating_sub(1));
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.worktree_selected = self.worktree_selected.saturating_sub(1);
-            }
-            KeyCode::Char('g') => self.worktree_selected = 0,
-            KeyCode::Char('G') => self.worktree_selected = count.saturating_sub(1),
+            KeyCode::Char('j') | KeyCode::Down => cursor.move_by(&rows, 1),
+            KeyCode::Char('k') | KeyCode::Up => cursor.move_by(&rows, -1),
+            KeyCode::Char('g') => cursor.top(&rows),
+            KeyCode::Char('G') => cursor.bottom(&rows),
             KeyCode::Char('x') | KeyCode::Char('d') => self.remove_worktree(false),
             KeyCode::Char('X') | KeyCode::Char('D') => self.confirm_force_remove(),
             KeyCode::Enter | KeyCode::Char('l') => {
-                if let Some(worktree) = self.worktrees.get(self.worktree_selected) {
+                if let Some(worktree) = self.cursor_worktree() {
                     let thread_id = worktree.thread_id.clone();
                     self.mode = Mode::Normal;
                     self.open_thread(&thread_id);
@@ -3348,6 +3372,18 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// The worktrees listed, as the list's cursor is lent them: by thread, since two can
+    /// share a worktree. What is done to one is still done by its path.
+    pub fn worktree_rows(&self) -> Vec<Row<String>> {
+        popup_rows(self.worktrees.iter().map(|w| w.thread_id.clone()))
+    }
+
+    /// The worktree under the list's cursor, wherever the list has moved it to.
+    fn cursor_worktree(&self) -> Option<&ThreadWorktree> {
+        let at = self.worktree_cursor.selection(&self.worktree_rows())?;
+        self.worktrees.get(at)
     }
 
     /// The box is a question with two answers, and the rest of its keys move through
@@ -3359,10 +3395,14 @@ impl App {
             self.worktree_confirm = None;
             return;
         };
-        let last = worktree.files.len().saturating_sub(1);
+        let files = worktree.files.len();
         let Some(confirm) = self.worktree_confirm.as_mut() else {
             return;
         };
+        // No further than the box has room to show, so the first key back up moves it —
+        // and a box made taller since shows more, so it is brought back to that first.
+        let last = confirm.last(files);
+        confirm.offset = confirm.offset.min(last);
         let by = |offset: usize, delta: isize| {
             (offset as isize + delta).clamp(0, last as isize) as usize
         };
@@ -3387,7 +3427,7 @@ impl App {
     /// for it to refuse over and nothing to lose, so that one goes straight through —
     /// the question is only worth asking where there is an answer worth having.
     fn confirm_force_remove(&mut self) {
-        let Some(worktree) = self.worktrees.get(self.worktree_selected) else {
+        let Some(worktree) = self.cursor_worktree() else {
             return;
         };
         // The reasons it cannot go at all are worth giving before the question rather
@@ -3403,7 +3443,7 @@ impl App {
         // Asked again on the way in: the server's status is cached, and a list of files
         // somebody is about to agree to lose should be the one that is there now.
         self.check_worktree(path.clone());
-        self.worktree_confirm = Some(WorktreeConfirm { path, offset: 0 });
+        self.worktree_confirm = Some(WorktreeConfirm::new(path));
     }
 
     /// Why a worktree is not tria's to remove, whatever git thinks of it.
@@ -3429,7 +3469,7 @@ impl App {
     /// in it, which is the check worth having and is git's to make: it counts what is
     /// not tracked as well, which a status does not.
     fn remove_worktree(&mut self, force: bool) {
-        if let Some(worktree) = self.worktrees.get(self.worktree_selected) {
+        if let Some(worktree) = self.cursor_worktree() {
             let path = worktree.path.clone();
             self.remove_worktree_at(&path, force);
         }
@@ -3493,9 +3533,6 @@ impl App {
                 {
                     self.worktree_confirm = None;
                 }
-                self.worktree_selected = self
-                    .worktree_selected
-                    .min(self.worktrees.len().saturating_sub(1));
                 self.toast(format!("removed {}", short_path(&path)), false);
                 if self.worktrees.is_empty() && self.mode == Mode::Worktrees {
                     self.mode = Mode::Normal;
@@ -3700,33 +3737,37 @@ impl App {
             .reader
             .agent_id()
             .and_then(|reading| agents.iter().position(|a| a.id == reading));
-        self.agent_selected = reading
+        let at = reading
             .or_else(|| agents.iter().position(|agent| agent.status.is_active()))
             .unwrap_or(agents.len() - 1);
+        self.agent_cursor = ListCursor::on(&self.agent_rows(), at);
         self.mode = Mode::Agents;
+    }
+
+    /// The subagents in the roster, oldest first, as its cursor is lent them.
+    pub fn agent_rows(&self) -> Vec<Row<String>> {
+        popup_rows(self.subagents().into_iter().map(|agent| agent.id))
     }
 
     fn on_agents_key(&mut self, key: KeyEvent) {
         let agents = self.subagents();
-        let count = agents.len();
+        let rows = self.agent_rows();
+        let cursor = &mut self.agent_cursor;
+        let selected = cursor.selection(&rows).and_then(|at| agents.get(at));
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('A') => self.mode = Mode::Normal,
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.agent_selected = (self.agent_selected + 1).min(count.saturating_sub(1));
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.agent_selected = self.agent_selected.saturating_sub(1);
-            }
-            KeyCode::Char('g') => self.agent_selected = 0,
-            KeyCode::Char('G') => self.agent_selected = count.saturating_sub(1),
-            KeyCode::Enter | KeyCode::Char('l') => match agents.get(self.agent_selected) {
+            KeyCode::Char('j') | KeyCode::Down => cursor.move_by(&rows, 1),
+            KeyCode::Char('k') | KeyCode::Up => cursor.move_by(&rows, -1),
+            KeyCode::Char('g') => cursor.top(&rows),
+            KeyCode::Char('G') => cursor.bottom(&rows),
+            KeyCode::Enter | KeyCode::Char('l') => match selected {
                 Some(agent) => {
                     self.open_reading(Source::Subagent(agent.id.clone()), Origin::Roster)
                 }
                 None => self.toast("no subagent selected", true),
             },
-            KeyCode::Char('y') => match agents.get(self.agent_selected) {
-                Some(agent) => match agent.result.as_deref().or(agent.error.as_deref()) {
+            KeyCode::Char('y') => match selected {
+                Some(agent) => match agent.report() {
                     Some(report) => {
                         copy_to_clipboard(report);
                         self.toast("yanked the report", false);
@@ -7295,6 +7336,18 @@ pub enum SidebarRow {
     },
 }
 
+/// Lines each row of the terminal, worktree, and subagent lists is drawn in.
+pub const POPUP_ROW_LINES: usize = 3;
+
+/// The rows of one of those lists, by what each one is.
+fn popup_rows(keys: impl Iterator<Item = String>) -> Vec<Row<String>> {
+    keys.map(|key| Row {
+        key,
+        height: POPUP_ROW_LINES,
+    })
+    .collect()
+}
+
 /// What a sidebar row is, for the sidebar's view to find it again when the list has moved:
 /// the section a header heads, the thread, the pull request, the subagent. A tab with
 /// nothing to list says so in a row of its own, and there is only ever the one.
@@ -9198,9 +9251,10 @@ mod tests {
         app.focus = Focus::Composer;
         app.open_agents();
         assert_eq!(app.mode, Mode::Agents);
+        let at = app.agent_cursor.selection(&app.agent_rows());
         assert_eq!(
-            app.subagents()[app.agent_selected].id,
-            "a1",
+            at.map(|at| app.subagents()[at].id.clone()).as_deref(),
+            Some("a1"),
             "the one still working"
         );
 
@@ -9231,7 +9285,8 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         answer_the_read(&mut app, &mut requests, &mut sent, &["Looking now."]).await;
 
-        app.agent_selected = 0;
+        let rows = app.agent_rows();
+        app.agent_cursor.top(&rows);
         agent_progresses(app.thread.as_mut().unwrap(), "2026-01-01T00:00:05Z");
         apply(&mut app, AppEvent::Tick);
         let more = ["Looking now.", "Found it."];
@@ -9242,9 +9297,127 @@ mod tests {
         );
         assert!(drawn(&mut app).contains("Found it."));
         assert_eq!(
-            app.agent_selected, 0,
+            app.agent_cursor.selection(&app.agent_rows()),
+            Some(0),
             "the roster's row stayed where it was put"
         );
+    }
+
+    /// A terminal of the open thread's, as the server lists it.
+    fn terminal(id: &str, status: &str) -> crate::model::TerminalSummary {
+        serde_json::from_value(json!({
+            "threadId": "t1", "terminalId": id, "cwd": "/src/p", "status": status,
+            "label": format!("shell {id}"),
+        }))
+        .expect("a terminal the server could list")
+    }
+
+    /// The open thread's terminal list up, with the keys on it.
+    fn terminals_up(app: &mut App, terminals: Vec<crate::model::TerminalSummary>) {
+        app.thread = Some(stacked_thread());
+        app.current_thread_id = Some("t1".into());
+        app.terminals = terminals;
+        app.open_terminals();
+        assert_eq!(app.mode, Mode::Terminals);
+    }
+
+    /// The live terminals are listed first, so one exiting moves down the list; `x` still
+    /// closes the terminal that is marked, not the one that slid under where it was.
+    #[tokio::test]
+    async fn x_closes_the_terminal_marked_after_the_list_resorts() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let running = |id| terminal(id, "running");
+        terminals_up(&mut app, vec![running("a"), running("b"), running("c")]);
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.terminals[0] = terminal("a", "exited");
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let payload = loop {
+            match asked(&mut requests).await.expect("a terminal is closed") {
+                crate::session::Request::Call { tag, payload, .. } if tag == "terminal.close" => {
+                    break payload;
+                }
+                _ => continue,
+            }
+        };
+        assert_eq!(payload["terminalId"], "b");
+    }
+
+    /// A list that shrinks under the selection leaves it on the last row, which is marked,
+    /// and `Enter` attaches to that rather than saying nothing is selected.
+    #[tokio::test]
+    async fn enter_attaches_the_terminal_marked_after_the_list_shrinks() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let running = |id| terminal(id, "running");
+        terminals_up(&mut app, vec![running("a"), running("b"), running("c")]);
+        app.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        app.terminals.pop();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::TerminalPane, "attached to b");
+    }
+
+    /// More terminals than the popup is tall scroll to keep the one selected on screen.
+    #[tokio::test]
+    async fn a_long_terminal_list_follows_the_selection() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let many = (0..12).map(|n| terminal(&format!("t{n:02}"), "running"));
+        terminals_up(&mut app, many.collect());
+        app.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        let screen = drawn(&mut app);
+        assert!(screen.contains("shell t11"), "{screen}");
+        assert!(screen.contains("above"), "{screen}");
+    }
+
+    /// The followable agent's thread with more subagents started after it, `a2` onwards.
+    fn with_more_agents(count: usize) -> ThreadState {
+        let mut thread = thread_with_a_followable_agent();
+        for n in 2..2 + count {
+            let at = format!("2026-01-01T00:00:{:02}Z", 10 + n);
+            let started: crate::model::Activity = serde_json::from_value(json!({
+                "id": format!("s{n}"), "kind": "task.started", "tone": "info", "summary": "",
+                "createdAt": at, "payload": {"taskId": format!("a{n}"), "agentKind": "agent",
+                "taskType": "local_agent", "title": format!("Look into a{n}"), "startedAt": at},
+            }))
+            .unwrap();
+            thread.detail.activities.push(started);
+        }
+        thread
+    }
+
+    /// More subagents than the roster is tall scroll to keep the one selected on screen.
+    #[tokio::test]
+    async fn a_long_roster_follows_the_selection() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(with_more_agents(12));
+        app.current_thread_id = Some("t1".into());
+        app.open_agents();
+        app.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        let screen = drawn(&mut app);
+        assert!(screen.contains("Look into a13"), "{screen}");
+    }
+
+    /// A roster that shrinks under the selection leaves it on the last row, and `Enter`
+    /// reads that one.
+    #[tokio::test]
+    async fn enter_reads_the_subagent_marked_after_the_roster_shrinks() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(with_more_agents(1));
+        app.current_thread_id = Some("t1".into());
+        app.open_agents();
+        app.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        app.thread.as_mut().unwrap().detail.activities.pop();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let payload = answer_the_read(&mut app, &mut requests, &mut sent, &["Looking now."]).await;
+        assert_eq!(payload["relativePath"], "/tmp/tasks/a1.output");
     }
 
     fn drawn(app: &mut App) -> String {
@@ -10961,9 +11134,49 @@ mod tests {
         };
         let path = worktree.path.clone();
         app.worktrees = vec![worktree];
-        app.worktree_selected = 0;
+        app.worktree_cursor = ListCursor::default();
         app.mode = Mode::Worktrees;
         path
+    }
+
+    /// Two threads can work in the one worktree — a plan implemented in its own thread,
+    /// a pull request checked out where it was — and the list has a row for each, so `j`
+    /// goes through both and `Enter` opens the one it is on.
+    #[tokio::test]
+    async fn j_goes_through_threads_that_share_a_worktree() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let shared = holding(&mut app, Some(false));
+        let other = |id: &str, path: &str| ThreadWorktree {
+            thread_id: id.into(),
+            title: format!("thread {id}"),
+            project: "p".into(),
+            project_cwd: "/src/p".into(),
+            path: path.into(),
+            branch: None,
+            settled: true,
+            running: false,
+            changes: Some(false),
+            files: Vec::new(),
+        };
+        app.worktrees = vec![
+            other("a", "/worktrees/p/a"),
+            other("t1", &shared),
+            other("t2", &shared),
+            other("z", "/worktrees/p/z"),
+        ];
+        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        for at in 1..4 {
+            app.on_key(j);
+            assert_eq!(
+                app.worktree_cursor.selection(&app.worktree_rows()),
+                Some(at)
+            );
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.current_thread_id.as_deref(), Some("t2"));
     }
 
     /// A worktree on its way out says so until the server answers, whichever way, and
