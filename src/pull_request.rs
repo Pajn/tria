@@ -644,6 +644,7 @@ fn draw_markdown(
         match segment {
             Segment::Markdown(text) => {
                 let mut rendered = crate::timeline::markdown(text.trim_matches('\n'));
+                crate::table::fit(&mut rendered, width);
                 let (images, rows, pictures) = crate::timeline::place_message_images(
                     &format!("{id}-{n}"),
                     &text,

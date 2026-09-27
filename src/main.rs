@@ -18,6 +18,7 @@ mod server;
 mod session;
 mod state;
 mod subagent;
+mod table;
 mod term;
 mod timeline;
 mod tool_text;

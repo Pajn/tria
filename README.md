@@ -837,6 +837,12 @@ place of the picture when the file is something else, or when the terminal answe
 way to draw one, and says so with `nothing at that path now` when what the tool read was a
 temporary file that has since been cleaned up.
 
+A table wider than the chat is narrowed to fit rather than wrapped across its borders. Each
+column keeps its longest word where there is room for that, and every column gives up the same
+share of its width past that; the text then wraps inside its cells, which grow taller instead.
+A pull request's description and reviews are drawn the same way. A view too narrow for even
+one letter per column leaves the table as it is.
+
 ## Thread list
 
 The sidebar mirrors the desktop app's sections: pinned, active, snoozed, and settled. Settled

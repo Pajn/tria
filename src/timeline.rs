@@ -286,7 +286,7 @@ pub fn build(
                     "user" | "prompt" => render_user(&message.text, role),
                     "system" => render_system(&message.text),
                     _ => {
-                        let mut text = render_assistant(&message.text, message.streaming);
+                        let mut text = render_assistant(&message.text, message.streaming, width);
                         (images, rows, pictures) = place_message_images(
                             &message.id,
                             &message.text,
@@ -1334,8 +1334,9 @@ fn render_system(text: &str) -> Text<'static> {
     Text::from(lines)
 }
 
-fn render_assistant(text: &str, streaming: bool) -> Text<'static> {
+fn render_assistant(text: &str, streaming: bool, width: u16) -> Text<'static> {
     let mut rendered = markdown(text);
+    crate::table::fit(&mut rendered, width);
     if streaming {
         let cursor = Span::styled(STREAM_CURSOR, Style::default().fg(Color::Magenta));
         match rendered.lines.last_mut() {
@@ -1833,7 +1834,7 @@ mod tests {
             "| Before | After |\n| --- | --- |\n| ![Home ends at its tenth section]({}) | ![Skeleton sections]({}) |\n",
             paths[0], paths[1]
         );
-        let mut text = render_assistant(&source, false);
+        let mut text = render_assistant(&source, false, 100);
         let widths_before: Vec<usize> = text
             .lines
             .iter()
@@ -1901,7 +1902,7 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let path = path.to_str().unwrap().to_string();
         let source = format!("Here it is.\n\n![the viewer serving a run]({path})\n");
-        let mut text = render_assistant(&source, false);
+        let mut text = render_assistant(&source, false, 100);
         let (images, regions, pictures) =
             place_message_images("m1", &source, &mut text, 80, 24, None);
 
@@ -1943,7 +1944,7 @@ mod tests {
     fn a_picture_whose_file_is_gone_says_so() {
         picture::draw_in_halfblocks();
         let source = "![a run](/tmp/tria-no-such-message-picture.png)".to_string();
-        let mut text = render_assistant(&source, false);
+        let mut text = render_assistant(&source, false, 100);
         let (images, regions, pictures) =
             place_message_images("m2", &source, &mut text, 80, 24, None);
         assert!(images.is_empty(), "nothing was drawn");
@@ -1970,7 +1971,7 @@ mod tests {
         let source = "![one](/tmp/tria-one.png) and ![two](/tmp/tria-two.png), then \
                       ![three](relative.png) and ![four](https://example.com/four.png)"
             .to_string();
-        let mut text = render_assistant(&source, false);
+        let mut text = render_assistant(&source, false, 100);
         let (_, _, pictures) = place_message_images("m3", &source, &mut text, 80, 24, None);
         assert_eq!(
             pictures,
@@ -1994,8 +1995,8 @@ mod tests {
     fn a_message_without_a_picture_is_left_alone() {
         picture::draw_in_halfblocks();
         let source = "A paragraph with `code` and a [link](http://example.com).".to_string();
-        let before = render_assistant(&source, false);
-        let mut text = render_assistant(&source, false);
+        let before = render_assistant(&source, false, 100);
+        let mut text = render_assistant(&source, false, 100);
         let (images, regions, pictures) =
             place_message_images("m4", &source, &mut text, 80, 24, None);
         assert!(images.is_empty() && regions.is_empty() && pictures.is_empty());
