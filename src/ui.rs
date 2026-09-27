@@ -23,6 +23,7 @@ use crate::{
     config::SidebarLayout,
     model::ThreadStatus,
     picture,
+    reader::{Badge, Source},
     session::Status,
     subagent,
     timeline::{self, Block as ChatBlock, BlockKey},
@@ -756,16 +757,8 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     app.sidebar_inner = Some(inner);
 
     let rows = app.sidebar_rows();
-    let reading_url = app
-        .transcript
-        .as_ref()
-        .and_then(|t| t.pull_request())
-        .map(|d| d.url.clone());
-    let reading_agent = app
-        .transcript
-        .as_ref()
-        .and_then(|t| t.agent_id())
-        .map(str::to_string);
+    let reading_url = app.reader.pull_request().map(|d| d.url.clone());
+    let reading_agent = app.reader.agent_id().map(str::to_string);
     let width = inner.width as usize;
     let dim = Style::default().fg(Color::DarkGray);
     let two_line = app.sidebar_layout == SidebarLayout::TwoLine;
@@ -1187,44 +1180,30 @@ fn checks_glyph(checks: Option<&str>) -> Option<(&'static str, Color)> {
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
-    // While a transcript is open the header names what is being read, since the chat
-    // below it is no longer the thread's own conversation.
-    if let Some(transcript) = &app.transcript {
+    // While something is read in place of the conversation the header names it, since the
+    // chat below it is no longer the thread's own conversation.
+    if let Some(header) = app.reader.header() {
         spans.push(Span::styled("⤷ ", Style::default().fg(Color::Magenta)));
         spans.push(Span::styled(
-            transcript.title.clone(),
+            header.title,
             Style::default().add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            format!("  {}", transcript.subtitle),
+            format!("  {}", header.subtitle),
             Style::default().fg(Color::DarkGray),
         ));
-        if transcript.truncated {
+        for badge in header.badges {
+            let color = match badge {
+                Badge::Truncated => Color::Yellow,
+                Badge::Working => Color::Cyan,
+            };
             spans.push(Span::styled(
-                "  cut at 1 MB",
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-        // A run still going has written more since this was read, and nothing tells us.
-        if transcript.live {
-            spans.push(Span::styled(
-                "  still working",
-                Style::default().fg(Color::Cyan),
+                format!("  {}", badge.text()),
+                Style::default().fg(color),
             ));
         }
         spans.push(Span::styled(
-            if transcript
-                .pull_request()
-                .is_some_and(|d| d.labels_editable())
-            {
-                "  r re-reads · gx opens · L labels · q back"
-            } else if transcript.pull_request().is_some() {
-                "  r re-reads · gx opens · q back"
-            } else if transcript.live {
-                "  r re-reads · q back"
-            } else {
-                "  q back"
-            },
+            format!("  {}", header.hint),
             Style::default().fg(Color::DarkGray),
         ));
         let width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -1427,11 +1406,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     app.chat_area = inner;
     // A subagent's transcript, or a pull request, is read in place of the conversation,
     // through the same chat: scrolled, searched, and yanked like it.
-    let open = app
-        .transcript
-        .as_ref()
-        .map(|transcript| &transcript.state)
-        .or(app.thread.as_ref());
+    let open = app.reader.conversation().or(app.thread.as_ref());
     let Some(thread) = open else {
         let text = if app.draft.is_some() {
             "Type your first message below and press Enter."
@@ -1455,12 +1430,15 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
 
-    // Owned, and read before the drawing below takes hold of the app.
-    let stack = app.pull_request_stack();
     let expanded_hash = hash_set(&app.expanded);
+    let revision = if app.reader.is_open() {
+        app.reader.revision()
+    } else {
+        thread.revision
+    };
     let key = (
         thread.id().to_string(),
-        thread.revision,
+        revision,
         inner.width,
         inner.height,
         expanded_hash,
@@ -1482,28 +1460,24 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             None => true,
         };
         if needs_rebuild {
-            // A pull request is drawn by its own module, already styled; everything after
-            // this treats its blocks like any others.
-            let blocks = match app.transcript.as_ref().and_then(|t| t.pull_request()) {
-                Some(detail) => crate::pull_request::blocks(
-                    detail,
-                    &crate::pull_request::Context {
-                        activity: app.pull_request_activity.get(&detail.url),
-                        stack: stack.as_ref().map(|(layers, at)| (layers.as_slice(), *at)),
-                        expanded: &app.expanded,
-                        open_levels: app.open_levels,
-                        size: (inner.width, inner.height),
-                        images: &app.pull_request_images,
-                        now: &crate::commands::now_iso(),
-                    },
-                ),
-                None => timeline::build(
+            // What is read in place of the conversation draws itself; everything after this
+            // treats its blocks like any others.
+            let blocks = if app.reader.is_open() {
+                app.reader.blocks(
+                    app.thread.as_ref(),
+                    &app.expanded,
+                    app.open_levels,
+                    (inner.width, inner.height),
+                    &crate::commands::now_iso(),
+                )
+            } else {
+                timeline::build(
                     thread,
                     &app.expanded,
                     app.open_levels,
                     inner.width,
                     inner.height,
-                ),
+                )
             };
             let mut total = 0usize;
             let blocks: Vec<CachedBlock> = blocks
@@ -1984,11 +1958,7 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
             crate::app::TranscriptSend::Now => "Enter",
             crate::app::TranscriptSend::Queued => "Ctrl-s",
         };
-        let noun = app
-            .transcript
-            .as_ref()
-            .map(|t| t.noun())
-            .unwrap_or("what is open");
+        let noun = app.reader.noun().unwrap_or("what is open");
         block = block.title_bottom(Line::from(Span::styled(
             format!(
                 " this goes to the main agent, with context about {noun} · {key} or y sends · anything else keeps writing "
@@ -3118,10 +3088,14 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
         if agent.activations > 1 {
             facts.push(format!("run {}", agent.activations));
         }
-        if app.transcript_path(agent).is_none() {
+        let path = app
+            .thread
+            .as_ref()
+            .and_then(|thread| crate::reader::transcript_path(thread, agent));
+        if path.is_none() {
             facts.push("no transcript".to_string());
         }
-        if app.transcript_loading.as_deref() == Some(agent.id.as_str()) {
+        if app.reader.is_loading(&Source::Subagent(agent.id.clone())) {
             facts.push("reading…".to_string());
         }
         lines.push(Line::from(Span::styled(

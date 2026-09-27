@@ -23,6 +23,7 @@ use crate::{
     model::{Id, ModelSelection, ServerConfig, ShellItem, ThreadDetailSnapshot, ThreadItem},
     picture,
     question::QuestionDraft,
+    reader::{self, Origin, Reader, Source, TranscriptFile},
     session::{self, Handle, Status, Update},
     state::{ApprovalOption, PendingApproval, Shell, ThreadState},
     ui, vim,
@@ -51,9 +52,6 @@ const TICK: Duration = Duration::from_millis(120);
 /// enough that a stream which never stops still gets drawn.
 const BATCH: usize = 512;
 const TOAST_TTL: Duration = Duration::from_secs(6);
-/// How often a running agent's open transcript is read again when nothing it did said so.
-const TRANSCRIPT_POLL: Duration = Duration::from_secs(5);
-
 /// How often to look for worktrees that have gone from the disk. They only go when
 /// something removes one, which is rare and is usually this.
 const WORKTREE_REFRESH: Duration = Duration::from_secs(60);
@@ -603,71 +601,9 @@ pub struct LostStream {
     retry_at: Instant,
 }
 
-/// A transcript as the server read it off disk.
-#[derive(Debug)]
-pub struct TranscriptFile {
-    pub contents: String,
-    /// The server stops reading at a megabyte; the tail of a long run is then missing.
-    pub truncated: bool,
-}
-
-/// Something read in place of the thread's conversation: a subagent's own conversation,
-/// or one of the thread's pull requests.
-pub struct Transcript {
-    pub source: Reading,
-    pub title: String,
-    pub subtitle: String,
-    /// The transcript rendered as a thread, so the chat draws it like any other.
-    pub state: ThreadState,
-    pub truncated: bool,
-    /// Whether the agent was still working when this was read, so what is shown is as
-    /// far as it had got rather than the whole run.
-    pub live: bool,
-    /// Where the conversation underneath was, to put it back on the way out.
-    restore: (Scroll, usize, Focus),
-}
-
-/// What an open [`Transcript`] is of.
-pub enum Reading {
-    Subagent(String),
-    PullRequest(Box<crate::pull_request::Detail>),
-}
-
-impl Transcript {
-    /// The subagent being read, when it is one.
-    pub fn agent_id(&self) -> Option<&str> {
-        match &self.source {
-            Reading::Subagent(id) => Some(id),
-            Reading::PullRequest(_) => None,
-        }
-    }
-
-    pub fn pull_request(&self) -> Option<&crate::pull_request::Detail> {
-        match &self.source {
-            Reading::PullRequest(detail) => Some(detail),
-            Reading::Subagent(_) => None,
-        }
-    }
-
-    /// What a message written over it says first, so the agent knows what "this" is.
-    fn context(&self) -> String {
-        match &self.source {
-            Reading::Subagent(id) => format!("Sent looking at the transcript for subagent {id}:"),
-            Reading::PullRequest(detail) => format!(
-                "Sent looking at pull request {}#{} ({}):",
-                detail.repository, detail.number, detail.url
-            ),
-        }
-    }
-
-    /// What it is, in a sentence about it.
-    pub fn noun(&self) -> &'static str {
-        match self.source {
-            Reading::Subagent(_) => "the subagent",
-            Reading::PullRequest(_) => "the pull request",
-        }
-    }
-}
+/// Where the conversation was when a reading opened over it: how it was scrolled, the line
+/// the cursor was on, and which pane had the keys. The reader keeps it for the way back.
+pub type Restore = (Scroll, usize, Focus);
 
 pub struct App {
     pub handle: Handle,
@@ -711,19 +647,6 @@ pub struct App {
     pub sidebar_tab_spans: Vec<(u16, u16, SidebarTab)>,
     /// The pull request `d` in the sidebar has asked about unlinking, until it is answered.
     pub sidebar_unlinking: Option<String>,
-    /// What was last asked for from the sidebar — a pull request's link or a subagent's id —
-    /// whose reading leaves the keys there, so the next row is one keystroke away. Named,
-    /// so a read that never came leaves nothing to mislead the next one from elsewhere.
-    keep_sidebar_focus: Option<String>,
-    /// Whether the transcript open was opened from the subagent list, which `q` goes back to.
-    transcript_from_roster: bool,
-    /// Whether the transcript read on its way was one nobody asked for, bringing a running
-    /// agent's up to date: it says nothing, and moves nobody.
-    transcript_quiet: bool,
-    /// When the open transcript was last read, and the running agent as it stood then, to
-    /// tell when it is worth reading again.
-    transcript_read_at: Option<Instant>,
-    transcript_seen: Option<String>,
     /// First visible line of the help, which is taller than most terminals.
     pub help_offset: usize,
     /// Rows the help fits and rows it has, filled by the renderer each frame.
@@ -795,31 +718,8 @@ pub struct App {
     pub terminal_selected: usize,
     /// Selection in the subagent roster.
     pub agent_selected: usize,
-    /// The subagent transcript being read, in place of the thread's conversation.
-    pub transcript: Option<Transcript>,
-    /// The subagent whose transcript is on its way, so the row can say so and a second
-    /// keypress does not ask for it twice.
-    pub transcript_loading: Option<String>,
-    /// The pull request whose detail is on its way, by its link, so a second `Enter` does
-    /// not ask for it twice.
-    pub pull_request_loading: Option<String>,
-    /// How many times something has been read in place of the conversation, or redrawn
-    /// there, which is the revision each read gets. The chat rebuilds what it draws only
-    /// when the revision moves, and a re-read keeps the identity of the one before it.
-    reads: u64,
-    /// The pictures pull requests' descriptions show, by their links: base64, or `None`
-    /// where the fetch failed. Kept for the session, so a re-read does not fetch again.
-    pub pull_request_images: HashMap<String, Option<String>>,
-    /// Whether the read on its way was one nobody asked for, which says nothing and opens
-    /// nothing: it only brings a pull request already open up to date.
-    pull_request_quiet: bool,
-    /// The server's refresh count as last heard, to tell a change from where it stands.
-    pull_request_revision: Option<u64>,
-    /// The open pull request's link as the thread list last had it, to notice the server's
-    /// sync bringing news of it.
-    pull_request_synced: Option<String>,
-    /// The stack the open pull request is in, as last drawn.
-    pull_request_stack_seen: Option<String>,
+    /// What is read in place of the thread's conversation, and the reads on their way.
+    pub reader: Reader<Restore>,
     /// Pull requests to put on threads being made, by the thread they go on.
     pending_links: HashMap<Id, commands::PullRequestLink>,
     /// The labels on the pull request as the label picker shows them, what each is for, and
@@ -827,10 +727,6 @@ pub struct App {
     labels_applied: HashSet<String>,
     labels_described: Vec<(String, String)>,
     pub labels_truncated: bool,
-    /// Each pull request's review history as last read, by its link, or why it could not be.
-    pub pull_request_activity: HashMap<String, Result<crate::pull_request::Activity, String>>,
-    /// Pictures asked for, whether or not they have come back.
-    pull_request_images_asked: HashSet<String>,
     /// `gh`'s tokens, by the directory it was run in and the host asked about.
     gh_tokens: std::sync::Arc<tokio::sync::Mutex<HashMap<(String, String), String>>>,
     /// The attached terminal, when one is open.
@@ -961,11 +857,6 @@ impl App {
             sidebar_places: [(0, 0); 3],
             sidebar_tab_spans: Vec::new(),
             sidebar_unlinking: None,
-            keep_sidebar_focus: None,
-            transcript_from_roster: false,
-            transcript_quiet: false,
-            transcript_read_at: None,
-            transcript_seen: None,
             help_offset: 0,
             help_viewport: (0, 0),
             show_settled: false,
@@ -995,21 +886,11 @@ impl App {
             terminals: Vec::new(),
             terminal_selected: 0,
             agent_selected: 0,
-            transcript: None,
-            transcript_loading: None,
-            pull_request_loading: None,
-            reads: 0,
-            pull_request_images: HashMap::new(),
-            pull_request_activity: HashMap::new(),
-            pull_request_quiet: false,
-            pull_request_revision: None,
-            pull_request_synced: None,
-            pull_request_stack_seen: None,
+            reader: Reader::default(),
             pending_links: HashMap::new(),
             labels_applied: HashSet::new(),
             labels_described: Vec::new(),
             labels_truncated: false,
-            pull_request_images_asked: HashSet::new(),
             gh_tokens: Default::default(),
             pane: None,
             pending_pane_command: None,
@@ -1320,8 +1201,10 @@ impl App {
     fn sidebar_reread(&mut self) {
         match self.sidebar_rows().get(self.sidebar_selected).cloned() {
             Some(SidebarRow::PullRequest { url, .. }) => {
-                self.keep_sidebar_focus = Some(url.clone());
-                self.read_pull_request_as(&url, false, true);
+                let origin = self.sidebar_origin();
+                self.read_with(|reader, thread| {
+                    reader.reread(thread, Source::PullRequest(url), origin)
+                });
             }
             Some(SidebarRow::Agent { .. }) => self.sidebar_activate(),
             _ => {}
@@ -1336,8 +1219,20 @@ impl App {
         }
     }
 
+    /// Where a read asked for from the sidebar's list comes from: the sidebar, whose keys
+    /// it leaves there, when the keys were there to ask; a click from anywhere else takes
+    /// the keys to what is read, as any other read does.
+    fn sidebar_origin(&self) -> Origin {
+        if self.focus == Focus::Sidebar {
+            Origin::Sidebar
+        } else {
+            Origin::Chat
+        }
+    }
+
     fn sidebar_activate(&mut self) {
         let rows = self.sidebar_rows();
+        let origin = self.sidebar_origin();
         match rows.get(self.sidebar_selected) {
             Some(SidebarRow::Thread { id, .. }) => {
                 let id = id.clone();
@@ -1348,18 +1243,10 @@ impl App {
             // Read where the conversation was, and the keys stay in the sidebar, so the
             // next one is `j` and `Enter` away.
             Some(SidebarRow::PullRequest { url, .. }) => {
-                let url = url.clone();
-                self.keep_sidebar_focus = Some(url.clone());
-                self.read_pull_request(&url);
+                self.open_reading(Source::PullRequest(url.clone()), origin);
             }
             Some(SidebarRow::Agent { id }) => {
-                let Some(index) = self.subagents().iter().position(|agent| &agent.id == id) else {
-                    return;
-                };
-                self.agent_selected = index;
-                self.keep_sidebar_focus = Some(id.clone());
-                self.transcript_from_roster = false;
-                self.read_transcript();
+                self.open_reading(Source::Subagent(id.clone()), origin);
             }
             Some(SidebarRow::Empty { .. }) | None => {}
         }
@@ -1413,9 +1300,7 @@ impl App {
         self.sidebar_unlinking = None;
         // A transcript belongs to the thread that ran the subagent, and a pull request to
         // the thread it is linked to; neither follows.
-        self.transcript = None;
-        self.transcript_loading = None;
-        self.pull_request_loading = None;
+        self.reader.forget();
         self.tool_recovery_request = None;
         self.current_thread_id = Some(thread_id.to_string());
         self.lost_stream = None;
@@ -1525,9 +1410,7 @@ impl App {
         self.swap_composer_draft(NEW_THREAD_DRAFT_KEY);
         // What was being read belonged to the thread being left, as it does when another
         // thread is opened.
-        self.transcript = None;
-        self.transcript_loading = None;
-        self.pull_request_loading = None;
+        self.reader.forget();
         self.draft = Some(NewThreadDraft {
             project_id: project_id.to_string(),
             worktree: env_mode.as_deref() == Some("worktree"),
@@ -1764,7 +1647,7 @@ impl App {
     }
 
     fn send_message(&mut self) {
-        if self.transcript.is_some() {
+        if self.reader.is_open() {
             return self.ask_to_send_over_transcript(TranscriptSend::Now);
         }
         self.send_composed(None);
@@ -1784,7 +1667,7 @@ impl App {
             return;
         }
         // The message joins the conversation, so that is what to be looking at.
-        self.leave_transcript();
+        self.leave_reading();
         // Read the slot before sending: starting a new thread moves the view to it, and the
         // parked text belongs to the slot the message was written in.
         let draft_key = self.draft_key();
@@ -1876,7 +1759,7 @@ impl App {
     /// with it as `Enter` does. With no turn running there is nothing to wait for, and
     /// it is sent.
     fn queue_message(&mut self) {
-        if self.transcript.is_some() {
+        if self.reader.is_open() {
             return self.ask_to_send_over_transcript(TranscriptSend::Queued);
         }
         self.queue_composed(None);
@@ -1902,7 +1785,7 @@ impl App {
             .as_ref()
             .filter(|turn| turn.state == "running")
             .map(|turn| turn.turn_id.clone());
-        self.leave_transcript();
+        self.leave_reading();
         let queued = self.queued.entry(thread_id.clone()).or_insert(Queued {
             text: String::new(),
             after_turn: None,
@@ -2187,7 +2070,7 @@ impl App {
                 "default",
                 None,
             );
-            self.leave_transcript();
+            self.leave_reading();
             self.dispatch(commands::implementing(command, &source, &plan_id));
             self.scroll = Scroll::Follow;
             return;
@@ -2234,7 +2117,7 @@ impl App {
 
     /// `gr`: rewind to before the message under the chat cursor.
     fn rewind_at_cursor(&mut self) {
-        if self.transcript.is_some() {
+        if self.reader.is_open() {
             self.toast("what is open here is read, not rewound", true);
             return;
         }
@@ -3852,14 +3735,10 @@ impl App {
 
     // ── Subagents ──────────────────────────────────────────────────────
 
-    /// The conversation on screen: a subagent's transcript when one is open, otherwise
-    /// the thread's own. The renderer reads the same two fields directly, because taking
-    /// a reference to the whole of `self` here would borrow the fields it writes.
+    /// The conversation on screen: what is being read in place of the thread's when
+    /// something is, otherwise the thread's own.
     pub fn open_conversation(&self) -> Option<&ThreadState> {
-        self.transcript
-            .as_ref()
-            .map(|transcript| &transcript.state)
-            .or(self.thread.as_ref())
+        self.reader.conversation().or(self.thread.as_ref())
     }
 
     /// The subagents the open thread has run, newest work last.
@@ -3884,9 +3763,8 @@ impl App {
         // one still working, else the last to finish, which is the one the conversation
         // has just been talking about.
         let reading = self
-            .transcript
-            .as_ref()
-            .and_then(|transcript| transcript.agent_id())
+            .reader
+            .agent_id()
             .and_then(|reading| agents.iter().position(|a| a.id == reading));
         self.agent_selected = reading
             .or_else(|| agents.iter().position(|agent| agent.status.is_active()))
@@ -3907,10 +3785,12 @@ impl App {
             }
             KeyCode::Char('g') => self.agent_selected = 0,
             KeyCode::Char('G') => self.agent_selected = count.saturating_sub(1),
-            KeyCode::Enter | KeyCode::Char('l') => {
-                self.transcript_from_roster = true;
-                self.read_transcript();
-            }
+            KeyCode::Enter | KeyCode::Char('l') => match agents.get(self.agent_selected) {
+                Some(agent) => {
+                    self.open_reading(Source::Subagent(agent.id.clone()), Origin::Roster)
+                }
+                None => self.toast("no subagent selected", true),
+            },
             KeyCode::Char('y') => match agents.get(self.agent_selected) {
                 Some(agent) => match agent.result.as_deref().or(agent.error.as_deref()) {
                     Some(report) => {
@@ -3925,247 +3805,208 @@ impl App {
         }
     }
 
-    /// Where the provider is writing a subagent's transcript. It tells the server the
-    /// path only when the task finishes, so for one still working it is taken from a
-    /// task in the same thread that has: they are written side by side in one directory
-    /// and named after the task, and the file is there from the moment the agent starts.
-    pub fn transcript_path(&self, agent: &crate::subagent::Subagent) -> Option<String> {
-        if let Some(path) = &agent.output_file {
-            return Some(path.clone());
-        }
-        let thread = self.thread.as_ref()?;
-        let known = thread
-            .detail
-            .activities
-            .iter()
-            .rev()
-            .find_map(|activity| activity.str("outputFile"))?;
-        crate::transcript::sibling_path(known, &agent.id)
-    }
+    // ── Reading ────────────────────────────────────────────────────────
 
-    /// Fetch the selected subagent's transcript from the machine that ran it. The path
-    /// is the provider's own, outside any workspace, which is what `projects.readFile`
-    /// takes an absolute path for.
-    fn read_transcript(&mut self) {
-        self.read_transcript_as(false);
-    }
-
-    /// Read the selected subagent's transcript, `quiet`ly to bring an open one up to date.
-    fn read_transcript_as(&mut self, quiet: bool) {
-        let agents = self.subagents();
-        let Some(agent) = agents.get(self.agent_selected) else {
-            if !quiet {
-                self.toast("no subagent selected", true);
-            }
-            return;
+    /// Lend the reader the open thread for `act`, and do what it answers. Whether there
+    /// was a thread to lend: a reading belongs to the thread it was read from, so with none
+    /// open there is nothing to read, and nothing left to bring up to date.
+    fn read_with(
+        &mut self,
+        act: impl FnOnce(&mut Reader<Restore>, &reader::Thread<'_>) -> reader::Step,
+    ) -> bool {
+        let branch = self.checked_out_branch().map(str::to_string);
+        let directory = self.thread_directory();
+        let Some(state) = self.thread.as_ref() else {
+            self.reader.forget();
+            return false;
         };
-        let Some(path) = self.transcript_path(agent) else {
-            if !quiet {
-                self.toast("no transcript for this subagent yet", false);
-            }
-            return;
-        };
-        if self.transcript_loading.is_some() {
-            return;
-        }
-        let Some(cwd) = self.thread_directory() else {
-            if !quiet {
-                self.toast("thread has no directory", true);
-            }
-            return;
-        };
-        self.transcript_loading = Some(agent.id.clone());
-        self.transcript_quiet = quiet;
-        let agent_id = agent.id.clone();
-        let handle = self.handle.clone();
-        let events = self.events.clone();
-        let payload = json!({ "cwd": cwd, "relativePath": path });
-        tokio::spawn(async move {
-            let result = handle
-                .call("projects.readFile", payload)
-                .await
-                .map_err(|e| e.to_string())
-                .map(|value| TranscriptFile {
-                    contents: value
-                        .get("contents")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    truncated: value
-                        .get("truncated")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                });
-            let _ = events.send(AppEvent::Transcript { agent_id, result });
-        });
-    }
-
-    fn on_transcript(&mut self, agent_id: String, result: Result<TranscriptFile, String>) {
-        if self.transcript_loading.as_deref() != Some(agent_id.as_str()) {
-            return;
-        }
-        self.transcript_loading = None;
-        self.transcript_read_at = Some(Instant::now());
-        let quiet = std::mem::take(&mut self.transcript_quiet);
-        // A read nobody asked for only brings up to date what is still open.
-        let open = self
-            .transcript
-            .as_ref()
-            .is_some_and(|t| t.agent_id() == Some(agent_id.as_str()));
-        if quiet && !open {
-            return;
-        }
-        let agent_id_read = agent_id.clone();
-        let file = match result {
-            Ok(file) => file,
-            Err(error) if quiet => {
-                tracing::info!(%error, "bringing the transcript up to date");
-                return;
-            }
-            Err(error) => return self.toast(format!("reading the transcript: {error}"), true),
-        };
-        let agents = self.subagents();
-        let Some(agent) = agents.iter().find(|agent| agent.id == agent_id) else {
-            return;
-        };
-        let (mut state, summary) =
-            match crate::transcript::parse(&file.contents, &agent.id, &agent.title) {
-                Ok(parsed) => parsed,
-                Err(error) if quiet => {
-                    tracing::info!(%error, "bringing the transcript up to date");
-                    return;
-                }
-                Err(error) => return self.toast(format!("{error}"), true),
-            };
-        self.reads += 1;
-        state.revision = self.reads;
-        let mut subtitle = format!(
-            "{} message{} · {} tool call{}",
-            summary.messages,
-            if summary.messages == 1 { "" } else { "s" },
-            summary.tools,
-            if summary.tools == 1 { "" } else { "s" },
-        );
-        if let Some(role) = &agent.role {
-            subtitle = format!("{role} · {subtitle}");
-        }
-        // Re-reading a running agent replaces what is open, so the way back is the one
-        // taken on the way in, not wherever the reading had got to.
-        let reread = self
-            .transcript
-            .as_ref()
-            .is_some_and(|open| open.agent_id() == Some(agent_id.as_str()));
-        // Whatever is open already holds the conversation's own place.
-        let restore = match &self.transcript {
-            Some(open) => open.restore,
-            None => (self.scroll, self.chat_cursor, self.focus),
-        };
-        let live = !agent.status.is_terminal();
-        if !reread {
-            self.transcript_seen = Some(format!("{} {:?}", agent.updated_at, agent.status));
-        }
-        self.transcript = Some(Transcript {
-            source: Reading::Subagent(agent_id),
-            title: agent.title.clone(),
-            subtitle,
+        let thread = reader::Thread {
             state,
-            truncated: file.truncated,
-            live,
-            restore,
-        });
-        // The transcript is read, not written to, so the cursor goes where the reading
-        // is done and the conversation's own place is kept for the way back. A re-read
-        // of a run still going lands at the end, which is the part that is new. One asked
-        // for from the sidebar leaves the keys there, for the next.
-        // Brought up to date under somebody, it leaves them where they were: reading
-        // further up stays put, and reading at the end follows what is new.
-        if quiet {
+            branch: branch.as_deref(),
+            directory: directory.as_deref(),
+        };
+        let step = act(&mut self.reader, &thread);
+        self.take_step(step);
+        true
+    }
+
+    /// Read something in place of the conversation, because somebody asked from `origin`.
+    fn open_reading(&mut self, source: Source, origin: Origin) {
+        if !self.read_with(|reader, thread| reader.open(thread, source, origin)) {
+            self.toast("no thread open", true);
+        }
+    }
+
+    /// `r`: read what is open again. An agent still working has written more since, and a
+    /// pull request moves on while it is read.
+    fn reread_reading(&mut self) {
+        let Some(source) = self.reader.source() else {
+            return;
+        };
+        self.read_with(|reader, thread| reader.reread(thread, source, Origin::Chat));
+    }
+
+    /// Keep a running agent's open transcript up to date.
+    fn follow_reading(&mut self) {
+        self.read_with(|reader, thread| reader.tick(thread, Instant::now()));
+    }
+
+    /// Do what the reader answered: fetch what it wants, say what it says, and put the
+    /// reader where what it read has opened.
+    fn take_step(&mut self, step: reader::Step) {
+        for fetch in step.fetches {
+            self.fetch(fetch);
+        }
+        match step.toast {
+            None => {}
+            Some(reader::Toast::Clear) => self.toast = None,
+            Some(reader::Toast::Say(text)) => self.toast(text, false),
+            Some(reader::Toast::Warn(text)) => self.toast(text, true),
+        }
+        let reader::Outcome::Opened { place, take_focus } = step.outcome else {
+            return;
+        };
+        if place == reader::Place::Keep {
             return;
         }
         self.mode = Mode::Normal;
-        if self.keep_sidebar_focus.take().as_deref() != Some(agent_id_read.as_str()) {
+        if take_focus {
             self.focus = Focus::Chat;
         }
-        if reread && live {
-            self.scroll = Scroll::Follow;
-        } else {
-            self.scroll = Scroll::Offset(0);
-            self.chat_cursor = 0;
+        match place {
+            reader::Place::End => self.scroll = Scroll::Follow,
+            _ => {
+                self.scroll = Scroll::Offset(0);
+                self.chat_cursor = 0;
+            }
         }
         self.chat_visual = None;
         self.search = None;
     }
 
-    /// Keep a running agent's transcript up to date while it is open. The server has no
-    /// way to say a file changed, but the thread says when the agent does something, and
-    /// that is when its transcript grows; between those, a stretch of writing is caught by
-    /// reading again every few seconds. Once the agent has finished, one last read shows
-    /// how it ended, and that is the end of it.
-    fn follow_transcript(&mut self) {
-        let Some(id) = self
-            .transcript
-            .as_ref()
-            .filter(|t| t.live)
-            .and_then(|t| t.agent_id())
-            .map(str::to_string)
-        else {
-            return;
-        };
-        if self.transcript_loading.is_some() {
-            return;
+    /// Fetch what the reader asked for, and hand it back as an event once it has come.
+    fn fetch(&mut self, fetch: reader::Fetch) {
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        match fetch {
+            reader::Fetch::Transcript {
+                agent_id,
+                cwd,
+                path,
+            } => {
+                let payload = json!({ "cwd": cwd, "relativePath": path });
+                tokio::spawn(async move {
+                    let result = handle
+                        .call("projects.readFile", payload)
+                        .await
+                        .map_err(|e| e.to_string())
+                        .map(|value| TranscriptFile {
+                            contents: value
+                                .get("contents")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            truncated: value
+                                .get("truncated")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        });
+                    let _ = events.send(AppEvent::Transcript { agent_id, result });
+                });
+            }
+            // The server asks the host, so this is the one read that can be slow.
+            reader::Fetch::PullRequest {
+                url,
+                payload,
+                fresh,
+            } => {
+                tokio::spawn(async move {
+                    if fresh {
+                        let reference = json!({ "reference": payload });
+                        if let Err(err) = handle.call("pullRequests.invalidate", reference).await {
+                            tracing::info!(%err, "the server kept its copy of the pull request");
+                        }
+                    }
+                    // The review history is asked for beside the detail rather than after
+                    // it: it is the slower of the two, and the view fills it in when it comes.
+                    let detail = async {
+                        let result = handle
+                            .call("pullRequests.detail", payload.clone())
+                            .await
+                            .map_err(|e| e.to_string());
+                        let _ = events.send(AppEvent::PullRequest {
+                            url: url.clone(),
+                            result,
+                        });
+                    };
+                    let activity = async {
+                        let result = handle
+                            .call("pullRequests.activity", payload.clone())
+                            .await
+                            .map_err(|e| e.to_string());
+                        let _ = events.send(AppEvent::PullRequestActivity {
+                            url: url.clone(),
+                            result,
+                        });
+                    };
+                    tokio::join!(detail, activity);
+                });
+            }
+            reader::Fetch::Image {
+                url,
+                token_host,
+                directory,
+            } => {
+                let tokens = self.gh_tokens.clone();
+                tokio::spawn(async move {
+                    let token = match token_host {
+                        Some(host) => gh_token(&tokens, directory.as_deref(), &host).await,
+                        None => None,
+                    };
+                    let data = fetch_image(&url, token.as_deref()).await;
+                    let _ = events.send(AppEvent::PullRequestImage { url, data });
+                });
+            }
         }
-        let agents = self.subagents();
-        let Some(index) = agents.iter().position(|agent| agent.id == id) else {
-            return;
-        };
-        let agent = &agents[index];
-        let seen = format!("{} {:?}", agent.updated_at, agent.status);
-        let moved = self.transcript_seen.as_ref() != Some(&seen);
-        let due = self
-            .transcript_read_at
-            .is_none_or(|at| at.elapsed() >= TRANSCRIPT_POLL);
-        if !moved && !due {
-            return;
-        }
-        self.transcript_seen = Some(seen);
-        self.agent_selected = index;
-        self.read_transcript_as(true);
     }
 
-    /// Read the open transcript again: an agent still working has written more since.
-    fn reload_transcript(&mut self) {
-        let Some(open) = self.transcript.as_ref() else {
-            return;
-        };
-        if let Some(detail) = open.pull_request() {
-            let url = detail.url.clone();
-            return self.read_pull_request_as(&url, false, true);
-        }
-        let Some(open) = open.agent_id().map(str::to_string) else {
-            return;
-        };
-        let agents = self.subagents();
-        let Some(index) = agents.iter().position(|agent| agent.id == open) else {
-            self.toast("that subagent is no longer in this thread", true);
-            return;
-        };
-        self.agent_selected = index;
-        self.read_transcript();
+    /// Where the conversation is now, for the reader to keep should what it read open over it.
+    fn here(&self) -> Restore {
+        (self.scroll, self.chat_cursor, self.focus)
     }
 
-    /// Leave the transcript and put the conversation back where it was. Where to go next
-    /// is the caller's: `q` returns to the list the transcript was opened from, while
-    /// sending a message simply carries on.
-    fn leave_transcript(&mut self) {
-        let Some(transcript) = self.transcript.take() else {
-            return;
-        };
-        let (scroll, cursor, focus) = transcript.restore;
+    fn on_transcript(&mut self, agent_id: String, result: Result<TranscriptFile, String>) {
+        let here = self.here();
+        self.read_with(|reader, thread| {
+            reader.on_transcript(thread, agent_id, result, here, Instant::now())
+        });
+    }
+
+    fn on_pull_request(&mut self, url: String, result: Result<Value, String>) {
+        let here = self.here();
+        self.read_with(|reader, thread| reader.on_pull_request(thread, url, result, here));
+    }
+
+    fn on_pull_request_activity(&mut self, url: String, result: Result<Value, String>) {
+        self.read_with(|reader, thread| reader.on_activity(thread, url, result));
+    }
+
+    fn on_pull_request_image(&mut self, url: String, data: Option<String>) {
+        let step = self.reader.on_image(url, data);
+        self.take_step(step);
+    }
+
+    /// Put away what is being read and put the conversation back where it was. Where to go
+    /// next is the caller's, from where the reading was asked for, which this gives back.
+    fn leave_reading(&mut self) -> Option<Origin> {
+        let closed = self.reader.close()?;
+        let (scroll, cursor, focus) = closed.restore;
         self.scroll = scroll;
         self.chat_cursor = cursor;
         self.focus = focus;
         self.chat_visual = None;
         self.search = None;
+        Some(closed.origin)
     }
 
     /// Ask before sending a message written over a transcript: it looks like a reply to
@@ -4191,7 +4032,7 @@ impl App {
         if !agreed {
             return;
         }
-        let context = self.transcript.as_ref().map(Transcript::context);
+        let context = self.reader.context();
         match send {
             TranscriptSend::Now => self.send_composed(context),
             TranscriptSend::Queued => self.queue_composed(context),
@@ -4617,17 +4458,8 @@ impl App {
         // A check's or a reviewer's row in a pull request stands for a link, kept off the
         // row to leave room.
         let row = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .zip(self.region_at(self.chat_cursor))
-            .and_then(|(detail, (key, _))| {
-                let activity = self
-                    .pull_request_activity
-                    .get(&detail.url)
-                    .and_then(|a| a.as_ref().ok());
-                crate::pull_request::link_at(&key, detail, activity)
-            });
+            .region_at(self.chat_cursor)
+            .and_then(|(key, _)| self.reader.link_at(&key));
         if let Some(url) = row {
             self.open_url(&url);
             return;
@@ -4637,12 +4469,7 @@ impl App {
             return;
         }
         // The pull request being read is the one meant, whichever the header shows.
-        if let Some(url) = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .map(|detail| detail.url.clone())
-        {
+        if let Some(url) = self.reader.pull_request().map(|detail| detail.url.clone()) {
             self.open_url(&url);
             return;
         }
@@ -4705,57 +4532,6 @@ impl App {
         }
     }
 
-    /// Fetch the pictures a description shows that have not been asked for yet. They are
-    /// fetched from here rather than through the server, which has no way to hand them
-    /// over; a picture on the pull request's own host is asked for with `gh`'s token for
-    /// that host, since a private repository's uploads are private too. `gh` is asked in
-    /// the thread's directory, because which account it answers for can depend on where
-    /// it is run.
-    fn fetch_pull_request_images(&mut self, detail: &crate::pull_request::Detail) {
-        let host = url_host(&detail.url).map(str::to_string);
-        let directory = self.thread_directory();
-        let activity = self
-            .pull_request_activity
-            .get(&detail.url)
-            .and_then(|a| a.as_ref().ok());
-        for url in crate::pull_request::image_urls(detail, activity) {
-            if !self.pull_request_images_asked.insert(url.clone()) {
-                continue;
-            }
-            let own = host.as_deref().filter(|host| url_host(&url) == Some(*host));
-            let host = own.map(str::to_string);
-            let directory = directory.clone();
-            let tokens = self.gh_tokens.clone();
-            let events = self.events.clone();
-            tokio::spawn(async move {
-                let token = match host {
-                    Some(host) => gh_token(&tokens, directory.as_deref(), &host).await,
-                    None => None,
-                };
-                let data = fetch_image(&url, token.as_deref()).await;
-                let _ = events.send(AppEvent::PullRequestImage { url, data });
-            });
-        }
-    }
-
-    fn on_pull_request_image(&mut self, url: String, data: Option<String>) {
-        if data.is_none() {
-            tracing::info!(%url, "a pull request's picture could not be fetched");
-            // Asked for again on the next read, which is what `r` is for.
-            self.pull_request_images_asked.remove(&url);
-        }
-        self.pull_request_images.insert(url, data);
-        // The chat redraws what it has built only when the revision moves.
-        if let Some(open) = self
-            .transcript
-            .as_mut()
-            .filter(|t| t.pull_request().is_some())
-        {
-            self.reads += 1;
-            open.state.revision = self.reads;
-        }
-    }
-
     /// The open thread's pull requests as they are listed, in `:pr` and the sidebar alike:
     /// stack by stack, the one the header speaks for first, each bottom to top, and whether
     /// each builds on the one before it. One on the thread's branch that was never linked
@@ -4804,83 +4580,20 @@ impl App {
         }
     }
 
-    /// Ask the server for a pull request's detail, to read it in place of the conversation.
-    /// The server asks the host, so this is the one read that can be slow.
+    /// Read a pull request in place of the conversation, because somebody asked.
     fn read_pull_request(&mut self, url: &str) {
-        self.read_pull_request_as(url, false, false);
+        self.open_reading(Source::PullRequest(url.to_string()), Origin::Chat);
     }
 
-    /// Read a pull request, `quiet`ly to bring an open one up to date, and `fresh` past the
-    /// server's cache of what the host said, which it keeps until it has reason to doubt it.
-    fn read_pull_request_as(&mut self, url: &str, quiet: bool, fresh: bool) {
-        let (payload, number) = match self.pull_request_payload(url) {
-            Ok(found) => found,
-            Err(why) => return self.toast(why, true),
-        };
-        if self.pull_request_loading.as_deref() == Some(url) {
-            return;
-        }
-        self.pull_request_loading = Some(url.to_string());
-        self.pull_request_quiet = quiet;
-        if !quiet {
-            self.toast(format!("reading #{number}…"), false);
-        }
-        let url = url.to_string();
-        let handle = self.handle.clone();
-        let events = self.events.clone();
-        tokio::spawn(async move {
-            if fresh {
-                let reference = json!({ "reference": payload });
-                if let Err(err) = handle.call("pullRequests.invalidate", reference).await {
-                    tracing::info!(%err, "the server kept its copy of the pull request");
-                }
-            }
-            // The review history is asked for beside the detail rather than after it: it
-            // is the slower of the two, and the view fills it in when it comes.
-            let detail = async {
-                let result = handle
-                    .call("pullRequests.detail", payload.clone())
-                    .await
-                    .map_err(|e| e.to_string());
-                let _ = events.send(AppEvent::PullRequest {
-                    url: url.clone(),
-                    result,
-                });
-            };
-            let activity = async {
-                let result = handle
-                    .call("pullRequests.activity", payload.clone())
-                    .await
-                    .map_err(|e| e.to_string());
-                let _ = events.send(AppEvent::PullRequestActivity {
-                    url: url.clone(),
-                    result,
-                });
-            };
-            tokio::join!(detail, activity);
-        });
-    }
-
-    /// How the server knows a pull request linked to the open thread: its project, host,
-    /// repository, and number. And the number, to speak of it by.
+    /// How the server knows a pull request linked to the open thread, and its number.
     fn pull_request_payload(&self, url: &str) -> Result<(Value, u64), &'static str> {
-        let shell = &self.thread.as_ref().ok_or("no thread open")?.detail.shell;
-        let pr = shell
-            .all_pull_requests(self.checked_out_branch())
-            .into_iter()
-            .find(|pr| pr.url == url)
-            .ok_or("that pull request is not linked to this thread")?;
-        let mut payload = json!({
-            "projectId": shell.project_id,
-            "repository": pr.repository,
-            "number": pr.number,
-        });
-        // One the server found on the branch but never linked has no host of its own; the
-        // server then takes the project's.
-        if !pr.host.is_empty() {
-            payload["host"] = json!(pr.host);
-        }
-        Ok((payload, pr.number))
+        let state = self.thread.as_ref().ok_or("no thread open")?;
+        let thread = reader::Thread {
+            state,
+            branch: self.checked_out_branch(),
+            directory: None,
+        };
+        reader::pull_request_payload(&thread, url)
     }
 
     /// `:checkout` and `c` on a pull request in the sidebar: have the server check the pull
@@ -4960,7 +4673,7 @@ impl App {
     /// The pull request the screen is about: the one being read, else the one picked in
     /// the sidebar's list, else the one the header shows.
     fn pull_request_in_view(&self) -> Option<String> {
-        if let Some(detail) = self.transcript.as_ref().and_then(|t| t.pull_request()) {
+        if let Some(detail) = self.reader.pull_request() {
             return Some(detail.url.clone());
         }
         if self.sidebar_tab == SidebarTab::PullRequests
@@ -5027,7 +4740,7 @@ impl App {
     /// `L` and `:labels`: the repository's labels, to put on the pull request being read or
     /// take off it. Only offered where the host can change them and the viewer may.
     fn edit_labels(&mut self) {
-        let Some(detail) = self.transcript.as_ref().and_then(|t| t.pull_request()) else {
+        let Some(detail) = self.reader.pull_request() else {
             self.toast("read a pull request first: gp", true);
             return;
         };
@@ -5053,11 +4766,7 @@ impl App {
     }
 
     fn on_label_candidates(&mut self, url: String, result: Result<Value, String>) {
-        let still_open = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .is_some_and(|d| d.url == url);
+        let still_open = self.reader.pull_request().is_some_and(|d| d.url == url);
         if !still_open {
             return;
         }
@@ -5106,12 +4815,7 @@ impl App {
         else {
             return;
         };
-        let Some(url) = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .map(|d| d.url.clone())
-        else {
+        let Some(url) = self.reader.pull_request().map(|d| d.url.clone()) else {
             return;
         };
         let (mut payload, _) = match self.pull_request_payload(&url) {
@@ -5174,15 +4878,7 @@ impl App {
             Ok(()) => {
                 let done = if applied { "put on" } else { "took off" };
                 self.toast(format!("{done} {name}"), false);
-                // The chips across the top are the pull request's own, read again.
-                let open = self
-                    .transcript
-                    .as_ref()
-                    .and_then(|t| t.pull_request())
-                    .is_some_and(|d| d.url == url);
-                if open {
-                    self.read_pull_request_as(&url, true, true);
-                }
+                self.read_with(|reader, thread| reader.label_set(thread, &url, &name, applied));
             }
             Err(error) => {
                 self.set_label_shown(&name, !applied);
@@ -5191,197 +4887,19 @@ impl App {
         }
     }
 
-    /// The server says pull requests may have changed: a turn has ended, and the agent may
-    /// have pushed, commented, or merged. The first count after connecting is only where it
-    /// stands, unless it moved while the connection was down.
+    /// The server says pull requests may have changed, and the open one may be worth
+    /// reading again.
     fn on_pull_requests_refreshed(&mut self, revision: u64) {
-        let changed = self
-            .pull_request_revision
-            .is_some_and(|seen| seen != revision);
-        self.pull_request_revision = Some(revision);
-        if changed {
-            self.refresh_open_pull_request();
+        if self.reader.server_refreshed(revision) {
+            self.read_with(|reader, thread| reader.refresh(thread));
         }
     }
 
-    /// The server syncs linked pull requests with the host on its own, and the thread list
-    /// carries what it found. News of the one being read — checks finishing, a review, a
-    /// merge — is a reason to read it again.
+    /// The thread list carries what the server's own sync found, which may be news of the
+    /// pull request being read.
     fn notice_pull_request_sync(&mut self) {
-        let Some(url) = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .map(|detail| detail.url.clone())
-        else {
-            return;
-        };
-        // The strip across the top is the thread list's, so a layer landing or linked
-        // redraws it, without reading anything.
-        let stack = format!("{:?}", self.pull_request_stack());
-        if self.pull_request_stack_seen.as_ref() != Some(&stack) {
-            self.pull_request_stack_seen = Some(stack);
-            if let Some(open) = self.transcript.as_mut() {
-                self.reads += 1;
-                open.state.revision = self.reads;
-            }
-        }
-        let synced = self.synced_link(&url);
-        if synced.is_some() && synced != self.pull_request_synced {
-            let had = std::mem::replace(&mut self.pull_request_synced, synced);
-            if had.is_some() {
-                self.refresh_open_pull_request();
-            }
-        }
-    }
-
-    /// The stack the pull request being read is a layer of, bottom to top, and which layer
-    /// it is. Only a stack of more than one: a pull request on its own is not in one.
-    pub fn pull_request_stack(&self) -> Option<(Vec<crate::model::PullRequestRef>, usize)> {
-        let url = &self.transcript.as_ref()?.pull_request()?.url;
-        let shell = &self.thread.as_ref()?.detail.shell;
-        shell
-            .pull_request_chains()
-            .into_iter()
-            .filter(|chain| chain.layers.len() > 1)
-            .find_map(|chain| {
-                let at = chain.layers.iter().position(|layer| &layer.url == url)?;
-                Some((chain.layers, at))
-            })
-    }
-
-    /// `[` and `]`: read the layer below or above in the stack.
-    fn move_through_stack(&mut self, by: isize) {
-        let Some((layers, at)) = self.pull_request_stack() else {
-            self.toast("this pull request is not in a stack", false);
-            return;
-        };
-        match at.checked_add_signed(by).and_then(|next| layers.get(next)) {
-            Some(layer) => self.read_pull_request(&layer.url.clone()),
-            None if by < 0 => self.toast("already the bottom of the stack", false),
-            None => self.toast("already the top of the stack", false),
-        }
-    }
-
-    /// What the thread list says of a linked pull request, as something to compare.
-    fn synced_link(&self, url: &str) -> Option<String> {
-        let shell = &self.thread.as_ref()?.detail.shell;
-        let link = shell.pull_requests.iter().find(|pr| pr.url == url)?;
-        Some(format!("{:?}", link.snapshot))
-    }
-
-    fn refresh_open_pull_request(&mut self) {
-        if let Some(url) = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .map(|detail| detail.url.clone())
-        {
-            self.read_pull_request_as(&url, true, true);
-        }
-    }
-
-    fn on_pull_request_activity(&mut self, url: String, result: Result<Value, String>) {
-        let activity = result.and_then(|value| {
-            serde_json::from_value::<crate::pull_request::Activity>(value)
-                .map_err(|e| e.to_string())
-        });
-        // What was read before stays in view over a re-read that failed.
-        if activity.is_err() && matches!(self.pull_request_activity.get(&url), Some(Ok(_))) {
-            return;
-        }
-        self.pull_request_activity.insert(url.clone(), activity);
-        // The reviews shown can have pictures of their own.
-        let detail = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .filter(|d| d.url == url)
-            .cloned();
-        if let Some(detail) = detail {
-            self.fetch_pull_request_images(&detail);
-        }
-        if let Some(open) = self
-            .transcript
-            .as_mut()
-            .filter(|t| t.pull_request().is_some_and(|d| d.url == url))
-        {
-            self.reads += 1;
-            open.state.revision = self.reads;
-        }
-    }
-
-    fn on_pull_request(&mut self, url: String, result: Result<Value, String>) {
-        if self.pull_request_loading.as_deref() != Some(url.as_str()) {
-            return;
-        }
-        self.pull_request_loading = None;
-        let quiet = std::mem::take(&mut self.pull_request_quiet);
-        // A read nobody asked for only brings up to date what is still open.
-        let open = self
-            .transcript
-            .as_ref()
-            .and_then(|t| t.pull_request())
-            .is_some_and(|open| open.url == url);
-        if quiet && !open {
-            return;
-        }
-        let detail = match result.and_then(|value| {
-            serde_json::from_value::<crate::pull_request::Detail>(value).map_err(|e| e.to_string())
-        }) {
-            // Known by the link it was asked for by, which is what its review history is
-            // kept under too.
-            Ok(detail) => crate::pull_request::Detail {
-                url: url.clone(),
-                ..detail
-            },
-            Err(error) if quiet => {
-                tracing::info!(%error, "bringing the pull request up to date");
-                return;
-            }
-            Err(error) => return self.toast(format!("reading the pull request: {error}"), true),
-        };
-        self.fetch_pull_request_images(&detail);
-        self.reads += 1;
-        let state = match crate::pull_request::state(&detail, self.reads) {
-            Ok(state) => state,
-            Err(error) => return self.toast(format!("{error}"), true),
-        };
-        // A re-read keeps the place in it; anything else starts at the top.
-        let reread = open;
-        if !reread {
-            self.pull_request_synced = self.synced_link(&url);
-        }
-        let restore = match &self.transcript {
-            Some(open) => open.restore,
-            None => (self.scroll, self.chat_cursor, self.focus),
-        };
-        self.transcript = Some(Transcript {
-            // The title is the first thing the view itself says.
-            title: format!("{}#{}", detail.repository, detail.number),
-            subtitle: "pull request".to_string(),
-            source: Reading::PullRequest(Box::new(detail)),
-            state,
-            truncated: false,
-            live: false,
-            restore,
-        });
-        if !quiet {
-            self.toast = None;
-        }
-        // Brought up to date under somebody, it leaves them where they were: writing, with
-        // a selection, or in the middle of a search.
-        let keep_sidebar =
-            !quiet && self.keep_sidebar_focus.take().as_deref() == Some(url.as_str());
-        if !reread {
-            self.mode = Mode::Normal;
-            if !keep_sidebar {
-                self.focus = Focus::Chat;
-            }
-            self.scroll = Scroll::Offset(0);
-            self.chat_cursor = 0;
-            self.chat_visual = None;
-            self.search = None;
+        if self.reader.pull_request().is_some() {
+            self.read_with(|reader, thread| reader.notice_sync(thread));
         }
     }
 
@@ -6060,42 +5578,35 @@ impl App {
         // and go back to the list it was opened from; anything that moves the focus
         // elsewhere closes it too, so the keyboard and the screen never disagree about
         // which conversation is in front.
-        if self.transcript.is_some() && prefix.is_none() {
+        if self.reader.is_open() && prefix.is_none() {
             let idle = self.chat_visual.is_none() && self.chat_count.is_none();
-            let reading_pull_request = self
-                .transcript
-                .as_ref()
-                .is_some_and(|t| t.pull_request().is_some());
+            let reading_pull_request = self.reader.pull_request().is_some();
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc if idle => {
-                    let from_roster = self.transcript_from_roster
-                        && self
-                            .transcript
-                            .as_ref()
-                            .is_some_and(|t| t.agent_id().is_some());
-                    self.leave_transcript();
-                    if from_roster {
+                    if self.leave_reading() == Some(Origin::Roster) {
                         self.mode = Mode::Agents;
                     }
                     return;
                 }
-                KeyCode::Tab | KeyCode::BackTab => self.leave_transcript(),
+                KeyCode::Tab | KeyCode::BackTab => {
+                    self.leave_reading();
+                }
                 KeyCode::Char('L') if idle && reading_pull_request => {
                     self.edit_labels();
                     return;
                 }
                 KeyCode::Char('[') if idle && reading_pull_request => {
-                    self.move_through_stack(-1);
+                    self.read_with(|reader, thread| reader.move_through_stack(thread, -1));
                     return;
                 }
                 KeyCode::Char(']') if idle && reading_pull_request => {
-                    self.move_through_stack(1);
+                    self.read_with(|reader, thread| reader.move_through_stack(thread, 1));
                     return;
                 }
                 // The file grows while the agent works, and a pull request moves on while it
                 // is read; nothing pushes either to us.
                 KeyCode::Char('r') if idle => {
-                    self.reload_transcript();
+                    self.reread_reading();
                     return;
                 }
                 _ => {}
@@ -6150,7 +5661,7 @@ impl App {
                 self.scroll = Scroll::Offset(0);
                 // A transcript is whole as it was read; there is nothing older to fetch,
                 // and the thread underneath is not what the top of the view belongs to.
-                if self.transcript.is_none() && self.thread.as_ref().is_some_and(|t| t.has_more) {
+                if !self.reader.is_open() && self.thread.as_ref().is_some_and(|t| t.has_more) {
                     self.load_older();
                 }
             }
@@ -6507,7 +6018,7 @@ impl App {
     /// Read in a blocking worker: large transcripts must not stop terminal input.
     /// Reopening retries missing results and refreshes background output files.
     fn recover_tools(&mut self) {
-        if !self.local_disk || self.transcript.is_some() || self.tool_recovery_request.is_some() {
+        if !self.local_disk || self.reader.is_open() || self.tool_recovery_request.is_some() {
             return;
         }
         let Some(cwd) = self.thread_directory() else {
@@ -7076,12 +6587,8 @@ impl App {
                         self.toggle_section(*section);
                     }
                     Some(SidebarRow::PullRequest { .. } | SidebarRow::Agent { .. }) => {
-                        let stay = self.focus == Focus::Sidebar;
                         self.sidebar_selected = index;
                         self.sidebar_activate();
-                        if !stay {
-                            self.keep_sidebar_focus = None;
-                        }
                     }
                     Some(SidebarRow::Empty { .. }) | None => {}
                 }
@@ -7602,7 +7109,7 @@ impl App {
             self.notice_pull_request_sync();
         }
         if may_move {
-            self.follow_transcript();
+            self.follow_reading();
         }
     }
 
@@ -8255,13 +7762,6 @@ fn write_picture(data: &str) -> Option<String> {
     Some(path.to_string_lossy().into_owned())
 }
 
-/// The host a link is on.
-fn url_host(url: &str) -> Option<&str> {
-    let rest = url.split_once("://")?.1;
-    let host = rest.split(['/', '?', '#']).next()?;
-    (!host.is_empty()).then_some(host)
-}
-
 /// `gh`'s token for a host, run in `directory` where that is a directory here. A token is
 /// kept for the session; no `gh`, or none signed in, is no token and is asked about again
 /// next time, and the picture is asked for without one, which is all a public one needs.
@@ -8381,7 +7881,7 @@ fn apply(app: &mut App, event: AppEvent) {
             app.search_thread_contents();
             app.refresh_vcs_periodically();
             app.refresh_worktrees_periodically();
-            app.follow_transcript();
+            app.follow_reading();
             if app
                 .toast
                 .as_ref()
@@ -8558,6 +8058,10 @@ mod tests {
 
     use super::*;
     use crate::model::{Project, VcsLocal, VcsWorkingTree};
+    use crate::reader::tests::{
+        agent_progresses, open_detail, stacked_thread, thread_with_a_followable_agent,
+        transcript_saying,
+    };
 
     #[test]
     fn older_pages_keep_turn_completions_without_duplicates() {
@@ -10055,16 +9559,22 @@ mod tests {
         assert!(said.starts_with("not sent:"), "{said}");
     }
 
+    /// A subagent's transcript open over the thread's conversation.
     fn over_a_transcript(app: &mut App) {
-        app.transcript = Some(Transcript {
-            source: Reading::Subagent("agent-7".into()),
-            title: "look into it".into(),
-            subtitle: String::new(),
-            state: running_thread(),
-            truncated: false,
-            live: false,
-            restore: (Scroll::Follow, 0, Focus::Composer),
-        });
+        let agents = thread_with_a_followable_agent();
+        let thread = reader::Thread {
+            state: &agents,
+            branch: None,
+            directory: Some("/tmp"),
+        };
+        let _ = app
+            .reader
+            .open(&thread, Source::Subagent("a1".into()), Origin::Chat);
+        let answer = Ok(transcript_saying(&["Looking now."]));
+        let here = (Scroll::Follow, 0, Focus::Composer);
+        let _ = app
+            .reader
+            .on_transcript(&thread, "a1".into(), answer, here, Instant::now());
     }
 
     /// A message written over a subagent's transcript reads like a reply to it, and
@@ -10089,85 +9599,10 @@ mod tests {
         let command = sent_command(&mut requests).await.expect("sent once agreed");
         assert_eq!(
             command["message"]["text"],
-            "Sent looking at the transcript for subagent agent-7:\n\nwhy did it stop?"
+            "Sent looking at the transcript for subagent a1:\n\nwhy did it stop?"
         );
-        assert!(app.transcript.is_none(), "still reading the transcript");
+        assert!(!app.reader.is_open(), "still reading the transcript");
         assert!(app.composer.is_empty());
-    }
-
-    #[test]
-    fn a_link_names_its_host() {
-        assert_eq!(
-            url_host("https://github.com/o/r/pull/1"),
-            Some("github.com")
-        );
-        assert_eq!(
-            url_host("https://ghe.example.com?x"),
-            Some("ghe.example.com")
-        );
-        assert_eq!(url_host("not a link"), None);
-    }
-
-    /// A thread whose one subagent is still working.
-    fn thread_with_a_running_agent() -> ThreadState {
-        let started = json!({
-            "id": "task.started-1", "kind": "task.started", "tone": "info", "summary": "",
-            "createdAt": "2026-01-01T00:00:00Z",
-            "payload": {"taskId": "a1", "agentKind": "agent", "taskType": "local_agent",
-                "title": "Look into it"},
-        });
-        serde_json::from_value::<crate::model::ThreadDetailSnapshot>(json!({
-            "snapshotSequence": 0,
-            "thread": {"id": "t1", "projectId": "p", "title": "A thread",
-                "modelSelection": {"instanceId": "c", "model": "m"},
-                "messages": [], "activities": [started], "proposedPlans": []},
-        }))
-        .map(ThreadState::from_snapshot)
-        .unwrap()
-    }
-
-    /// A thread whose subagent `a1` is still working, beside a finished one whose output
-    /// file says where `a1`'s is being written.
-    fn thread_with_a_followable_agent() -> ThreadState {
-        let activity = |id: &str, kind: &str, at: &str, payload: Value| {
-            json!({"id": id, "kind": kind, "tone": "info", "summary": "", "createdAt": at,
-                "payload": payload})
-        };
-        let started = |task: &str, at: &str| {
-            json!({"taskId": task, "agentKind": "agent", "taskType": "local_agent",
-                "title": format!("Look into {task}"), "startedAt": at})
-        };
-        let mut thread = serde_json::from_value::<crate::model::ThreadDetailSnapshot>(json!({
-            "snapshotSequence": 0,
-            "thread": {"id": "t1", "projectId": "p", "title": "A thread",
-                "modelSelection": {"instanceId": "c", "model": "m"},
-                "session": {"status": "running"},
-                "messages": [], "proposedPlans": [], "activities": [
-                    activity("s0", "task.started", "2026-01-01T00:00:00Z", started("a0", "2026-01-01T00:00:00Z")),
-                    activity("c0", "task.completed", "2026-01-01T00:00:01Z",
-                        json!({"taskId": "a0", "status": "completed", "outputFile": "/tmp/tasks/a0.output"})),
-                    activity("s1", "task.started", "2026-01-01T00:00:02Z", started("a1", "2026-01-01T00:00:02Z")),
-                ]},
-        }))
-        .map(ThreadState::from_snapshot)
-        .unwrap();
-        thread.detail.shell.worktree_path = Some("/tmp".into());
-        thread
-    }
-
-    /// The agent does something: a progress activity arrives on the thread.
-    fn agent_progresses(app: &mut App, at: &str) {
-        let progress: crate::model::Activity = serde_json::from_value(json!({
-            "id": format!("p-{at}"), "kind": "task.progress", "tone": "info", "summary": "",
-            "createdAt": at, "payload": {"taskId": "a1", "detail": "Reading ws.ts", "lastToolName": "Read"},
-        }))
-        .unwrap();
-        app.thread
-            .as_mut()
-            .unwrap()
-            .detail
-            .activities
-            .push(progress);
     }
 
     /// The next transcript read asked for, answered with these replies.
@@ -10199,112 +9634,65 @@ mod tests {
         payload
     }
 
-    /// A running agent's transcript reads itself again when the agent does something, and
-    /// shows what was written without moving whoever is reading it.
+    /// The subagent roster opens a transcript in place of the conversation, with the keys
+    /// on it, and `q` goes back to the roster it came from.
     #[tokio::test]
-    async fn a_running_agents_transcript_follows_what_it_does() {
+    async fn the_roster_opens_a_transcript_and_q_goes_back_to_it() {
         let (handle, mut requests) = crate::session::Handle::detached();
         let (events, mut sent) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         app.thread = Some(thread_with_a_followable_agent());
         app.current_thread_id = Some("t1".into());
-        app.transcript_loading = Some("a1".into());
-        app.on_transcript("a1".into(), Ok(transcript_saying(&["Looking now."])));
-        app.transcript_read_at = Some(Instant::now());
-        app.mode = Mode::Insert;
         app.focus = Focus::Composer;
-
-        app.follow_transcript();
-        assert!(
-            asked_nothing(&mut requests).await,
-            "nothing has happened, and it is not due"
+        app.open_agents();
+        assert_eq!(app.mode, Mode::Agents);
+        assert_eq!(
+            app.subagents()[app.agent_selected].id,
+            "a1",
+            "the one still working"
         );
 
-        agent_progresses(&mut app, "2026-01-01T00:00:05Z");
-        app.follow_transcript();
-        let payload = answer_the_read(
-            &mut app,
-            &mut requests,
-            &mut sent,
-            &["Looking now.", "Found it."],
-        )
-        .await;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let payload = answer_the_read(&mut app, &mut requests, &mut sent, &["Looking now."]).await;
         assert_eq!(payload["relativePath"], "/tmp/tasks/a1.output");
+        assert_eq!(app.reader.agent_id(), Some("a1"));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.focus, Focus::Chat);
+        assert!(drawn(&mut app).contains("Looking now."));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.reader.is_open());
+        assert_eq!(app.mode, Mode::Agents, "back to the roster");
+        assert_eq!(app.focus, Focus::Composer, "the conversation's own place");
+    }
+
+    /// Following a transcript is following the subagent it is of, wherever the roster's
+    /// selection has gone meanwhile.
+    #[tokio::test]
+    async fn following_leaves_the_rosters_selection_alone() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut sent) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_with_a_followable_agent());
+        app.current_thread_id = Some("t1".into());
+        app.open_agents();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        answer_the_read(&mut app, &mut requests, &mut sent, &["Looking now."]).await;
+
+        app.agent_selected = 0;
+        agent_progresses(app.thread.as_mut().unwrap(), "2026-01-01T00:00:05Z");
+        apply(&mut app, AppEvent::Tick);
+        let more = ["Looking now.", "Found it."];
+        let payload = answer_the_read(&mut app, &mut requests, &mut sent, &more).await;
+        assert_eq!(
+            payload["relativePath"], "/tmp/tasks/a1.output",
+            "a1 is followed"
+        );
         assert!(drawn(&mut app).contains("Found it."));
         assert_eq!(
-            app.mode,
-            Mode::Insert,
-            "whoever was writing is still writing"
+            app.agent_selected, 0,
+            "the roster's row stayed where it was put"
         );
-        assert_eq!(app.focus, Focus::Composer);
-        assert!(app.toast.is_none());
-
-        // A stretch of writing says nothing on the thread; the clock catches it.
-        app.transcript_read_at = Instant::now().checked_sub(TRANSCRIPT_POLL * 2);
-        app.follow_transcript();
-        let more = ["Looking now.", "Found it.", "Still writing."];
-        answer_the_read(&mut app, &mut requests, &mut sent, &more).await;
-        assert!(drawn(&mut app).contains("Still writing."));
-
-        // Finished, it is read once more for how it ended, and then left alone.
-        let done: crate::model::Activity = serde_json::from_value(json!({
-            "id": "done", "kind": "task.completed", "tone": "info", "summary": "",
-            "createdAt": "2026-01-01T00:00:09Z",
-            "payload": {"taskId": "a1", "status": "completed", "summary": "Found it in ws.ts"},
-        }))
-        .unwrap();
-        app.thread.as_mut().unwrap().detail.activities.push(done);
-        app.follow_transcript();
-        let last = ["Looking now.", "Found it.", "Done."];
-        answer_the_read(&mut app, &mut requests, &mut sent, &last).await;
-        assert!(!app.transcript.as_ref().unwrap().live);
-        app.transcript_read_at = Instant::now().checked_sub(TRANSCRIPT_POLL * 2);
-        app.follow_transcript();
-        assert!(
-            asked_nothing(&mut requests).await,
-            "a finished run is not read again"
-        );
-    }
-
-    /// Put away, a transcript is not brought back by a read that was already on its way.
-    #[tokio::test]
-    async fn a_put_away_transcript_stays_away() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, mut sent) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(thread_with_a_followable_agent());
-        app.current_thread_id = Some("t1".into());
-        app.transcript_loading = Some("a1".into());
-        app.on_transcript("a1".into(), Ok(transcript_saying(&["Looking now."])));
-        agent_progresses(&mut app, "2026-01-01T00:00:05Z");
-        app.follow_transcript();
-        app.leave_transcript();
-        answer_the_read(
-            &mut app,
-            &mut requests,
-            &mut sent,
-            &["Looking now.", "Found it."],
-        )
-        .await;
-        assert!(app.transcript.is_none());
-    }
-
-    fn transcript_saying(replies: &[&str]) -> TranscriptFile {
-        let mut contents = String::from(
-            r#"{"type":"user","uuid":"u1","timestamp":"1","message":{"role":"user","content":"Look into it"}}"#,
-        );
-        for (n, reply) in replies.iter().enumerate() {
-            contents.push('\n');
-            contents.push_str(
-                &json!({"type": "assistant", "uuid": format!("a{n}"), "timestamp": format!("{}", n + 2),
-                    "message": {"role": "assistant", "content": [{"type": "text", "text": reply}]}})
-                .to_string(),
-            );
-        }
-        TranscriptFile {
-            contents,
-            truncated: false,
-        }
     }
 
     fn drawn(app: &mut App) -> String {
@@ -10320,31 +9708,6 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    /// `r` on an agent still working reads what it has written since, and that is what
-    /// the view then shows — not what was drawn the first time.
-    #[tokio::test]
-    async fn reading_a_running_agent_again_shows_what_it_has_written_since() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(thread_with_a_running_agent());
-        app.current_thread_id = Some("t1".into());
-
-        app.transcript_loading = Some("a1".into());
-        app.on_transcript("a1".into(), Ok(transcript_saying(&["Looking now."])));
-        assert!(drawn(&mut app).contains("Looking now."));
-
-        app.transcript_loading = Some("a1".into());
-        app.on_transcript(
-            "a1".into(),
-            Ok(transcript_saying(&["Looking now.", "Found it in ws.ts."])),
-        );
-        assert!(
-            drawn(&mut app).contains("Found it in ws.ts."),
-            "the second read is on the screen"
-        );
     }
 
     /// With a selection up in the composer, `gg` grows it to the top rather than being
@@ -10365,20 +9728,6 @@ mod tests {
         assert!(app.composer.vim_busy(), "still selecting");
         app.on_key(key('y'));
         assert!(!app.composer.vim_busy());
-    }
-
-    fn stacked_thread() -> ThreadState {
-        let mut thread = running_thread();
-        let pr = |number: u64, head: &str, base: &str| {
-            json!({"host":"github.com","repository":"o/r","number":number,
-                "url":format!("https://github.com/o/r/pull/{number}"),"source":"agent",
-                "linkedAt":"2026-01-01T00:00:00.000Z",
-                "snapshot":{"state":"open","title":format!("layer {number}"),
-                    "headBranch":head,"baseBranch":base}})
-        };
-        thread.detail.shell.pull_requests =
-            serde_json::from_value(json!([pr(2, "b", "a"), pr(1, "a", "main")])).unwrap();
-        thread
     }
 
     /// The picker lists a stack bottom to top, each layer above the first marked as
@@ -10412,7 +9761,7 @@ mod tests {
     /// identity, and what comes back opens in place of the conversation. A message written
     /// over it says which pull request it was written against, and `q` puts it away.
     #[tokio::test]
-    async fn enter_reads_a_pull_request_in_place_of_the_chat() {
+    async fn a_pull_request_is_read_in_place_of_the_chat_and_q_puts_it_away() {
         let (handle, mut requests) = crate::session::Handle::detached();
         let (events, mut sent) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
@@ -10440,20 +9789,20 @@ mod tests {
             json!({"projectId": project, "host": "github.com", "repository": "o/r", "number": 1});
         assert_eq!(payload, identity);
         assert_eq!(activity, identity);
-        let _ = reply.send(Ok(json!({
-            "repository": "o/r", "number": 1, "title": "layer 1", "body": "Why.",
-            "url": "https://github.com/o/r/pull/1", "state": "open",
-            "headBranch": "a", "baseBranch": "main",
-        })));
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.0.as_str()),
+            Some("reading #1…")
+        );
+        let _ = reply.send(Ok(open_detail("layer 1")));
         let event = tokio::time::timeout(Duration::from_millis(500), sent.recv())
             .await
             .expect("the detail comes back")
             .expect("an event");
         apply(&mut app, event);
-        let open = app.transcript.as_ref().expect("it is open");
-        assert_eq!(open.title, "o/r#1");
-        assert_eq!(open.pull_request().map(|d| d.number), Some(1));
+        assert_eq!(app.reader.pull_request().map(|d| d.number), Some(1));
         assert_eq!(app.focus, Focus::Chat);
+        assert!(app.toast.is_none());
+        assert!(drawn(&mut app).contains("o/r#1"));
 
         app.mode = Mode::Insert;
         app.composer.set_text("is this ready?");
@@ -10464,86 +9813,57 @@ mod tests {
             command["message"]["text"],
             "Sent looking at pull request o/r#1 (https://github.com/o/r/pull/1):\n\nis this ready?"
         );
-    }
+        assert!(!app.reader.is_open(), "the message joins the conversation");
 
-    /// A thread with a pull request open in place of its conversation.
-    fn reading_a_pull_request(app: &mut App) {
-        app.thread = Some(stacked_thread());
-        app.current_thread_id = Some("t1".into());
-        app.pull_request_loading = Some("https://github.com/o/r/pull/1".into());
+        app.read_pull_request("https://github.com/o/r/pull/1");
         app.on_pull_request(
             "https://github.com/o/r/pull/1".into(),
             Ok(open_detail("layer 1")),
         );
+        assert!(app.reader.is_open());
+        app.mode = Mode::Normal;
+        app.focus = Focus::Chat;
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.reader.is_open());
+        assert_eq!(app.mode, Mode::Normal, "not the subagent roster");
     }
 
-    fn open_detail(title: &str) -> Value {
-        json!({
-            "repository": "o/r", "number": 1, "title": title,
-            "url": "https://github.com/o/r/pull/1", "state": "open",
-            "headBranch": "a", "baseBranch": "main",
-        })
+    /// A thread with a pull request open in place of its conversation, read without
+    /// anything asked of the server.
+    fn reading_a_pull_request(app: &mut App) {
+        app.thread = Some(stacked_thread());
+        app.current_thread_id = Some("t1".into());
+        showing(app, open_detail("layer 1"));
     }
 
-    /// The calls asked for, by name, and what with.
-    async fn calls(
-        requests: &mut mpsc::UnboundedReceiver<crate::session::Request>,
-        how_many: usize,
-    ) -> Vec<(String, Value)> {
-        let mut calls = Vec::new();
-        while calls.len() < how_many {
-            match asked(requests).await {
-                Some(crate::session::Request::Call {
-                    tag,
-                    payload,
-                    reply,
-                }) => {
-                    // Answered, so a read waiting on this one goes on to the next.
-                    let _ = reply.send(Ok(Value::Null));
-                    calls.push((tag, payload));
-                }
-                Some(_) => continue,
-                None => break,
-            }
-        }
-        calls
+    /// Pull request #1 opened with this detail, as though read.
+    fn showing(app: &mut App, detail: Value) {
+        let url = "https://github.com/o/r/pull/1";
+        let thread = reader::Thread {
+            state: app.thread.as_ref().unwrap(),
+            branch: None,
+            directory: None,
+        };
+        let here = (app.scroll, app.chat_cursor, app.focus);
+        let _ = app
+            .reader
+            .open(&thread, Source::PullRequest(url.into()), Origin::Chat);
+        let _ = app
+            .reader
+            .on_pull_request(&thread, url.into(), Ok(detail), here);
     }
 
-    /// The first count after connecting is where the server stands; a change is a turn
-    /// that ended, and the pull request open is read again, past the server's copy of it,
-    /// without a word.
+    /// News of the pull request open, from the server's own sync, reads it again past the
+    /// server's copy, and what comes back is shown under whoever is writing without a word.
     #[tokio::test]
-    async fn a_pull_request_is_read_again_when_the_server_says_so() {
+    async fn news_from_the_sync_reads_it_again_quietly() {
         let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
+        let (events, mut sent) = mpsc::unbounded_channel();
         let mut app = App::new(handle, events);
         reading_a_pull_request(&mut app);
-        app.toast = None;
-
-        app.on_update(crate::session::Update::PullRequestsRefreshed(4));
-        assert!(
-            asked_nothing(&mut requests).await,
-            "where it stands is not a change"
-        );
-
-        app.on_update(crate::session::Update::PullRequestsRefreshed(5));
-        let calls = calls(&mut requests, 3).await;
-        let tags: Vec<&str> = calls.iter().map(|(tag, _)| tag.as_str()).collect();
-        assert_eq!(tags[0], "pullRequests.invalidate", "past the server's copy");
-        assert_eq!(calls[0].1["reference"]["number"], 1);
-        assert!(tags.contains(&"pullRequests.detail") && tags.contains(&"pullRequests.activity"));
-        assert!(app.toast.is_none(), "without a word");
-    }
-
-    /// The server's own sync bringing news of the pull request open is a reason to read it
-    /// again; news of anything else is not.
-    #[tokio::test]
-    async fn news_from_the_sync_reads_it_again() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        reading_a_pull_request(&mut app);
-        let _ = calls(&mut requests, 2).await;
+        app.mode = Mode::Insert;
+        app.focus = Focus::Composer;
+        app.toast("writing", false);
 
         app.notice_pull_request_sync();
         assert!(asked_nothing(&mut requests).await, "nothing new yet");
@@ -10556,80 +9876,45 @@ mod tests {
             .unwrap();
         link.snapshot.as_mut().unwrap().checks_state = Some("failing".into());
         app.notice_pull_request_sync();
-        let tags: Vec<String> = calls(&mut requests, 3)
-            .await
-            .into_iter()
-            .map(|(t, _)| t)
-            .collect();
-        assert!(
-            tags.contains(&"pullRequests.detail".to_string()),
-            "{tags:?}"
+        let mut tags = Vec::new();
+        let reply = loop {
+            match asked(&mut requests).await.expect("it is read again") {
+                crate::session::Request::Call { tag, reply, .. } => {
+                    tags.push(tag.clone());
+                    match tag.as_str() {
+                        "pullRequests.detail" => break reply,
+                        _ => {
+                            let _ = reply.send(Ok(Value::Null));
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        };
+        assert_eq!(tags[0], "pullRequests.invalidate", "past the server's copy");
+        let _ = reply.send(Ok(open_detail("checks failing")));
+        loop {
+            let event = tokio::time::timeout(Duration::from_millis(500), sent.recv())
+                .await
+                .expect("it comes back")
+                .expect("an event");
+            let detail = matches!(event, AppEvent::PullRequest { .. });
+            apply(&mut app, event);
+            if detail {
+                break;
+            }
+        }
+        assert_eq!(
+            app.reader.pull_request().map(|d| d.title.as_str()),
+            Some("checks failing")
         );
-    }
-
-    /// Brought up to date while somebody is writing, it leaves them writing; one that
-    /// comes back after the view was put away does not bring it back.
-    #[tokio::test]
-    async fn a_quiet_read_disturbs_nobody() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        reading_a_pull_request(&mut app);
-        app.mode = Mode::Insert;
-        app.focus = Focus::Composer;
-        app.refresh_open_pull_request();
-        app.on_pull_request(
-            "https://github.com/o/r/pull/1".into(),
-            Ok(open_detail("renamed")),
+        assert_eq!(
+            app.mode,
+            Mode::Insert,
+            "whoever was writing is still writing"
         );
-        assert_eq!(app.mode, Mode::Insert);
         assert_eq!(app.focus, Focus::Composer);
-        assert_eq!(
-            app.transcript
-                .as_ref()
-                .and_then(|t| t.pull_request())
-                .map(|d| d.title.as_str()),
-            Some("renamed")
-        );
-
-        app.refresh_open_pull_request();
-        app.leave_transcript();
-        app.on_pull_request(
-            "https://github.com/o/r/pull/1".into(),
-            Ok(open_detail("late")),
-        );
-        assert!(app.transcript.is_none(), "put away, it stays away");
-    }
-
-    /// `]` reads the layer above, and the bottom of a stack says so rather than moving.
-    #[tokio::test]
-    async fn brackets_move_through_a_stack() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        reading_a_pull_request(&mut app);
-        let _ = calls(&mut requests, 2).await;
-        assert_eq!(
-            app.pull_request_stack()
-                .map(|(layers, at)| (layers.len(), at)),
-            Some((2, 0))
-        );
-
-        app.on_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
-        assert!(asked_nothing(&mut requests).await);
-        assert_eq!(
-            app.toast.as_ref().map(|t| t.0.as_str()),
-            Some("already the bottom of the stack")
-        );
-
-        app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
-        let asked = calls(&mut requests, 2).await;
-        assert!(
-            asked
-                .iter()
-                .any(|(tag, payload)| tag == "pullRequests.detail" && payload["number"] == 2),
-            "{asked:?}"
-        );
+        assert_eq!(app.toast.as_ref().map(|t| t.0.as_str()), Some("writing"));
     }
 
     /// `L` lists the repository's labels, the ones on it first; `Enter` puts one on and
@@ -10641,22 +9926,19 @@ mod tests {
         let mut app = App::new(handle, events);
         app.thread = Some(stacked_thread());
         app.current_thread_id = Some("t1".into());
-        let url = "https://github.com/o/r/pull/1".to_string();
         let mut editable = open_detail("layer 1");
         editable["capabilities"] = json!({"labels": true});
 
         // Not until the host says it can.
-        app.pull_request_loading = Some(url.clone());
-        app.on_pull_request(url.clone(), Ok(open_detail("layer 1")));
+        showing(&mut app, open_detail("layer 1"));
+        app.focus = Focus::Chat;
         app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
         assert_eq!(
             app.toast.as_ref().map(|t| t.0.as_str()),
             Some("its labels cannot be changed from here")
         );
 
-        app.pull_request_loading = Some(url.clone());
-        app.on_pull_request(url.clone(), Ok(editable));
-        let _ = calls(&mut requests, 2).await;
+        showing(&mut app, editable);
         app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE));
         let reply = loop {
             match asked(&mut requests)
@@ -10757,43 +10039,6 @@ mod tests {
         assert_eq!(app.sidebar_tab, SidebarTab::Threads);
     }
 
-    /// `Enter` on a pull request reads it in place of the conversation and leaves the keys
-    /// in the sidebar, so the next one is `j` and `Enter` away.
-    #[tokio::test]
-    async fn enter_in_the_sidebar_reads_and_stays() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        sidebar_on_pull_requests(&mut app);
-        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let asked = calls(&mut requests, 2).await;
-        assert!(
-            asked
-                .iter()
-                .any(|(tag, p)| tag == "pullRequests.detail" && p["number"] == 2)
-        );
-        let mut second = open_detail("layer 2");
-        second["number"] = json!(2);
-        second["url"] = json!("https://github.com/o/r/pull/2");
-        app.on_pull_request("https://github.com/o/r/pull/2".into(), Ok(second));
-        assert!(
-            app.transcript
-                .as_ref()
-                .and_then(|t| t.pull_request())
-                .is_some()
-        );
-        assert_eq!(app.focus, Focus::Sidebar, "the keys stayed");
-
-        // Read from anywhere else, it takes the keys to what is read, as before.
-        app.pull_request_loading = Some("https://github.com/o/r/pull/1".into());
-        app.on_pull_request(
-            "https://github.com/o/r/pull/1".into(),
-            Ok(open_detail("layer 1")),
-        );
-        assert_eq!(app.focus, Focus::Chat);
-    }
-
     /// The pull requests listed are the open thread's, so another thread's list starts at
     /// its top, and the threads tab still follows the thread that is open.
     #[tokio::test]
@@ -10877,7 +10122,6 @@ mod tests {
         let project_id = project(&mut app);
         reading_a_pull_request(&mut app);
         app.thread.as_mut().unwrap().detail.shell.project_id = project_id;
-        let _ = calls(&mut requests, 2).await;
 
         app.run_command("checkout");
         let (payload, reply) = loop {
@@ -10960,30 +10204,8 @@ mod tests {
         let project_id = project(&mut app);
         reading_a_pull_request(&mut app);
         app.start_new_thread(&project_id);
-        assert!(app.transcript.is_none());
+        assert!(!app.reader.is_open());
         assert!(app.draft.is_some());
-    }
-
-    #[tokio::test]
-    async fn q_puts_a_pull_request_away() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(stacked_thread());
-        app.current_thread_id = Some("t1".into());
-        app.pull_request_loading = Some("https://github.com/o/r/pull/1".into());
-        app.on_pull_request(
-            "https://github.com/o/r/pull/1".into(),
-            Ok(json!({
-                "repository": "o/r", "number": 1, "title": "layer 1",
-                "url": "https://github.com/o/r/pull/1", "state": "open",
-                "headBranch": "a", "baseBranch": "main",
-            })),
-        );
-        assert!(app.transcript.is_some());
-        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-        assert!(app.transcript.is_none());
-        assert_eq!(app.mode, Mode::Normal, "not the subagent roster");
     }
 
     /// Unlinking asks first, and only the answer sends it.
@@ -11039,7 +10261,7 @@ mod tests {
         assert_eq!(app.confirm_transcript_send, None);
         assert_eq!(app.composer.text(), "not for the main agent");
         assert_eq!(app.queued_message(), None);
-        assert!(app.transcript.is_some());
+        assert!(app.reader.is_open());
         assert!(sent_no_command(&mut requests).await);
     }
 

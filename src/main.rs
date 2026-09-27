@@ -12,6 +12,7 @@ mod notify;
 mod picture;
 mod pull_request;
 mod question;
+mod reader;
 mod recovery;
 mod rpc;
 mod server;
