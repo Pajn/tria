@@ -23,7 +23,7 @@ use crate::{
     composer::Composer,
     list_cursor::{ListCursor, Row},
     model::{Id, ModelSelection, ServerConfig, ShellItem, ThreadDetailSnapshot, ThreadItem},
-    outbox::{self, Outbox},
+    outbox::{self, NEW_THREAD_DRAFT_KEY, NewThreadDraft, Outbox, PreparedCheckout},
     picture,
     question::QuestionDraft,
     reader::{self, Origin, Reader, Source, TranscriptFile},
@@ -39,9 +39,6 @@ const TERMINAL_ROWS: u16 = 30;
 
 /// The terminal `g!` reuses, one per thread.
 const SHELL_TERMINAL_ID: &str = "tria-shell";
-
-/// Draft key for a thread that does not exist yet.
-const NEW_THREAD_DRAFT_KEY: &str = "\0new-thread";
 
 /// Rows moved per mouse wheel notch.
 const MOUSE_SCROLL_LINES: usize = 3;
@@ -338,24 +335,6 @@ pub struct RewindAsk {
     pub rewind: crate::state::Rewind,
 }
 
-/// A rewind the server has been asked for. The command is taken before the work is
-/// done, so what says it happened is the messages going, and what says it did not is a
-/// failure the server writes into the thread.
-struct PendingRewind {
-    thread_id: Id,
-    rewind: crate::state::Rewind,
-    /// Failures already in the thread when it was asked for, which are not this one's.
-    failures_seen: HashSet<Id>,
-    deadline: Instant,
-}
-
-/// How long a rewind is waited for before its messages are given back anyway. A
-/// Claude rewind reads and forks the session's history, which is not instant.
-/// The activity the server writes into a thread when a rewind did not happen.
-const REWIND_FAILED: &str = "checkpoint.revert.failed";
-
-const REWIND_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// A message to go to, from a search of what threads said.
 struct Jump {
     thread_id: Id,
@@ -374,16 +353,6 @@ pub struct CompletionMenu {
     pub trigger: crate::composer::Trigger,
     pub items: Vec<crate::completion::Item>,
     pub selected: usize,
-}
-
-/// What a plan calls itself: its first heading.
-fn plan_title(markdown: &str) -> Option<&str> {
-    markdown
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with('#'))
-        .map(|line| line.trim_start_matches('#').trim())
-        .filter(|title| !title.is_empty())
 }
 
 /// The last two parts of a path, which is what tells one worktree from another.
@@ -441,33 +410,12 @@ impl WorktreeConfirm {
     }
 }
 
-/// A thread being composed that does not exist on the server yet.
-#[derive(Debug, Clone)]
-pub struct NewThreadDraft {
-    pub project_id: Id,
-    pub model_selection: ModelSelection,
-    pub runtime_mode: String,
-    pub interaction_mode: String,
-    /// Start the thread in a fresh worktree rather than the project's own checkout.
-    pub worktree: bool,
-    /// A pull request checked out for the thread to start in, where it was made for one.
-    pub checkout: Option<PreparedCheckout>,
-}
-
-/// A pull request checked out by the server for a thread to be written in.
-#[derive(Debug, Clone)]
-pub struct PreparedCheckout {
-    /// The thread's id, chosen before it exists so the server could set the worktree up
-    /// for it.
-    pub thread_id: Id,
-    pub number: u64,
-    pub branch: String,
-    pub worktree_path: String,
-    /// False where a worktree that was already there kept changes or commits of its own,
-    /// so what the thread starts in is not the pull request's latest.
-    pub on_head: bool,
-    /// The link the thread gets once it exists, where one could be made.
-    pub link: Option<commands::PullRequestLink>,
+/// A turn as the command for it, marked as building a plan where it builds one.
+fn building(command: Value, implementing: Option<outbox::Implementing>) -> Value {
+    match implementing {
+        Some(plan) => commands::implementing(command, &plan.thread, &plan.plan),
+        None => command,
+    }
 }
 
 pub enum AppEvent {
@@ -494,17 +442,10 @@ pub enum AppEvent {
         path: String,
         result: Result<(), String>,
     },
-    /// A thread made to build a plan exists now, and is where to look.
-    PlanThreadCreated(Id),
     /// What the server found in the threads' messages, for the query it was asked.
     ThreadSearch {
         query: String,
         result: Result<Value, String>,
-    },
-    /// The server would not take a rewind at all.
-    RewindRefused {
-        thread_id: Id,
-        error: String,
     },
     /// The config was read again for the usage window, or was not.
     UsageRead(Result<Box<ServerConfig>, String>),
@@ -647,11 +588,9 @@ pub struct App {
     favicons: HashMap<Id, Option<Vec<u8>>>,
     /// A search being typed on the command line, before it is the chat's.
     pub search_input: Option<SearchInput>,
-    /// Unsent composer text per thread, keyed by thread id, so switching threads keeps a
-    /// half-written message where it belongs. New-thread drafts use `NEW_THREAD_DRAFT_KEY`.
-    drafts: HashMap<String, String>,
-    /// Messages on their way to the server, held back for a turn to end, or making the
-    /// thread they are for, until each is taken or given back.
+    /// What is written, from being written to being taken: parked per thread while
+    /// another is open, on its way to the server, held back for a turn to end, making the
+    /// thread it is for, or taken back out of a thread by a rewind.
     outbox: Outbox,
     /// A message a search found, to go to once its thread is open and laid out.
     jump: Option<Jump>,
@@ -662,7 +601,6 @@ pub struct App {
     completion_dismissed: Option<crate::composer::Trigger>,
     /// A rewind asked about and not yet answered, which takes the next key.
     pub rewind_ask: Option<RewindAsk>,
-    rewinding: Option<PendingRewind>,
     /// Every terminal session the server knows about, across threads.
     pub terminals: Vec<crate::model::TerminalSummary>,
     /// The cursor in the terminal panel, on a terminal by its id.
@@ -842,13 +780,11 @@ impl App {
             vcs_refreshed: Instant::now(),
             new_thread_model: None,
             links: Vec::new(),
-            drafts: HashMap::new(),
             outbox: Outbox::default(),
             jump: None,
             completion: None,
             completion_dismissed: None,
             rewind_ask: None,
-            rewinding: None,
             programs: vec![crate::config::Program {
                 key: 'l',
                 command: crate::config::DEFAULT_GIT_COMMAND.to_string(),
@@ -1183,17 +1119,14 @@ impl App {
 
     /// Park the composer text for the current thread and load the target's, if any.
     fn swap_composer_draft(&mut self, target: &str) {
-        if let Some(key) = self.draft_key() {
-            let text = self.composer.text();
-            if text.trim().is_empty() {
-                self.drafts.remove(&key);
-            } else {
-                self.drafts.insert(key, text);
-            }
-        }
+        let leaving = self.draft_key();
+        let text = self.composer.text();
+        let parked = self
+            .outbox
+            .swap(leaving.as_deref(), &text, target)
+            .map(str::to_string);
         self.composer.clear();
-        if let Some(text) = self.drafts.get(target) {
-            let text = text.clone();
+        if let Some(text) = parked {
             self.composer.set_text(&text);
             self.composer.leave_insert();
         }
@@ -1453,12 +1386,26 @@ impl App {
     /// Ask the outbox something, lending it where things stand on screen, and do what
     /// it answers.
     fn with_outbox(&mut self, ask: impl FnOnce(&mut Outbox, &outbox::Here) -> outbox::Step) {
+        let composer = self.composer.text();
         let here = outbox::Here {
             thread: self.current_thread_id.as_deref(),
-            composer_empty: self.composer.is_empty(),
-            drafts: &self.drafts,
+            composer: &composer,
         };
         let step = ask(&mut self.outbox, &here);
+        self.take_outbox_step(step);
+    }
+
+    /// Show the outbox the open thread as it now stands, for a rewind on its way there.
+    fn notice_open_thread(&mut self) {
+        let Some(thread) = &self.thread else {
+            return;
+        };
+        let composer = self.composer.text();
+        let here = outbox::Here {
+            thread: self.current_thread_id.as_deref(),
+            composer: &composer,
+        };
+        let step = self.outbox.on_thread(thread, &here);
         self.take_outbox_step(step);
     }
 
@@ -1472,6 +1419,7 @@ impl App {
                 self.thread = None;
             }
             Some(outbox::Go::Made(thread_id)) => self.handle.open_thread(&thread_id),
+            Some(outbox::Go::Open(thread_id)) => self.open_thread(&thread_id),
             Some(outbox::Go::Draft(draft)) => {
                 self.current_thread_id = None;
                 self.thread = None;
@@ -1497,8 +1445,13 @@ impl App {
                         self.composer.clamp_normal();
                     }
                 }
-                outbox::Slot::Draft => {
-                    self.drafts.insert(back.thread, back.text);
+                outbox::Slot::Rewound => {
+                    self.composer.set_text(&back.text);
+                    if matches!(self.mode, Mode::Normal | Mode::Insert) {
+                        self.composer.checkpoint();
+                        self.focus = Focus::Composer;
+                        self.mode = Mode::Insert;
+                    }
                 }
                 // Most of what comes back went into the history as it was sent, and a
                 // second copy would only stand between `Ctrl-p` and what came before it.
@@ -1516,6 +1469,7 @@ impl App {
         }
         match step.toast {
             None => {}
+            Some(outbox::Toast::Say(text)) => self.toast(text, false),
             Some(outbox::Toast::Warn(text)) => self.toast(text, true),
         }
     }
@@ -1531,17 +1485,25 @@ impl App {
                 model_selection,
                 runtime_mode,
                 interaction_mode,
+                implementing,
                 ..
-            } => commands::turn_start(
-                &thread,
-                &text,
-                &model_selection,
-                &runtime_mode,
-                &interaction_mode,
-                None,
+            } => building(
+                commands::turn_start(
+                    &thread,
+                    &text,
+                    &model_selection,
+                    &runtime_mode,
+                    &interaction_mode,
+                    None,
+                ),
+                implementing,
             ),
             outbox::Command::Create {
-                thread, text, new, ..
+                thread,
+                text,
+                new,
+                implementing,
+                ..
             } => {
                 tracing::info!(
                     %thread,
@@ -1550,7 +1512,7 @@ impl App {
                     "creating a thread"
                 );
                 let branch = commands::worktree_branch(&thread);
-                commands::turn_start(
+                let command = commands::turn_start(
                     &thread,
                     &text,
                     &new.model_selection,
@@ -1571,10 +1533,20 @@ impl App {
                         branch: new.branch.as_deref(),
                         worktree_path: new.worktree_path.as_deref(),
                     }),
-                )
+                );
+                building(command, implementing)
             }
             outbox::Command::Link { thread, link, .. } => {
                 commands::pull_request_link(&thread, &link)
+            }
+            outbox::Command::Revert {
+                thread,
+                turn_count,
+                restore_files,
+                ..
+            } => {
+                tracing::info!(%thread, turn_count, restore_files, "rewinding");
+                commands::thread_revert(&thread, turn_count, restore_files)
             }
         };
         let handle = self.handle.clone();
@@ -1645,7 +1617,7 @@ impl App {
         self.composer.push_history(text);
         self.composer.clear();
         if let Some(key) = draft_key {
-            self.drafts.remove(&key);
+            self.outbox.unpark(&key);
         }
         self.chat_view.follow();
     }
@@ -1868,76 +1840,17 @@ impl App {
             self.toast("no thread open", true);
             return;
         };
-        if thread.is_running() {
-            self.toast(
-                "the thread is still working; implement once it is done",
-                true,
-            );
-            return;
-        }
-        let Some(plan) = thread.actionable_plan() else {
-            self.toast("no plan waiting to be built", true);
-            return;
-        };
-        let text = format!(
-            "{}{}",
-            commands::PLAN_PROMPT_PREFIX,
-            plan.plan_markdown.trim()
-        );
-        let shell = &thread.detail.shell;
-        let (source, plan_id) = (thread.id().to_string(), plan.id.clone());
-        if arg.is_empty() {
-            let command = commands::turn_start(
-                &source,
-                &text,
-                &shell.model_selection,
-                &shell.runtime_mode,
-                "default",
-                None,
-            );
+        let new = arg == "new";
+        let step = self.outbox.implement(thread, new);
+        // Built here, it joins the conversation, so that is what to be looking at.
+        let here = !new && !step.commands.is_empty();
+        if here {
             self.leave_reading();
-            self.dispatch(commands::implementing(command, &source, &plan_id));
-            self.chat_view.follow();
-            return;
         }
-        let title: String = plan_title(&plan.plan_markdown)
-            .map_or_else(
-                || "Implement plan".into(),
-                |title| format!("Implement {title}"),
-            )
-            .chars()
-            .take(60)
-            .collect();
-        let thread_id = commands::new_id();
-        let command = commands::turn_start(
-            &thread_id,
-            &text,
-            &shell.model_selection,
-            &shell.runtime_mode,
-            "default",
-            Some(commands::NewThread {
-                project_id: &shell.project_id,
-                title: title.trim(),
-                model_selection: &shell.model_selection,
-                runtime_mode: &shell.runtime_mode,
-                interaction_mode: "default",
-                worktree: None,
-                branch: shell.branch.as_deref(),
-                worktree_path: shell.worktree_path.as_deref(),
-            }),
-        );
-        let command = commands::implementing(command, &source, &plan_id);
-        // The view stays on the plan until the thread building it exists: moving first
-        // would be looking at a thread that may never be made.
-        let handle = self.handle.clone();
-        let events = self.events.clone();
-        tokio::spawn(async move {
-            let _ = events.send(match handle.dispatch(command).await {
-                Ok(_) => AppEvent::PlanThreadCreated(thread_id),
-                Err(error) => AppEvent::Dispatched(Err(error.to_string())),
-            });
-        });
-        self.toast("starting a thread for the plan…", false);
+        self.take_outbox_step(step);
+        if here {
+            self.chat_view.follow();
+        }
     }
 
     /// `gr`: rewind to before the message under the chat cursor.
@@ -1963,14 +1876,14 @@ impl App {
     /// runs — the server would drop turns from under it — or where the provider cannot
     /// drop turns from its own history.
     fn ask_rewind(&mut self, message_id: Option<&str>) {
-        if self.rewinding.is_some() {
-            self.toast("a rewind is already on its way", true);
-            return;
-        }
         let Some(thread) = &self.thread else {
             self.toast("no thread open", true);
             return;
         };
+        if self.outbox.is_rewinding(thread.id()) {
+            self.toast("a rewind is already on its way", true);
+            return;
+        }
         if thread.is_running() {
             self.toast("interrupt the turn first (Ctrl-c), then rewind", true);
             return;
@@ -2024,126 +1937,22 @@ impl App {
             self.toast("a turn started meanwhile; interrupt it first", true);
             return;
         }
-        let failures_seen = thread
-            .detail
-            .activities
-            .iter()
-            .filter(|a| a.kind == REWIND_FAILED)
-            .map(|a| a.id.clone())
-            .collect();
-        let command = commands::thread_revert(&ask.thread_id, ask.rewind.turn_count, restore_files);
-        tracing::info!(
-            thread = %ask.thread_id,
-            turn_count = ask.rewind.turn_count,
-            restore_files,
-            "rewinding"
-        );
-        let handle = self.handle.clone();
-        let events = self.events.clone();
-        let thread_id = ask.thread_id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle.dispatch(command).await {
-                let _ = events.send(AppEvent::RewindRefused {
-                    thread_id,
-                    error: error.to_string(),
-                });
-            }
-        });
-        self.rewinding = Some(PendingRewind {
-            thread_id: ask.thread_id,
-            rewind: ask.rewind,
-            failures_seen,
-            deadline: Instant::now() + REWIND_TIMEOUT,
-        });
-        self.toast("rewinding…", false);
+        let step = self
+            .outbox
+            .rewind(thread, ask.rewind, restore_files, Instant::now());
+        self.take_outbox_step(step);
     }
 
     /// Whether the open thread has a rewind on its way.
     pub fn is_rewinding(&self) -> bool {
-        self.rewinding
-            .as_ref()
-            .is_some_and(|r| self.current_thread_id.as_ref() == Some(&r.thread_id))
+        self.current_thread_id
+            .as_deref()
+            .is_some_and(|thread| self.outbox.is_rewinding(thread))
     }
 
-    fn on_rewind_refused(&mut self, thread_id: Id, error: String) {
-        if self
-            .rewinding
-            .as_ref()
-            .is_some_and(|r| r.thread_id == thread_id)
-        {
-            self.rewinding = None;
-            self.toast(format!("not rewound: {error}"), true);
-        }
-    }
-
-    /// See whether the rewind on its way has been through. The messages it drops going
-    /// is what it looks like when it has, and they come back to the composer to be
-    /// written again; a failure the server wrote into the thread since is what it looks
-    /// like when it has not. With neither by the deadline the messages are given back
-    /// anyway: a copy too many is better than none.
+    /// A rewind nobody has heard of by its deadline gives its messages back anyway.
     fn check_rewind(&mut self) {
-        let Some(pending) = &self.rewinding else {
-            return;
-        };
-        if Instant::now() >= pending.deadline {
-            if let Some(pending) = self.rewinding.take() {
-                self.give_back(pending.thread_id, pending.rewind.text);
-                self.toast(
-                    "no word of the rewind from the server · what you sent is back in the composer",
-                    true,
-                );
-            }
-            return;
-        }
-        let Some(thread) = self.thread.as_ref().filter(|t| t.id() == pending.thread_id) else {
-            return;
-        };
-        let failure = thread
-            .detail
-            .activities
-            .iter()
-            .rev()
-            .find(|a| a.kind == REWIND_FAILED && !pending.failures_seen.contains(&a.id))
-            .map(|a| a.str("detail").unwrap_or(&a.summary).to_string());
-        if let Some(detail) = failure {
-            self.rewinding = None;
-            self.toast(format!("not rewound: {detail}"), true);
-            return;
-        }
-        let gone = pending
-            .rewind
-            .message_ids
-            .iter()
-            .all(|id| !thread.detail.messages.iter().any(|m| &m.id == id));
-        if gone && let Some(pending) = self.rewinding.take() {
-            self.give_back(pending.thread_id, pending.rewind.text);
-            self.toast("rewound · what you sent that turn is back to edit", false);
-        }
-    }
-
-    /// Put text a rewind took out of the thread back where it can be written again,
-    /// after whatever is already there: the composer when the thread is open, its
-    /// parked draft when it is not.
-    fn give_back(&mut self, thread_id: Id, text: String) {
-        let join = |existing: &str| {
-            if existing.trim().is_empty() {
-                text.clone()
-            } else {
-                format!("{}\n\n{text}", existing.trim_end())
-            }
-        };
-        if self.current_thread_id.as_deref() == Some(thread_id.as_str()) {
-            let joined = join(&self.composer.text());
-            self.composer.set_text(&joined);
-            if matches!(self.mode, Mode::Normal | Mode::Insert) {
-                self.composer.checkpoint();
-                self.focus = Focus::Composer;
-                self.mode = Mode::Insert;
-            }
-        } else {
-            let joined = join(self.drafts.get(&thread_id).map_or("", String::as_str));
-            self.drafts.insert(thread_id, joined);
-        }
+        self.with_outbox(|outbox, here| outbox.tick(Instant::now(), here));
     }
 
     /// Stop what the session is doing. Usually that is the turn, and the turn is named.
@@ -6735,7 +6544,6 @@ impl App {
                     ShellItem::ThreadRemoved { thread_id, .. } => {
                         // What was being written for it has nowhere to go.
                         dropped = self.outbox.on_removed(thread_id);
-                        self.drafts.remove(thread_id);
                         self.marks.remove(thread_id);
                         self.statuses.remove(thread_id);
                         self.unseen.remove(thread_id);
@@ -6795,7 +6603,7 @@ impl App {
                 {
                     self.handle.refresh_thread(&thread_id);
                 }
-                self.check_rewind();
+                self.notice_open_thread();
                 self.reconcile_question();
                 self.sync_vcs_watch();
                 // A finished turn has usually changed the checkout, and the server's
@@ -7420,8 +7228,6 @@ fn apply(app: &mut App, event: AppEvent) {
         }
         AppEvent::Update(update) => app.on_update(*update),
         AppEvent::Outbox(answer) => app.with_outbox(|outbox, here| outbox.on_answer(answer, here)),
-        AppEvent::RewindRefused { thread_id, error } => app.on_rewind_refused(thread_id, error),
-        AppEvent::PlanThreadCreated(thread_id) => app.open_thread(&thread_id),
         AppEvent::ThreadSearch { query, result } => app.on_thread_search(query, result),
         AppEvent::UsageRead(read) => app.on_usage_read(read),
         AppEvent::WorktreeChecked {
@@ -7584,6 +7390,7 @@ mod tests {
 
     use super::*;
     use crate::model::{Project, VcsLocal, VcsWorkingTree};
+    use crate::outbox::tests::{planned_thread, rewindable_thread};
     use crate::reader::tests::{
         agent_progresses, open_detail, stacked_thread, thread_with_a_followable_agent,
         transcript_saying,
@@ -10477,57 +10284,6 @@ mod tests {
         assert!(app.completion.is_some());
     }
 
-    /// A thread in plan mode on a worktree, with a plan waiting and an older one built.
-    fn planned_thread() -> ThreadState {
-        let snapshot: ThreadDetailSnapshot = serde_json::from_value(json!({
-            "snapshotSequence": 1,
-            "thread": {
-                "id": "t1", "projectId": "p", "title": "Test",
-                "modelSelection": {"instanceId": "instance", "model": "a-model"},
-                "runtimeMode": "full-access", "interactionMode": "plan",
-                "branch": "tria/abc", "worktreePath": "/worktrees/p-1",
-                "latestTurn": {"turnId": "turn", "state": "completed"},
-                "hasActionableProposedPlan": true,
-                "messages": [], "activities": [],
-                "proposedPlans": [
-                    {"id": "old", "planMarkdown": "# Old", "implementedAt": "2026-01-01T09:00:00Z",
-                        "createdAt": "2026-01-01T08:00:00Z"},
-                    {"id": "plan", "planMarkdown": "\n# Add a queue\n\n1. do it\n",
-                        "createdAt": "2026-01-01T10:00:00Z"},
-                ]
-            }
-        }))
-        .expect("a plan the server could have sent");
-        ThreadState::from_snapshot(snapshot)
-    }
-
-    /// `:implement` sends the plan back out of plan mode, naming it, so the server can
-    /// mark it built.
-    #[tokio::test]
-    async fn implement_builds_the_waiting_plan_here() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(planned_thread());
-        app.current_thread_id = Some("t1".into());
-
-        app.run_command("implement");
-        let command = sent_command(&mut requests)
-            .await
-            .expect("the plan was sent");
-        assert_eq!(command["type"], "thread.turn.start");
-        assert_eq!(command["threadId"], "t1");
-        assert_eq!(command["interactionMode"], "default");
-        assert_eq!(
-            command["message"]["text"],
-            "PLEASE IMPLEMENT THIS PLAN:\n# Add a queue\n\n1. do it"
-        );
-        assert_eq!(
-            command["sourceProposedPlan"],
-            json!({"threadId": "t1", "planId": "plan"})
-        );
-    }
-
     /// `:implement new` makes a thread where this one works, named for the plan, and
     /// moves there only once the server has made it.
     #[tokio::test]
@@ -10565,7 +10321,7 @@ mod tests {
             .await
             .ok()
             .flatten();
-        let Some(event @ AppEvent::PlanThreadCreated(_)) = made else {
+        let Some(event @ AppEvent::Outbox(_)) = made else {
             panic!("no word the thread was made");
         };
         apply(&mut app, event);
@@ -10574,58 +10330,6 @@ mod tests {
             command["threadId"].as_str(),
             "not moved to the new thread"
         );
-    }
-
-    /// A built plan is not built again.
-    #[test]
-    fn implement_wants_a_plan_nobody_has_built() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        let mut thread = planned_thread();
-        thread.detail.proposed_plans.retain(|p| p.id == "old");
-        app.thread = Some(thread);
-        app.current_thread_id = Some("t1".into());
-        app.run_command("implement");
-        assert!(app.toast.as_ref().unwrap().0.contains("no plan"));
-    }
-
-    /// Three finished turns, the second of them steered: `u3` arrived while it ran.
-    fn rewindable_thread() -> ThreadState {
-        let message = |id: &str, role: &str, turn: Option<&str>, at: &str| {
-            json!({"id": id, "role": role, "text": id, "turnId": turn,
-                "createdAt": format!("2026-01-01T10:{at}:00Z")})
-        };
-        let checkpoint = |turn: &str, count: u32, at: &str| {
-            json!({"turnId": turn, "checkpointTurnCount": count,
-                "completedAt": format!("2026-01-01T10:{at}:00Z")})
-        };
-        let snapshot: ThreadDetailSnapshot = serde_json::from_value(json!({
-            "snapshotSequence": 1,
-            "thread": {
-                "id": "t1", "projectId": "p", "title": "Test",
-                "modelSelection": {"instanceId": "instance", "model": "a-model"},
-                "latestTurn": {"turnId": "three", "state": "completed"},
-                "messages": [
-                    message("u1", "user", None, "00"),
-                    message("a1", "assistant", Some("one"), "01"),
-                    message("u2", "user", None, "03"),
-                    message("a2", "assistant", Some("two"), "04"),
-                    message("u3", "user", None, "05"),
-                    message("a3", "assistant", Some("two"), "06"),
-                    message("u4", "user", None, "08"),
-                    message("a4", "assistant", Some("three"), "09"),
-                ],
-                "checkpoints": [
-                    checkpoint("one", 1, "02"),
-                    checkpoint("two", 2, "07"),
-                    checkpoint("three", 3, "10"),
-                ],
-                "activities": []
-            }
-        }))
-        .expect("a thread the server could have sent");
-        ThreadState::from_snapshot(snapshot)
     }
 
     /// A steer is part of the turn it joined, so rewinding to it or to the prompt it
@@ -10667,6 +10371,12 @@ mod tests {
 
         app.ask_rewind(Some("u3"));
         assert!(app.rewind_ask.is_some(), "it asks first");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            sent_no_command(&mut requests).await,
+            "rewound without a yes"
+        );
+        app.ask_rewind(Some("u3"));
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let command = sent_command(&mut requests)
             .await
@@ -10686,7 +10396,7 @@ mod tests {
             .detail
             .messages
             .retain(|m| m.id == "u1" || m.id == "a1");
-        app.check_rewind();
+        app.notice_open_thread();
         assert!(!app.is_rewinding());
         assert_eq!(app.composer.text(), "half written\n\nu2\n\nu3");
         assert_eq!(app.mode, Mode::Insert);
@@ -10713,37 +10423,6 @@ mod tests {
             .expect("a rewind was sent");
         assert_eq!(command["type"], "thread.checkpoint.revert");
         assert_eq!(command["turnCount"], 2);
-    }
-
-    /// The server takes the command before it does the work, and says it could not
-    /// in the thread. That is where the reason is read from.
-    #[tokio::test]
-    async fn a_rewind_the_server_could_not_do_says_why() {
-        let (handle, _requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(rewindable_thread());
-        app.current_thread_id = Some("t1".into());
-        app.ask_rewind(None);
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        let failed: crate::model::Event = serde_json::from_value(json!({
-            "sequence": 2, "type": "thread.activity-appended",
-            "payload": {"threadId": "t1", "activity": {"id": "f1", "kind": "checkpoint.revert.failed",
-                "summary": "Checkpoint revert failed", "payload": {"detail": "no checkpoint"},
-                "turnId": null, "createdAt": ""}}
-        }))
-        .unwrap();
-        app.on_update(crate::session::Update::Thread {
-            thread_id: "t1".into(),
-            item: ThreadItem::Event { event: failed },
-        });
-        assert!(!app.is_rewinding());
-        assert_eq!(app.toast.as_ref().unwrap().0, "not rewound: no checkpoint");
-        assert!(
-            app.composer.is_empty(),
-            "nothing went, so nothing comes back"
-        );
     }
 
     /// Not while a turn runs, and not where the provider cannot drop turns.
@@ -10812,17 +10491,35 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         app.composer.set_text("half written");
         app.open_thread("t2");
-        assert!(app.drafts.contains_key("t1"));
+        assert!(app.outbox.parked("t1").is_some());
 
         app.on_update(Update::Shell(ShellItem::ThreadRemoved {
             sequence: 1,
             thread_id: "t1".into(),
         }));
-        assert!(!app.drafts.contains_key("t1"), "a draft for nothing");
+        assert!(app.outbox.parked("t1").is_none(), "a draft for nothing");
         let said = app.toast.as_ref().expect("it says so").0.clone();
         assert!(said.contains("queued message was dropped"), "{said}");
         app.composer.history_prev();
         assert_eq!(app.composer.text(), "after that");
+    }
+
+    /// What is half written in one thread waits there while another is open, and is
+    /// there again on the way back.
+    #[test]
+    fn a_draft_waits_in_its_thread_while_another_is_open() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.open_thread("t1");
+        app.composer.set_text("half written");
+        app.open_thread("t2");
+        assert!(app.composer.is_empty(), "t2 has nothing of its own");
+        app.composer.set_text("   ");
+        app.open_thread("t1");
+        assert_eq!(app.composer.text(), "half written");
+        app.open_thread("t2");
+        assert!(app.composer.is_empty(), "blanks came back for t2");
     }
 
     /// The app keeps a handful of letters the composer's Vim has no use for, but a key
