@@ -387,16 +387,18 @@ impl Outbox {
         let checkout = draft.checkout.as_ref();
         // A pull request checked out for the thread was checked out for this id.
         let thread = checkout.map_or_else(commands::new_id, |c| c.thread_id.clone());
+        // Named for its first line with anything in it, trimmed before it is cut short.
         let title: String = text
             .lines()
-            .next()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
             .unwrap_or("New thread")
             .chars()
             .take(60)
             .collect();
         let new = NewThread {
             project_id: draft.project_id.clone(),
-            title: title.trim().to_string(),
+            title: title.trim_end().to_string(),
             model_selection: draft.model_selection.clone(),
             runtime_mode: draft.runtime_mode.clone(),
             interaction_mode: draft.interaction_mode.clone(),
@@ -1234,6 +1236,19 @@ pub(crate) mod tests {
         assert_eq!(new.worktree, Some(worktree));
         assert!(new.branch.is_none() && new.worktree_path.is_none());
         assert!(matches!(&step.go, Some(Go::Opening(id)) if id == thread));
+
+        // Named for its first line with anything in it, whatever it starts with.
+        let named = |outbox: &mut Outbox, text: &str| {
+            let step = outbox.create(draft(), text, None);
+            match only_command(&step) {
+                Command::Create { new, .. } => new.title.clone(),
+                _ => panic!("not a thread made"),
+            }
+        };
+        assert_eq!(named(&mut outbox, "\n  Fix it  \nplease"), "Fix it");
+        let long = format!("{}{}", " ".repeat(70), "a".repeat(80));
+        assert_eq!(named(&mut outbox, &long), "a".repeat(60));
+        assert_eq!(named(&mut outbox, "   \n"), "New thread");
 
         // One made for a pull request checked out is the thread it was checked out for,
         // where it was checked out.
