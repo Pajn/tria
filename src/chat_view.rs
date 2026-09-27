@@ -671,12 +671,15 @@ pub fn match_ranges(line: &str, query: &str) -> Vec<(usize, usize)> {
     };
     if haystack.len() != line.len() {
         // Lowercasing changed byte lengths, and can change how many characters there are
-        // too (`İ` lowers to two), so match over the lowered characters, each kept with
-        // the bytes of the character of `line` it came from.
+        // too (`İ` lowers to two), so match over the lowered line's characters, each kept
+        // with the bytes of the character of `line` it came from. They are taken from the
+        // line lowered as a whole, as `line_matches` sees it, since a sigma ending a word
+        // lowers differently there than on its own; it is still one character for one.
+        let mut lowered = haystack.chars();
         let mut hay: Vec<char> = Vec::new();
         let mut spans: Vec<(usize, usize)> = Vec::new();
         for (byte, ch) in line.char_indices() {
-            for lower in ch.to_lowercase() {
+            for lower in lowered.by_ref().take(ch.to_lowercase().count()) {
                 hay.push(lower);
                 spans.push((byte, byte + ch.len_utf8()));
             }
@@ -1092,6 +1095,10 @@ mod tests {
         // `İ` lowers to two characters, so the lowered line is longer than the line.
         assert_eq!(match_ranges("İa", "a"), vec![(2, 3)]);
         assert_eq!(match_ranges("İa", "i"), vec![(0, 2)]);
+        // A sigma ending a word lowers to `ς` in the line as a whole, and it is the line
+        // as a whole that is matched.
+        assert!(line_matches("ΟΣ İ", "ς"));
+        assert_eq!(match_ranges("ΟΣ İ", "ς"), vec![(2, 4)]);
         assert!(match_ranges("abc", "").is_empty());
     }
 }
