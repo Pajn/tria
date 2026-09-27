@@ -5497,11 +5497,7 @@ impl App {
             KeyCode::Char('y') if ctrl => self.chat_scroll_by(-1),
             KeyCode::Char('g') if prefix == Some('g') => {
                 view.top();
-                // A transcript is whole as it was read; there is nothing older to fetch,
-                // and the thread underneath is not what the top of the view belongs to.
-                if !self.reader.is_open() && self.thread.as_ref().is_some_and(|t| t.has_more) {
-                    self.load_older();
-                }
+                self.reached_the_top();
             }
             KeyCode::Char('e') if prefix == Some('g') => self.view_at_cursor(),
             KeyCode::Char('r') if prefix == Some('g') => self.rewind_at_cursor(),
@@ -5676,7 +5672,9 @@ impl App {
 
     /// Scrolled up as far as the chat goes: pull in older turns if the server has them.
     fn reached_the_top(&mut self) {
-        if self.thread.as_ref().is_some_and(|t| t.has_more) {
+        // A reading is whole as it was read; there is nothing older to fetch, and the
+        // thread underneath is not what the top of the view belongs to.
+        if !self.reader.is_open() && self.thread.as_ref().is_some_and(|t| t.has_more) {
             self.load_older();
         }
     }
@@ -10174,6 +10172,34 @@ mod tests {
         assert!(!app.reader.is_open());
         assert_eq!(app.chat_view.place(), kept);
         assert_eq!(app.focus, Focus::Chat);
+    }
+
+    /// Scrolling to the top of a reading asks for nothing: the top is the reading's, not
+    /// the older turns of the thread underneath.
+    #[tokio::test]
+    async fn the_top_of_a_reading_asks_for_no_older_turns() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        reading_a_pull_request(&mut app);
+        let thread = app.thread.as_mut().unwrap();
+        thread.has_more = true;
+        thread.before_cursor = Some("page-1".into());
+        drawn(&mut app);
+        app.mode = Mode::Normal;
+        app.focus = Focus::Chat;
+        typed(&mut app, "G");
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        typed(&mut app, "gg");
+        assert_eq!(app.chat_view.offset(), 0, "at the top");
+        while let Some(request) = asked(&mut requests).await {
+            assert!(
+                !matches!(request, crate::session::Request::LoadOlder { .. }),
+                "asked for older turns"
+            );
+        }
     }
 
     /// The spinner turns while a thread works, and nothing laid out in the chat draws
