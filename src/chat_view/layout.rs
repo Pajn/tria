@@ -9,6 +9,8 @@
 //!
 //! The size is the renderer's: it says each frame how big the chat is, and the layout keeps
 //! the last it was told. Before the first frame there is no size, and so no lines.
+//!
+//! Where the reader is in it is the view's, which owns it.
 
 use std::{
     cell::OnceCell,
@@ -18,8 +20,8 @@ use std::{
 
 use ratatui::text::Line;
 
+use super::{Scroll, Search, line_matches};
 use crate::{
-    app::{Scroll, Search, line_matches},
     reader::{Reader, Source},
     state::ThreadState,
     timeline::{self, Block, BlockKey, Picture, Placed, Region, Wrapped},
@@ -117,7 +119,7 @@ pub struct Shown<'a> {
 }
 
 #[derive(Default)]
-pub struct ChatLayout {
+pub struct Layout {
     /// The chat's width and height as it was last drawn.
     size: Option<(u16, u16)>,
     /// What the blocks were built from, with the width and picture rows they were built at.
@@ -143,19 +145,19 @@ pub struct ChatLayout {
     builds: usize,
 }
 
-impl ChatLayout {
+impl Layout {
     // ── Laying out ─────────────────────────────────────────────────────
 
     /// Be told how big the chat is. What was laid out at another size is laid out again
     /// the next time it is asked for.
-    pub fn resize(&mut self, width: u16, height: u16) {
+    pub(super) fn resize(&mut self, width: u16, height: u16) {
         self.size = Some((width, height));
     }
 
     /// Lay out what `key` names, building its blocks at the chat's width and height with
     /// `build` if it is not what is laid out already. Without a size there is nowhere to
     /// lay anything out, and the chat has no lines.
-    pub fn lay_out(&mut self, key: Key, build: impl FnOnce(u16, u16) -> Vec<Block>) {
+    pub(super) fn lay_out(&mut self, key: Key, build: impl FnOnce(u16, u16) -> Vec<Block>) {
         let Some((width, height)) = self.size else {
             self.clear();
             return;
@@ -171,7 +173,7 @@ impl ChatLayout {
     }
 
     /// Lay out nothing, as when no thread is open.
-    pub fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         if self.built.is_none() && self.blocks.is_empty() {
             return;
         }
@@ -277,7 +279,7 @@ impl ChatLayout {
 
     /// The first content line in view. Following the end is being scrolled as far down
     /// as the chat goes, and an offset past that is as far as it goes.
-    pub fn offset(&self, scroll: Scroll) -> usize {
+    pub(super) fn offset(&self, scroll: Scroll) -> usize {
         let most = self.total.saturating_sub(self.height());
         match scroll {
             Scroll::Follow => most,
@@ -287,7 +289,7 @@ impl ChatLayout {
 
     /// Where the chat cursor is, kept on a line the chat has: the last one while the view
     /// follows new output.
-    pub fn cursor(&self, scroll: Scroll, cursor: usize) -> usize {
+    pub(super) fn cursor(&self, scroll: Scroll, cursor: usize) -> usize {
         let last = self.total.saturating_sub(1);
         match scroll {
             Scroll::Follow => last,
@@ -296,7 +298,7 @@ impl ChatLayout {
     }
 
     /// What of each block is in view from `offset` down, top to bottom.
-    pub fn shown(&self, offset: usize) -> Vec<Shown<'_>> {
+    pub(super) fn shown(&self, offset: usize) -> Vec<Shown<'_>> {
         let mut room = self.height();
         let mut shown = Vec::new();
         let mut y = 0usize;
@@ -349,7 +351,7 @@ impl ChatLayout {
 
     /// A line and a character on it, the character kept on the line. A column is held
     /// where it was put, so passing a short line does not pull the cursor left for good.
-    pub fn spot(&self, line: usize, column: usize) -> (usize, usize) {
+    pub(super) fn spot(&self, line: usize, column: usize) -> (usize, usize) {
         (line, column.min(self.len(line).saturating_sub(1)))
     }
 
@@ -594,8 +596,8 @@ mod tests {
     }
 
     /// A layout of the thread at a size, built as the app builds it.
-    fn laid_out(thread: &ThreadState, width: u16, height: u16) -> ChatLayout {
-        let mut layout = ChatLayout::default();
+    fn laid_out(thread: &ThreadState, width: u16, height: u16) -> Layout {
+        let mut layout = Layout::default();
         layout.resize(width, height);
         layout.lay_out(key(thread), |width, height| {
             timeline::build(thread, &HashSet::new(), 0, width, height)
@@ -626,7 +628,7 @@ mod tests {
     #[test]
     fn before_it_is_drawn_the_chat_has_no_lines() {
         let thread = thread(SAID, "fine");
-        let mut layout = ChatLayout::default();
+        let mut layout = Layout::default();
         layout.lay_out(key(&thread), |_, _| panic!("there is nowhere to build it"));
         assert_eq!((layout.total(), layout.height()), (0, 0));
         assert_eq!(layout.row(0), "");
@@ -725,7 +727,7 @@ mod tests {
     fn the_blocks_are_built_again_only_when_what_they_are_built_from_moves() {
         let thread = thread(SAID, "fine");
         let mut layout = laid_out(&thread, 60, 20);
-        let lay_out = |layout: &mut ChatLayout, key: Key| {
+        let lay_out = |layout: &mut Layout, key: Key| {
             layout.lay_out(key, |width, height| {
                 timeline::build(&thread, &HashSet::new(), 0, width, height)
             })
@@ -745,7 +747,7 @@ mod tests {
         lay_out(
             &mut layout,
             Key {
-                revision: 9,
+                revision: thread.revision + 1,
                 ..key(&thread)
             },
         );
@@ -758,7 +760,7 @@ mod tests {
     /// last line; an offset is held to what the chat has.
     #[test]
     fn following_is_the_bottom_of_the_chat() {
-        let mut layout = ChatLayout::default();
+        let mut layout = Layout::default();
         layout.resize(40, 4);
         layout.lay_out(key(&thread("", "")), |_, _| {
             vec![block(BlockKey::Message("m1".into()), 10)]
@@ -775,7 +777,7 @@ mod tests {
     /// above the top so its pictures land where its lines did.
     #[test]
     fn what_is_shown_is_the_rows_in_view() {
-        let mut layout = ChatLayout::default();
+        let mut layout = Layout::default();
         layout.resize(40, 5);
         layout.lay_out(key(&thread("", "")), |_, _| {
             vec![
@@ -802,7 +804,7 @@ mod tests {
         };
         let shot = Picture::File("/tmp/shot.png".into());
         let shown = Picture::File("/tmp/shown.png".into());
-        let mut layout = ChatLayout::default();
+        let mut layout = Layout::default();
         layout.resize(40, 40);
         layout.lay_out(key(&thread("", "")), |_, _| {
             vec![

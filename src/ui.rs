@@ -212,68 +212,39 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
     {
         return;
     }
-    let layout = &app.chat_layout;
-    let offset = layout.offset(app.scroll);
-    let (cursor, column) = layout.spot(app.chat_cursor, app.chat_column);
-    let row = |line: usize| {
-        (line >= offset)
-            .then(|| chat.y + (line - offset) as u16)
-            .filter(|y| *y < chat.y + chat.height)
-    };
+    let view = &app.chat_view;
     let buffer = frame.buffer_mut();
-    let paint = |buffer: &mut ratatui::buffer::Buffer, line, from: u16, to: u16, style| {
-        let Some(y) = row(line) else { return };
+    let paint = |buffer: &mut ratatui::buffer::Buffer, row: usize, from: u16, to: u16, style| {
+        let y = chat.y + row as u16;
         for x in from.max(chat.x)..to.min(chat.x + chat.width) {
             if let Some(cell) = buffer.cell_mut(Position::new(x, y)) {
                 cell.set_style(style);
             }
         }
     };
+    let cursor = view.cursor_cell();
     // The line being read is tinted rather than filled, so the conversation keeps the
     // colours it is written in and the cursor is still easy to find on a wide screen.
-    paint(
-        buffer,
-        cursor,
-        chat.x,
-        chat.x + chat.width,
-        Style::default().bg(Color::Indexed(236)),
-    );
-    if let Some(anchor) = app.chat_visual {
-        let style = Style::default().bg(Color::Blue).fg(Color::White);
-        let head = (anchor.line, anchor.column.min(layout.len(anchor.line)));
-        let spot = (cursor, column);
-        let (first, last) = if head <= spot {
-            (head, spot)
-        } else {
-            (spot, head)
-        };
-        for line in first.0..=last.0 {
-            let (from, to) = if anchor.whole_lines {
-                (0, chat.width)
-            } else {
-                let from = if line == first.0 {
-                    layout.column(line, first.1)
-                } else {
-                    0
-                };
-                let to = if line == last.0 {
-                    layout.column(line, last.1 + 1)
-                } else {
-                    layout.column(line, layout.len(line))
-                };
-                // An empty line still shows that it is in the selection.
-                (from, to.max(from + 1))
-            };
-            paint(buffer, line, chat.x + from, chat.x + to, style);
-        }
+    if let Some((row, _)) = cursor {
+        paint(
+            buffer,
+            row,
+            chat.x,
+            chat.x + chat.width,
+            Style::default().bg(Color::Indexed(236)),
+        );
+    }
+    let style = Style::default().bg(Color::Blue).fg(Color::White);
+    for (row, from, to) in view.selection(chat.width) {
+        paint(buffer, row, chat.x + from, chat.x + to, style);
     }
     // The cursor is a block on the character under it, as the composer's is, drawn as
     // whichever way round that cell is not so it shows on the tinted line and inside a
     // selection alike.
-    if let Some(y) = row(cursor) {
-        let x = chat.x + layout.column(cursor, column);
+    if let Some((row, column)) = cursor {
+        let x = chat.x + column;
         if x < chat.x + chat.width
-            && let Some(cell) = buffer.cell_mut(Position::new(x, y))
+            && let Some(cell) = buffer.cell_mut(Position::new(x, chat.y + row as u16))
         {
             let style = if cell.style().add_modifier.contains(Modifier::REVERSED) {
                 Style::default().remove_modifier(Modifier::REVERSED)
@@ -362,7 +333,7 @@ fn apply_links(frame: &mut Frame, app: &mut App, chat: Rect) {
 }
 
 fn apply_search_highlights(frame: &mut Frame, app: &App, chat: Rect) {
-    let query = match (&app.search_input, &app.search) {
+    let query = match (&app.search_input, app.chat_view.search()) {
         (Some(input), _) if app.mode == Mode::Search => input.query.text(),
         (_, Some(search)) if app.focus == Focus::Chat => search.query.clone(),
         _ => return,
@@ -384,7 +355,7 @@ fn apply_search_highlights(frame: &mut Frame, app: &App, chat: Rect) {
                 text.push_str(symbol);
             }
         }
-        for (from, to) in crate::app::match_ranges(&text, query) {
+        for (from, to) in crate::chat_view::match_ranges(&text, query) {
             for &(byte, x) in &starts {
                 if byte >= from
                     && byte < to
@@ -1229,7 +1200,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         height: area.height,
     };
     app.chat_area = inner;
-    app.chat_layout.resize(inner.width, inner.height);
+    app.chat_view.resize(inner.width, inner.height);
     // A subagent's transcript, or a pull request, is read in place of the conversation,
     // through the same chat: scrolled, searched, and yanked like it.
     if app.reader.conversation().or(app.thread.as_ref()).is_none() {
@@ -1254,14 +1225,9 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    app.chat();
-    let layout = &app.chat_layout;
-    if app.focus == Focus::Chat {
-        app.chat_cursor = layout.cursor(app.scroll, app.chat_cursor);
-    }
-    let offset = layout.offset(app.scroll);
+    let view = app.chat();
     let mut y = inner.y;
-    for shown in layout.shown(offset) {
+    for shown in view.shown() {
         let rect = Rect {
             x: inner.x,
             y,
@@ -1291,9 +1257,9 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         y += rect.height;
     }
 
-    let (total, height) = (layout.total(), layout.height());
+    let (total, height) = (view.total(), view.height());
     if total > height {
-        draw_scrollbar(frame, area, offset, total, height);
+        draw_scrollbar(frame, area, view.offset(), total, height);
     }
 }
 
@@ -1876,11 +1842,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             " VISUAL ",
             Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
         ),
-        (_, Focus::Chat) if app.chat_visual.is_some_and(|a| a.whole_lines) => (
+        (_, Focus::Chat) if app.chat_view.visual().is_some_and(|a| a.whole_lines) => (
             " VISUAL LINE ",
             Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
         ),
-        (_, Focus::Chat) if app.chat_visual.is_some() => (
+        (_, Focus::Chat) if app.chat_view.visual().is_some() => (
             " VISUAL ",
             Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
         ),
@@ -3747,13 +3713,14 @@ mod tests {
 
         let buffer = screen(60, &mut app);
         let region = app
-            .chat_layout
+            .chat_view
+            .layout()
             .picture_ranges()
             .first()
             .cloned()
             .expect("the message has a picture");
         assert_eq!(
-            app.chat_layout.picture_at(region.first),
+            app.chat_view.layout().picture_at(region.first),
             Some(&crate::timeline::Picture::File(
                 path.to_string_lossy().into_owned()
             )),
@@ -3768,10 +3735,10 @@ mod tests {
                     .is_some_and(|bg| bg != Color::Reset)
             })
         };
-        let top = app.chat_area.y + (region.first + 1 - app.chat_offset()) as u16;
+        let top = app.chat_area.y + (region.first + 1 - app.chat_view.offset()) as u16;
         assert!(painted(top), "the picture starts under its caption");
         assert!(
-            painted(app.chat_area.y + (region.end - 1 - app.chat_offset()) as u16),
+            painted(app.chat_area.y + (region.end - 1 - app.chat_view.offset()) as u16),
             "and runs to the end of the lines it was given"
         );
         std::fs::remove_file(&path).unwrap();
@@ -3796,14 +3763,14 @@ mod tests {
             path.display()
         )));
         screen(60, &mut app);
-        let builds = app.chat_layout.builds();
-        let region = app.chat_layout.picture_ranges()[0].clone();
-        let y = app.chat_area.y + (region.first + 1 - app.chat_offset()) as u16;
+        let builds = app.chat_view.layout().builds();
+        let region = app.chat_view.layout().picture_ranges()[0].clone();
+        let y = app.chat_area.y + (region.first + 1 - app.chat_view.offset()) as u16;
 
         crate::picture::forget();
         let buffer = screen(60, &mut app);
         assert_eq!(
-            app.chat_layout.builds(),
+            app.chat_view.layout().builds(),
             builds,
             "nothing was laid out again"
         );
@@ -4131,6 +4098,16 @@ mod tests {
         assert!(text.contains("Esc closes"), "{text}");
     }
 
+    /// Put the chat cursor on a character of a line, the way the keys do.
+    fn put_cursor(app: &mut App, line: usize, column: usize) {
+        let view = app.chat();
+        view.set_cursor(line);
+        view.line_start();
+        for _ in 0..column {
+            view.right();
+        }
+    }
+
     #[test]
     fn insert_mode_does_not_leave_a_second_cursor_in_the_chat() {
         let (handle, _requests) = crate::session::Handle::detached();
@@ -4139,12 +4116,12 @@ mod tests {
         app.thread = Some(thread_saying("read this"));
         app.focus = Focus::Chat;
         app.mode = Mode::Insert;
-        app.scroll = crate::app::Scroll::Offset(0);
         // The first frame is what tells the chat how big it is.
         chat(50, &mut app);
-        app.chat_cursor = app.chat().message_starts()[0] + 1;
+        let line = app.chat().layout().message_starts()[0] + 1;
+        put_cursor(&mut app, line, 0);
         let buffer = screen(50, &mut app);
-        let y = app.chat_area.y + (app.chat_cursor - app.chat_offset()) as u16;
+        let y = app.chat_area.y + (line - app.chat_view.offset()) as u16;
         for x in app.chat_area.x..app.chat_area.right() {
             assert_ne!(buffer[(x, y)].style().bg, Some(Color::Indexed(236)));
             assert!(
@@ -4173,28 +4150,23 @@ mod tests {
         chat(30, &mut app);
 
         // "two" on the first row of the message.
-        let line = app.chat().message_starts()[0] + 1;
         app.focus = crate::app::Focus::Chat;
-        // Following new output keeps the cursor on the last line; this is a reader
-        // looking at something further up.
-        app.scroll = crate::app::Scroll::Offset(0);
-        app.chat_cursor = line;
-        app.chat_column = 6;
-        app.chat_visual = Some(crate::app::ChatAnchor {
-            line,
-            column: 4,
-            whole_lines: false,
-        });
+        let line = app.chat().layout().message_starts()[0] + 1;
+        put_cursor(&mut app, line, 4);
+        let view = app.chat();
+        view.toggle_visual(false);
+        view.right();
+        view.right();
         let buffer = screen(30, &mut app);
 
-        let y = app.chat_area.y + (line - app.chat_offset()) as u16;
+        let y = app.chat_area.y + (line - app.chat_view.offset()) as u16;
         let marked: String = (0..buffer.area.width)
             .filter(|x| buffer[(*x, y)].style().bg == Some(Color::Blue))
             .map(|x| buffer[(x, y)].symbol())
             .collect();
         assert_eq!(marked, "two");
         // And the cursor, at the far end of it, is turned the other way round again.
-        let x = app.chat_area.x + app.chat_layout.column(line, 6);
+        let x = app.chat_area.x + app.chat_view.layout().column(line, 6);
         assert!(
             buffer[(x, y)]
                 .style()
@@ -4213,14 +4185,12 @@ mod tests {
         app.thread = Some(thread_saying("one two three four five six seven eight"));
         chat(30, &mut app);
 
-        let line = app.chat().message_starts()[0] + 1;
         app.focus = crate::app::Focus::Chat;
-        app.scroll = crate::app::Scroll::Offset(0);
-        app.chat_cursor = line;
-        app.chat_column = 4;
+        let line = app.chat().layout().message_starts()[0] + 1;
+        put_cursor(&mut app, line, 4);
         let buffer = screen(30, &mut app);
 
-        let y = app.chat_area.y + (line - app.chat_offset()) as u16;
+        let y = app.chat_area.y + (line - app.chat_view.offset()) as u16;
         let marked: Vec<u16> = (0..buffer.area.width)
             .filter(|x| {
                 buffer[(*x, y)]
@@ -4231,7 +4201,7 @@ mod tests {
             .collect();
         assert_eq!(
             marked,
-            vec![app.chat_area.x + app.chat_layout.column(line, 4)]
+            vec![app.chat_area.x + app.chat_view.layout().column(line, 4)]
         );
 
         // The line carries the tint from edge to edge, and no other line does.
