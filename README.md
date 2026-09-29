@@ -320,6 +320,12 @@ the server creates when the thread starts. `gw` or `:worktree` switches between 
 default comes from the project's own setting, then the server's, and the server's default is
 the current checkout.
 
+Directory-based commands work before the first message too: `gl`, custom program bindings,
+`g!`, the terminal panel, the editor, reveal, and tmux commands use the draft's project
+checkout or its prepared pull-request worktree. A fresh worktree requested with `gw` is
+created when you send, so these commands use the project checkout until then. Opening a
+program leaves your message unsent; its terminal identity carries through to the new thread.
+
 A worktree branches off whatever the project's checkout has at the time, or off the remote's
 copy of it where the server is set to start new worktrees from origin. Its branch is named
 after the thread rather than the message, since the server names the worktree's directory

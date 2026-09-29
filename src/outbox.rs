@@ -42,6 +42,8 @@ pub const REWIND_TIMEOUT: Duration = Duration::from_secs(120);
 /// A thread being composed that does not exist on the server yet.
 #[derive(Debug, Clone)]
 pub struct NewThreadDraft {
+    /// Reserved while drafting, so terminals can belong to the thread before it is sent.
+    pub thread_id: Id,
     pub project_id: Id,
     pub model_selection: ModelSelection,
     pub runtime_mode: String,
@@ -50,6 +52,16 @@ pub struct NewThreadDraft {
     pub worktree: bool,
     /// A pull request checked out for the thread to start in, where it was made for one.
     pub checkout: Option<PreparedCheckout>,
+}
+
+impl NewThreadDraft {
+    pub fn id(&self) -> &str {
+        self.checkout
+            .as_ref()
+            .map_or(self.thread_id.as_str(), |checkout| {
+                checkout.thread_id.as_str()
+            })
+    }
 }
 
 /// A pull request checked out by the server for a thread to be written in.
@@ -385,8 +397,8 @@ impl Outbox {
         worktree: Option<Worktree>,
     ) -> Step {
         let checkout = draft.checkout.as_ref();
-        // A pull request checked out for the thread was checked out for this id.
-        let thread = checkout.map_or_else(commands::new_id, |c| c.thread_id.clone());
+        // Keep the identity used by terminals and any prepared pull-request checkout.
+        let thread = draft.id().to_string();
         // Named for its first line with anything in it, trimmed before it is cut short.
         let title: String = text
             .lines()
@@ -1047,6 +1059,7 @@ pub(crate) mod tests {
 
     fn draft() -> NewThreadDraft {
         NewThreadDraft {
+            thread_id: commands::new_id(),
             project_id: "p".into(),
             model_selection: selection(),
             runtime_mode: "full-access".into(),

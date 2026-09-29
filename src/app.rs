@@ -1148,7 +1148,7 @@ impl App {
             return;
         }
         self.swap_composer_draft(thread_id);
-        if let Some(leaving) = self.current_thread_id.clone() {
+        if let Some(leaving) = self.terminal_owner() {
             self.release_popup_terminals(&leaving);
         }
         // The pull requests and subagents listed are the thread's, so a new thread's list
@@ -1294,11 +1294,15 @@ impl App {
         // The project's setting wins, then the server's; the server's own default is
         // the current checkout.
         let env_mode = self.config.settings.thread_env_mode(project);
+        if let Some(leaving) = self.terminal_owner() {
+            self.release_popup_terminals(&leaving);
+        }
         self.swap_composer_draft(NEW_THREAD_DRAFT_KEY);
         // What was being read belonged to the thread being left, as it does when another
         // thread is opened.
         self.reader.forget();
         self.draft = Some(NewThreadDraft {
+            thread_id: commands::new_id(),
             project_id: project_id.to_string(),
             worktree: env_mode.as_deref() == Some("worktree"),
             model_selection,
@@ -2322,9 +2326,9 @@ impl App {
         }
     }
 
-    /// The open thread's terminals, live ones first.
+    /// The open thread or draft's terminals, live ones first.
     pub fn thread_terminals(&self) -> Vec<&crate::model::TerminalSummary> {
-        let Some(id) = self.current_thread_id.as_deref() else {
+        let Some(id) = self.terminal_owner() else {
             return Vec::new();
         };
         let mut list: Vec<&crate::model::TerminalSummary> = self
@@ -2343,7 +2347,7 @@ impl App {
     }
 
     fn open_terminals(&mut self) {
-        if self.thread.is_none() {
+        if self.terminal_owner().is_none() {
             self.toast("no thread open", true);
             return;
         }
@@ -2397,11 +2401,11 @@ impl App {
 
     /// Open a new shell for the thread and attach to it.
     fn new_terminal(&mut self) {
-        let Some(thread_id) = self.current_thread_id.clone() else {
+        let Some(thread_id) = self.terminal_owner() else {
             self.toast("no thread open", true);
             return;
         };
-        let Some(cwd) = self.thread_directory() else {
+        let Some(cwd) = self.working_directory() else {
             self.toast("thread has no directory", true);
             return;
         };
@@ -2462,6 +2466,7 @@ impl App {
     fn detach_terminal(&mut self) {
         self.handle.detach_terminal();
         self.pane = None;
+        self.pending_pane_command = None;
         self.mode = Mode::Normal;
         // Whatever ran in there probably touched the checkout.
         self.handle.refresh_vcs();
@@ -2777,7 +2782,7 @@ impl App {
     /// The parked sections are left out: they are collapsed most of the time, and a
     /// settled thread's worktree is usually gone.
     fn sync_vcs_watch(&mut self) {
-        self.vcs_cwd = self.watch_directory();
+        self.vcs_cwd = self.working_directory();
         let sections = self.shell.sections(&commands::now_iso());
         let mut cwds: Vec<String> = self.vcs_cwd.clone().into_iter().collect();
         for thread in sections.pinned.iter().chain(&sections.active) {
@@ -2845,7 +2850,7 @@ impl App {
     /// shut. The two calls share a task because the order is the point: the other way
     /// round the close takes the shell that was just warmed.
     fn end_terminal(&self, thread_id: String, terminal_id: String, warm: bool) {
-        let warm = warm.then(|| self.thread_directory()).flatten();
+        let warm = warm.then(|| self.working_directory()).flatten();
         let (cols, rows) = self.pane_size();
         let handle = self.handle.clone();
         tokio::spawn(async move {
@@ -2896,9 +2901,12 @@ impl App {
 
     /// Whether that terminal has a command running, as the metadata stream last said.
     fn terminal_busy(&self, terminal_id: &str) -> bool {
-        self.terminals
-            .iter()
-            .any(|t| t.terminal_id == terminal_id && t.has_running_subprocess)
+        let Some(owner) = self.terminal_owner() else {
+            return false;
+        };
+        self.terminals.iter().any(|t| {
+            t.thread_id == owner && t.terminal_id == terminal_id && t.has_running_subprocess
+        })
     }
 
     /// Tell the server the pane's size after a redraw changed it.
@@ -3505,7 +3513,7 @@ impl App {
         act: impl FnOnce(&mut Reader<Restore>, &reader::Thread<'_>) -> reader::Step,
     ) -> bool {
         let branch = self.checked_out_branch().map(str::to_string);
-        let directory = self.thread_directory();
+        let directory = self.working_directory();
         let Some(state) = self.thread.as_ref() else {
             self.reader.forget();
             return false;
@@ -3720,22 +3728,19 @@ impl App {
 
     // ── Git popup ──────────────────────────────────────────────────────
 
-    /// `gl` and `:git`: run the git command in the thread's directory. Inside tmux it opens
-    /// as a popup over the pane and tria keeps running; elsewhere tria steps aside until
-    /// the command exits.
-    /// `gl` and `:git`: run the git command in the thread's own terminal, in the pane.
-    /// Reuses one terminal per thread, so leaving and coming back finds it where it was.
+    /// Run a bound program in the thread or draft's terminal, in the current checkout.
+    /// The draft's terminal identity survives its first message.
     fn open_program(&mut self, key: char) {
         let Some(program) = self.programs.iter().find(|p| p.key == key).cloned() else {
             // Only `:git` reaches this: the key itself is not a key until it is bound.
             self.toast(format!("nothing is bound to g{key}"), true);
             return;
         };
-        let Some(dir) = self.thread_directory() else {
+        let Some(dir) = self.working_directory() else {
             self.toast("no thread open", true);
             return;
         };
-        let Some(thread_id) = self.current_thread_id.clone() else {
+        let Some(thread_id) = self.terminal_owner() else {
             self.toast("no thread open", true);
             return;
         };
@@ -3766,11 +3771,11 @@ impl App {
     /// `g!` and `:shell`: a plain shell for the thread, in the pane. Exiting it closes
     /// the popup, so this is a scratch shell rather than something to keep around.
     fn open_shell(&mut self) {
-        let Some(dir) = self.thread_directory() else {
+        let Some(dir) = self.working_directory() else {
             self.toast("no thread open", true);
             return;
         };
-        let Some(thread_id) = self.current_thread_id.clone() else {
+        let Some(thread_id) = self.terminal_owner() else {
             self.toast("no thread open", true);
             return;
         };
@@ -3869,7 +3874,7 @@ impl App {
     }
 
     fn external_dir(&self) -> String {
-        self.thread_directory().unwrap_or_else(|| {
+        self.working_directory().unwrap_or_else(|| {
             std::env::current_dir()
                 .map(|d| d.display().to_string())
                 .unwrap_or_else(|_| ".".to_string())
@@ -3938,23 +3943,28 @@ impl App {
 
     // ── tmux ───────────────────────────────────────────────────────────
 
-    /// Directory the current thread works in: its worktree, else the project root.
-    /// The checkout the header describes: the open thread's, or the project a new
-    /// thread would start in.
-    fn watch_directory(&self) -> Option<String> {
+    /// The checkout on screen: a draft's prepared worktree or project root, or the
+    /// existing thread's working directory. A planned worktree does not exist yet.
+    fn working_directory(&self) -> Option<String> {
         if let Some(draft) = &self.draft {
+            if let Some(checkout) = &draft.checkout {
+                return Some(checkout.worktree_path.clone());
+            }
             return self
                 .shell
                 .projects
                 .get(&draft.project_id)
                 .map(|p| p.workspace_root.clone());
         }
-        self.thread_directory()
-    }
-
-    fn thread_directory(&self) -> Option<String> {
         let shell = self.thread.as_ref().map(|t| &t.detail.shell)?;
         self.directory_of(shell)
+    }
+
+    fn terminal_owner(&self) -> Option<String> {
+        self.draft
+            .as_ref()
+            .map(|draft| draft.id().to_string())
+            .or_else(|| self.current_thread_id.clone())
     }
 
     /// Where a thread works: the worktree it was given one, and otherwise the project's
@@ -3994,7 +4004,7 @@ impl App {
     /// so it means nothing when the server is on another machine: there it is either not
     /// a directory here or, worse, a different one.
     fn reveal_directory(&mut self) {
-        let Some(dir) = self.thread_directory() else {
+        let Some(dir) = self.working_directory() else {
             self.toast("no thread open", true);
             return;
         };
@@ -4014,7 +4024,7 @@ impl App {
             self.toast("not running inside tmux", true);
             return None;
         }
-        let Some(dir) = self.thread_directory() else {
+        let Some(dir) = self.working_directory() else {
             self.toast("no thread open", true);
             return None;
         };
@@ -4387,6 +4397,7 @@ impl App {
         };
         draft.worktree = false;
         draft.checkout = Some(checkout);
+        self.sync_vcs_watch();
         self.toast(
             if on_head {
                 format!("#{number} is checked out; write what the thread is for")
@@ -5459,7 +5470,7 @@ impl App {
         if !self.local_disk || self.reader.is_open() || self.tool_recovery_request.is_some() {
             return;
         }
-        let Some(cwd) = self.thread_directory() else {
+        let Some(cwd) = self.working_directory() else {
             return;
         };
         let Some(thread) = self.thread.as_mut() else {
@@ -6185,7 +6196,7 @@ impl App {
                     .map(|t| &t.detail.shell.model_selection)
             })
             .map(|selection| selection.instance_id.clone());
-        let cwd = self.watch_directory();
+        let cwd = self.working_directory();
         let items = self
             .config
             .providers
@@ -6613,7 +6624,7 @@ impl App {
                     && let Some(pane) = &self.pane
                 {
                     let (cols, rows) = pane.size();
-                    let cwd = self.thread_directory().unwrap_or_default();
+                    let cwd = self.working_directory().unwrap_or_default();
                     self.handle.attach_terminal(
                         &pane.thread_id,
                         &pane.terminal_id,
@@ -7863,6 +7874,161 @@ mod tests {
     /// `g` and a key run whatever the config file put there, in the thread's own
     /// terminal — the binding tria ships with is only the first entry in that list.
     #[tokio::test]
+    async fn project_commands_work_before_the_first_message_and_keep_their_terminal_identity() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let project_id = project(&mut app);
+        app.programs.push(crate::config::Program {
+            key: 'b',
+            command: "yazi".into(),
+        });
+        app.start_new_thread(&project_id);
+        let id = app.draft.as_ref().unwrap().id().to_string();
+        app.composer.set_text("the first message");
+        assert_eq!(app.external_dir(), "/src/p");
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(key('g'));
+        app.on_key(key('l'));
+        assert_eq!(app.mode, Mode::TerminalPane);
+        assert_eq!(app.pane.as_ref().unwrap().thread_id, id);
+        assert!(app.current_thread_id.is_none() && app.thread.is_none());
+        loop {
+            match asked(&mut requests)
+                .await
+                .expect("attaches a draft terminal")
+            {
+                crate::session::Request::Attach {
+                    thread_id,
+                    terminal_id,
+                    cwd,
+                    ..
+                } => {
+                    assert_eq!(thread_id, id);
+                    assert_eq!(terminal_id, "tria-gl");
+                    assert_eq!(cwd, "/src/p");
+                    break;
+                }
+                crate::session::Request::Dispatch { .. } => {
+                    panic!("opening git must not send a message")
+                }
+                _ => {}
+            }
+        }
+        // A lazygit in another thread does not suppress this draft's startup command.
+        app.terminals = serde_json::from_value(json!([
+            {"threadId": "other", "terminalId": "tria-gl", "cwd": "/other", "status": "running", "hasRunningSubprocess": true},
+            {"threadId": id, "terminalId": "tria-gl", "cwd": "/src/p", "status": "running"}
+        ])).unwrap();
+        app.apply_terminal_stream(
+            serde_json::from_value(json!({
+                "type": "snapshot", "snapshot": {"threadId": id, "terminalId": "tria-gl",
+                    "cwd": "/src/p", "status": "running", "history": "", "label": "shell"}
+            }))
+            .unwrap(),
+        );
+        let crate::session::Request::Call {
+            tag,
+            payload,
+            reply,
+        } = asked(&mut requests).await.unwrap()
+        else {
+            panic!("types the program into the draft's terminal")
+        };
+        assert_eq!(tag, "terminal.write");
+        assert_eq!(payload["threadId"], id);
+        assert_eq!(payload["data"], "exec lazygit\r");
+        let _ = reply.send(Ok(Value::Null));
+        app.detach_terminal();
+        app.run_command("yazi");
+        assert_eq!(app.pane.as_ref().unwrap().thread_id, id);
+        assert_eq!(app.pending_pane_command.as_deref(), Some("exec yazi\r"));
+        app.detach_terminal();
+        app.run_command("shell");
+        assert_eq!(app.pane.as_ref().unwrap().thread_id, id);
+        assert_eq!(
+            app.pending_pane_command, None,
+            "the prior command stays with its popup"
+        );
+        app.detach_terminal();
+        app.run_command("terminals");
+        assert_eq!(app.mode, Mode::Terminals);
+        assert_eq!(app.thread_terminals().len(), 1);
+        assert_eq!(app.thread_terminals()[0].thread_id, id);
+        app.new_terminal();
+        loop {
+            match asked(&mut requests).await.expect("opens a draft shell") {
+                crate::session::Request::Call {
+                    tag,
+                    payload,
+                    reply,
+                } if tag == "terminal.open" => {
+                    assert_eq!(payload["threadId"], id);
+                    assert_eq!(payload["cwd"], "/src/p");
+                    let _ = reply.send(Ok(Value::Null));
+                    break;
+                }
+                crate::session::Request::Dispatch { .. } => {
+                    panic!("commands must not start the agent")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(app.composer.text(), "the first message");
+        app.mode = Mode::Normal;
+        app.send_message();
+        let command = sent_command(&mut requests).await.unwrap();
+        assert_eq!(command["threadId"], id);
+        assert_eq!(
+            command["bootstrap"]["createThread"]["projectId"],
+            project_id
+        );
+        assert_eq!(app.current_thread_id.as_deref(), Some(id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn draft_commands_use_a_prepared_checkout_and_otherwise_the_project_directory() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let project_id = project(&mut app);
+        app.start_new_thread(&project_id);
+        app.draft.as_mut().unwrap().worktree = true;
+        assert_eq!(app.working_directory().as_deref(), Some("/src/p"));
+        // A requested worktree has not been made yet. A prepared checkout has.
+        app.on_checkout_prepared(
+            project_id,
+            "prepared-thread".into(),
+            None,
+            Ok(json!({
+                "pullRequest": {"number": 7}, "branch": "pr/7",
+                "worktreePath": "/worktrees/p/pr7", "isOnPullRequestHead": true
+            })),
+        );
+        assert_eq!(app.working_directory().as_deref(), Some("/worktrees/p/pr7"));
+        assert_eq!(app.external_dir(), "/worktrees/p/pr7");
+        assert_eq!(app.vcs_cwd.as_deref(), Some("/worktrees/p/pr7"));
+        app.open_shell();
+        assert_eq!(app.pane.as_ref().unwrap().thread_id, "prepared-thread");
+        loop {
+            match asked(&mut requests)
+                .await
+                .expect("attaches to the prepared checkout")
+            {
+                crate::session::Request::Attach { thread_id, cwd, .. } => {
+                    assert_eq!(thread_id, "prepared-thread");
+                    assert_eq!(cwd, "/worktrees/p/pr7");
+                    break;
+                }
+                crate::session::Request::Dispatch { .. } => panic!("no message has been sent"),
+                _ => {}
+            }
+        }
+    }
+
+    /// A configured key runs its command in the thread's own terminal.
+    #[tokio::test]
     async fn a_program_the_config_bound_runs_on_its_key() {
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = mpsc::unbounded_channel();
@@ -9012,7 +9178,7 @@ mod tests {
         );
         assert_eq!(answer.await.unwrap(), Ok(()));
         assert_eq!(app.draft.as_ref().unwrap().project_id, "asked");
-        assert_eq!(app.watch_directory().as_deref(), Some(root.as_str()));
+        assert_eq!(app.working_directory().as_deref(), Some(root.as_str()));
         assert_eq!(
             app.outbox.parked("previous"),
             Some("message still being written")
@@ -9160,7 +9326,7 @@ mod tests {
             },
         ));
         assert_eq!(app.draft.as_ref().map(|d| d.project_id.as_str()), Some(id));
-        assert_eq!(app.watch_directory().as_deref(), Some(root.as_str()));
+        assert_eq!(app.working_directory().as_deref(), Some(root.as_str()));
         assert!(app.open_at.is_none());
         app.composer.set_text("hello");
         app.send_message();
