@@ -1200,27 +1200,19 @@ impl App {
         self.open_thread(&id);
     }
 
-    /// The project a directory belongs to: the one whose checkout it is, or failing
-    /// that the innermost one it sits inside. Opening `src/` of a project is opening
-    /// that project, not asking for a second one alongside it.
+    /// Reuse a project only when it is registered for the requested directory itself.
+    /// An enclosing project (including the home directory) is a different workspace.
     fn project_for(&self, root: &str) -> Option<Id> {
-        let inside = |project_root: &str| {
-            root == project_root
-                || root.starts_with(project_root)
-                    && root[project_root.len()..].starts_with(std::path::MAIN_SEPARATOR)
-        };
         self.shell
             .projects
             .values()
-            .filter(|project| inside(&project.workspace_root))
-            .max_by_key(|project| project.workspace_root.len())
+            .find(|project| project.workspace_root == root)
             .map(|project| project.id.clone())
     }
 
     /// What `tria open` asked for, once the project list has arrived: a new thread in
-    /// the project the directory belongs to. Where it belongs to none, the project is
-    /// made first — for the checkout the directory is in, since that is what a project
-    /// usually is — and this runs again when the server sends it back.
+    /// the project registered for that exact directory. If it is not registered, make
+    /// the project first and run this again when the server sends it back.
     fn open_where_asked(&mut self) {
         let Some(root) = self.open_at.clone() else {
             return;
@@ -1235,7 +1227,6 @@ impl App {
             return;
         }
         self.open_asked = true;
-        let root = crate::workspace::checkout_root(&root).unwrap_or(root);
         let title = crate::workspace::title(&root);
         tracing::info!(%root, %title, "adding a project");
         self.toast(format!("adding {title}…"), false);
@@ -8944,9 +8935,7 @@ mod tests {
         json!({"id": id, "title": title, "workspaceRoot": root})
     }
 
-    /// `tria open` in a directory the server already has a project for goes straight to
-    /// a new thread in it — and so does one run inside that project, since `src/` of a
-    /// project is that project rather than a second one beside it.
+    /// An exact project match is reused even when its ancestors also have projects.
     #[tokio::test]
     async fn opening_a_directory_starts_a_thread_in_its_project() {
         let (handle, mut requests) = crate::session::Handle::detached();
@@ -8957,14 +8946,14 @@ mod tests {
             model: "a-model".into(),
             options: Vec::new(),
         });
-        app.open_at = Some("/src/tria/src".into());
+        app.open_at = Some("/src/tria".into());
 
         shell_with(
             &mut app,
             json!([
                 project_json("p1", "tria", "/src/tria"),
                 project_json("p2", "other", "/src/other"),
-                // A project further in wins over one it sits inside.
+                project_json("parent", "parent", "/src"),
                 project_json("p3", "inner", "/src/tria/src/inner"),
             ]),
         );
@@ -8979,8 +8968,7 @@ mod tests {
         );
     }
 
-    /// A directory with no project of its own gets one — for the checkout it is in,
-    /// named after it — and the thread waits for the server to send the project back.
+    /// A directory gets its own project even inside a registered home or repository.
     #[tokio::test]
     async fn opening_a_directory_that_is_not_a_project_adds_one() {
         let (handle, mut requests) = crate::session::Handle::detached();
@@ -8991,35 +8979,51 @@ mod tests {
             model: "a-model".into(),
             options: Vec::new(),
         });
-        // The repository tria itself is in, so the checkout is a real one.
+        // A subdirectory of a real checkout must keep the directory that was requested.
         let here = std::env::current_dir().unwrap().display().to_string();
-        app.open_at = Some(format!("{here}/src"));
+        let home = dirs::home_dir().unwrap().display().to_string();
+        let root = format!("{here}/src");
+        app.open_at = Some(root.clone());
+        let projects = json!([
+            project_json("home", "home", &home),
+            project_json("parent", "tria", &here),
+            project_json("p2", "other", "/src/other"),
+        ]);
 
-        shell_with(&mut app, json!([project_json("p2", "other", "/src/other")]));
+        shell_with(&mut app, projects.clone());
         assert!(app.draft.is_none(), "there is no project to draft in yet");
+        assert!(app.current_thread_id.is_none());
 
         let command = sent_command(&mut requests)
             .await
             .expect("it asks for the project");
         assert_eq!(command["type"], "project.create");
-        assert_eq!(command["workspaceRoot"], here, "the checkout, not src/");
-        assert_eq!(command["title"], "tria");
+        assert_eq!(command["workspaceRoot"], root);
+        assert_eq!(command["title"], "src");
+        let id = command["projectId"].as_str().unwrap();
 
         // Asked for once, however many times the list changes in the meantime.
-        shell_with(&mut app, json!([project_json("p2", "other", "/src/other")]));
+        shell_with(&mut app, projects);
         assert!(sent_no_command(&mut requests).await);
 
         // And when the server sends it back, that is the thread.
         app.on_update(crate::session::Update::Shell(
             crate::model::ShellItem::ProjectUpserted {
                 sequence: 2,
-                project: serde_json::from_value(project_json("p9", "tria", &here)).unwrap(),
+                project: serde_json::from_value(project_json(id, "src", &root)).unwrap(),
             },
         ));
-        assert_eq!(
-            app.draft.as_ref().map(|d| d.project_id.as_str()),
-            Some("p9")
-        );
+        assert_eq!(app.draft.as_ref().map(|d| d.project_id.as_str()), Some(id));
+        assert_eq!(app.watch_directory().as_deref(), Some(root.as_str()));
+        assert!(app.open_at.is_none());
+        app.composer.set_text("hello");
+        app.send_message();
+        let turn = sent_command(&mut requests)
+            .await
+            .expect("the thread starts");
+        assert_eq!(turn["type"], "thread.turn.start");
+        assert_eq!(turn["bootstrap"]["createThread"]["projectId"], id);
+        assert!(turn["bootstrap"]["createThread"]["worktreePath"].is_null());
     }
 
     /// Sending empties the composer, which is what sending looks like — but a message

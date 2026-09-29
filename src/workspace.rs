@@ -55,20 +55,6 @@ fn resolve(path: &Path) -> PathBuf {
     out
 }
 
-/// The top of the checkout a directory is in, where it is in one. A project is a whole
-/// checkout far more often than it is one directory inside one, so a directory with no
-/// project of its own is opened as the checkout it belongs to.
-pub fn checkout_root(path: &str) -> Option<String> {
-    let mut at = Path::new(path);
-    loop {
-        // A worktree's `.git` is a file rather than a directory, and is still the top.
-        if at.join(".git").exists() {
-            return Some(at.display().to_string());
-        }
-        at = at.parent()?;
-    }
-}
-
 /// What a project for this directory is called: the name of it, as the server names one.
 pub fn title(path: &str) -> String {
     let name = Path::new(path)
@@ -112,20 +98,5 @@ mod tests {
         let file = here.join("Cargo.toml");
         let said = root(Some(file.to_str().unwrap())).unwrap_err().to_string();
         assert!(said.contains("not a directory"), "{said}");
-    }
-
-    /// A directory inside a checkout is opened as the checkout: the top of this one is
-    /// the repository tria itself is in.
-    #[test]
-    fn the_checkout_a_directory_belongs_to_is_the_top_of_it() {
-        let here = std::env::current_dir().unwrap();
-        let src = here.join("src");
-        assert_eq!(
-            checkout_root(src.to_str().unwrap()),
-            Some(here.display().to_string())
-        );
-        assert_eq!(checkout_root("/"), None);
-        assert_eq!(title("/a/b/tria"), "tria");
-        assert_eq!(title("/"), "project");
     }
 }

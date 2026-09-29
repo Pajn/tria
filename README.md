@@ -301,11 +301,11 @@ composer's and the panel says so; `:approve <n>` answers it whatever is written 
 
 `tria open` starts tria on the project for the directory you are in, with a draft ready to
 write: it is the way in from a checkout rather than from the thread list. `tria open <path>`
-names another directory. A directory inside a project opens that project — `src/` of a
-checkout is the checkout — and one the server has no project for adds it first, for the
-repository the directory is in, named after it. The directory has to be one: a path that is
-not there is said on the terminal before the screen is taken over. A project belongs to the
-server, so adding one adds it for the desktop app too.
+names another directory. It reuses a project registered for that exact directory, or
+registers the directory as a new project named after it. This also works inside a registered
+home directory or another project. The directory has to exist: a missing path is reported
+on the terminal before the screen is taken over. A project belongs to the server, so adding
+one adds it for the desktop app too.
 
 `n` picks a project and opens a draft; the message you write starts the thread. The header says
 where it will run: `⌂ project checkout on <branch>`, or `⌂ new worktree off <branch>`, which
