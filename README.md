@@ -307,6 +307,13 @@ home directory or another project. The directory has to exist: a missing path is
 on the terminal before the screen is taken over. A project belongs to the server, so adding
 one adds it for the desktop app too.
 
+Inside tmux, `tria open` first looks for a running tria on the same tmux server and T3
+server, preferring one in the current session. It opens the directory's draft there and
+switches to that instance's session, window, and pane. If none is available, it starts a
+new tria. The running instance must have been started with a version that supports this
+handoff. Unsent text in an existing thread stays with that thread; an unsent new-thread
+draft must be finished first.
+
 `n` picks a project and opens a draft; the message you write starts the thread. The header says
 where it will run: `⌂ project checkout on <branch>`, or `⌂ new worktree off <branch>`, which
 the server creates when the thread starts. `gw` or `:worktree` switches between them. The

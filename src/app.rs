@@ -427,6 +427,11 @@ pub enum AppEvent {
     Terminal(Event),
     Tick,
     Update(Box<Update>),
+    /// A `tria open` in another tmux pane wants a new thread here.
+    OpenDirectory {
+        root: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     Dispatched(Result<(), String>),
     /// The server answered something the outbox sent: a message, a thread made for one,
     /// or a pull request put on that thread.
@@ -1235,6 +1240,43 @@ impl App {
             &title,
             &root,
         ));
+    }
+
+    fn accept_open_directory(&mut self, root: &str) -> Result<(), String> {
+        if self.quit || self.open_at.is_some() {
+            return Err("tria is still opening a directory; try again shortly".into());
+        }
+        let unsent_new_thread = if self.draft.is_some() {
+            !self.composer.text().trim().is_empty()
+        } else {
+            self.outbox
+                .parked(NEW_THREAD_DRAFT_KEY)
+                .is_some_and(|text| !text.trim().is_empty())
+        };
+        if unsent_new_thread {
+            return Err(
+                "tria has an unsent new-thread draft; finish it before opening another directory"
+                    .into(),
+            );
+        }
+        let root = crate::workspace::root(Some(root)).map_err(|err| err.to_string())?;
+        if self.pane.is_some() {
+            self.detach_terminal();
+        }
+        self.picker = None;
+        self.question = None;
+        self.rewind_ask = None;
+        self.selection = None;
+        self.pending_prefix = None;
+        self.open_at = Some(root);
+        self.open_asked = false;
+        if self.shell.synchronized {
+            self.open_where_asked();
+            if self.open_at.is_none() && self.draft.is_none() {
+                return Err("no usable provider or model configured on the server".into());
+            }
+        }
+        Ok(())
     }
 
     fn start_new_thread(&mut self, project_id: &str) {
@@ -7307,6 +7349,9 @@ fn apply(app: &mut App, event: AppEvent) {
             }
         }
         AppEvent::Update(update) => app.on_update(*update),
+        AppEvent::OpenDirectory { root, reply } => {
+            let _ = reply.send(app.accept_open_directory(&root));
+        }
         AppEvent::Outbox(answer) => app.with_outbox(|outbox, here| outbox.on_answer(answer, here)),
         AppEvent::ThreadSearch { query, result } => app.on_thread_search(query, result),
         AppEvent::UsageRead(read) => app.on_usage_read(read),
@@ -7372,6 +7417,13 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     app.notify = launch.notify;
     app.new_thread_model = launch.model;
     app.open_at = launch.open_at;
+    let _handoff = match crate::handoff::listen(events_tx, &app.origin).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            tracing::warn!(%err, "registering tria for tmux directory opens");
+            None
+        }
+    };
     if launch.started_server {
         // Said again here because the line printed before the screen was taken over is
         // gone, and starting a server that outlives tria is worth knowing about.
@@ -8933,6 +8985,100 @@ mod tests {
 
     fn project_json(id: &str, title: &str, root: &str) -> serde_json::Value {
         json!({"id": id, "title": title, "workspaceRoot": root})
+    }
+
+    #[tokio::test]
+    async fn a_tmux_directory_handoff_preserves_the_message_in_the_previous_thread() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.new_thread_model = Some(ModelSelection {
+            instance_id: "instance".into(),
+            model: "a-model".into(),
+            options: Vec::new(),
+        });
+        let root = std::env::current_dir().unwrap().display().to_string();
+        shell_with(&mut app, json!([project_json("asked", "tria", &root)]));
+        app.thread = Some(running_thread());
+        app.current_thread_id = Some("previous".into());
+        app.composer.set_text("message still being written");
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        apply(
+            &mut app,
+            AppEvent::OpenDirectory {
+                root: root.clone(),
+                reply,
+            },
+        );
+        assert_eq!(answer.await.unwrap(), Ok(()));
+        assert_eq!(app.draft.as_ref().unwrap().project_id, "asked");
+        assert_eq!(app.watch_directory().as_deref(), Some(root.as_str()));
+        assert_eq!(
+            app.outbox.parked("previous"),
+            Some("message still being written")
+        );
+        assert!(app.composer.is_empty());
+        assert_eq!(app.mode, Mode::Insert);
+        assert!(sent_no_command(&mut requests).await);
+
+        // A new-thread draft has no thread to park its text on. Keep its project and text.
+        app.composer.set_text("unsent new-thread message");
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        apply(
+            &mut app,
+            AppEvent::OpenDirectory {
+                root: format!("{root}/src"),
+                reply,
+            },
+        );
+        assert!(
+            answer
+                .await
+                .unwrap()
+                .unwrap_err()
+                .contains("unsent new-thread draft")
+        );
+        assert_eq!(app.draft.as_ref().unwrap().project_id, "asked");
+        assert_eq!(app.composer.text(), "unsent new-thread message");
+        assert!(sent_no_command(&mut requests).await);
+        app.open_thread("previous");
+        assert_eq!(app.composer.text(), "message still being written");
+        assert!(app.accept_open_directory(&root).is_err());
+        assert_eq!(app.current_thread_id.as_deref(), Some("previous"));
+        assert_eq!(
+            app.outbox.parked(NEW_THREAD_DRAFT_KEY),
+            Some("unsent new-thread message")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tmux_directory_handoff_waits_for_the_project_list_and_validates_the_path() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.new_thread_model = Some(ModelSelection {
+            instance_id: "instance".into(),
+            model: "a-model".into(),
+            options: Vec::new(),
+        });
+        let root = std::env::current_dir().unwrap().display().to_string();
+        let missing = format!("{root}/missing-{}", commands::new_id());
+        assert!(
+            app.accept_open_directory(&missing)
+                .unwrap_err()
+                .contains("no directory")
+        );
+        assert!(app.open_at.is_none());
+        assert_eq!(app.accept_open_directory(&root), Ok(()));
+        assert!(app.draft.is_none());
+        assert_eq!(app.open_at.as_deref(), Some(root.as_str()));
+        assert!(
+            app.accept_open_directory(&root).is_err(),
+            "a pending open is not replaced"
+        );
+        shell_with(&mut app, json!([project_json("asked", "tria", &root)]));
+        assert_eq!(app.draft.as_ref().unwrap().project_id, "asked");
+        assert!(app.open_at.is_none());
     }
 
     /// An exact project match is reused even when its ancestors also have projects.
