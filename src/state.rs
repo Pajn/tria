@@ -1,7 +1,7 @@
 //! Pure reducers for the shell (project and thread list) and one open thread.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -300,9 +300,19 @@ pub struct PlanStep {
 }
 
 #[derive(Debug)]
+pub enum AttachmentImage {
+    Loading,
+    Unavailable,
+    Ready(String),
+}
+
+#[derive(Debug)]
 pub struct ThreadState {
     /// Local payloads are an overlay; server events remain authoritative.
     pub recovered_tools: HashMap<String, crate::recovery::Recovery>,
+    /// Downloaded message pictures. In-flight and failed downloads are retained too,
+    /// so a stream delta does not ask for the same attachment again.
+    pub attachment_images: HashMap<Id, AttachmentImage>,
     /// Exact turn timing seen on the shell stream, retained as the next turn starts.
     pub turn_timings: HashMap<String, crate::model::LatestTurn>,
     pub detail: ThreadDetail,
@@ -358,6 +368,7 @@ impl ThreadState {
                 .collect(),
             detail: snapshot.thread,
             recovered_tools: HashMap::new(),
+            attachment_images: HashMap::new(),
             last_sequence: snapshot.snapshot_sequence,
             synchronized: false,
             has_more,
@@ -382,7 +393,22 @@ impl ThreadState {
             ThreadItem::Snapshot { snapshot } => {
                 let synchronized = self.synchronized;
                 let timings = std::mem::take(&mut self.turn_timings);
+                let same_thread = self.id() == snapshot.thread.shell.id;
+                let images = std::mem::take(&mut self.attachment_images);
                 *self = Self::from_snapshot(snapshot);
+                if same_thread {
+                    let ids: HashSet<_> = self
+                        .detail
+                        .messages
+                        .iter()
+                        .flat_map(|message| &message.attachments)
+                        .map(|attachment| attachment.id.as_str())
+                        .collect();
+                    self.attachment_images = images
+                        .into_iter()
+                        .filter(|(id, _)| ids.contains(id.as_str()))
+                        .collect();
+                }
                 for (id, timing) in timings {
                     if self.detail.checkpoints.iter().any(|c| c.turn_id == id) {
                         self.turn_timings.entry(id).or_insert(timing);
@@ -477,6 +503,9 @@ impl ThreadState {
             } else if !incoming.text.is_empty() {
                 existing.text = incoming.text;
             }
+            if let Some(attachments) = incoming.attachments {
+                existing.attachments = attachments;
+            }
             existing.streaming = incoming.streaming;
             existing.updated_at = incoming.updated_at;
             if incoming.turn_id.is_some() {
@@ -487,6 +516,7 @@ impl ThreadState {
                 id: incoming.message_id,
                 role: incoming.role,
                 text: incoming.text,
+                attachments: incoming.attachments.unwrap_or_default(),
                 turn_id: incoming.turn_id,
                 streaming: incoming.streaming,
                 created_at: incoming.created_at,
@@ -911,6 +941,8 @@ struct MessageSent {
     role: String,
     text: String,
     #[serde(default)]
+    attachments: Option<Vec<crate::model::Attachment>>,
+    #[serde(default)]
     turn_id: Option<Id>,
     #[serde(default)]
     streaming: bool,
@@ -937,6 +969,60 @@ mod tests {
         }))
         .unwrap();
         ThreadState::from_snapshot(snapshot)
+    }
+
+    #[test]
+    fn message_events_keep_attachments_until_the_server_replaces_them() {
+        let mut state = thread();
+        let mut event = message_event(11, "See this screenshot.", false);
+        event.payload["role"] = json!("user");
+        event.payload["attachments"] = json!([{
+            "type": "image", "id": "image-1", "name": "Screenshot.png",
+            "mimeType": "image/png", "sizeBytes": 37407
+        }]);
+        state.apply_event(event);
+        assert_eq!(state.detail.messages[0].attachments[0].id, "image-1");
+        assert!(state.detail.messages[0].attachments[0].is_image());
+        state.apply_event(message_event(12, "", false));
+        assert_eq!(state.detail.messages[0].attachments.len(), 1);
+        let mut event = message_event(13, "", false);
+        event.payload["attachments"] = json!([]);
+        state.apply_event(event);
+        assert!(state.detail.messages[0].attachments.is_empty());
+    }
+
+    #[test]
+    fn snapshots_keep_downloads_for_attachments_still_in_the_thread() {
+        let snapshot = || {
+            serde_json::from_value::<ThreadDetailSnapshot>(json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p1", "title": "Test",
+                "modelSelection": {"instanceId": "codex", "model": "m"},
+                "messages": [{"id": "m1", "role": "user", "text": "", "attachments": [{
+                    "type": "image", "id": "image-1", "name": "Screenshot.png", "mimeType": "image/png"
+                }]}], "activities": []
+            }
+        })).unwrap()
+        };
+        let mut state = ThreadState::from_snapshot(snapshot());
+        state
+            .attachment_images
+            .insert("image-1".into(), AttachmentImage::Ready("bytes".into()));
+        state
+            .attachment_images
+            .insert("removed".into(), AttachmentImage::Loading);
+        state.apply(ThreadItem::Snapshot {
+            snapshot: snapshot(),
+        });
+        assert!(
+            matches!(state.attachment_images.get("image-1"), Some(AttachmentImage::Ready(data)) if data == "bytes")
+        );
+        assert!(!state.attachment_images.contains_key("removed"));
+        let mut changed = snapshot();
+        changed.thread.messages.clear();
+        state.apply(ThreadItem::Snapshot { snapshot: changed });
+        assert!(state.attachment_images.is_empty());
     }
 
     /// What is laid out from a thread is kept for as long as its revision stands, so a

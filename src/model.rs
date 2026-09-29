@@ -55,6 +55,8 @@ pub enum ProjectIcon {
         name: String,
         #[serde(default)]
         color: Option<String>,
+        #[serde(default, rename = "monogramText", alias = "monogram")]
+        monogram: Option<String>,
     },
     #[serde(other)]
     Unknown,
@@ -69,10 +71,26 @@ impl Project {
         }
     }
 
+    /// A letter badge chosen in the desktop's icon picker.
+    pub fn monogram(&self) -> Option<(&str, Option<&str>)> {
+        match &self.project_icon {
+            Some(ProjectIcon::Lucide {
+                monogram: Some(text),
+                color,
+                ..
+            }) if !text.is_empty() => Some((text, color.as_deref())),
+            _ => None,
+        }
+    }
+
     /// The drawn icon the project was given, as its name and the colour to draw it in.
     pub fn lucide(&self) -> Option<(&str, Option<&str>)> {
         match &self.project_icon {
-            Some(ProjectIcon::Lucide { name, color }) => Some((name, color.as_deref())),
+            Some(ProjectIcon::Lucide {
+                name,
+                color,
+                monogram,
+            }) if monogram.as_deref().is_none_or(str::is_empty) => Some((name, color.as_deref())),
             _ => None,
         }
     }
@@ -836,12 +854,32 @@ impl ThreadShell {
     }
 }
 
+/// An uploaded attachment, served by the environment's asset API.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Attachment {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: Id,
+    pub name: String,
+    #[serde(default)]
+    pub mime_type: String,
+}
+
+impl Attachment {
+    pub fn is_image(&self) -> bool {
+        self.kind == "image" || self.mime_type.starts_with("image/")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
     pub id: Id,
     pub role: String,
     pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
     #[serde(default)]
     pub turn_id: Option<Id>,
     #[serde(default)]

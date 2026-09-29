@@ -483,6 +483,12 @@ pub enum AppEvent {
         url: String,
         result: Result<Value, String>,
     },
+    /// An uploaded message picture came back, base64, or failed to.
+    AttachmentImage {
+        thread_id: Id,
+        attachment_id: Id,
+        data: Option<String>,
+    },
     /// A picture a pull request's description shows came back, base64, or failed to.
     PullRequestImage {
         url: String,
@@ -4609,16 +4615,14 @@ impl App {
         self.shell.projects.get(project)?.lucide()
     }
 
-    /// The icon a project falls back to, which is a guess at what it is from its name.
-    /// Nobody sends this: the desktop app works it out for itself, and so does this, out
-    /// of the same name and by the same rules, so that a project nobody has given an
-    /// icon still looks like itself in both.
-    pub fn project_guessed_icon(&self, project: &str) -> Option<(&'static str, &'static str)> {
+    /// A chosen letter badge, or the default initials and colour from the project's name.
+    pub fn project_monogram(&self, project: &str) -> Option<(String, Option<&str>)> {
         let project = self.shell.projects.get(project)?;
-        Some(crate::lucide::guess(
-            &project.title,
-            &project.workspace_root,
-        ))
+        if let Some((text, colour)) = project.monogram() {
+            return Some((text.to_string(), colour));
+        }
+        let (text, colour) = crate::monogram::fallback(&project.title, &project.workspace_root);
+        Some((text, Some(colour)))
     }
 
     /// Hand a project an icon, for a test that draws one.
@@ -6485,12 +6489,77 @@ impl App {
 
     // ── Server updates ─────────────────────────────────────────────────
 
+    fn ask_attachment_images(&mut self) {
+        let Some(thread) = self.thread.as_mut() else {
+            return;
+        };
+        let thread_id = thread.id().to_string();
+        for attachment in thread
+            .detail
+            .messages
+            .iter()
+            .flat_map(|message| &message.attachments)
+            .filter(|attachment| attachment.is_image())
+        {
+            if thread.attachment_images.contains_key(&attachment.id) {
+                continue;
+            }
+            thread.attachment_images.insert(
+                attachment.id.clone(),
+                crate::state::AttachmentImage::Loading,
+            );
+            let attachment = attachment.clone();
+            let thread_id = thread_id.clone();
+            let handle = self.handle.clone();
+            let origin = self.origin.clone();
+            let events = self.events.clone();
+            tokio::spawn(async move {
+                let data = attachment_image(&handle, &origin, &attachment).await;
+                let _ = events.send(AppEvent::AttachmentImage {
+                    thread_id,
+                    attachment_id: attachment.id,
+                    data,
+                });
+            });
+        }
+    }
+
+    fn on_attachment_image(&mut self, thread_id: Id, attachment_id: Id, data: Option<String>) {
+        let Some(thread) = self
+            .thread
+            .as_mut()
+            .filter(|thread| thread.id() == thread_id)
+        else {
+            return;
+        };
+        if !thread.detail.messages.iter().any(|message| {
+            message
+                .attachments
+                .iter()
+                .any(|attachment| attachment.id == attachment_id)
+        }) {
+            return;
+        }
+        thread.attachment_images.insert(
+            attachment_id,
+            match data {
+                Some(data) => crate::state::AttachmentImage::Ready(data),
+                None => crate::state::AttachmentImage::Unavailable,
+            },
+        );
+        thread.touch();
+    }
+
     fn on_update(&mut self, update: Update) {
         let may_sync = matches!(update, Update::Shell(_) | Update::Thread { .. });
         let may_move = matches!(update, Update::Thread { .. });
+        let may_have_images = matches!(update, Update::Thread { .. } | Update::OlderPage { .. });
         self.apply_update(update);
         if may_sync {
             self.notice_pull_request_sync();
+        }
+        if may_have_images {
+            self.ask_attachment_images();
         }
         if may_move {
             self.follow_reading();
@@ -7160,6 +7229,26 @@ async fn fetch_image(url: &str, token: Option<&str>) -> Option<String> {
     Some(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
+async fn attachment_image(
+    handle: &session::Handle,
+    origin: &str,
+    attachment: &crate::model::Attachment,
+) -> Option<String> {
+    let answer = handle
+        .call(
+            "assets.createUrl",
+            json!({ "resource": {
+                "_tag": "attachment", "attachmentId": attachment.id,
+                "fileName": attachment.name, "mimeType": attachment.mime_type,
+            }}),
+        )
+        .await
+        .ok()?;
+    let relative = answer.get("relativeUrl")?.as_str()?;
+    let url = url::Url::parse(origin).ok()?.join(relative).ok()?;
+    fetch_image(url.as_str(), None).await
+}
+
 async fn favicon_bytes(handle: &session::Handle, origin: &str, cwd: &str) -> Option<Vec<u8>> {
     let answer = handle
         .call(
@@ -7249,6 +7338,11 @@ fn apply(app: &mut App, event: AppEvent) {
         } => app.on_tool_recovery(request, thread_id, recovered),
         AppEvent::Transcript { agent_id, result } => app.on_transcript(agent_id, result),
         AppEvent::PullRequest { url, result } => app.on_pull_request(url, result),
+        AppEvent::AttachmentImage {
+            thread_id,
+            attachment_id,
+            data,
+        } => app.on_attachment_image(thread_id, attachment_id, data),
         AppEvent::PullRequestImage { url, data } => app.on_pull_request_image(url, data),
         AppEvent::PullRequestActivity { url, result } => app.on_pull_request_activity(url, result),
         AppEvent::LabelCandidates { url, result } => app.on_label_candidates(url, result),
@@ -7395,6 +7489,85 @@ mod tests {
         agent_progresses, open_detail, stacked_thread, thread_with_a_followable_agent,
         transcript_saying,
     };
+
+    #[tokio::test]
+    async fn attachment_loading_uses_asset_urls_once_and_rebuilds_the_message() {
+        use base64::Engine;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let data = crate::picture::test_png(120, 60);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&data)
+            .unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let length = stream.read(&mut request).await.unwrap();
+            let request = std::str::from_utf8(&request[..length]).unwrap();
+            assert!(request.starts_with("GET /asset/image?token=signed "));
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        });
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.origin = origin;
+        let snapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1, "thread": {
+                "id": "t1", "projectId": "p1", "title": "Test",
+                "modelSelection": {"instanceId": "codex", "model": "m"},
+                "messages": [{"id": "m1", "role": "user", "text": "", "attachments": [{
+                    "type": "image", "id": "image-1", "name": "Screenshot.png", "mimeType": "image/png"
+                }]}], "activities": []
+            }
+        })).unwrap();
+        app.thread = Some(ThreadState::from_snapshot(snapshot));
+        app.ask_attachment_images();
+        app.ask_attachment_images();
+        let crate::session::Request::Call {
+            tag,
+            payload,
+            reply,
+        } = requests.recv().await.unwrap()
+        else {
+            panic!("expected an asset request")
+        };
+        assert_eq!(tag, "assets.createUrl");
+        assert_eq!(
+            payload,
+            json!({ "resource": { "_tag": "attachment", "attachmentId": "image-1", "fileName": "Screenshot.png", "mimeType": "image/png" } })
+        );
+        reply
+            .send(Ok(json!({"relativeUrl": "/asset/image?token=signed"})))
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let revision = app.thread.as_ref().unwrap().revision;
+        apply(&mut app, event);
+        assert!(app.thread.as_ref().unwrap().revision > revision);
+        assert!(
+            matches!(app.thread.as_ref().unwrap().attachment_images.get("image-1"), Some(crate::state::AttachmentImage::Ready(loaded)) if loaded == &data)
+        );
+        app.ask_attachment_images();
+        assert!(requests.try_recv().is_err());
+        serving.await.unwrap();
+        app.on_attachment_image("elsewhere".into(), "image-1".into(), None);
+        assert!(matches!(
+            app.thread
+                .as_ref()
+                .unwrap()
+                .attachment_images
+                .get("image-1"),
+            Some(crate::state::AttachmentImage::Ready(_))
+        ));
+    }
 
     #[test]
     fn older_pages_keep_turn_completions_without_duplicates() {

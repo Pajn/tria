@@ -292,7 +292,17 @@ pub fn build(
                 let text = match message.role.as_str() {
                     // A subagent transcript opens with the brief it was given, which is
                     // the agent's instruction rather than anything the user typed.
-                    "user" | "prompt" => render_user(&message.text, role),
+                    "user" | "prompt" => {
+                        let mut text = render_user(&message.text, role);
+                        (images, rows, pictures) = place_attachments(
+                            message,
+                            &thread.attachment_images,
+                            &mut text,
+                            width,
+                            height,
+                        );
+                        text
+                    }
                     "system" => render_system(&message.text),
                     _ => {
                         let mut text = render_assistant(&message.text, message.streaming, width);
@@ -1354,6 +1364,80 @@ fn render_user(text: &str, label: &str) -> Text<'static> {
     }
     lines.push(Line::default());
     Text::from(lines)
+}
+
+/// Uploaded pictures follow the user's plain text, without turning their words into
+/// Markdown. Each caption and picture form one region for `gx`.
+fn place_attachments(
+    message: &crate::model::Message,
+    downloaded: &HashMap<String, crate::state::AttachmentImage>,
+    text: &mut Text<'static>,
+    width: u16,
+    height: u16,
+) -> (Vec<Placed>, Vec<Region>, Vec<(String, Picture)>) {
+    use crate::state::AttachmentImage;
+    let mut placed = Vec::new();
+    let mut regions = Vec::new();
+    let mut pictures = Vec::new();
+    if message.attachments.is_empty() {
+        return (placed, regions, pictures);
+    }
+    text.lines.pop(); // Keep the message's trailing blank after its pictures.
+    let indent = 2;
+    let room = image_room(width, height, indent);
+    let mark = Style::default().fg(Color::Green);
+    for attachment in &message.attachments {
+        let first = text.lines.len();
+        let key = format!("attachment:{}", attachment.id);
+        let mut caption = vec![
+            Span::styled(USER_MARK, mark),
+            Span::raw(format!(" {}", attachment.name)),
+        ];
+        let mut image = None;
+        if attachment.is_image() {
+            let note = match downloaded.get(&attachment.id) {
+                Some(AttachmentImage::Ready(data)) => {
+                    let picture = Picture::Data(data.clone());
+                    pictures.push((key.clone(), picture.clone()));
+                    image =
+                        picture::place(&key, picture.source(), room).map(|size| (picture, size));
+                    image.is_none().then_some("could not be displayed")
+                }
+                Some(AttachmentImage::Unavailable) => Some("could not be fetched"),
+                Some(AttachmentImage::Loading) | None => Some("loading…"),
+            };
+            if let Some(note) = note {
+                caption.push(Span::styled(
+                    format!(" · {note}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+        text.lines.push(Line::from(caption));
+        if let Some((picture, size)) = image {
+            placed.push(Placed {
+                line: text.lines.len(),
+                indent,
+                key: key.clone(),
+                picture,
+                room,
+            });
+            text.lines.extend(std::iter::repeat_n(
+                Line::from(Span::styled(USER_MARK, mark)),
+                size.height as usize,
+            ));
+        }
+        if attachment.is_image() {
+            regions.push(Region {
+                first,
+                end: text.lines.len(),
+                key,
+                foldable: false,
+            });
+        }
+    }
+    text.lines.push(Line::default());
+    (placed, regions, pictures)
 }
 
 fn render_system(text: &str) -> Text<'static> {

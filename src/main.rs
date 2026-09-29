@@ -11,6 +11,7 @@ mod list_cursor;
 mod lucide;
 mod markdown;
 mod model;
+mod monogram;
 mod notify;
 mod outbox;
 mod picture;
