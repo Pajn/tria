@@ -207,8 +207,29 @@ impl Layout {
         for mut block in blocks {
             let exports = std::mem::take(&mut block.exports);
             let wrapped = timeline::wrap(&block.text, width);
+            // Detect URLs in logical lines, before wrapping can put an unrelated reply
+            // directly below one. Keep the complete target even if its first row is
+            // outside the viewport. Markdown labels retain their explicit destination.
+            let mut destinations = std::mem::take(&mut block.links);
+            for (line, text) in block.text.lines.iter().enumerate() {
+                let text = text.to_string();
+                for (start, end) in crate::app::link_ranges(&text) {
+                    if destinations
+                        .iter()
+                        .any(|link| link.line == line && start < link.end && end > link.start)
+                    {
+                        continue;
+                    }
+                    destinations.push(crate::markdown::Link {
+                        line,
+                        start,
+                        end,
+                        url: text[start..end].to_string(),
+                    });
+                }
+            }
             let mut links = Vec::new();
-            for link in &block.links {
+            for link in &destinations {
                 let prefix =
                     block.text.lines[link.line].to_string().len() - wrapped.texts[link.line].len();
                 let start = link.start.saturating_sub(prefix);

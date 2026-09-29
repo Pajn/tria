@@ -257,42 +257,31 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
     }
 }
 
-/// Record Markdown labels from the layout, then underline and record bare URLs from
-/// the drawn cells. Both resolve through the same mouse and keyboard link handling.
+/// Underline and record the layout's Markdown labels and bare URLs. Both resolve
+/// through the same mouse and keyboard link handling.
 fn apply_links(frame: &mut Frame, app: &mut App, chat: Rect) {
     app.links.clear();
     if app.thread.is_none() || chat.height == 0 {
         return;
     }
     let buffer = frame.buffer_mut();
-    // Read the visible rows as text, keeping the column each byte came from.
-    let mut rows: Vec<(String, Vec<(usize, u16)>)> = Vec::new();
-    for y in chat.y..chat.y + chat.height {
-        let mut text = String::new();
-        let mut columns: Vec<(usize, u16)> = Vec::new();
-        for x in chat.x..chat.x + chat.width {
-            if let Some(cell) = buffer.cell(Position::new(x, y)) {
-                let symbol = cell.symbol();
-                if !symbol.is_empty() {
-                    columns.push((text.len(), x));
-                }
-                text.push_str(symbol);
-            }
-        }
-        rows.push((text, columns));
-    }
-
     let mut links: Vec<crate::app::Link> = Vec::new();
     let mut y = chat.y;
     for shown in app.chat().shown() {
         for link in shown.links {
             let row = link.row;
             if row >= shown.skip && row < shown.skip + shown.lines.len() {
+                let row = y + (row - shown.skip) as u16;
                 let start = chat.x + link.start.min(chat.width);
                 let end = chat.x + link.end.min(chat.width);
                 if start < end {
+                    for x in start..end {
+                        if let Some(cell) = buffer.cell_mut(Position::new(x, row)) {
+                            cell.set_style(Style::default().add_modifier(Modifier::UNDERLINED));
+                        }
+                    }
                     links.push(crate::app::Link {
-                        row: y + (row - shown.skip) as u16,
+                        row,
                         start,
                         end,
                         url: link.url.clone(),
@@ -301,64 +290,6 @@ fn apply_links(frame: &mut Frame, app: &mut App, chat: Rect) {
             }
         }
         y += shown.lines.len() as u16;
-    }
-    for index in 0..rows.len() {
-        for (from, to) in crate::app::link_ranges(&rows[index].0) {
-            // A URL used as a Markdown label already has its own destination.
-            if let Some((_, x)) = rows[index].1.iter().find(|(byte, _)| *byte == from)
-                && links.iter().any(|link| {
-                    link.row == chat.y + index as u16 && *x >= link.start && *x < link.end
-                })
-            {
-                continue;
-            }
-            // A link that runs to the end of its row carries on below, one row at a time.
-            let mut url = rows[index].0[from..to].to_string();
-            let mut spans = vec![(index, from, to)];
-            let mut row = index;
-            let mut end = to;
-            while end == rows[row].0.trim_end().len() && row + 1 < rows.len() {
-                let next = &rows[row + 1].0;
-                let run = next.find(char::is_whitespace).unwrap_or(next.len());
-                if run == 0 {
-                    break;
-                }
-                url.push_str(&next[..run]);
-                spans.push((row + 1, 0, run));
-                row += 1;
-                end = run;
-            }
-            for (row, from, to) in spans {
-                let y = chat.y + row as u16;
-                let mut first = None;
-                let mut last = None;
-                for &(byte, x) in &rows[row].1 {
-                    if byte < from || byte >= to {
-                        continue;
-                    }
-                    first.get_or_insert(x);
-                    last = Some(x);
-                    if let Some(cell) = buffer.cell_mut(Position::new(x, y)) {
-                        let style = cell.style().add_modifier(Modifier::UNDERLINED);
-                        cell.set_style(style);
-                    }
-                }
-                if let (Some(first), Some(last)) = (first, last) {
-                    if links
-                        .iter()
-                        .any(|link| link.row == y && first < link.end && last + 1 > link.start)
-                    {
-                        continue;
-                    }
-                    links.push(crate::app::Link {
-                        row: y,
-                        start: first,
-                        end: last + 1,
-                        url: url.clone(),
-                    });
-                }
-            }
-        }
     }
     links.sort_by_key(|link| (link.row, link.start));
     app.links = links;
@@ -3940,6 +3871,65 @@ mod tests {
         let link = app.links.first().unwrap();
         assert_eq!(buffer[(link.start, link.row)].symbol(), "資");
         assert_eq!(link.url, "https://example.com/target");
+    }
+
+    #[test]
+    fn web_search_urls_end_before_the_next_reply() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let url = "https://rust-lang.github.io/mdBook/format/configuration/renderers.html";
+        let mut thread = thread_answering("**Yes—mdBook** is a good fit for qk.");
+        thread.detail.messages[0].created_at = "2".into();
+        thread.detail.activities = serde_json::from_value(json!([{
+            "id": "search", "kind": "tool.completed", "tone": "info",
+            "summary": "Web search", "createdAt": "1",
+            "payload": {
+                "itemType": "web_search", "toolCallId": "search",
+                "status": "completed", "title": format!("Web search: {url}")
+            }
+        }]))
+        .unwrap();
+        app.thread = Some(thread);
+        for width in [160, 200] {
+            let buffer = screen(width, &mut app);
+            assert_eq!(app.links.len(), 1);
+            assert_eq!(app.links[0].url, url);
+            let link = &app.links[0];
+            assert_eq!(buffer[(link.start, link.row)].symbol(), "h");
+            assert!(
+                !buffer[(app.chat_area.x, link.row + 1)]
+                    .modifier
+                    .contains(Modifier::UNDERLINED)
+            );
+        }
+    }
+
+    #[test]
+    fn bare_urls_keep_their_full_target_when_wrapped_or_partly_scrolled_offscreen() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let url = format!("https://example.com/{}", "資料-path/".repeat(60));
+        app.thread = Some(thread_saying(&format!("{url}\nYes—mdBook follows.")));
+        for width in [30, 60] {
+            screen(width, &mut app);
+            assert!(app.chat_view.offset() > 0);
+            assert!(!app.links.is_empty());
+            assert!(app.links.iter().all(|link| link.url == url));
+            app.chat_view.top();
+            let buffer = screen(width, &mut app);
+            assert!(app.links.len() > 1);
+            assert!(app.links.iter().all(|link| link.url == url));
+            for link in &app.links {
+                assert!(
+                    buffer[(link.start, link.row)]
+                        .modifier
+                        .contains(Modifier::UNDERLINED)
+                );
+            }
+            app.chat_view.follow();
+        }
     }
 
     #[test]
