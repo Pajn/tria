@@ -9,6 +9,7 @@ mod discovery;
 mod kitty;
 mod list_cursor;
 mod lucide;
+mod markdown;
 mod model;
 mod notify;
 mod outbox;

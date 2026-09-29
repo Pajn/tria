@@ -11129,6 +11129,46 @@ mod link_tests {
     }
 
     #[test]
+    fn a_markdown_labels_cells_resolve_for_clicks_and_keyboard_opening() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = super::App::new(handle, events);
+        let snapshot = serde_json::from_value(serde_json::json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p1", "title": "Test",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "m"},
+                "runtimeMode": "full-access", "latestTurn": null, "session": null,
+                "messages": [{"id": "m1", "role": "assistant", "text": "[#32](https://github.com/Pajn/fallout/pull/32), done."}],
+                "activities": []
+            }
+        })).unwrap();
+        app.thread = Some(crate::state::ThreadState::from_snapshot(snapshot));
+        app.focus = super::Focus::Chat;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 16)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let link = app.links[0].clone();
+        for column in link.start..link.end {
+            assert_eq!(
+                app.link_at(ratatui::layout::Position::new(column, link.row)),
+                Some(link.url.clone())
+            );
+        }
+        assert_eq!(
+            app.link_at(ratatui::layout::Position::new(link.end, link.row)),
+            None
+        );
+        app.chat_view.click(
+            app.chat_view.line_at((link.row - app.chat_area.y) as usize),
+            link.start - app.chat_area.x,
+        );
+        assert_eq!(app.link_at_cursor(), Some(link.url));
+    }
+
+    #[test]
     fn a_bare_url_is_a_link() {
         assert_eq!(
             links("see https://example.com/a for more"),

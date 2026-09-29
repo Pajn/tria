@@ -38,6 +38,7 @@ pub enum BlockKey {
 pub struct Block {
     pub key: BlockKey,
     pub text: Text<'static>,
+    pub links: Vec<crate::markdown::Link>,
     /// Toggleable regions, in text-line indices before wrapping. Work groups list their
     /// header and every tool row, foldable or not.
     pub rows: Vec<Region>,
@@ -245,6 +246,7 @@ pub fn build(
             exports,
             images,
             pictures,
+            links: Vec::new(),
         });
         pending.clear();
     };
@@ -268,6 +270,7 @@ pub fn build(
                     exports: vec![(format!("turn:{}", turn.id), format!("{}\n", turn.label))],
                     images: Vec::new(),
                     pictures: Vec::new(),
+                    links: Vec::new(),
                 });
             }
 
@@ -285,6 +288,7 @@ pub fn build(
                 let mut images = Vec::new();
                 let mut rows = Vec::new();
                 let mut pictures = Vec::new();
+                let mut links = Vec::new();
                 let text = match message.role.as_str() {
                     // A subagent transcript opens with the brief it was given, which is
                     // the agent's instruction rather than anything the user typed.
@@ -300,6 +304,8 @@ pub fn build(
                             height,
                             None,
                         );
+                        let (text, destinations) = text.into_parts();
+                        links = destinations;
                         text
                     }
                 };
@@ -313,6 +319,7 @@ pub fn build(
                     )],
                     images,
                     pictures,
+                    links,
                 });
             }
             Item::Activity(activity) => {
@@ -328,9 +335,10 @@ pub fn build(
                     &mut work_anchor,
                     &mut work_group_index,
                 );
+                let (text, links) = render_plan(plan).into_parts();
                 blocks.push(Block {
                     key: BlockKey::Plan(plan.id.clone()),
-                    text: render_plan(plan),
+                    text,
                     rows: Vec::new(),
                     exports: vec![(
                         format!("plan:{}", plan.id),
@@ -338,6 +346,7 @@ pub fn build(
                     )],
                     images: Vec::new(),
                     pictures: Vec::new(),
+                    links,
                 });
             }
         }
@@ -357,6 +366,7 @@ pub fn build(
             exports: Vec::new(),
             images: Vec::new(),
             pictures: Vec::new(),
+            links: Vec::new(),
         });
     }
     blocks
@@ -1090,11 +1100,12 @@ pub fn picture_rows(height: u16) -> u16 {
 pub fn place_message_images(
     id: &str,
     source: &str,
-    rendered: &mut Text<'static>,
+    rendered: &mut crate::markdown::Text,
     width: u16,
     height: u16,
     remote: Option<&HashMap<String, Option<String>>>,
 ) -> (Vec<Placed>, Vec<Region>, Vec<(String, Picture)>) {
+    use crate::markdown::{Line, Span};
     let mut placed = Vec::new();
     let mut regions = Vec::new();
     let mut pictures = Vec::new();
@@ -1105,7 +1116,7 @@ pub fn place_message_images(
     }
     let mut sources = image_sources(source).into_iter();
     let mut taken = 0usize;
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rendered.lines.len());
+    let mut lines: Vec<Line> = Vec::with_capacity(rendered.lines.len());
     for mut line in std::mem::take(&mut rendered.lines) {
         let marks: Vec<usize> = line
             .spans
@@ -1359,23 +1370,23 @@ fn render_system(text: &str) -> Text<'static> {
     Text::from(lines)
 }
 
-fn render_assistant(text: &str, streaming: bool, width: u16) -> Text<'static> {
-    let mut rendered = markdown(text);
-    crate::table::fit(&mut rendered, width);
+fn render_assistant(text: &str, streaming: bool, width: u16) -> crate::markdown::Text {
+    let mut rendered = crate::markdown::render(text);
+    crate::table::fit_linked(&mut rendered, width);
     if streaming {
         let cursor = Span::styled(STREAM_CURSOR, Style::default().fg(Color::Magenta));
         match rendered.lines.last_mut() {
-            Some(last) => last.spans.push(cursor),
-            None => rendered.lines.push(Line::from(cursor)),
+            Some(last) => last.spans.push(cursor.into()),
+            None => rendered.lines.push(Line::from(cursor).into()),
         }
     }
-    rendered.lines.push(Line::default());
+    rendered.lines.push(crate::markdown::Line::default());
     rendered
 }
 
-fn render_plan(plan: &crate::model::ProposedPlan) -> Text<'static> {
+fn render_plan(plan: &crate::model::ProposedPlan) -> crate::markdown::Text {
     let style = Style::default().fg(Color::Blue);
-    let mut lines = vec![Line::from(vec![
+    let lines = vec![Line::from(vec![
         Span::styled("▌ ", style),
         Span::styled("Proposed plan", style.add_modifier(Modifier::BOLD)),
         Span::styled(
@@ -1387,12 +1398,14 @@ fn render_plan(plan: &crate::model::ProposedPlan) -> Text<'static> {
             Style::default().fg(Color::DarkGray),
         ),
     ])];
-    for mut line in markdown(&plan.plan_markdown).lines {
-        line.spans.insert(0, Span::styled("▌ ", style));
-        lines.push(line);
+    let mut rendered = crate::markdown::render(&plan.plan_markdown);
+    let mut linked = crate::markdown::Text::from(Text::from(lines));
+    for mut line in rendered.lines.drain(..) {
+        line.spans.insert(0, Span::styled("▌ ", style).into());
+        linked.lines.push(line);
     }
-    lines.push(Line::default());
-    Text::from(lines)
+    linked.lines.push(crate::markdown::Line::default());
+    linked
 }
 
 fn render_working(thread: &ThreadState) -> Text<'static> {
@@ -1431,28 +1444,9 @@ fn render_working(thread: &ThreadState) -> Text<'static> {
 }
 
 /// Render markdown to an owned `Text`.
+#[cfg(test)]
 pub fn markdown(text: &str) -> Text<'static> {
-    let rendered = tui_markdown::from_str(text);
-    Text {
-        lines: rendered
-            .lines
-            .into_iter()
-            .map(|line| Line {
-                spans: line
-                    .spans
-                    .into_iter()
-                    .map(|span| Span {
-                        content: span.content.into_owned().into(),
-                        style: span.style,
-                    })
-                    .collect(),
-                style: line.style,
-                alignment: line.alignment,
-            })
-            .collect(),
-        style: rendered.style,
-        alignment: rendered.alignment,
-    }
+    crate::markdown::render(text).into_parts().0
 }
 
 #[cfg(test)]

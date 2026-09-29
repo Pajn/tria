@@ -740,6 +740,7 @@ mod tests {
             exports: vec![(format!("msg:{id}"), lines.join("\n"))],
             images: Vec::new(),
             pictures: Vec::new(),
+            links: Vec::new(),
         }
     }
 

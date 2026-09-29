@@ -570,6 +570,7 @@ fn reviews(
     }
     drawn.lines.push(Line::default());
     let mut block = block("pr-reviews", drawn.lines, drawn.rows);
+    block.links = drawn.links;
     block.images = drawn.images;
     block.pictures = drawn.pictures;
     block
@@ -592,6 +593,7 @@ pub fn image_urls(detail: &Detail, activity: Option<&Activity>) -> Vec<String> {
 #[derive(Default)]
 struct Drawn {
     lines: Vec<Line<'static>>,
+    links: Vec<crate::markdown::Link>,
     rows: Vec<Region>,
     images: Vec<crate::timeline::Placed>,
     pictures: Vec<(String, crate::timeline::Picture)>,
@@ -624,6 +626,13 @@ impl Drawn {
                 }),
         );
         self.pictures.extend(other.pictures);
+        self.links
+            .extend(other.links.into_iter().map(|link| crate::markdown::Link {
+                line: link.line + offset,
+                start: link.start + indent as usize,
+                end: link.end + indent as usize,
+                ..link
+            }));
     }
 }
 
@@ -643,8 +652,8 @@ fn draw_markdown(
     {
         match segment {
             Segment::Markdown(text) => {
-                let mut rendered = crate::timeline::markdown(text.trim_matches('\n'));
-                crate::table::fit(&mut rendered, width);
+                let mut rendered = crate::markdown::render(text.trim_matches('\n'));
+                crate::table::fit_linked(&mut rendered, width);
                 let (images, rows, pictures) = crate::timeline::place_message_images(
                     &format!("{id}-{n}"),
                     &text,
@@ -653,10 +662,12 @@ fn draw_markdown(
                     height,
                     Some(images),
                 );
+                let (rendered, links) = rendered.into_parts();
                 let lines = rendered.lines;
                 drawn.append(
                     Drawn {
                         lines,
+                        links,
                         rows,
                         images,
                         pictures,
@@ -953,6 +964,7 @@ fn block(key: &str, lines: Vec<Line<'static>>, rows: Vec<Region>) -> Block {
         exports: vec![(format!("msg:{key}"), format!("{plain}\n"))],
         images: Vec::new(),
         pictures: Vec::new(),
+        links: Vec::new(),
     }
 }
 
@@ -1265,6 +1277,15 @@ fn body(
     );
     lines.push(Line::default());
     let mut block = block("pr-body", lines, rows);
+    block.links = drawn
+        .links
+        .into_iter()
+        .filter(|link| link.line < shown)
+        .map(|link| crate::markdown::Link {
+            line: link.line + offset,
+            ..link
+        })
+        .collect();
     block.images = drawn
         .images
         .into_iter()

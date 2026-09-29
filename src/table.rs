@@ -5,10 +5,8 @@
 //! box falls apart. Here each such table is laid out again after rendering. Its columns
 //! shrink until it fits, and the text wraps inside its cells, which grow taller instead.
 
-use ratatui::{
-    style::Style,
-    text::{Line, Span, Text},
-};
+use crate::markdown::{Line, Span, Text};
+use ratatui::style::Style;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const VERTICAL: &str = "│";
@@ -18,7 +16,14 @@ const VERTICAL: &str = "│";
 const WORD_FLOOR: usize = 12;
 
 /// Lay out again every table in `text` that is wider than `width`.
-pub fn fit(text: &mut Text<'static>, width: u16) {
+#[cfg(test)]
+pub fn fit(text: &mut ratatui::text::Text<'static>, width: u16) {
+    let mut linked = Text::from(std::mem::take(text));
+    fit_linked(&mut linked, width);
+    *text = linked.into_parts().0;
+}
+
+pub fn fit_linked(text: &mut Text, width: u16) {
     let width = width as usize;
     let lines = std::mem::take(&mut text.lines);
     let mut out = Vec::with_capacity(lines.len());
@@ -37,7 +42,38 @@ pub fn fit(text: &mut Text<'static>, width: u16) {
             }
         }
         match Table::read(&table, top) {
-            Some(parsed) if parsed.width() > width => out.extend(parsed.draw(width, table)),
+            Some(mut parsed) => {
+                let hidden = table
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.hidden);
+                if !hidden && parsed.width() <= width {
+                    out.extend(table);
+                    continue;
+                }
+                for row in &mut parsed.rows {
+                    if let Row::Cells { cells, .. } = row {
+                        for cell in cells {
+                            cell.spans.retain(|span| !span.hidden);
+                        }
+                    }
+                }
+                for column in 0..parsed.widths.len() {
+                    parsed.widths[column] = parsed
+                        .rows
+                        .iter()
+                        .filter_map(|row| match row {
+                            Row::Cells { cells, .. } => {
+                                Some(cells[column].spans.iter().map(|s| s.width()).sum::<usize>())
+                            }
+                            _ => None,
+                        })
+                        .max()
+                        .unwrap_or(0)
+                        .max(1);
+                }
+                out.extend(parsed.draw(width, table));
+            }
             _ => out.extend(table),
         }
     }
@@ -63,7 +99,7 @@ enum Align {
 }
 
 struct Cell {
-    spans: Vec<Span<'static>>,
+    spans: Vec<Span>,
     /// What its padding is drawn in, the header's style or a cell's.
     pad: Style,
 }
@@ -92,7 +128,7 @@ struct Table {
 impl Table {
     /// Read a table back out of the lines it was rendered to: the top border gives the
     /// columns' widths, and each row is cut at them.
-    fn read(lines: &[Line<'static>], top: usize) -> Option<Table> {
+    fn read(lines: &[Line], top: usize) -> Option<Table> {
         let first = &lines[0].spans[top];
         let widths: Vec<usize> = first
             .content
@@ -101,7 +137,7 @@ impl Table {
             .split('┬')
             .map(|segment| segment.chars().count().checked_sub(2))
             .collect::<Option<_>>()?;
-        let indent = lines[0].spans[..top].iter().map(Span::width).sum();
+        let indent = lines[0].spans[..top].iter().map(|span| span.width()).sum();
         let mut aligns: Vec<Option<Align>> = vec![None; widths.len()];
         let mut rows = Vec::with_capacity(lines.len());
         for line in lines {
@@ -172,8 +208,13 @@ impl Table {
 
     /// The table drawn again in `width`, from the lines it was read from, which still hold
     /// what goes before each of them.
-    fn draw(&self, width: usize, lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
-        let Some(widths) = self.narrowed(width.saturating_sub(self.indent)) else {
+    fn draw(&self, width: usize, lines: Vec<Line>) -> Vec<Line> {
+        let widths = if self.width() <= width {
+            Some(self.widths.clone())
+        } else {
+            self.narrowed(width.saturating_sub(self.indent))
+        };
+        let Some(widths) = widths else {
             return lines;
         };
         let mut out = Vec::with_capacity(lines.len());
@@ -186,7 +227,7 @@ impl Table {
                 }
                 Row::Cells { at, cells } => {
                     let before = &line.spans[..*at];
-                    let wrapped: Vec<Vec<Vec<Span<'static>>>> = cells
+                    let wrapped: Vec<Vec<Vec<Span>>> = cells
                         .iter()
                         .zip(&widths)
                         .map(|(cell, &width)| wrap(&cell.spans, width))
@@ -197,7 +238,7 @@ impl Table {
                         spans.push(Span::styled(VERTICAL, self.border));
                         for (column, cell) in cells.iter().enumerate() {
                             let content = wrapped[column].get(n).cloned().unwrap_or_default();
-                            let used: usize = content.iter().map(Span::width).sum();
+                            let used: usize = content.iter().map(|span| span.width()).sum();
                             let room = widths[column].saturating_sub(used);
                             let (left, right) = match self.aligns[column] {
                                 Align::Left => (0, room),
@@ -271,7 +312,7 @@ impl Table {
                 Row::Border { .. } => None,
             })
             .flat_map(|cell| words(&cell.spans))
-            .map(|word| word.iter().map(|(text, _)| text.width()).sum::<usize>())
+            .map(|word| word.iter().map(|span| span.width()).sum::<usize>())
             .max()
             .unwrap_or(0)
     }
@@ -294,11 +335,11 @@ fn rule(widths: &[usize], [left, middle, right]: [char; 3]) -> String {
     out
 }
 
-type Word = Vec<(String, Style)>;
+type Word = Vec<Span>;
 
 /// What a cell says, cut into words, each in the pieces of the spans it came from so the
 /// styles and the spans' own boundaries survive.
-fn words(spans: &[Span<'static>]) -> Vec<Word> {
+fn words(spans: &[Span]) -> Vec<Word> {
     let mut out = Vec::new();
     let mut word: Word = Vec::new();
     for span in spans {
@@ -306,7 +347,7 @@ fn words(spans: &[Span<'static>]) -> Vec<Word> {
         for c in span.content.chars() {
             if c.is_whitespace() {
                 if !piece.is_empty() {
-                    word.push((std::mem::take(&mut piece), span.style));
+                    word.push(span.piece(std::mem::take(&mut piece)));
                 }
                 if !word.is_empty() {
                     out.push(std::mem::take(&mut word));
@@ -316,7 +357,7 @@ fn words(spans: &[Span<'static>]) -> Vec<Word> {
             }
         }
         if !piece.is_empty() {
-            word.push((piece, span.style));
+            word.push(span.piece(piece));
         }
     }
     if !word.is_empty() {
@@ -327,25 +368,32 @@ fn words(spans: &[Span<'static>]) -> Vec<Word> {
 
 /// A cell's text wrapped at `width`, a line of spans each. Words go whole where they fit
 /// on a line of their own, and are broken where they do not.
-fn wrap(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
-    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut line: Vec<Span<'static>> = Vec::new();
+fn wrap(spans: &[Span], width: usize) -> Vec<Vec<Span>> {
+    let mut lines: Vec<Vec<Span>> = Vec::new();
+    let mut line: Vec<Span> = Vec::new();
     let mut used = 0;
     for word in words(spans) {
-        let size: usize = word.iter().map(|(text, _)| text.width()).sum();
+        let size: usize = word.iter().map(|span| span.width()).sum();
         if used > 0 && used + 1 + size > width {
             lines.push(std::mem::take(&mut line));
             used = 0;
         }
         if used > 0 {
-            let style = line.last().map(|s| s.style).unwrap_or_default();
-            line.push(Span::styled(" ", style));
+            let mut space = line
+                .last()
+                .map(|s| s.piece(" "))
+                .unwrap_or_else(|| Span::raw(" "));
+            if space.url != word.first().and_then(|s| s.url.clone()) {
+                space.url = None;
+            }
+            line.push(space);
             used += 1;
         }
-        for (text, style) in word {
+        for span in word {
+            let text = span.content.as_ref();
             if used + text.width() <= width {
                 used += text.width();
-                line.push(Span::styled(text, style));
+                line.push(span.clone());
                 continue;
             }
             let mut piece = String::new();
@@ -353,7 +401,7 @@ fn wrap(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
                 let size = c.width().unwrap_or(0);
                 if used + size > width && used > 0 {
                     if !piece.is_empty() {
-                        line.push(Span::styled(std::mem::take(&mut piece), style));
+                        line.push(span.piece(std::mem::take(&mut piece)));
                     }
                     lines.push(std::mem::take(&mut line));
                     used = 0;
@@ -362,7 +410,7 @@ fn wrap(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
                 used += size;
             }
             if !piece.is_empty() {
-                line.push(Span::styled(piece, style));
+                line.push(span.piece(piece));
             }
         }
     }

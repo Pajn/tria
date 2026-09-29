@@ -257,11 +257,8 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
     }
 }
 
-/// Paint search matches on the visible chat rows, reading the drawn cells so highlights land
-/// on the right columns regardless of wrapping or wide characters.
-/// Underline the links on screen and record where they are, so a click can open one.
-/// This reads the drawn cells rather than the source text, so it covers everything the
-/// chat shows without each renderer having to care.
+/// Record Markdown labels from the layout, then underline and record bare URLs from
+/// the drawn cells. Both resolve through the same mouse and keyboard link handling.
 fn apply_links(frame: &mut Frame, app: &mut App, chat: Rect) {
     app.links.clear();
     if app.thread.is_none() || chat.height == 0 {
@@ -286,8 +283,35 @@ fn apply_links(frame: &mut Frame, app: &mut App, chat: Rect) {
     }
 
     let mut links: Vec<crate::app::Link> = Vec::new();
+    let mut y = chat.y;
+    for shown in app.chat().shown() {
+        for link in shown.links {
+            let row = link.row;
+            if row >= shown.skip && row < shown.skip + shown.lines.len() {
+                let start = chat.x + link.start.min(chat.width);
+                let end = chat.x + link.end.min(chat.width);
+                if start < end {
+                    links.push(crate::app::Link {
+                        row: y + (row - shown.skip) as u16,
+                        start,
+                        end,
+                        url: link.url.clone(),
+                    });
+                }
+            }
+        }
+        y += shown.lines.len() as u16;
+    }
     for index in 0..rows.len() {
         for (from, to) in crate::app::link_ranges(&rows[index].0) {
+            // A URL used as a Markdown label already has its own destination.
+            if let Some((_, x)) = rows[index].1.iter().find(|(byte, _)| *byte == from)
+                && links.iter().any(|link| {
+                    link.row == chat.y + index as u16 && *x >= link.start && *x < link.end
+                })
+            {
+                continue;
+            }
             // A link that runs to the end of its row carries on below, one row at a time.
             let mut url = rows[index].0[from..to].to_string();
             let mut spans = vec![(index, from, to)];
@@ -320,6 +344,12 @@ fn apply_links(frame: &mut Frame, app: &mut App, chat: Rect) {
                     }
                 }
                 if let (Some(first), Some(last)) = (first, last) {
+                    if links
+                        .iter()
+                        .any(|link| link.row == y && first < link.end && last + 1 > link.start)
+                    {
+                        continue;
+                    }
                     links.push(crate::app::Link {
                         row: y,
                         start: first,
@@ -330,6 +360,7 @@ fn apply_links(frame: &mut Frame, app: &mut App, chat: Rect) {
             }
         }
     }
+    links.sort_by_key(|link| (link.row, link.start));
     app.links = links;
 }
 
@@ -3813,6 +3844,73 @@ mod tests {
         }))
         .unwrap();
         crate::state::ThreadState::from_snapshot(snapshot)
+    }
+
+    #[test]
+    fn markdown_labels_are_the_click_targets_and_destinations_are_hidden() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_answering(
+            "- [#32](https://github.com/Pajn/fallout/pull/32), then [#33](https://github.com/Pajn/fallout/pull/33).",
+        ));
+        let buffer = screen(70, &mut app);
+        assert_eq!(app.links.len(), 2);
+        for (link, label) in app.links.iter().zip(["#32", "#33"]) {
+            let shown: String = (link.start..link.end)
+                .map(|x| buffer[(x, link.row)].symbol())
+                .collect();
+            assert_eq!(shown, label);
+            assert!(link.url.ends_with(&label[1..]));
+        }
+        assert!(
+            !buffer
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "h" && cell.fg == Color::Blue)
+        );
+    }
+
+    #[test]
+    fn a_url_label_opens_its_destination_and_bare_urls_still_work() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_answering(
+            "https://bare.example [https://label.example](https://target.example)",
+        ));
+        screen(70, &mut app);
+        let urls: Vec<_> = app.links.iter().map(|link| link.url.as_str()).collect();
+        assert_eq!(urls, ["https://bare.example", "https://target.example"]);
+    }
+
+    #[test]
+    fn wrapped_unicode_labels_keep_targets_after_resize_and_scroll() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let label = "資料 étiquette long label with several words to wrap across rows";
+        app.thread = Some(thread_answering(&format!(
+            "[{label}](https://example.com/target)\n\nafter"
+        )));
+        for width in [32, 50, 22] {
+            let buffer = screen(width, &mut app);
+            assert!(app.links.len() > 1);
+            for link in &app.links {
+                assert_eq!(link.url, "https://example.com/target");
+                assert!(link.start >= app.chat_area.x && link.end <= app.chat_area.right());
+                assert!(link.row >= app.chat_area.y && link.row < app.chat_area.bottom());
+                let shown: String = (link.start..link.end)
+                    .map(|x| buffer[(x, link.row)].symbol())
+                    .collect();
+                assert!(!shown.trim().is_empty());
+            }
+        }
+        app.chat_view.top();
+        let buffer = screen(22, &mut app);
+        let link = app.links.first().unwrap();
+        assert_eq!(buffer[(link.start, link.row)].symbol(), "資");
+        assert_eq!(link.url, "https://example.com/target");
     }
 
     /// An agent that has taken a screenshot writes it out and then shows it. The chat
