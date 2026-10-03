@@ -6,10 +6,13 @@ mod completion;
 mod composer;
 mod config;
 mod discovery;
+mod handoff;
 mod kitty;
 mod list_cursor;
 mod lucide;
+mod markdown;
 mod model;
+mod monogram;
 mod notify;
 mod outbox;
 mod picture;
@@ -95,6 +98,9 @@ async fn main() -> Result<()> {
         // that has already been taken over.
         Some(Command::Open { path }) => {
             let open_at = workspace::root(path.as_deref())?;
+            if handoff::reuse(&open_at, known.as_deref()).await? {
+                return Ok(());
+            }
             chat(known, &cfg, Some(open_at)).await
         }
         None => chat(known, &cfg, None).await,

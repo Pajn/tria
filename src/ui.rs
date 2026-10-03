@@ -257,79 +257,41 @@ fn apply_chat_cursor(frame: &mut Frame, app: &App, chat: Rect) {
     }
 }
 
-/// Paint search matches on the visible chat rows, reading the drawn cells so highlights land
-/// on the right columns regardless of wrapping or wide characters.
-/// Underline the links on screen and record where they are, so a click can open one.
-/// This reads the drawn cells rather than the source text, so it covers everything the
-/// chat shows without each renderer having to care.
+/// Underline and record the layout's Markdown labels and bare URLs. Both resolve
+/// through the same mouse and keyboard link handling.
 fn apply_links(frame: &mut Frame, app: &mut App, chat: Rect) {
     app.links.clear();
     if app.thread.is_none() || chat.height == 0 {
         return;
     }
     let buffer = frame.buffer_mut();
-    // Read the visible rows as text, keeping the column each byte came from.
-    let mut rows: Vec<(String, Vec<(usize, u16)>)> = Vec::new();
-    for y in chat.y..chat.y + chat.height {
-        let mut text = String::new();
-        let mut columns: Vec<(usize, u16)> = Vec::new();
-        for x in chat.x..chat.x + chat.width {
-            if let Some(cell) = buffer.cell(Position::new(x, y)) {
-                let symbol = cell.symbol();
-                if !symbol.is_empty() {
-                    columns.push((text.len(), x));
-                }
-                text.push_str(symbol);
-            }
-        }
-        rows.push((text, columns));
-    }
-
     let mut links: Vec<crate::app::Link> = Vec::new();
-    for index in 0..rows.len() {
-        for (from, to) in crate::app::link_ranges(&rows[index].0) {
-            // A link that runs to the end of its row carries on below, one row at a time.
-            let mut url = rows[index].0[from..to].to_string();
-            let mut spans = vec![(index, from, to)];
-            let mut row = index;
-            let mut end = to;
-            while end == rows[row].0.trim_end().len() && row + 1 < rows.len() {
-                let next = &rows[row + 1].0;
-                let run = next.find(char::is_whitespace).unwrap_or(next.len());
-                if run == 0 {
-                    break;
-                }
-                url.push_str(&next[..run]);
-                spans.push((row + 1, 0, run));
-                row += 1;
-                end = run;
-            }
-            for (row, from, to) in spans {
-                let y = chat.y + row as u16;
-                let mut first = None;
-                let mut last = None;
-                for &(byte, x) in &rows[row].1 {
-                    if byte < from || byte >= to {
-                        continue;
+    let mut y = chat.y;
+    for shown in app.chat().shown() {
+        for link in shown.links {
+            let row = link.row;
+            if row >= shown.skip && row < shown.skip + shown.lines.len() {
+                let row = y + (row - shown.skip) as u16;
+                let start = chat.x + link.start.min(chat.width);
+                let end = chat.x + link.end.min(chat.width);
+                if start < end {
+                    for x in start..end {
+                        if let Some(cell) = buffer.cell_mut(Position::new(x, row)) {
+                            cell.set_style(Style::default().add_modifier(Modifier::UNDERLINED));
+                        }
                     }
-                    first.get_or_insert(x);
-                    last = Some(x);
-                    if let Some(cell) = buffer.cell_mut(Position::new(x, y)) {
-                        let style = cell.style().add_modifier(Modifier::UNDERLINED);
-                        cell.set_style(style);
-                    }
-                }
-                if let (Some(first), Some(last)) = (first, last) {
                     links.push(crate::app::Link {
-                        row: y,
-                        start: first,
-                        end: last + 1,
-                        url: url.clone(),
+                        row,
+                        start,
+                        end,
+                        url: link.url.clone(),
                     });
                 }
             }
         }
+        y += shown.lines.len() as u16;
     }
+    links.sort_by_key(|link| (link.row, link.start));
     app.links = links;
 }
 
@@ -826,13 +788,18 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
 /// Draw what a project is known by over the room a row kept for it, and say whether
 /// anything went there. In the order the desktop app draws them: the icon somebody chose
 /// for it from the drawing set, failing that the one its checkout carries, and failing
-/// both a guess at what the project is from its name. All three are pictures and so go
-/// on after the list rather than into it, over the room the text left.
+/// both a letter badge from its name. Icons and badges go on after the list, over the
+/// room the text left.
 ///
 /// An emoji is not here: it is a character, and a character belongs in the line.
-fn draw_project_picture(frame: &mut Frame, app: &App, project: &str, area: Rect) -> bool {
+fn draw_project_icon(frame: &mut Frame, app: &App, project: &str, area: Rect) -> bool {
     if area.width == 0 || area.height == 0 {
         return false;
+    }
+    if let Some(project) = app.shell.projects.get(project)
+        && let Some((text, colour)) = project.monogram()
+    {
+        return draw_project_monogram(frame, text, colour, area);
     }
     if let Some((name, colour)) = app.project_lucide(project)
         && draw_drawn_icon(frame, name, colour, area)
@@ -846,12 +813,36 @@ fn draw_project_picture(frame: &mut Frame, app: &App, project: &str, area: Rect)
             return true;
         }
     }
-    // Nothing chosen and no icon in the checkout: the name is all there is to go on, and
-    // a guess at what the project is beats a blank column.
-    match app.project_guessed_icon(project) {
-        Some((name, colour)) => draw_drawn_icon(frame, name, Some(colour), area),
+    match app.project_monogram(project) {
+        Some((text, colour)) => draw_project_monogram(frame, &text, colour, area),
         None => false,
     }
+}
+
+/// Letter badges use terminal text, so the fallback is readable even without graphics.
+fn draw_project_monogram(frame: &mut Frame, text: &str, colour: Option<&str>, area: Rect) -> bool {
+    let [r, g, b] = crate::lucide::ink(colour);
+    let style = Style::default()
+        .fg(Color::Rgb(r, g, b))
+        .bg(Color::Rgb(
+            (u16::from(r) * 14 / 100) as u8,
+            (u16::from(g) * 14 / 100) as u8,
+            (u16::from(b) * 14 / 100) as u8,
+        ))
+        .add_modifier(Modifier::BOLD);
+    frame.render_widget(Block::default().style(style), area);
+    let text_area = Rect {
+        y: area.y + (area.height - 1) / 2,
+        height: 1,
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(text.to_string())
+            .style(style)
+            .alignment(ratatui::layout::Alignment::Center),
+        text_area,
+    );
+    true
 }
 
 /// Draw an icon from the drawing set over `area`, at the size that room comes to in
@@ -916,7 +907,7 @@ fn draw_sidebar_icons(frame: &mut Frame, app: &App, inner: Rect, rows: &[Sidebar
             width: 4,
             height: room as u16,
         };
-        draw_project_picture(frame, app, project, area);
+        draw_project_icon(frame, app, project, area);
     }
 }
 
@@ -2122,7 +2113,7 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
                 width: 2,
                 height: 1,
             };
-            draw_project_picture(frame, app, &item.key, area);
+            draw_project_icon(frame, app, &item.key, area);
         }
     }
 }
@@ -3815,6 +3806,195 @@ mod tests {
         crate::state::ThreadState::from_snapshot(snapshot)
     }
 
+    #[test]
+    fn markdown_labels_are_the_click_targets_and_destinations_are_hidden() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_answering(
+            "- [#32](https://github.com/Pajn/fallout/pull/32), then [#33](https://github.com/Pajn/fallout/pull/33).",
+        ));
+        let buffer = screen(70, &mut app);
+        assert_eq!(app.links.len(), 2);
+        for (link, label) in app.links.iter().zip(["#32", "#33"]) {
+            let shown: String = (link.start..link.end)
+                .map(|x| buffer[(x, link.row)].symbol())
+                .collect();
+            assert_eq!(shown, label);
+            assert!(link.url.ends_with(&label[1..]));
+        }
+        assert!(
+            !buffer
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "h" && cell.fg == Color::Blue)
+        );
+    }
+
+    #[test]
+    fn a_url_label_opens_its_destination_and_bare_urls_still_work() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(thread_answering(
+            "https://bare.example [https://label.example](https://target.example)",
+        ));
+        screen(70, &mut app);
+        let urls: Vec<_> = app.links.iter().map(|link| link.url.as_str()).collect();
+        assert_eq!(urls, ["https://bare.example", "https://target.example"]);
+    }
+
+    #[test]
+    fn wrapped_unicode_labels_keep_targets_after_resize_and_scroll() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let label = "資料 étiquette long label with several words to wrap across rows";
+        app.thread = Some(thread_answering(&format!(
+            "[{label}](https://example.com/target)\n\nafter"
+        )));
+        for width in [32, 50, 22] {
+            let buffer = screen(width, &mut app);
+            assert!(app.links.len() > 1);
+            for link in &app.links {
+                assert_eq!(link.url, "https://example.com/target");
+                assert!(link.start >= app.chat_area.x && link.end <= app.chat_area.right());
+                assert!(link.row >= app.chat_area.y && link.row < app.chat_area.bottom());
+                let shown: String = (link.start..link.end)
+                    .map(|x| buffer[(x, link.row)].symbol())
+                    .collect();
+                assert!(!shown.trim().is_empty());
+            }
+        }
+        app.chat_view.top();
+        let buffer = screen(22, &mut app);
+        let link = app.links.first().unwrap();
+        assert_eq!(buffer[(link.start, link.row)].symbol(), "資");
+        assert_eq!(link.url, "https://example.com/target");
+    }
+
+    #[test]
+    fn web_search_urls_end_before_the_next_reply() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let url = "https://rust-lang.github.io/mdBook/format/configuration/renderers.html";
+        let mut thread = thread_answering("**Yes—mdBook** is a good fit for qk.");
+        thread.detail.messages[0].created_at = "2".into();
+        thread.detail.activities = serde_json::from_value(json!([{
+            "id": "search", "kind": "tool.completed", "tone": "info",
+            "summary": "Web search", "createdAt": "1",
+            "payload": {
+                "itemType": "web_search", "toolCallId": "search",
+                "status": "completed", "title": format!("Web search: {url}")
+            }
+        }]))
+        .unwrap();
+        app.thread = Some(thread);
+        for width in [160, 200] {
+            let buffer = screen(width, &mut app);
+            assert_eq!(app.links.len(), 1);
+            assert_eq!(app.links[0].url, url);
+            let link = &app.links[0];
+            assert_eq!(buffer[(link.start, link.row)].symbol(), "h");
+            assert!(
+                !buffer[(app.chat_area.x, link.row + 1)]
+                    .modifier
+                    .contains(Modifier::UNDERLINED)
+            );
+        }
+    }
+
+    #[test]
+    fn bare_urls_keep_their_full_target_when_wrapped_or_partly_scrolled_offscreen() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let url = format!("https://example.com/{}", "資料-path/".repeat(60));
+        app.thread = Some(thread_saying(&format!("{url}\nYes—mdBook follows.")));
+        for width in [30, 60] {
+            screen(width, &mut app);
+            assert!(app.chat_view.offset() > 0);
+            assert!(!app.links.is_empty());
+            assert!(app.links.iter().all(|link| link.url == url));
+            app.chat_view.top();
+            let buffer = screen(width, &mut app);
+            assert!(app.links.len() > 1);
+            assert!(app.links.iter().all(|link| link.url == url));
+            for link in &app.links {
+                assert!(
+                    buffer[(link.start, link.row)]
+                        .modifier
+                        .contains(Modifier::UNDERLINED)
+                );
+            }
+            app.chat_view.follow();
+        }
+    }
+
+    #[test]
+    fn uploaded_images_are_drawn_below_user_text_and_open_from_their_region() {
+        crate::picture::draw_in_halfblocks();
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let mut thread = thread_saying("**Keep my text literal**");
+        thread.detail.messages[0].attachments = serde_json::from_value(json!([
+            {"type": "image", "id": "screenshot", "name": "Screenshot.png", "mimeType": "image/png"},
+            {"type": "image", "id": "second", "name": "Second.png", "mimeType": "image/png"}
+        ])).unwrap();
+        let data = crate::picture::test_png(120, 60);
+        thread.attachment_images.insert(
+            "screenshot".into(),
+            crate::state::AttachmentImage::Ready(data.clone()),
+        );
+        thread.attachment_images.insert(
+            "second".into(),
+            crate::state::AttachmentImage::Ready(data.clone()),
+        );
+        app.thread = Some(thread);
+        for width in [60, 36] {
+            let buffer = screen(width, &mut app);
+            let area = app.chat_area;
+            let view = app.chat();
+            let picture_row = view.total() - 2;
+            let region = view.layout().picture_at(picture_row);
+            assert!(matches!(region, Some(crate::timeline::Picture::Data(_))));
+            let y = area.y + (picture_row - view.offset()) as u16;
+            assert!(
+                (area.x + 2..area.right())
+                    .any(|x| matches!(buffer[(x, y)].bg, Color::Rgb(_, _, _))),
+                "the uploaded image paints its reserved row"
+            );
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("Second.png"));
+        }
+        app.chat_view.top();
+        let shown = chat(60, &mut app);
+        assert!(shown.contains("**Keep my text literal**"));
+        assert!(shown.contains("Screenshot.png"));
+    }
+
+    #[test]
+    fn missing_user_images_keep_their_filename_and_explain_the_failure() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let mut thread = thread_saying("");
+        thread.detail.messages[0].attachments = serde_json::from_value(json!([
+            {"type": "image", "id": "missing", "name": "Missing.png", "mimeType": "image/png"}
+        ]))
+        .unwrap();
+        app.thread = Some(thread);
+        assert!(chat(70, &mut app).contains("Missing.png · loading…"));
+        let thread = app.thread.as_mut().unwrap();
+        thread
+            .attachment_images
+            .insert("missing".into(), crate::state::AttachmentImage::Unavailable);
+        thread.touch();
+        assert!(chat(70, &mut app).contains("Missing.png · could not be fetched"));
+    }
+
     /// An agent that has taken a screenshot writes it out and then shows it. The chat
     /// draws the picture under the caption, and the lines it goes on are the picture's,
     /// so `gx` anywhere on it opens the file.
@@ -4676,6 +4856,126 @@ mod tests {
         let store = row("What do I need");
         assert_eq!(painted(store), 0);
         assert!(text(store).contains("📚"), "{}", text(store));
+    }
+
+    #[test]
+    fn unnamed_project_icons_are_readable_letter_badges() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        for (id, title) in [("kindra", "Kindra"), ("github", "github_ui"), ("qk", "qk")] {
+            let project = serde_json::from_value(
+                json!({ "id": id, "title": title, "workspaceRoot": format!("/src/{id}") }),
+            )
+            .unwrap();
+            app.shell.projects.insert(id.into(), project);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(12, 6)).unwrap();
+        terminal
+            .draw(|frame| {
+                for (row, id) in ["kindra", "github", "qk"].iter().enumerate() {
+                    assert!(draw_project_icon(
+                        frame,
+                        &app,
+                        id,
+                        Rect::new(2, row as u16 * 2, 4, 2)
+                    ));
+                }
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for (row, letters) in ["KA", "GU", "QK"].iter().enumerate() {
+            let text: String = (2..6)
+                .map(|x| buffer[(x, row as u16 * 2)].symbol())
+                .collect();
+            assert_eq!(text.trim(), *letters);
+            assert!(
+                buffer[(3, row as u16 * 2)]
+                    .modifier
+                    .contains(Modifier::BOLD)
+            );
+        }
+        assert_eq!(buffer[(3, 0)].fg, Color::Rgb(0xfb, 0xbf, 0x24));
+        assert_eq!(buffer[(3, 2)].fg, Color::Rgb(0x9c, 0xa3, 0xaf));
+        assert_eq!(buffer[(3, 4)].fg, Color::Rgb(0x38, 0xbd, 0xf8));
+    }
+
+    #[test]
+    fn a_chosen_letter_badge_wins_over_the_project_name_and_favicon() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.shell.projects.insert("p1".into(), serde_json::from_value(json!({
+            "id": "p1", "title": "backend", "workspaceRoot": "/src/backend",
+            "projectIcon": {"kind": "lucide", "name": "folder-code", "color": "red", "monogram": "NX"}
+        })).unwrap());
+        app.give_favicon("p1", icon_bytes());
+        let mut terminal = Terminal::new(TestBackend::new(4, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                assert!(draw_project_icon(frame, &app, "p1", Rect::new(0, 0, 2, 1)));
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..2).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert_eq!(text, "NX");
+        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(0xf8, 0x71, 0x71));
+        assert!(app.project_lucide("p1").is_none());
+    }
+
+    #[test]
+    fn desktop_monogram_text_updates_the_sidebar_and_project_picker() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        with_threads(&mut app);
+        app.give_favicon("p1", icon_bytes());
+        // The desktop stores this under monogramText, alongside the underlying icon.
+        app.shell.apply(
+            serde_json::from_value(json!({
+                "kind": "project-upserted", "sequence": 2,
+                "project": {
+                    "id": "p1", "title": "main", "workspaceRoot": "/src/main",
+                    "projectIcon": {"kind": "lucide", "name": "folder-code",
+                                    "color": "yellow", "monogramText": "JS"}
+                }
+            }))
+            .unwrap(),
+        );
+        let yellow = Color::Rgb(0xfa, 0xcc, 0x15);
+        let badges = |buffer: &ratatui::buffer::Buffer, width: u16| {
+            (0..buffer.area.height)
+                .flat_map(|y| (0..width - 1).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    buffer[(x, y)].symbol() == "J"
+                        && buffer[(x + 1, y)].symbol() == "S"
+                        && buffer[(x, y)].fg == yellow
+                        && buffer[(x + 1, y)].fg == yellow
+                })
+                .count()
+        };
+        app.sidebar_layout = SidebarLayout::TwoLine;
+        assert_eq!(badges(&screen(100, &mut app), SIDEBAR_WIDTH), 2);
+        app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('n'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.mode, Mode::Picker);
+        let buffer = screen(100, &mut app);
+        let row = (0..buffer.area.height)
+            .find(|&y| {
+                (0..100)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("/src/main")
+            })
+            .expect("the project is listed in the picker");
+        assert!((0..99).any(|x| {
+            buffer[(x, row)].symbol() == "J"
+                && buffer[(x + 1, row)].symbol() == "S"
+                && buffer[(x, row)].fg == yellow
+                && buffer[(x + 1, row)].fg == yellow
+        }));
     }
 
     /// The set the desktop app draws a project's icon from is a set of pictures, which

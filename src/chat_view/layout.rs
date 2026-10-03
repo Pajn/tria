@@ -97,6 +97,7 @@ fn hash_set(set: &HashSet<String>) -> u64 {
 struct Laid {
     /// The block's text broken into the rows it is drawn as.
     wrapped: Wrapped,
+    links: Vec<Link>,
     exports: Vec<(String, String)>,
     /// Images in wrapped content lines relative to the block start.
     images: Vec<Placed>,
@@ -108,10 +109,19 @@ impl Laid {
     }
 }
 
+/// A link on a wrapped row, in terminal columns counted from the block's left edge.
+pub struct Link {
+    pub row: usize,
+    pub start: u16,
+    pub end: u16,
+    pub url: String,
+}
+
 /// What of one block is on the screen, for the renderer to paint.
 pub struct Shown<'a> {
     /// The block's rows that are in view, already broken to the width.
     pub lines: &'a [Line<'static>],
+    pub links: &'a [Link],
     /// How many of its rows are above the view.
     pub skip: usize,
     /// Its pictures, on rows counted from the block's first.
@@ -197,6 +207,53 @@ impl Layout {
         for mut block in blocks {
             let exports = std::mem::take(&mut block.exports);
             let wrapped = timeline::wrap(&block.text, width);
+            // Detect URLs in logical lines, before wrapping can put an unrelated reply
+            // directly below one. Keep the complete target even if its first row is
+            // outside the viewport. Markdown labels retain their explicit destination.
+            let mut destinations = std::mem::take(&mut block.links);
+            for (line, text) in block.text.lines.iter().enumerate() {
+                let text = text.to_string();
+                for (start, end) in crate::app::link_ranges(&text) {
+                    if destinations
+                        .iter()
+                        .any(|link| link.line == line && start < link.end && end > link.start)
+                    {
+                        continue;
+                    }
+                    destinations.push(crate::markdown::Link {
+                        line,
+                        start,
+                        end,
+                        url: text[start..end].to_string(),
+                    });
+                }
+            }
+            let mut links = Vec::new();
+            for link in &destinations {
+                let prefix =
+                    block.text.lines[link.line].to_string().len() - wrapped.texts[link.line].len();
+                let start = link.start.saturating_sub(prefix);
+                let end = link.end.saturating_sub(prefix);
+                for row in wrapped.starts[link.line]..wrapped.starts[link.line + 1] {
+                    let at = &wrapped.rows[row];
+                    let from = start.max(at.start);
+                    let to = end.min(at.end);
+                    if from < to {
+                        let text = &wrapped.texts[link.line];
+                        let column = |byte| {
+                            at.indent
+                                + unicode_width::UnicodeWidthStr::width(&text[at.start..byte])
+                                    as u16
+                        };
+                        links.push(Link {
+                            row,
+                            start: column(from),
+                            end: column(to),
+                            url: link.url.clone(),
+                        });
+                    }
+                }
+            }
             // Where each line of the text starts turns text-line row ranges into
             // content lines, and says where an image's reserved lines landed.
             let (rows, images) = if block.rows.is_empty() {
@@ -253,6 +310,7 @@ impl Layout {
             }
             self.blocks.push(Laid {
                 wrapped,
+                links,
                 exports,
                 images,
             });
@@ -315,6 +373,7 @@ impl Layout {
             let visible = (laid.height() - skip).min(room);
             shown.push(Shown {
                 lines: &laid.wrapped.lines[skip..skip + visible],
+                links: &laid.links,
                 skip,
                 images: &laid.images,
             });
@@ -618,6 +677,7 @@ mod tests {
             exports: Vec::new(),
             images: Vec::new(),
             pictures: Vec::new(),
+            links: Vec::new(),
         }
     }
 

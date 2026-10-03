@@ -301,17 +301,30 @@ composer's and the panel says so; `:approve <n>` answers it whatever is written 
 
 `tria open` starts tria on the project for the directory you are in, with a draft ready to
 write: it is the way in from a checkout rather than from the thread list. `tria open <path>`
-names another directory. A directory inside a project opens that project — `src/` of a
-checkout is the checkout — and one the server has no project for adds it first, for the
-repository the directory is in, named after it. The directory has to be one: a path that is
-not there is said on the terminal before the screen is taken over. A project belongs to the
-server, so adding one adds it for the desktop app too.
+names another directory. It reuses a project registered for that exact directory, or
+registers the directory as a new project named after it. This also works inside a registered
+home directory or another project. The directory has to exist: a missing path is reported
+on the terminal before the screen is taken over. A project belongs to the server, so adding
+one adds it for the desktop app too.
+
+Inside tmux, `tria open` first looks for a running tria on the same tmux server and T3
+server, preferring one in the current session. It opens the directory's draft there and
+switches to that instance's session, window, and pane. If none is available, it starts a
+new tria. The running instance must have been started with a version that supports this
+handoff. Unsent text in an existing thread stays with that thread; an unsent new-thread
+draft must be finished first.
 
 `n` picks a project and opens a draft; the message you write starts the thread. The header says
 where it will run: `⌂ project checkout on <branch>`, or `⌂ new worktree off <branch>`, which
 the server creates when the thread starts. `gw` or `:worktree` switches between them. The
 default comes from the project's own setting, then the server's, and the server's default is
 the current checkout.
+
+Directory-based commands work before the first message too: `gl`, custom program bindings,
+`g!`, the terminal panel, the editor, reveal, and tmux commands use the draft's project
+checkout or its prepared pull-request worktree. A fresh worktree requested with `gw` is
+created when you send, so these commands use the project checkout until then. Opening a
+program leaves your message unsent; its terminal identity carries through to the new thread.
 
 A worktree branches off whatever the project's checkout has at the time, or off the remote's
 copy of it where the server is set to start new worktrees from origin. Its branch is named
@@ -348,19 +361,16 @@ connect. It is `^R` rather than `r` because the letters in that list go to the s
 
 The project list `n` opens draws each project with what it is known by, in the order the
 desktop app uses it: the emoji it was given, the icon it was named from the Lucide set, the
-icon its checkout carries, and failing all three a guess at what the project is, read from
-its name. Everything but the emoji is a picture, so it needs a terminal that can draw one.
+icon its checkout carries, and failing all three a badge with initials from its name.
+The initials and their colour follow the desktop app's rules: `Kindra` is `KA`,
+`github_ui` is `GU`, and `qk` is `QK`. The badge uses terminal text, so it works without
+image support too. A custom monogram chosen in the desktop's project settings uses your
+letters and colour instead, taking priority over the checkout's icon.
 
 A named icon arrives as a name and a colour, since the picture itself is nobody's to send.
 Lucide publishes the set as a font, so tria looks the name up there and draws the character
 into pixels at the size of the room it has. A name from a set newer than the one tria was
 built against is not drawn, and the project falls back to the icon its checkout carries.
-
-The guess is the desktop app's own: the name is cut into words, each is looked up in a table
-that knows what a backend, a docs site or a mobile app is called, and a name that says
-nothing keeps one of five generic icons, picked by hashing it so that it stays the same icon.
-Neither end sends this to the other — both work it out — so tria copies the rules rather than
-inventing its own, and a project looks like itself in both.
 
 The looking is the server's: the icon the project names, then the one its `t3.json` names in
 `iconPath`, then the usual places a favicon lives, then whatever the project's `index.html`
@@ -819,6 +829,12 @@ picture, so the file is read from disk — which works when the server is on thi
 is why an image row against a remote server has nothing to unfold. A subagent's transcript is
 the exception again: the provider's file carries its pictures inside it, and those draw
 wherever the server runs.
+
+Pictures attached to your messages appear below your text, with their filenames as captions.
+They are downloaded through the server's asset API, so this works with a remote server too.
+`gx` on the caption or picture opens it in your machine's image viewer. While a picture is
+being fetched its caption says `loading…`; if it cannot be fetched, the filename stays with
+`could not be fetched` beside it.
 
 A picture the agent points at in what it writes is drawn as well. An agent that takes a
 screenshot writes the file out and then shows it, which in markdown is an image: what it

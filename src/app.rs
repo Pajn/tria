@@ -427,6 +427,11 @@ pub enum AppEvent {
     Terminal(Event),
     Tick,
     Update(Box<Update>),
+    /// A `tria open` in another tmux pane wants a new thread here.
+    OpenDirectory {
+        root: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     Dispatched(Result<(), String>),
     /// The server answered something the outbox sent: a message, a thread made for one,
     /// or a pull request put on that thread.
@@ -482,6 +487,12 @@ pub enum AppEvent {
     PullRequestActivity {
         url: String,
         result: Result<Value, String>,
+    },
+    /// An uploaded message picture came back, base64, or failed to.
+    AttachmentImage {
+        thread_id: Id,
+        attachment_id: Id,
+        data: Option<String>,
     },
     /// A picture a pull request's description shows came back, base64, or failed to.
     PullRequestImage {
@@ -1137,7 +1148,7 @@ impl App {
             return;
         }
         self.swap_composer_draft(thread_id);
-        if let Some(leaving) = self.current_thread_id.clone() {
+        if let Some(leaving) = self.terminal_owner() {
             self.release_popup_terminals(&leaving);
         }
         // The pull requests and subagents listed are the thread's, so a new thread's list
@@ -1194,27 +1205,19 @@ impl App {
         self.open_thread(&id);
     }
 
-    /// The project a directory belongs to: the one whose checkout it is, or failing
-    /// that the innermost one it sits inside. Opening `src/` of a project is opening
-    /// that project, not asking for a second one alongside it.
+    /// Reuse a project only when it is registered for the requested directory itself.
+    /// An enclosing project (including the home directory) is a different workspace.
     fn project_for(&self, root: &str) -> Option<Id> {
-        let inside = |project_root: &str| {
-            root == project_root
-                || root.starts_with(project_root)
-                    && root[project_root.len()..].starts_with(std::path::MAIN_SEPARATOR)
-        };
         self.shell
             .projects
             .values()
-            .filter(|project| inside(&project.workspace_root))
-            .max_by_key(|project| project.workspace_root.len())
+            .find(|project| project.workspace_root == root)
             .map(|project| project.id.clone())
     }
 
     /// What `tria open` asked for, once the project list has arrived: a new thread in
-    /// the project the directory belongs to. Where it belongs to none, the project is
-    /// made first — for the checkout the directory is in, since that is what a project
-    /// usually is — and this runs again when the server sends it back.
+    /// the project registered for that exact directory. If it is not registered, make
+    /// the project first and run this again when the server sends it back.
     fn open_where_asked(&mut self) {
         let Some(root) = self.open_at.clone() else {
             return;
@@ -1229,7 +1232,6 @@ impl App {
             return;
         }
         self.open_asked = true;
-        let root = crate::workspace::checkout_root(&root).unwrap_or(root);
         let title = crate::workspace::title(&root);
         tracing::info!(%root, %title, "adding a project");
         self.toast(format!("adding {title}…"), false);
@@ -1238,6 +1240,43 @@ impl App {
             &title,
             &root,
         ));
+    }
+
+    fn accept_open_directory(&mut self, root: &str) -> Result<(), String> {
+        if self.quit || self.open_at.is_some() {
+            return Err("tria is still opening a directory; try again shortly".into());
+        }
+        let unsent_new_thread = if self.draft.is_some() {
+            !self.composer.text().trim().is_empty()
+        } else {
+            self.outbox
+                .parked(NEW_THREAD_DRAFT_KEY)
+                .is_some_and(|text| !text.trim().is_empty())
+        };
+        if unsent_new_thread {
+            return Err(
+                "tria has an unsent new-thread draft; finish it before opening another directory"
+                    .into(),
+            );
+        }
+        let root = crate::workspace::root(Some(root)).map_err(|err| err.to_string())?;
+        if self.pane.is_some() {
+            self.detach_terminal();
+        }
+        self.picker = None;
+        self.question = None;
+        self.rewind_ask = None;
+        self.selection = None;
+        self.pending_prefix = None;
+        self.open_at = Some(root);
+        self.open_asked = false;
+        if self.shell.synchronized {
+            self.open_where_asked();
+            if self.open_at.is_none() && self.draft.is_none() {
+                return Err("no usable provider or model configured on the server".into());
+            }
+        }
+        Ok(())
     }
 
     fn start_new_thread(&mut self, project_id: &str) {
@@ -1255,11 +1294,15 @@ impl App {
         // The project's setting wins, then the server's; the server's own default is
         // the current checkout.
         let env_mode = self.config.settings.thread_env_mode(project);
+        if let Some(leaving) = self.terminal_owner() {
+            self.release_popup_terminals(&leaving);
+        }
         self.swap_composer_draft(NEW_THREAD_DRAFT_KEY);
         // What was being read belonged to the thread being left, as it does when another
         // thread is opened.
         self.reader.forget();
         self.draft = Some(NewThreadDraft {
+            thread_id: commands::new_id(),
             project_id: project_id.to_string(),
             worktree: env_mode.as_deref() == Some("worktree"),
             model_selection,
@@ -2283,9 +2326,9 @@ impl App {
         }
     }
 
-    /// The open thread's terminals, live ones first.
+    /// The open thread or draft's terminals, live ones first.
     pub fn thread_terminals(&self) -> Vec<&crate::model::TerminalSummary> {
-        let Some(id) = self.current_thread_id.as_deref() else {
+        let Some(id) = self.terminal_owner() else {
             return Vec::new();
         };
         let mut list: Vec<&crate::model::TerminalSummary> = self
@@ -2304,7 +2347,7 @@ impl App {
     }
 
     fn open_terminals(&mut self) {
-        if self.thread.is_none() {
+        if self.terminal_owner().is_none() {
             self.toast("no thread open", true);
             return;
         }
@@ -2358,11 +2401,11 @@ impl App {
 
     /// Open a new shell for the thread and attach to it.
     fn new_terminal(&mut self) {
-        let Some(thread_id) = self.current_thread_id.clone() else {
+        let Some(thread_id) = self.terminal_owner() else {
             self.toast("no thread open", true);
             return;
         };
-        let Some(cwd) = self.thread_directory() else {
+        let Some(cwd) = self.working_directory() else {
             self.toast("thread has no directory", true);
             return;
         };
@@ -2423,6 +2466,7 @@ impl App {
     fn detach_terminal(&mut self) {
         self.handle.detach_terminal();
         self.pane = None;
+        self.pending_pane_command = None;
         self.mode = Mode::Normal;
         // Whatever ran in there probably touched the checkout.
         self.handle.refresh_vcs();
@@ -2738,7 +2782,7 @@ impl App {
     /// The parked sections are left out: they are collapsed most of the time, and a
     /// settled thread's worktree is usually gone.
     fn sync_vcs_watch(&mut self) {
-        self.vcs_cwd = self.watch_directory();
+        self.vcs_cwd = self.working_directory();
         let sections = self.shell.sections(&commands::now_iso());
         let mut cwds: Vec<String> = self.vcs_cwd.clone().into_iter().collect();
         for thread in sections.pinned.iter().chain(&sections.active) {
@@ -2806,7 +2850,7 @@ impl App {
     /// shut. The two calls share a task because the order is the point: the other way
     /// round the close takes the shell that was just warmed.
     fn end_terminal(&self, thread_id: String, terminal_id: String, warm: bool) {
-        let warm = warm.then(|| self.thread_directory()).flatten();
+        let warm = warm.then(|| self.working_directory()).flatten();
         let (cols, rows) = self.pane_size();
         let handle = self.handle.clone();
         tokio::spawn(async move {
@@ -2857,9 +2901,12 @@ impl App {
 
     /// Whether that terminal has a command running, as the metadata stream last said.
     fn terminal_busy(&self, terminal_id: &str) -> bool {
-        self.terminals
-            .iter()
-            .any(|t| t.terminal_id == terminal_id && t.has_running_subprocess)
+        let Some(owner) = self.terminal_owner() else {
+            return false;
+        };
+        self.terminals.iter().any(|t| {
+            t.thread_id == owner && t.terminal_id == terminal_id && t.has_running_subprocess
+        })
     }
 
     /// Tell the server the pane's size after a redraw changed it.
@@ -3466,7 +3513,7 @@ impl App {
         act: impl FnOnce(&mut Reader<Restore>, &reader::Thread<'_>) -> reader::Step,
     ) -> bool {
         let branch = self.checked_out_branch().map(str::to_string);
-        let directory = self.thread_directory();
+        let directory = self.working_directory();
         let Some(state) = self.thread.as_ref() else {
             self.reader.forget();
             return false;
@@ -3681,22 +3728,19 @@ impl App {
 
     // ── Git popup ──────────────────────────────────────────────────────
 
-    /// `gl` and `:git`: run the git command in the thread's directory. Inside tmux it opens
-    /// as a popup over the pane and tria keeps running; elsewhere tria steps aside until
-    /// the command exits.
-    /// `gl` and `:git`: run the git command in the thread's own terminal, in the pane.
-    /// Reuses one terminal per thread, so leaving and coming back finds it where it was.
+    /// Run a bound program in the thread or draft's terminal, in the current checkout.
+    /// The draft's terminal identity survives its first message.
     fn open_program(&mut self, key: char) {
         let Some(program) = self.programs.iter().find(|p| p.key == key).cloned() else {
             // Only `:git` reaches this: the key itself is not a key until it is bound.
             self.toast(format!("nothing is bound to g{key}"), true);
             return;
         };
-        let Some(dir) = self.thread_directory() else {
+        let Some(dir) = self.working_directory() else {
             self.toast("no thread open", true);
             return;
         };
-        let Some(thread_id) = self.current_thread_id.clone() else {
+        let Some(thread_id) = self.terminal_owner() else {
             self.toast("no thread open", true);
             return;
         };
@@ -3727,11 +3771,11 @@ impl App {
     /// `g!` and `:shell`: a plain shell for the thread, in the pane. Exiting it closes
     /// the popup, so this is a scratch shell rather than something to keep around.
     fn open_shell(&mut self) {
-        let Some(dir) = self.thread_directory() else {
+        let Some(dir) = self.working_directory() else {
             self.toast("no thread open", true);
             return;
         };
-        let Some(thread_id) = self.current_thread_id.clone() else {
+        let Some(thread_id) = self.terminal_owner() else {
             self.toast("no thread open", true);
             return;
         };
@@ -3830,7 +3874,7 @@ impl App {
     }
 
     fn external_dir(&self) -> String {
-        self.thread_directory().unwrap_or_else(|| {
+        self.working_directory().unwrap_or_else(|| {
             std::env::current_dir()
                 .map(|d| d.display().to_string())
                 .unwrap_or_else(|_| ".".to_string())
@@ -3899,23 +3943,28 @@ impl App {
 
     // ── tmux ───────────────────────────────────────────────────────────
 
-    /// Directory the current thread works in: its worktree, else the project root.
-    /// The checkout the header describes: the open thread's, or the project a new
-    /// thread would start in.
-    fn watch_directory(&self) -> Option<String> {
+    /// The checkout on screen: a draft's prepared worktree or project root, or the
+    /// existing thread's working directory. A planned worktree does not exist yet.
+    fn working_directory(&self) -> Option<String> {
         if let Some(draft) = &self.draft {
+            if let Some(checkout) = &draft.checkout {
+                return Some(checkout.worktree_path.clone());
+            }
             return self
                 .shell
                 .projects
                 .get(&draft.project_id)
                 .map(|p| p.workspace_root.clone());
         }
-        self.thread_directory()
-    }
-
-    fn thread_directory(&self) -> Option<String> {
         let shell = self.thread.as_ref().map(|t| &t.detail.shell)?;
         self.directory_of(shell)
+    }
+
+    fn terminal_owner(&self) -> Option<String> {
+        self.draft
+            .as_ref()
+            .map(|draft| draft.id().to_string())
+            .or_else(|| self.current_thread_id.clone())
     }
 
     /// Where a thread works: the worktree it was given one, and otherwise the project's
@@ -3955,7 +4004,7 @@ impl App {
     /// so it means nothing when the server is on another machine: there it is either not
     /// a directory here or, worse, a different one.
     fn reveal_directory(&mut self) {
-        let Some(dir) = self.thread_directory() else {
+        let Some(dir) = self.working_directory() else {
             self.toast("no thread open", true);
             return;
         };
@@ -3975,7 +4024,7 @@ impl App {
             self.toast("not running inside tmux", true);
             return None;
         }
-        let Some(dir) = self.thread_directory() else {
+        let Some(dir) = self.working_directory() else {
             self.toast("no thread open", true);
             return None;
         };
@@ -4348,6 +4397,7 @@ impl App {
         };
         draft.worktree = false;
         draft.checkout = Some(checkout);
+        self.sync_vcs_watch();
         self.toast(
             if on_head {
                 format!("#{number} is checked out; write what the thread is for")
@@ -4609,16 +4659,14 @@ impl App {
         self.shell.projects.get(project)?.lucide()
     }
 
-    /// The icon a project falls back to, which is a guess at what it is from its name.
-    /// Nobody sends this: the desktop app works it out for itself, and so does this, out
-    /// of the same name and by the same rules, so that a project nobody has given an
-    /// icon still looks like itself in both.
-    pub fn project_guessed_icon(&self, project: &str) -> Option<(&'static str, &'static str)> {
+    /// A chosen letter badge, or the default initials and colour from the project's name.
+    pub fn project_monogram(&self, project: &str) -> Option<(String, Option<&str>)> {
         let project = self.shell.projects.get(project)?;
-        Some(crate::lucide::guess(
-            &project.title,
-            &project.workspace_root,
-        ))
+        if let Some((text, colour)) = project.monogram() {
+            return Some((text.to_string(), colour));
+        }
+        let (text, colour) = crate::monogram::fallback(&project.title, &project.workspace_root);
+        Some((text, Some(colour)))
     }
 
     /// Hand a project an icon, for a test that draws one.
@@ -5422,7 +5470,7 @@ impl App {
         if !self.local_disk || self.reader.is_open() || self.tool_recovery_request.is_some() {
             return;
         }
-        let Some(cwd) = self.thread_directory() else {
+        let Some(cwd) = self.working_directory() else {
             return;
         };
         let Some(thread) = self.thread.as_mut() else {
@@ -6148,7 +6196,7 @@ impl App {
                     .map(|t| &t.detail.shell.model_selection)
             })
             .map(|selection| selection.instance_id.clone());
-        let cwd = self.watch_directory();
+        let cwd = self.working_directory();
         let items = self
             .config
             .providers
@@ -6485,12 +6533,77 @@ impl App {
 
     // ── Server updates ─────────────────────────────────────────────────
 
+    fn ask_attachment_images(&mut self) {
+        let Some(thread) = self.thread.as_mut() else {
+            return;
+        };
+        let thread_id = thread.id().to_string();
+        for attachment in thread
+            .detail
+            .messages
+            .iter()
+            .flat_map(|message| &message.attachments)
+            .filter(|attachment| attachment.is_image())
+        {
+            if thread.attachment_images.contains_key(&attachment.id) {
+                continue;
+            }
+            thread.attachment_images.insert(
+                attachment.id.clone(),
+                crate::state::AttachmentImage::Loading,
+            );
+            let attachment = attachment.clone();
+            let thread_id = thread_id.clone();
+            let handle = self.handle.clone();
+            let origin = self.origin.clone();
+            let events = self.events.clone();
+            tokio::spawn(async move {
+                let data = attachment_image(&handle, &origin, &attachment).await;
+                let _ = events.send(AppEvent::AttachmentImage {
+                    thread_id,
+                    attachment_id: attachment.id,
+                    data,
+                });
+            });
+        }
+    }
+
+    fn on_attachment_image(&mut self, thread_id: Id, attachment_id: Id, data: Option<String>) {
+        let Some(thread) = self
+            .thread
+            .as_mut()
+            .filter(|thread| thread.id() == thread_id)
+        else {
+            return;
+        };
+        if !thread.detail.messages.iter().any(|message| {
+            message
+                .attachments
+                .iter()
+                .any(|attachment| attachment.id == attachment_id)
+        }) {
+            return;
+        }
+        thread.attachment_images.insert(
+            attachment_id,
+            match data {
+                Some(data) => crate::state::AttachmentImage::Ready(data),
+                None => crate::state::AttachmentImage::Unavailable,
+            },
+        );
+        thread.touch();
+    }
+
     fn on_update(&mut self, update: Update) {
         let may_sync = matches!(update, Update::Shell(_) | Update::Thread { .. });
         let may_move = matches!(update, Update::Thread { .. });
+        let may_have_images = matches!(update, Update::Thread { .. } | Update::OlderPage { .. });
         self.apply_update(update);
         if may_sync {
             self.notice_pull_request_sync();
+        }
+        if may_have_images {
+            self.ask_attachment_images();
         }
         if may_move {
             self.follow_reading();
@@ -6511,7 +6624,7 @@ impl App {
                     && let Some(pane) = &self.pane
                 {
                     let (cols, rows) = pane.size();
-                    let cwd = self.thread_directory().unwrap_or_default();
+                    let cwd = self.working_directory().unwrap_or_default();
                     self.handle.attach_terminal(
                         &pane.thread_id,
                         &pane.terminal_id,
@@ -7160,6 +7273,26 @@ async fn fetch_image(url: &str, token: Option<&str>) -> Option<String> {
     Some(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
+async fn attachment_image(
+    handle: &session::Handle,
+    origin: &str,
+    attachment: &crate::model::Attachment,
+) -> Option<String> {
+    let answer = handle
+        .call(
+            "assets.createUrl",
+            json!({ "resource": {
+                "_tag": "attachment", "attachmentId": attachment.id,
+                "fileName": attachment.name, "mimeType": attachment.mime_type,
+            }}),
+        )
+        .await
+        .ok()?;
+    let relative = answer.get("relativeUrl")?.as_str()?;
+    let url = url::Url::parse(origin).ok()?.join(relative).ok()?;
+    fetch_image(url.as_str(), None).await
+}
+
 async fn favicon_bytes(handle: &session::Handle, origin: &str, cwd: &str) -> Option<Vec<u8>> {
     let answer = handle
         .call(
@@ -7227,6 +7360,9 @@ fn apply(app: &mut App, event: AppEvent) {
             }
         }
         AppEvent::Update(update) => app.on_update(*update),
+        AppEvent::OpenDirectory { root, reply } => {
+            let _ = reply.send(app.accept_open_directory(&root));
+        }
         AppEvent::Outbox(answer) => app.with_outbox(|outbox, here| outbox.on_answer(answer, here)),
         AppEvent::ThreadSearch { query, result } => app.on_thread_search(query, result),
         AppEvent::UsageRead(read) => app.on_usage_read(read),
@@ -7249,6 +7385,11 @@ fn apply(app: &mut App, event: AppEvent) {
         } => app.on_tool_recovery(request, thread_id, recovered),
         AppEvent::Transcript { agent_id, result } => app.on_transcript(agent_id, result),
         AppEvent::PullRequest { url, result } => app.on_pull_request(url, result),
+        AppEvent::AttachmentImage {
+            thread_id,
+            attachment_id,
+            data,
+        } => app.on_attachment_image(thread_id, attachment_id, data),
         AppEvent::PullRequestImage { url, data } => app.on_pull_request_image(url, data),
         AppEvent::PullRequestActivity { url, result } => app.on_pull_request_activity(url, result),
         AppEvent::LabelCandidates { url, result } => app.on_label_candidates(url, result),
@@ -7287,6 +7428,13 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     app.notify = launch.notify;
     app.new_thread_model = launch.model;
     app.open_at = launch.open_at;
+    let _handoff = match crate::handoff::listen(events_tx, &app.origin).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            tracing::warn!(%err, "registering tria for tmux directory opens");
+            None
+        }
+    };
     if launch.started_server {
         // Said again here because the line printed before the screen was taken over is
         // gone, and starting a server that outlives tria is worth knowing about.
@@ -7395,6 +7543,85 @@ mod tests {
         agent_progresses, open_detail, stacked_thread, thread_with_a_followable_agent,
         transcript_saying,
     };
+
+    #[tokio::test]
+    async fn attachment_loading_uses_asset_urls_once_and_rebuilds_the_message() {
+        use base64::Engine;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let data = crate::picture::test_png(120, 60);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&data)
+            .unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let length = stream.read(&mut request).await.unwrap();
+            let request = std::str::from_utf8(&request[..length]).unwrap();
+            assert!(request.starts_with("GET /asset/image?token=signed "));
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        });
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.origin = origin;
+        let snapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1, "thread": {
+                "id": "t1", "projectId": "p1", "title": "Test",
+                "modelSelection": {"instanceId": "codex", "model": "m"},
+                "messages": [{"id": "m1", "role": "user", "text": "", "attachments": [{
+                    "type": "image", "id": "image-1", "name": "Screenshot.png", "mimeType": "image/png"
+                }]}], "activities": []
+            }
+        })).unwrap();
+        app.thread = Some(ThreadState::from_snapshot(snapshot));
+        app.ask_attachment_images();
+        app.ask_attachment_images();
+        let crate::session::Request::Call {
+            tag,
+            payload,
+            reply,
+        } = requests.recv().await.unwrap()
+        else {
+            panic!("expected an asset request")
+        };
+        assert_eq!(tag, "assets.createUrl");
+        assert_eq!(
+            payload,
+            json!({ "resource": { "_tag": "attachment", "attachmentId": "image-1", "fileName": "Screenshot.png", "mimeType": "image/png" } })
+        );
+        reply
+            .send(Ok(json!({"relativeUrl": "/asset/image?token=signed"})))
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let revision = app.thread.as_ref().unwrap().revision;
+        apply(&mut app, event);
+        assert!(app.thread.as_ref().unwrap().revision > revision);
+        assert!(
+            matches!(app.thread.as_ref().unwrap().attachment_images.get("image-1"), Some(crate::state::AttachmentImage::Ready(loaded)) if loaded == &data)
+        );
+        app.ask_attachment_images();
+        assert!(requests.try_recv().is_err());
+        serving.await.unwrap();
+        app.on_attachment_image("elsewhere".into(), "image-1".into(), None);
+        assert!(matches!(
+            app.thread
+                .as_ref()
+                .unwrap()
+                .attachment_images
+                .get("image-1"),
+            Some(crate::state::AttachmentImage::Ready(_))
+        ));
+    }
 
     #[test]
     fn older_pages_keep_turn_completions_without_duplicates() {
@@ -7646,6 +7873,161 @@ mod tests {
 
     /// `g` and a key run whatever the config file put there, in the thread's own
     /// terminal — the binding tria ships with is only the first entry in that list.
+    #[tokio::test]
+    async fn project_commands_work_before_the_first_message_and_keep_their_terminal_identity() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let project_id = project(&mut app);
+        app.programs.push(crate::config::Program {
+            key: 'b',
+            command: "yazi".into(),
+        });
+        app.start_new_thread(&project_id);
+        let id = app.draft.as_ref().unwrap().id().to_string();
+        app.composer.set_text("the first message");
+        assert_eq!(app.external_dir(), "/src/p");
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(key('g'));
+        app.on_key(key('l'));
+        assert_eq!(app.mode, Mode::TerminalPane);
+        assert_eq!(app.pane.as_ref().unwrap().thread_id, id);
+        assert!(app.current_thread_id.is_none() && app.thread.is_none());
+        loop {
+            match asked(&mut requests)
+                .await
+                .expect("attaches a draft terminal")
+            {
+                crate::session::Request::Attach {
+                    thread_id,
+                    terminal_id,
+                    cwd,
+                    ..
+                } => {
+                    assert_eq!(thread_id, id);
+                    assert_eq!(terminal_id, "tria-gl");
+                    assert_eq!(cwd, "/src/p");
+                    break;
+                }
+                crate::session::Request::Dispatch { .. } => {
+                    panic!("opening git must not send a message")
+                }
+                _ => {}
+            }
+        }
+        // A lazygit in another thread does not suppress this draft's startup command.
+        app.terminals = serde_json::from_value(json!([
+            {"threadId": "other", "terminalId": "tria-gl", "cwd": "/other", "status": "running", "hasRunningSubprocess": true},
+            {"threadId": id, "terminalId": "tria-gl", "cwd": "/src/p", "status": "running"}
+        ])).unwrap();
+        app.apply_terminal_stream(
+            serde_json::from_value(json!({
+                "type": "snapshot", "snapshot": {"threadId": id, "terminalId": "tria-gl",
+                    "cwd": "/src/p", "status": "running", "history": "", "label": "shell"}
+            }))
+            .unwrap(),
+        );
+        let crate::session::Request::Call {
+            tag,
+            payload,
+            reply,
+        } = asked(&mut requests).await.unwrap()
+        else {
+            panic!("types the program into the draft's terminal")
+        };
+        assert_eq!(tag, "terminal.write");
+        assert_eq!(payload["threadId"], id);
+        assert_eq!(payload["data"], "exec lazygit\r");
+        let _ = reply.send(Ok(Value::Null));
+        app.detach_terminal();
+        app.run_command("yazi");
+        assert_eq!(app.pane.as_ref().unwrap().thread_id, id);
+        assert_eq!(app.pending_pane_command.as_deref(), Some("exec yazi\r"));
+        app.detach_terminal();
+        app.run_command("shell");
+        assert_eq!(app.pane.as_ref().unwrap().thread_id, id);
+        assert_eq!(
+            app.pending_pane_command, None,
+            "the prior command stays with its popup"
+        );
+        app.detach_terminal();
+        app.run_command("terminals");
+        assert_eq!(app.mode, Mode::Terminals);
+        assert_eq!(app.thread_terminals().len(), 1);
+        assert_eq!(app.thread_terminals()[0].thread_id, id);
+        app.new_terminal();
+        loop {
+            match asked(&mut requests).await.expect("opens a draft shell") {
+                crate::session::Request::Call {
+                    tag,
+                    payload,
+                    reply,
+                } if tag == "terminal.open" => {
+                    assert_eq!(payload["threadId"], id);
+                    assert_eq!(payload["cwd"], "/src/p");
+                    let _ = reply.send(Ok(Value::Null));
+                    break;
+                }
+                crate::session::Request::Dispatch { .. } => {
+                    panic!("commands must not start the agent")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(app.composer.text(), "the first message");
+        app.mode = Mode::Normal;
+        app.send_message();
+        let command = sent_command(&mut requests).await.unwrap();
+        assert_eq!(command["threadId"], id);
+        assert_eq!(
+            command["bootstrap"]["createThread"]["projectId"],
+            project_id
+        );
+        assert_eq!(app.current_thread_id.as_deref(), Some(id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn draft_commands_use_a_prepared_checkout_and_otherwise_the_project_directory() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let project_id = project(&mut app);
+        app.start_new_thread(&project_id);
+        app.draft.as_mut().unwrap().worktree = true;
+        assert_eq!(app.working_directory().as_deref(), Some("/src/p"));
+        // A requested worktree has not been made yet. A prepared checkout has.
+        app.on_checkout_prepared(
+            project_id,
+            "prepared-thread".into(),
+            None,
+            Ok(json!({
+                "pullRequest": {"number": 7}, "branch": "pr/7",
+                "worktreePath": "/worktrees/p/pr7", "isOnPullRequestHead": true
+            })),
+        );
+        assert_eq!(app.working_directory().as_deref(), Some("/worktrees/p/pr7"));
+        assert_eq!(app.external_dir(), "/worktrees/p/pr7");
+        assert_eq!(app.vcs_cwd.as_deref(), Some("/worktrees/p/pr7"));
+        app.open_shell();
+        assert_eq!(app.pane.as_ref().unwrap().thread_id, "prepared-thread");
+        loop {
+            match asked(&mut requests)
+                .await
+                .expect("attaches to the prepared checkout")
+            {
+                crate::session::Request::Attach { thread_id, cwd, .. } => {
+                    assert_eq!(thread_id, "prepared-thread");
+                    assert_eq!(cwd, "/worktrees/p/pr7");
+                    break;
+                }
+                crate::session::Request::Dispatch { .. } => panic!("no message has been sent"),
+                _ => {}
+            }
+        }
+    }
+
+    /// A configured key runs its command in the thread's own terminal.
     #[tokio::test]
     async fn a_program_the_config_bound_runs_on_its_key() {
         let (handle, _requests) = crate::session::Handle::detached();
@@ -8771,9 +9153,101 @@ mod tests {
         json!({"id": id, "title": title, "workspaceRoot": root})
     }
 
-    /// `tria open` in a directory the server already has a project for goes straight to
-    /// a new thread in it — and so does one run inside that project, since `src/` of a
-    /// project is that project rather than a second one beside it.
+    #[tokio::test]
+    async fn a_tmux_directory_handoff_preserves_the_message_in_the_previous_thread() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.new_thread_model = Some(ModelSelection {
+            instance_id: "instance".into(),
+            model: "a-model".into(),
+            options: Vec::new(),
+        });
+        let root = std::env::current_dir().unwrap().display().to_string();
+        shell_with(&mut app, json!([project_json("asked", "tria", &root)]));
+        app.thread = Some(running_thread());
+        app.current_thread_id = Some("previous".into());
+        app.composer.set_text("message still being written");
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        apply(
+            &mut app,
+            AppEvent::OpenDirectory {
+                root: root.clone(),
+                reply,
+            },
+        );
+        assert_eq!(answer.await.unwrap(), Ok(()));
+        assert_eq!(app.draft.as_ref().unwrap().project_id, "asked");
+        assert_eq!(app.working_directory().as_deref(), Some(root.as_str()));
+        assert_eq!(
+            app.outbox.parked("previous"),
+            Some("message still being written")
+        );
+        assert!(app.composer.is_empty());
+        assert_eq!(app.mode, Mode::Insert);
+        assert!(sent_no_command(&mut requests).await);
+
+        // A new-thread draft has no thread to park its text on. Keep its project and text.
+        app.composer.set_text("unsent new-thread message");
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        apply(
+            &mut app,
+            AppEvent::OpenDirectory {
+                root: format!("{root}/src"),
+                reply,
+            },
+        );
+        assert!(
+            answer
+                .await
+                .unwrap()
+                .unwrap_err()
+                .contains("unsent new-thread draft")
+        );
+        assert_eq!(app.draft.as_ref().unwrap().project_id, "asked");
+        assert_eq!(app.composer.text(), "unsent new-thread message");
+        assert!(sent_no_command(&mut requests).await);
+        app.open_thread("previous");
+        assert_eq!(app.composer.text(), "message still being written");
+        assert!(app.accept_open_directory(&root).is_err());
+        assert_eq!(app.current_thread_id.as_deref(), Some("previous"));
+        assert_eq!(
+            app.outbox.parked(NEW_THREAD_DRAFT_KEY),
+            Some("unsent new-thread message")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tmux_directory_handoff_waits_for_the_project_list_and_validates_the_path() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.new_thread_model = Some(ModelSelection {
+            instance_id: "instance".into(),
+            model: "a-model".into(),
+            options: Vec::new(),
+        });
+        let root = std::env::current_dir().unwrap().display().to_string();
+        let missing = format!("{root}/missing-{}", commands::new_id());
+        assert!(
+            app.accept_open_directory(&missing)
+                .unwrap_err()
+                .contains("no directory")
+        );
+        assert!(app.open_at.is_none());
+        assert_eq!(app.accept_open_directory(&root), Ok(()));
+        assert!(app.draft.is_none());
+        assert_eq!(app.open_at.as_deref(), Some(root.as_str()));
+        assert!(
+            app.accept_open_directory(&root).is_err(),
+            "a pending open is not replaced"
+        );
+        shell_with(&mut app, json!([project_json("asked", "tria", &root)]));
+        assert_eq!(app.draft.as_ref().unwrap().project_id, "asked");
+        assert!(app.open_at.is_none());
+    }
+
+    /// An exact project match is reused even when its ancestors also have projects.
     #[tokio::test]
     async fn opening_a_directory_starts_a_thread_in_its_project() {
         let (handle, mut requests) = crate::session::Handle::detached();
@@ -8784,14 +9258,14 @@ mod tests {
             model: "a-model".into(),
             options: Vec::new(),
         });
-        app.open_at = Some("/src/tria/src".into());
+        app.open_at = Some("/src/tria".into());
 
         shell_with(
             &mut app,
             json!([
                 project_json("p1", "tria", "/src/tria"),
                 project_json("p2", "other", "/src/other"),
-                // A project further in wins over one it sits inside.
+                project_json("parent", "parent", "/src"),
                 project_json("p3", "inner", "/src/tria/src/inner"),
             ]),
         );
@@ -8806,8 +9280,7 @@ mod tests {
         );
     }
 
-    /// A directory with no project of its own gets one — for the checkout it is in,
-    /// named after it — and the thread waits for the server to send the project back.
+    /// A directory gets its own project even inside a registered home or repository.
     #[tokio::test]
     async fn opening_a_directory_that_is_not_a_project_adds_one() {
         let (handle, mut requests) = crate::session::Handle::detached();
@@ -8818,35 +9291,51 @@ mod tests {
             model: "a-model".into(),
             options: Vec::new(),
         });
-        // The repository tria itself is in, so the checkout is a real one.
+        // A subdirectory of a real checkout must keep the directory that was requested.
         let here = std::env::current_dir().unwrap().display().to_string();
-        app.open_at = Some(format!("{here}/src"));
+        let home = dirs::home_dir().unwrap().display().to_string();
+        let root = format!("{here}/src");
+        app.open_at = Some(root.clone());
+        let projects = json!([
+            project_json("home", "home", &home),
+            project_json("parent", "tria", &here),
+            project_json("p2", "other", "/src/other"),
+        ]);
 
-        shell_with(&mut app, json!([project_json("p2", "other", "/src/other")]));
+        shell_with(&mut app, projects.clone());
         assert!(app.draft.is_none(), "there is no project to draft in yet");
+        assert!(app.current_thread_id.is_none());
 
         let command = sent_command(&mut requests)
             .await
             .expect("it asks for the project");
         assert_eq!(command["type"], "project.create");
-        assert_eq!(command["workspaceRoot"], here, "the checkout, not src/");
-        assert_eq!(command["title"], "tria");
+        assert_eq!(command["workspaceRoot"], root);
+        assert_eq!(command["title"], "src");
+        let id = command["projectId"].as_str().unwrap();
 
         // Asked for once, however many times the list changes in the meantime.
-        shell_with(&mut app, json!([project_json("p2", "other", "/src/other")]));
+        shell_with(&mut app, projects);
         assert!(sent_no_command(&mut requests).await);
 
         // And when the server sends it back, that is the thread.
         app.on_update(crate::session::Update::Shell(
             crate::model::ShellItem::ProjectUpserted {
                 sequence: 2,
-                project: serde_json::from_value(project_json("p9", "tria", &here)).unwrap(),
+                project: serde_json::from_value(project_json(id, "src", &root)).unwrap(),
             },
         ));
-        assert_eq!(
-            app.draft.as_ref().map(|d| d.project_id.as_str()),
-            Some("p9")
-        );
+        assert_eq!(app.draft.as_ref().map(|d| d.project_id.as_str()), Some(id));
+        assert_eq!(app.working_directory().as_deref(), Some(root.as_str()));
+        assert!(app.open_at.is_none());
+        app.composer.set_text("hello");
+        app.send_message();
+        let turn = sent_command(&mut requests)
+            .await
+            .expect("the thread starts");
+        assert_eq!(turn["type"], "thread.turn.start");
+        assert_eq!(turn["bootstrap"]["createThread"]["projectId"], id);
+        assert!(turn["bootstrap"]["createThread"]["worktreePath"].is_null());
     }
 
     /// Sending empties the composer, which is what sending looks like — but a message
@@ -11126,6 +11615,46 @@ mod link_tests {
             .into_iter()
             .map(|(from, to)| &text[from..to])
             .collect()
+    }
+
+    #[test]
+    fn a_markdown_labels_cells_resolve_for_clicks_and_keyboard_opening() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = super::App::new(handle, events);
+        let snapshot = serde_json::from_value(serde_json::json!({
+            "snapshotSequence": 1,
+            "thread": {
+                "id": "t1", "projectId": "p1", "title": "Test",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "m"},
+                "runtimeMode": "full-access", "latestTurn": null, "session": null,
+                "messages": [{"id": "m1", "role": "assistant", "text": "[#32](https://github.com/Pajn/fallout/pull/32), done."}],
+                "activities": []
+            }
+        })).unwrap();
+        app.thread = Some(crate::state::ThreadState::from_snapshot(snapshot));
+        app.focus = super::Focus::Chat;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 16)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let link = app.links[0].clone();
+        for column in link.start..link.end {
+            assert_eq!(
+                app.link_at(ratatui::layout::Position::new(column, link.row)),
+                Some(link.url.clone())
+            );
+        }
+        assert_eq!(
+            app.link_at(ratatui::layout::Position::new(link.end, link.row)),
+            None
+        );
+        app.chat_view.click(
+            app.chat_view.line_at((link.row - app.chat_area.y) as usize),
+            link.start - app.chat_area.x,
+        );
+        assert_eq!(app.link_at_cursor(), Some(link.url));
     }
 
     #[test]
