@@ -20,6 +20,108 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub const DEFAULT_COMMAND: &str = "t3 serve";
 
+/// Watches discovery without changing the connection. A second server can share the
+/// first one's database and execute its turns, even when tria stays on the first socket.
+pub struct WarningMonitor {
+    pub updates: tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for WarningMonitor {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+impl WarningMonitor {
+    /// No local discovery for SSH forwards or remote connections.
+    pub fn new(origin: Option<String>) -> Self {
+        Self::watch(
+            origin.filter(|origin| is_local(origin)),
+            crate::discovery::runtime_state_path().ok(),
+            Duration::from_secs(5),
+        )
+    }
+
+    fn watch(origin: Option<String>, path: Option<std::path::PathBuf>, period: Duration) -> Self {
+        let (updates, received) = tokio::sync::mpsc::unbounded_channel();
+        let task = origin.zip(path).map(|(origin, path)| {
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(period);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut previous = None;
+                loop {
+                    tick.tick().await;
+                    let runtime = crate::discovery::read_runtime(&path).ok();
+                    let warning = match runtime {
+                        Some(runtime) => duplicate_warning(&origin, &runtime).await,
+                        None => None,
+                    };
+                    if warning != previous {
+                        if let Some(warning) = &warning {
+                            tracing::warn!(%warning, "another local T3 server detected");
+                        }
+                        previous = warning.clone();
+                        if updates.send(warning).is_err() {
+                            break;
+                        }
+                    }
+                }
+            })
+        });
+        Self {
+            updates: received,
+            task,
+        }
+    }
+}
+
+/// Loopback aliases and a trailing slash can name the very same listener.
+fn same_local_listener(first: &str, second: &str) -> bool {
+    fn host(url: &url::Url) -> String {
+        match url.host_str().unwrap_or_default() {
+            "localhost" => "127.0.0.1".into(),
+            host => host.to_owned(),
+        }
+    }
+    match (url::Url::parse(first), url::Url::parse(second)) {
+        (Ok(first), Ok(second)) => {
+            first.scheme() == second.scheme()
+                && host(&first) == host(&second)
+                && first.port_or_known_default() == second.port_or_known_default()
+        }
+        _ => first == second,
+    }
+}
+
+async fn duplicate_warning(
+    connected: &str,
+    runtime: &crate::discovery::ServerRuntimeState,
+) -> Option<String> {
+    if !is_local(connected)
+        || !is_local(&runtime.origin)
+        || same_local_listener(connected, &runtime.origin)
+    {
+        return None;
+    }
+    let (connected_up, other_up) =
+        tokio::join!(is_listening(connected), is_listening(&runtime.origin),);
+    if !connected_up || !other_up {
+        return None;
+    }
+    let pid = runtime
+        .pid
+        .map(|pid| format!(" (PID {pid})"))
+        .unwrap_or_default();
+    Some(format!(
+        "Two local T3 servers may execute threads twice. Stop one server.\n\
+         Connected: {connected}. Other: {}{pid}. Tria stays on its current connection.",
+        runtime.origin,
+    ))
+}
+
 /// Whether something accepts connections at the origin. It says nothing about what is
 /// listening: a port answered by something else is a problem to report, not one to fix
 /// by starting a second server on top of it.
@@ -170,11 +272,115 @@ async fn start(command: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn duplicate_warning_requires_two_distinct_live_local_servers() {
+        assert!(!same_local_listener(
+            "http://127.0.0.1:3773",
+            "http://[::1]:3773"
+        ));
+        let (_connected, origin) = listener().await;
+        let (other, other_origin) = listener().await;
+        let mut runtime = crate::discovery::ServerRuntimeState {
+            origin: other_origin.clone(),
+            pid: Some(123),
+        };
+        let warning = duplicate_warning(&origin, &runtime).await.unwrap();
+        assert!(warning.contains(&origin));
+        assert!(warning.contains(&other_origin));
+        assert!(warning.contains("PID 123"));
+        assert!(warning.contains("execute threads twice"));
+
+        runtime.origin = origin.replace("127.0.0.1", "localhost") + "/";
+        assert!(duplicate_warning(&origin, &runtime).await.is_none());
+        runtime.origin = "https://example.com:3773".into();
+        assert!(duplicate_warning(&origin, &runtime).await.is_none());
+        runtime.origin = other_origin;
+        assert!(
+            duplicate_warning("https://example.com", &runtime)
+                .await
+                .is_none()
+        );
+        drop(other);
+        let (_reserved, absent) = absent_server();
+        runtime.origin = absent;
+        assert!(duplicate_warning(&origin, &runtime).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn warning_monitor_notices_runtime_changes_and_clears_for_unavailable_server() {
+        let (_connected, origin) = listener().await;
+        let (other, other_origin) = listener().await;
+        let path = std::env::temp_dir().join(format!("tria-runtime-{}.json", uuid::Uuid::new_v4()));
+        let write = |origin: &str| {
+            std::fs::write(
+                &path,
+                serde_json::json!({ "origin": origin, "pid": 123 }).to_string(),
+            )
+            .unwrap();
+        };
+        write(&origin);
+        let mut monitor = WarningMonitor::watch(
+            Some(origin.clone()),
+            Some(path.clone()),
+            Duration::from_millis(10),
+        );
+        // The first check names our own server and produces no warning.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), monitor.updates.recv())
+                .await
+                .is_err()
+        );
+        write(&other_origin);
+        let warning = tokio::time::timeout(Duration::from_secs(2), monitor.updates.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(warning.contains(&origin));
+        assert!(warning.contains(&other_origin));
+        // A persistent warning needs no repeated notifications.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), monitor.updates.recv())
+                .await
+                .is_err()
+        );
+        drop(other);
+        let (_reserved, absent) = absent_server();
+        write(&absent);
+        let cleared = tokio::time::timeout(Duration::from_secs(2), monitor.updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cleared.is_none());
+        let task = monitor.task.as_ref().unwrap().abort_handle();
+        drop(monitor);
+        tokio::task::yield_now().await;
+        assert!(task.is_finished());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_connections_do_not_watch_local_discovery() {
+        let monitor = WarningMonitor::new(Some("https://example.com".into()));
+        assert!(monitor.task.is_none());
+        let monitor = WarningMonitor::new(None);
+        assert!(monitor.task.is_none());
+    }
+
     /// A socket that is accepting, and the origin naming it.
     async fn listener() -> (tokio::net::TcpListener, String) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         (listener, format!("http://127.0.0.1:{port}"))
+    }
+
+    /// Reserve the port without accepting connections, so a parallel test cannot
+    /// reuse it and make an absent server appear alive.
+    fn absent_server() -> (tokio::net::TcpSocket, String) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (socket, format!("http://127.0.0.1:{port}"))
     }
 
     #[test]
@@ -198,10 +404,10 @@ mod tests {
 
     #[tokio::test]
     async fn listening_is_about_the_socket_answering() {
-        let (listener, origin) = listener().await;
+        let (_listener, origin) = listener().await;
         assert!(is_listening(&origin).await);
-        drop(listener);
-        assert!(!is_listening(&origin).await);
+        let (_reserved, absent) = absent_server();
+        assert!(!is_listening(&absent).await);
     }
 
     #[tokio::test]
@@ -235,8 +441,7 @@ mod tests {
     #[tokio::test]
     async fn a_server_running_elsewhere_is_used_rather_than_starting_another() {
         let (_running, running) = listener().await;
-        let (gone, stored) = listener().await;
-        drop(gone);
+        let (_reserved, stored) = absent_server();
         // Starting one is turned off, so reaching the start would be an error.
         let (used, started) = ensure_among(Some(stored), Some(running.clone()), "")
             .await
@@ -247,8 +452,7 @@ mod tests {
     /// A runtime file left behind by a server that has gone names nothing to use.
     #[tokio::test]
     async fn a_runtime_file_nothing_answers_at_is_passed_over() {
-        let (gone, left_behind) = listener().await;
-        drop(gone);
+        let (_reserved, left_behind) = absent_server();
         let err = ensure_among(None, Some(left_behind), "")
             .await
             .unwrap_err()

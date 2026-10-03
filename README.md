@@ -78,6 +78,13 @@ terminals, all of which outlive a chat window, so quitting tria is not a reason 
 down. The next `tria` finds it and connects straight away. Stop it like any other process, or
 install it as a background service with `t3 service install` and it will always be up.
 
+If local discovery names another live server while Tria's server is still answering,
+Tria shows a persistent warning with both addresses and the other server's PID when
+available. It checks at startup and every five seconds, keeps its current connection,
+and clears the warning when one server stops. Two servers using the same T3 home can
+execute the same threads twice; stop one server to resolve that. SSH and remote
+connections do not check this machine's runtime file.
+
 Set `server_command` in the config file to start it some other way:
 
 ```toml

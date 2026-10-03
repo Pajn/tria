@@ -419,6 +419,7 @@ fn building(command: Value, implementing: Option<outbox::Implementing>) -> Value
 }
 
 pub enum AppEvent {
+    ServerWarning(Option<String>),
     ToolRecovery {
         request: String,
         thread_id: Id,
@@ -594,6 +595,7 @@ pub struct App {
     pub composer_area: Rect,
     /// Where the server is, for the files it serves over HTTP rather than the socket.
     pub origin: String,
+    pub server_warning: Option<String>,
     /// The icon each project is known by, once asked for. `None` where the server found
     /// the project none.
     favicons: HashMap<Id, Option<Vec<u8>>>,
@@ -755,6 +757,7 @@ impl App {
             chat_area: Rect::default(),
             composer_area: Rect::default(),
             origin: String::new(),
+            server_warning: None,
             favicons: HashMap::new(),
             search_input: None,
             terminals: Vec::new(),
@@ -7332,6 +7335,7 @@ fn mark_of(thread: &crate::model::ThreadShell) -> String {
 /// costs one screen rather than one each.
 fn apply(app: &mut App, event: AppEvent) {
     match event {
+        AppEvent::ServerWarning(warning) => app.server_warning = warning,
         AppEvent::Terminal(Event::Key(key)) => app.on_key(key),
         AppEvent::Terminal(Event::Mouse(mouse)) => app.on_mouse(mouse),
         AppEvent::Terminal(Event::Paste(text)) => app.on_paste(&text),
@@ -7413,6 +7417,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     // A thread's images are files on the server's disk, which are ours to read only when
     // that disk is this one.
     let local_files = crate::server::is_local(&origin);
+    let mut server_warning = crate::server::WarningMonitor::new(Some(origin.clone()));
     let (handle, mut updates) = session::spawn(origin.clone(), token);
     let (events_tx, mut events) = mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new(handle, events_tx.clone());
@@ -7492,6 +7497,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
                 None => break Ok(()),
             },
             Some(ev) = events.recv() => ev,
+            Some(warning) = server_warning.updates.recv() => AppEvent::ServerWarning(warning),
             _ = tick.tick() => AppEvent::Tick,
         };
         apply(&mut app, event);
@@ -7534,6 +7540,24 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn server_warning_does_not_change_the_connection_or_dispatch_commands() {
+        let (handle, mut requests) = session::Handle::detached();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.origin = "http://127.0.0.1:3773".into();
+        apply(
+            &mut app,
+            AppEvent::ServerWarning(Some("Two local servers".into())),
+        );
+        app.toast("unrelated notice", false);
+        assert_eq!(app.server_warning.as_deref(), Some("Two local servers"));
+        assert_eq!(app.origin, "http://127.0.0.1:3773");
+        assert!(requests.try_recv().is_err());
+        apply(&mut app, AppEvent::ServerWarning(None));
+        assert!(app.server_warning.is_none());
+    }
+
     use tokio::sync::mpsc;
 
     use super::*;

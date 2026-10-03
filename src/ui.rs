@@ -94,9 +94,28 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Trouble that outlasts a toast gets a row of its own under the header, and only
     // takes one when there is some.
     let trouble = app.trouble();
-    let [header, banner, chat, approvals, questions, composer, status] = Layout::vertical([
+    let server_warning = app.server_warning.as_ref().map(|warning| {
+        Paragraph::new(format!("⚠ {warning}"))
+            .style(Style::default().fg(Color::Yellow))
+            .wrap(Wrap { trim: false })
+    });
+    let warning_rows = server_warning
+        .as_ref()
+        .map(|warning| warning.line_count(main_area.width) as u16)
+        .unwrap_or(0);
+    let [
+        header,
+        banner,
+        warning,
+        chat,
+        approvals,
+        questions,
+        composer,
+        status,
+    ] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(u16::from(trouble.is_some())),
+        Constraint::Length(warning_rows),
         Constraint::Fill(1),
         Constraint::Length(approval_rows),
         Constraint::Length(question_rows),
@@ -106,6 +125,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     .areas(main_area);
 
     draw_header(frame, app, header);
+    if let Some(server_warning) = server_warning {
+        frame.render_widget(server_warning, warning);
+    }
     if let Some(trouble) = trouble {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -4404,6 +4426,30 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn server_warning_wraps_and_keeps_connection_errors_visible() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.sidebar_visible = false;
+        app.status = Status::Failed("Connection refused".into());
+        app.server_warning = Some(
+            "Two local T3 servers may execute threads twice. Stop one server.\n\
+             Connected: http://127.0.0.1:3773. Other: http://127.0.0.1:58865 (PID 97310). Tria stays on its current connection."
+                .into(),
+        );
+        for width in [60, 120] {
+            let rendered = chat(width, &mut app);
+            let words = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains("Connection refused"));
+            assert!(words.contains("Two local T3 servers may execute threads twice"));
+            assert!(words.contains("PID 97310"));
+            assert!(words.contains("Tria stays on its current connection."));
+        }
+        app.server_warning = None;
+        assert!(!chat(120, &mut app).contains("Two local T3 servers"));
     }
 
     fn chat(width: u16, app: &mut App) -> String {
