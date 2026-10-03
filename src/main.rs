@@ -16,6 +16,7 @@ mod monogram;
 mod notify;
 mod outbox;
 mod picture;
+mod project;
 mod pull_request;
 mod question;
 mod reader;
@@ -24,6 +25,7 @@ mod rpc;
 mod server;
 mod session;
 mod sidebar_view;
+mod ssh;
 mod state;
 mod subagent;
 mod table;
@@ -79,10 +81,12 @@ async fn main() -> Result<()> {
         .clone()
         .or_else(|| cfg.url.clone())
         .or_else(|| discovery::local_origin().ok());
+    let use_saved_ssh = cli.url.is_none() && cfg.active_ssh.is_some();
     match cli.command {
         Some(Command::Pair { credential }) => {
             let origin = known.context("no running local server found")?;
             let token = auth::exchange_pairing_credential(&origin, &credential).await?;
+            cfg.active_ssh = None;
             cfg.url = Some(origin.clone());
             cfg.token = Some(token.access_token);
             cfg.save()?;
@@ -90,23 +94,33 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Probe) => {
-            let origin = known.context("no running local server found")?;
-            probe(&origin, &cfg).await
+            let connection = command_connection(known, &cfg, use_saved_ssh).await?;
+            probe(&connection.origin, &connection.token).await
         }
         // The directory is read before anything else: a path that is not there is worth
         // saying on the terminal it was typed at, rather than in a toast behind a screen
         // that has already been taken over.
         Some(Command::Open { path }) => {
-            let open_at = workspace::root(path.as_deref())?;
-            if handoff::reuse(&open_at, known.as_deref()).await? {
+            let open_at = if use_saved_ssh {
+                let path =
+                    path.context("a remote `tria open` needs an absolute server-side path")?;
+                anyhow::ensure!(
+                    path.starts_with('/'),
+                    "a remote `tria open` needs an absolute server-side path"
+                );
+                path
+            } else {
+                workspace::root(path.as_deref())?
+            };
+            if !use_saved_ssh && handoff::reuse(&open_at, known.as_deref()).await? {
                 return Ok(());
             }
-            chat(known, &cfg, Some(open_at)).await
+            chat(known, &cfg, Some(open_at), use_saved_ssh).await
         }
-        None => chat(known, &cfg, None).await,
+        None => chat(known, &cfg, None, use_saved_ssh).await,
         Some(Command::Dump { thread_id, seconds }) => {
-            let origin = known.context("no running local server found")?;
-            dump(&origin, &cfg, &thread_id, seconds).await
+            let connection = command_connection(known, &cfg, use_saved_ssh).await?;
+            dump(&connection.origin, &connection.token, &thread_id, seconds).await
         }
     }
 }
@@ -114,16 +128,44 @@ async fn main() -> Result<()> {
 /// Take over the terminal and talk to the server, starting one where none is running.
 /// `open_at` is the directory `tria open` named, which becomes a new thread in the
 /// project for it once the project list has arrived.
-async fn chat(known: Option<String>, cfg: &config::Config, open_at: Option<String>) -> Result<()> {
-    let token = cfg.token.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no token stored; run `tria pair <credential>` first (mint one with `t3 pair`)"
-        )
-    })?;
+async fn chat(
+    known: Option<String>,
+    cfg: &config::Config,
+    open_at: Option<String>,
+    use_saved_ssh: bool,
+) -> Result<()> {
     init_logging()?;
     // Only here: the chat is what a person opens expecting it to work, and the
     // subcommands are for a server that is already up.
-    let (origin, started) = server::ensure(known, &cfg.server_command()).await?;
+    let (connection, started) = if use_saved_ssh {
+        (None, false)
+    } else if cfg.token.is_none() && open_at.is_some() {
+        (
+            Some(project::Connection::prepare(project::Target::Local).await?),
+            false,
+        )
+    } else if let Some(token) = cfg.token.clone() {
+        let (origin, started) = server::ensure(known, &cfg.server_command()).await?;
+        let local_disk = server::is_local(&origin);
+        (
+            Some(project::Connection {
+                origin,
+                token,
+                target: local_disk.then_some(project::Target::Local),
+                local_disk,
+                _tunnel: None,
+            }),
+            started,
+        )
+    } else {
+        (None, false)
+    };
+    if cfg.token.is_none()
+        && open_at.is_some()
+        && let Some(connection) = &connection
+    {
+        connection.remember()?;
+    }
     let (programs, mut refused) = cfg.programs();
     let (sidebar_layout, refused_layout) = cfg.sidebar_layout();
     refused.extend(refused_layout);
@@ -135,19 +177,47 @@ async fn chat(known: Option<String>, cfg: &config::Config, open_at: Option<Strin
         sidebar_layout,
         refused,
         editor: cfg.editor(),
-        model: cfg.model.clone(),
+        model: if use_saved_ssh {
+            None
+        } else {
+            cfg.model.clone()
+        },
         prefix_timeout: cfg.prefix_timeout(),
         notify,
         open_at,
+        startup_target: if use_saved_ssh {
+            cfg.active_ssh.clone().map(project::Target::Ssh)
+        } else {
+            None
+        },
     };
-    app::run(origin, token, launch).await
+    app::run(connection, launch).await
 }
 
-async fn probe(origin: &str, cfg: &config::Config) -> Result<()> {
+async fn command_connection(
+    known: Option<String>,
+    cfg: &config::Config,
+    use_saved_ssh: bool,
+) -> Result<project::Connection> {
+    if use_saved_ssh {
+        return project::Connection::prepare(project::Target::Ssh(cfg.active_ssh.clone().unwrap()))
+            .await;
+    }
+    let origin = known.context("no running local server found")?;
     let token = cfg
         .token
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("no token stored; run `tria pair <credential>` first"))?;
+        .clone()
+        .context("no token stored; run `tria pair <credential>` first")?;
+    Ok(project::Connection {
+        local_disk: server::is_local(&origin),
+        origin,
+        token,
+        target: None,
+        _tunnel: None,
+    })
+}
+
+async fn probe(origin: &str, token: &str) -> Result<()> {
     let ticket = auth::websocket_ticket(origin, token).await?;
     let client = rpc::RpcClient::connect(origin, &ticket).await?;
     let config: serde_json::Value = client
@@ -198,11 +268,8 @@ async fn probe(origin: &str, cfg: &config::Config) -> Result<()> {
     Ok(())
 }
 
-async fn dump(origin: &str, cfg: &config::Config, thread_id: &str, seconds: u64) -> Result<()> {
-    let token = cfg
-        .token
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("no token stored; run `tria pair <credential>` first"))?;
+async fn dump(origin: &str, token: &str, thread_id: &str, seconds: u64) -> Result<()> {
+    let token = token.to_string();
     let (handle, mut updates) = session::spawn(origin.to_string(), token);
     let mut shell = state::Shell::default();
     let mut thread: Option<state::ThreadState> = None;

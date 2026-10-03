@@ -73,6 +73,7 @@ pub enum Mode {
     Insert,
     Command,
     Picker,
+    AddProject,
     Help,
     /// Answering an agent question: digits pick options, Enter advances.
     Question,
@@ -420,6 +421,19 @@ fn building(command: Value, implementing: Option<outbox::Implementing>) -> Value
 
 pub enum AppEvent {
     ServerWarning(Option<String>),
+    ProjectDirectory {
+        id: String,
+        result: Result<crate::project::Directory, String>,
+    },
+    ProjectConnection {
+        id: String,
+        root: String,
+        result: Result<crate::project::Connection, String>,
+    },
+    ProjectCreated {
+        root: String,
+        result: Result<(), String>,
+    },
     ToolRecovery {
         request: String,
         thread_id: Id,
@@ -445,6 +459,11 @@ pub enum AppEvent {
     },
     /// A worktree was removed, or was not.
     WorktreeRemoved {
+        path: String,
+        result: Result<(), String>,
+    },
+    WorktreeRecreated {
+        thread_id: Id,
         path: String,
         result: Result<(), String>,
     },
@@ -555,6 +574,9 @@ pub struct App {
     /// The `Tab` completion running on the command line, if one is.
     pub completing: Option<Completing>,
     pub picker: Option<Picker>,
+    pub project_browser: Option<crate::project::Wizard>,
+    pub connection_target: Option<crate::project::Target>,
+    pending_connection: Option<(crate::project::Connection, String)>,
     pub question: Option<QuestionDraft>,
     /// The one-line field a custom answer is typed into.
     pub custom_answer: Composer,
@@ -679,6 +701,7 @@ pub struct App {
     /// Worktrees the server has been asked to remove and has not answered about yet.
     /// Git deletes the whole directory before it answers, which can take a while.
     pub removing: HashSet<String>,
+    recreating: HashSet<String>,
     /// `None` until the first look, so the sidebar is marked as soon as there is a
     /// thread list to mark rather than a minute later.
     worktrees_checked: Option<Instant>,
@@ -736,6 +759,9 @@ impl App {
             command_line: Composer::new(),
             completing: None,
             picker: None,
+            project_browser: None,
+            connection_target: None,
+            pending_connection: None,
             question: None,
             custom_answer: Composer::new(),
             sidebar_visible: true,
@@ -787,6 +813,7 @@ impl App {
             worktree_cursor: ListCursor::default(),
             live_worktrees: HashSet::new(),
             removing: HashSet::new(),
+            recreating: HashSet::new(),
             worktrees_checked: None,
             local_disk: false,
             tool_recovery_request: None,
@@ -1238,14 +1265,26 @@ impl App {
         let title = crate::workspace::title(&root);
         tracing::info!(%root, %title, "adding a project");
         self.toast(format!("adding {title}…"), false);
-        self.dispatch(crate::commands::project_create(
-            &crate::commands::new_id(),
-            &title,
-            &root,
-        ));
+        let command = crate::commands::project_create(&crate::commands::new_id(), &title, &root);
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result = handle
+                .dispatch(command)
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string());
+            let _ = events.send(AppEvent::ProjectCreated { root, result });
+        });
     }
 
     fn accept_open_directory(&mut self, root: &str) -> Result<(), String> {
+        let root = crate::workspace::root(Some(root)).map_err(|err| err.to_string())?;
+        self.accept_project_directory(&root)
+    }
+
+    /// The browser has validated this directory on the chosen machine.
+    fn accept_project_directory(&mut self, root: &str) -> Result<(), String> {
         if self.quit || self.open_at.is_some() {
             return Err("tria is still opening a directory; try again shortly".into());
         }
@@ -1262,7 +1301,10 @@ impl App {
                     .into(),
             );
         }
-        let root = crate::workspace::root(Some(root)).map_err(|err| err.to_string())?;
+        if !root.starts_with('/') {
+            return Err("directory must be absolute".into());
+        }
+        let root = root.to_string();
         if self.pane.is_some() {
             self.detach_terminal();
         }
@@ -1480,8 +1522,8 @@ impl App {
             match back.slot {
                 outbox::Slot::Composer => {
                     self.composer.set_text(&back.text);
-                    // Sending leaves you in insert mode with an empty composer, which is
-                    // where the text goes back to. Anywhere else — a list, a pane, the
+                    // Sending leaves an empty composer in normal mode, which is where
+                    // the text goes back to. Anywhere else — a list, a pane, the
                     // chat — the view is left where it is and the text is simply there
                     // when you come back to it.
                     if matches!(self.mode, Mode::Normal | Mode::Insert) {
@@ -1657,11 +1699,12 @@ impl App {
     }
 
     /// What sending looks like, once a message has gone or been queued: the composer
-    /// empty, the message one `Ctrl-p` away, nothing parked for where it was written, and
-    /// the conversation followed to where it will show.
+    /// empty in normal mode, the message one `Ctrl-p` away, nothing parked for where it
+    /// was written, and the conversation followed to where it will show.
     fn sent(&mut self, text: String, draft_key: Option<String>) {
         self.composer.push_history(text);
         self.composer.clear();
+        self.mode = Mode::Normal;
         if let Some(key) = draft_key {
             self.outbox.unpark(&key);
         }
@@ -2617,6 +2660,11 @@ impl App {
             }
             Mode::QuestionCustom => self.custom_answer.insert_str(&one_line(text)),
             Mode::Command => self.command_line.insert_str(&one_line(text)),
+            Mode::AddProject => {
+                if let Some(browser) = self.project_browser.as_mut() {
+                    browser.paste(text);
+                }
+            }
             Mode::Picker => {
                 if let Some(picker) = self.picker.as_mut() {
                     picker.query.insert_str(&one_line(text));
@@ -3201,6 +3249,83 @@ impl App {
         }
     }
 
+    /// Restore the recorded checkout through the server, including for remote hosts.
+    fn recreate_worktree(&mut self, from_main: bool) {
+        let Some(shell) = self.thread.as_ref().map(|thread| &thread.detail.shell) else {
+            return self.toast("open a thread with a recorded worktree first", true);
+        };
+        let Some(path) = shell.worktree_path.clone().filter(|path| !path.is_empty()) else {
+            return self.toast("this thread has no recorded worktree", true);
+        };
+        let Some(branch) = shell.branch.clone().filter(|branch| !branch.is_empty()) else {
+            return self.toast("this thread has no recorded branch to recreate", true);
+        };
+        if shell.is_running() {
+            return self.toast("stop the running turn before recreating its worktree", true);
+        }
+        if self.recreating.contains(&path) || self.removing.contains(&path) {
+            return self.toast("that worktree already has an operation in progress", true);
+        }
+        let Some(project) = self.shell.projects.get(&shell.project_id) else {
+            return self.toast("the thread's project is unavailable", true);
+        };
+        let thread_id = shell.id.clone();
+        let payload = if from_main {
+            json!({ "cwd": project.workspace_root, "refName": "main", "newRefName": branch, "path": path })
+        } else {
+            json!({ "cwd": project.workspace_root, "refName": branch, "path": path })
+        };
+        let handle = self.handle.clone();
+        let events = self.events.clone();
+        self.recreating.insert(path.clone());
+        self.toast(
+            format!(
+                "recreating {}{}…",
+                short_path(&path),
+                if from_main { " from main" } else { "" }
+            ),
+            false,
+        );
+        tokio::spawn(async move {
+            // newRefName creates a missing branch from main with -b, never -B:
+            // an existing branch is retained, even when the fallback was requested.
+            let result = handle
+                .call("vcs.createWorktree", payload)
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string());
+            let _ = events.send(AppEvent::WorktreeRecreated {
+                thread_id,
+                path,
+                result,
+            });
+        });
+    }
+
+    fn on_worktree_recreated(
+        &mut self,
+        thread_id: String,
+        path: String,
+        result: Result<(), String>,
+    ) {
+        self.recreating.remove(&path);
+        match result {
+            Ok(()) => {
+                self.live_worktrees.insert(path.clone());
+                self.checkouts.remove(&path);
+                self.handle.refresh_vcs();
+                if self.current_thread_id.as_deref() == Some(&thread_id) {
+                    self.handle.refresh_thread(&thread_id);
+                }
+                self.toast("worktree recreated · send your message again", false);
+            }
+            Err(error) => self.toast(
+                format!("could not recreate worktree: {error} · if the branch was deleted, use :worktree recreate main"),
+                true,
+            ),
+        }
+    }
+
     /// Remove the worktree at `path`, named rather than pointed at: a question that was
     /// answered about one worktree must not be carried out on another.
     fn remove_worktree_at(&mut self, path: &str, force: bool) {
@@ -3210,6 +3335,9 @@ impl App {
         if let Some(refusal) = self.worktree_held(worktree) {
             self.toast(refusal, true);
             return;
+        }
+        if self.recreating.contains(&worktree.path) {
+            return self.toast("that worktree is being recreated", true);
         }
         let path = worktree.path.clone();
         let handle = self.handle.clone();
@@ -4609,6 +4737,94 @@ impl App {
         }
     }
 
+    fn open_project_browser(&mut self) {
+        let saved = crate::config::Config::load()
+            .map(|cfg| cfg.ssh_connections)
+            .unwrap_or_default();
+        self.picker = None;
+        self.project_browser = Some(crate::project::Wizard::new(saved));
+        self.mode = Mode::AddProject;
+    }
+
+    fn can_switch_connection(&self) -> bool {
+        self.composer.text().trim().is_empty()
+            && !self.outbox.has_pending_work()
+            && self.open_at.is_none()
+    }
+
+    fn on_project_browser_key(&mut self, key: KeyEvent) {
+        let action = self
+            .project_browser
+            .as_mut()
+            .and_then(|browser| browser.key(key));
+        let Some(action) = action else { return };
+        match action {
+            crate::project::Action::Close => {
+                self.project_browser = None;
+                self.mode = if self.draft.is_some() {
+                    Mode::Insert
+                } else {
+                    Mode::Normal
+                };
+            }
+            crate::project::Action::Read(target, path) => {
+                let browser = self.project_browser.as_mut().unwrap();
+                browser.busy = Some("Reading directories…".into());
+                browser.error = None;
+                let id = browser.id.clone();
+                let events = self.events.clone();
+                browser.task = Some(tokio::spawn(async move {
+                    let result = crate::project::Directory::read(&target, &path)
+                        .await
+                        .map_err(|err| format!("{err:#}"));
+                    let _ = events.send(AppEvent::ProjectDirectory { id, result });
+                }));
+            }
+            crate::project::Action::Open(target, root) => {
+                if self.connection_target.as_ref() == Some(&target)
+                    && self.status == Status::Connected
+                {
+                    match self.accept_project_directory(&root) {
+                        Ok(()) => {
+                            self.project_browser = None;
+                            if self.open_at.is_some() {
+                                self.mode = Mode::Normal;
+                            }
+                        }
+                        Err(error) => self.project_browser.as_mut().unwrap().error = Some(error),
+                    }
+                    return;
+                }
+                if !self.can_switch_connection() {
+                    self.project_browser.as_mut().unwrap().error = Some(
+                        "Finish or clear unsent and queued messages before switching machines"
+                            .into(),
+                    );
+                    return;
+                }
+                self.prepare_project_connection(target, root);
+            }
+        }
+    }
+
+    fn prepare_project_connection(&mut self, target: crate::project::Target, root: String) {
+        let browser = self.project_browser.as_mut().unwrap();
+        browser.busy = Some("Connecting · finding or starting T3 · authorizing…".into());
+        browser.error = None;
+        let id = browser.id.clone();
+        let events = self.events.clone();
+        browser.task = Some(tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(360),
+                crate::project::Connection::prepare(target),
+            )
+            .await
+            .map_err(|_| "Connection setup timed out".into())
+            .and_then(|result| result.map_err(|err| format!("{err:#}")));
+            let _ = events.send(AppEvent::ProjectConnection { id, root, result });
+        }));
+    }
+
     // ── Pickers ────────────────────────────────────────────────────────
 
     /// Fetch the icon of every project that has not been asked about yet.
@@ -4719,6 +4935,11 @@ impl App {
                         detail: p.workspace_root.clone(),
                         key: p.id.clone(),
                     })
+                    .chain(std::iter::once(PickerItem {
+                        label: "Add project…".into(),
+                        detail: "Browse a local or SSH directory".into(),
+                        key: "tria:add-project".into(),
+                    }))
                     .collect()
             }
             PickerKind::Model => self
@@ -4877,6 +5098,7 @@ impl App {
             PickerKind::PullRequest => self.read_pull_request(&item.key),
             // Toggled where the key is read, so the list stays open for the next one.
             PickerKind::Label => {}
+            PickerKind::Project if item.key == "tria:add-project" => self.open_project_browser(),
             PickerKind::Project => self.start_new_thread(&item.key),
             PickerKind::Model => {
                 let (instance_id, slug) = item.key.split_once('\t').unwrap_or((&item.key, ""));
@@ -4930,6 +5152,7 @@ impl App {
             "" => {}
             "q" | "quit" | "q!" => self.quit = true,
             "help" | "h" => self.open_help(),
+            "project" if arg == "add" => self.open_project_browser(),
             "new" | "n" => {
                 if arg.is_empty() {
                     self.open_picker(PickerKind::Project);
@@ -5057,7 +5280,13 @@ impl App {
             "terminals" | "shells" => self.open_terminals(),
             "worktrees" => self.open_worktrees(),
             "shell" => self.open_shell(),
-            "worktree" | "wt" => self.toggle_draft_worktree(),
+            "worktree" | "wt" if arg == "recreate" => self.recreate_worktree(false),
+            "worktree" | "wt" if arg == "recreate main" => self.recreate_worktree(true),
+            "worktree" | "wt" if arg.is_empty() => self.toggle_draft_worktree(),
+            "worktree" | "wt" => self.toast(
+                "use :worktree recreate, or :worktree recreate main if its branch was deleted",
+                true,
+            ),
             "edit" => self.edit_composer(),
             "view" => self.view_conversation(),
             "settled" => self.show_settled = !self.show_settled,
@@ -5640,6 +5869,7 @@ impl App {
             // Handled above, before the global chords.
             Mode::TerminalPane => {}
             Mode::Picker => self.on_picker_key(key),
+            Mode::AddProject => self.on_project_browser_key(key),
             Mode::Question => self.on_question_key(key),
             Mode::QuestionCustom => self.on_question_custom_key(key),
             Mode::Help => self.on_help_key(key),
@@ -5957,6 +6187,7 @@ impl App {
         if matches!(
             self.mode,
             Mode::Picker
+                | Mode::AddProject
                 | Mode::Help
                 | Mode::Tasks
                 | Mode::Usage
@@ -6410,6 +6641,9 @@ impl App {
     /// client knows. The rest take a name or a title that nothing here can guess, and
     /// are left alone rather than offered a wrong guess.
     fn argument_candidates(&self, before: &str) -> Vec<String> {
+        if matches!(before, "worktree recreate" | "wt recreate") {
+            return vec!["main".into()];
+        }
         let mut words = before.split_whitespace();
         let name = words.next().unwrap_or_default();
         // Only the first argument: past that these all take free text.
@@ -6419,7 +6653,8 @@ impl App {
         let fixed: &[&str] = match name {
             "mode" => &["plan", "default"],
             "perm" | "permissions" => RUNTIME_MODES,
-            "project" => &["rename"],
+            "project" => &["add", "rename"],
+            "worktree" | "wt" => &["recreate"],
             "implement" => &["new"],
             // The efforts are the model's own, and a model that has none offers none.
             "effort" | "e" => {
@@ -6474,6 +6709,9 @@ impl App {
                     .get(picker.selected)
                     .map(|item| (item.key.clone(), item.label.clone()));
                 match chosen {
+                    Some((project, _)) if project == "tria:add-project" => {
+                        self.toast("choose an existing project to rename", true)
+                    }
                     Some((project, title)) => {
                         picker.renaming = Some(project);
                         picker.query.set_text(&title);
@@ -6683,6 +6921,7 @@ impl App {
                     // A directory was named and its project is on its way; whatever
                     // thread happens to be first is not what was asked for.
                     && self.open_at.is_none()
+                    && self.mode != Mode::AddProject
                     && self.shell.synchronized
                     && let Some(first) = self.visible_threads().first().cloned()
                 {
@@ -6783,7 +7022,7 @@ impl App {
 /// The keys that edit text wherever it is typed, so a message and a custom answer are
 /// written the same way. Keys that only make sense in one of them — a newline, prompt
 /// history, sending — belong to the caller and are handled before this.
-fn edit_key(field: &mut Composer, key: KeyEvent) {
+pub(crate) fn edit_key(field: &mut Composer, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
@@ -7187,6 +7426,7 @@ pub struct Launch {
     pub notify: crate::notify::When,
     /// The directory `tria open` named, if it was `tria open`.
     pub open_at: Option<String>,
+    pub startup_target: Option<crate::project::Target>,
 }
 
 /// Ask where a project's icon is and fetch it. `sourcePath` is the server saying it found
@@ -7336,6 +7576,38 @@ fn mark_of(thread: &crate::model::ThreadShell) -> String {
 fn apply(app: &mut App, event: AppEvent) {
     match event {
         AppEvent::ServerWarning(warning) => app.server_warning = warning,
+        AppEvent::ProjectDirectory { id, result } => {
+            if let Some(browser) = app
+                .project_browser
+                .as_mut()
+                .filter(|browser| browser.id == id)
+            {
+                browser.loaded(result);
+            }
+        }
+        AppEvent::ProjectConnection { id, root, result } => {
+            if let Some(browser) = app
+                .project_browser
+                .as_mut()
+                .filter(|browser| browser.id == id)
+            {
+                browser.busy = None;
+                browser.task = None;
+                match result {
+                    Ok(connection) => app.pending_connection = Some((connection, root)),
+                    Err(error) => browser.error = Some(error),
+                }
+            }
+        }
+        AppEvent::ProjectCreated { root, result } => {
+            if app.open_at.as_deref() == Some(&root)
+                && let Err(error) = result
+            {
+                app.open_at = None;
+                app.open_asked = false;
+                app.toast(format!("could not add project: {error}"), true);
+            }
+        }
         AppEvent::Terminal(Event::Key(key)) => app.on_key(key),
         AppEvent::Terminal(Event::Mouse(mouse)) => app.on_mouse(mouse),
         AppEvent::Terminal(Event::Paste(text)) => app.on_paste(&text),
@@ -7375,6 +7647,11 @@ fn apply(app: &mut App, event: AppEvent) {
             changes,
             files,
         } => app.on_worktree_checked(path, changes, files),
+        AppEvent::WorktreeRecreated {
+            thread_id,
+            path,
+            result,
+        } => app.on_worktree_recreated(thread_id, path, result),
         AppEvent::WorktreeRemoved { path, result } => app.on_worktree_removed(path, result),
         AppEvent::Dispatched(Err(error)) => app.toast(format!("command failed: {error}"), true),
         AppEvent::Dispatched(Ok(())) => {}
@@ -7413,16 +7690,44 @@ fn apply(app: &mut App, event: AppEvent) {
     }
 }
 
-pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
+pub async fn run(connection: Option<crate::project::Connection>, launch: Launch) -> Result<()> {
+    let mut server_warning = crate::server::WarningMonitor::new(
+        connection
+            .as_ref()
+            .filter(|c| c.local_disk)
+            .map(|c| c.origin.clone()),
+    );
     // A thread's images are files on the server's disk, which are ours to read only when
     // that disk is this one.
-    let local_files = crate::server::is_local(&origin);
-    let mut server_warning = crate::server::WarningMonitor::new(Some(origin.clone()));
-    let (handle, mut updates) = session::spawn(origin.clone(), token);
+    let local_files = connection
+        .as_ref()
+        .is_some_and(|connection| connection.local_disk);
+    let (handle, mut updates, mut supervisor) = if let Some(connection) = &connection {
+        let method = if matches!(connection.target, Some(crate::project::Target::Ssh(_))) {
+            "ssh"
+        } else {
+            "direct"
+        };
+        let (handle, updates, guard) =
+            session::spawn_owned(connection.origin.clone(), connection.token.clone(), method);
+        (handle, updates, Some(guard))
+    } else {
+        let (handle, updates) = session::disconnected();
+        (handle, updates, None)
+    };
+    let mut connection = connection;
     let (events_tx, mut events) = mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new(handle, events_tx.clone());
     app.local_disk = local_files;
-    app.origin = origin;
+    app.origin = connection
+        .as_ref()
+        .map(|c| c.origin.clone())
+        .unwrap_or_default();
+    app.connection_target = connection.as_ref().and_then(|c| c.target.clone());
+    if connection.is_none() {
+        app.status = Status::Failed("Choose a local or remote directory to add a project".into());
+        app.open_project_browser();
+    }
     app.programs = launch.programs;
     app.sidebar_layout = launch.sidebar_layout;
     if !launch.refused.is_empty() {
@@ -7433,12 +7738,21 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
     app.notify = launch.notify;
     app.new_thread_model = launch.model;
     app.open_at = launch.open_at;
-    let _handoff = match crate::handoff::listen(events_tx, &app.origin).await {
-        Ok(listener) => listener,
-        Err(err) => {
-            tracing::warn!(%err, "registering tria for tmux directory opens");
-            None
+    if let Some(target) = launch.startup_target {
+        app.open_project_browser();
+        let root = app.open_at.take().unwrap_or_default();
+        app.prepare_project_connection(target, root);
+    }
+    let mut handoff = if connection.is_some() {
+        match crate::handoff::listen(events_tx, &app.origin).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                tracing::warn!(%err, "registering tria for tmux directory opens");
+                None
+            }
         }
+    } else {
+        None
     };
     if launch.started_server {
         // Said again here because the line printed before the screen was taken over is
@@ -7492,7 +7806,7 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
                 Some(Err(err)) => break Err(err.into()),
                 None => break Ok(()),
             },
-            update = updates.recv() => match update {
+            update = updates.recv(), if connection.is_some() => match update {
                 Some(update) => AppEvent::Update(Box::new(update)),
                 None => break Ok(()),
             },
@@ -7515,6 +7829,60 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
                 None => break,
             }
         }
+        if let Some((next, root)) = app.pending_connection.take() {
+            // Recheck before dropping the old environment; background events can arrive
+            // while connection setup is running.
+            if !app.can_switch_connection() {
+                if let Some(browser) = app.project_browser.as_mut() {
+                    browser.error =
+                        Some("Finish unsent and queued messages before switching machines".into());
+                }
+                continue;
+            }
+            if let Err(err) = next.remember() {
+                if let Some(browser) = app.project_browser.as_mut() {
+                    browser.error = Some(format!("could not save connection: {err}"));
+                }
+                continue;
+            }
+            drop(handoff.take());
+            drop(supervisor.take());
+            let method = if matches!(next.target, Some(crate::project::Target::Ssh(_))) {
+                "ssh"
+            } else {
+                "direct"
+            };
+            let (handle, next_updates, guard) =
+                session::spawn_owned(next.origin.clone(), next.token.clone(), method);
+            updates = next_updates;
+            supervisor = Some(guard);
+            server_warning =
+                crate::server::WarningMonitor::new(next.local_disk.then(|| next.origin.clone()));
+            let (next_events, next_receiver) = mpsc::unbounded_channel();
+            events = next_receiver;
+            let mut fresh = App::new(handle, next_events.clone());
+            fresh.programs = std::mem::take(&mut app.programs);
+            fresh.sidebar_layout = app.sidebar_layout;
+            fresh.sidebar_visible = app.sidebar_visible;
+            fresh.editor = app.editor.clone();
+            fresh.prefix_timeout = app.prefix_timeout;
+            fresh.notify = app.notify;
+            // Models belong to an environment; let its provider config choose one.
+            fresh.local_disk = next.local_disk;
+            fresh.connection_target = next.target.clone();
+            fresh.origin = next.origin.clone();
+            fresh.open_at = (!root.is_empty()).then_some(root);
+            fresh.repaint = true;
+            picture::set_local_files(next.local_disk);
+            handoff = crate::handoff::listen(next_events, &fresh.origin)
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(%err, "registering directory opens");
+                    None
+                });
+            app = fresh;
+            connection = Some(next);
+        }
         if let Some(external) = app.pending_external.take() {
             if let Err(err) = run_external(&mut terminal, &external) {
                 app.toast(format!("{}: {err}", external.command), true);
@@ -7535,11 +7903,24 @@ pub async fn run(origin: String, token: String, launch: Launch) -> Result<()> {
         crossterm::event::DisableFocusChange
     );
     ratatui::restore();
+    drop(handoff);
+    drop(supervisor);
+    drop(connection);
     result
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::model::{Project, VcsLocal, VcsWorkingTree};
+    use crate::outbox::tests::{planned_thread, rewindable_thread};
+    use crate::reader::tests::{
+        agent_progresses, open_detail, stacked_thread, thread_with_a_followable_agent,
+        transcript_saying,
+    };
+
     #[test]
     fn server_warning_does_not_change_the_connection_or_dispatch_commands() {
         let (handle, mut requests) = session::Handle::detached();
@@ -7558,15 +7939,40 @@ mod tests {
         assert!(app.server_warning.is_none());
     }
 
-    use tokio::sync::mpsc;
+    #[tokio::test]
+    async fn browser_opens_a_remote_only_project_and_preserves_the_remote_path() {
+        let (handle, mut requests) = session::Handle::detached();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let id = project(&mut app);
+        let root = format!("/remote-only/{}", commands::new_id());
+        app.shell.projects.get_mut(&id).unwrap().workspace_root = root.clone();
+        app.shell.synchronized = true;
+        app.local_disk = false;
+        assert_eq!(app.accept_project_directory(&root), Ok(()));
+        assert_eq!(app.draft.as_ref().unwrap().project_id, id);
+        assert_eq!(app.mode, Mode::Insert);
+        assert!(sent_no_command(&mut requests).await);
+    }
 
-    use super::*;
-    use crate::model::{Project, VcsLocal, VcsWorkingTree};
-    use crate::outbox::tests::{planned_thread, rewindable_thread};
-    use crate::reader::tests::{
-        agent_progresses, open_detail, stacked_thread, thread_with_a_followable_agent,
-        transcript_saying,
-    };
+    #[test]
+    fn a_stale_directory_result_cannot_replace_a_new_browser() {
+        let (handle, _requests) = session::Handle::detached();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.project_browser = Some(crate::project::Wizard::new(vec![]));
+        apply(
+            &mut app,
+            AppEvent::ProjectDirectory {
+                id: "old-dialog".into(),
+                result: Ok(crate::project::Directory {
+                    path: "/old".into(),
+                    entries: vec![],
+                }),
+            },
+        );
+        assert!(app.project_browser.as_ref().unwrap().directory.is_none());
+    }
 
     #[tokio::test]
     async fn attachment_loading_uses_asset_urls_once_and_rebuilds_the_message() {
@@ -7862,6 +8268,149 @@ mod tests {
         assert_eq!(app.composer.text(), "X");
         app.composer.history_prev();
         assert_eq!(app.composer.text(), "X", "nothing before it");
+    }
+
+    #[tokio::test]
+    async fn recreate_worktree_uses_recorded_branch_and_path_and_refreshes_on_success() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        project(&mut app);
+        let mut thread = running_thread();
+        thread.detail.shell = shell_thread("t1", "p", Some("/worktrees/tria-cee83878"));
+        thread.detail.shell.branch = Some("tria/cee83878".into());
+        app.thread = Some(thread);
+        app.current_thread_id = Some("t1".into());
+
+        app.run_command("worktree recreate");
+        let Some(crate::session::Request::Call {
+            tag,
+            payload,
+            reply,
+        }) = asked(&mut requests).await
+        else {
+            panic!("expected worktree creation");
+        };
+        assert_eq!(tag, "vcs.createWorktree");
+        assert_eq!(
+            payload,
+            json!({"cwd": "/src/p", "refName": "tria/cee83878", "path": "/worktrees/tria-cee83878"})
+        );
+        app.run_command("wt recreate");
+        assert!(
+            asked_nothing(&mut requests).await,
+            "duplicate creation is suppressed"
+        );
+        reply.send(Ok(json!({}))).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        apply(&mut app, event);
+        assert!(app.recreating.is_empty());
+        assert!(app.live_worktrees.contains("/worktrees/tria-cee83878"));
+        assert!(matches!(
+            asked(&mut requests).await,
+            Some(crate::session::Request::RefreshVcs)
+        ));
+        assert!(
+            matches!(asked(&mut requests).await, Some(crate::session::Request::RefreshThread(id)) if id == "t1")
+        );
+    }
+
+    #[tokio::test]
+    async fn recreate_from_main_creates_the_saved_branch_without_resetting_it() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _received) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        project(&mut app);
+        let mut thread = running_thread();
+        thread.detail.shell = shell_thread("t1", "p", Some("/worktrees/tria-cee83878"));
+        thread.detail.shell.branch = Some("tria/cee83878".into());
+        app.thread = Some(thread);
+
+        assert_eq!(app.argument_candidates("worktree recreate"), vec!["main"]);
+        app.run_command("wt recreate main");
+        let Some(crate::session::Request::Call { tag, payload, .. }) = asked(&mut requests).await
+        else {
+            panic!("expected creation from main");
+        };
+        assert_eq!(tag, "vcs.createWorktree");
+        assert_eq!(
+            payload,
+            json!({"cwd": "/src/p", "refName": "main", "newRefName": "tria/cee83878", "path": "/worktrees/tria-cee83878"})
+        );
+        app.run_command("worktree recreate main");
+        assert!(asked_nothing(&mut requests).await);
+    }
+
+    #[tokio::test]
+    async fn recreate_worktree_refuses_running_or_incomplete_threads_and_allows_retry() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        project(&mut app);
+        app.run_command("worktree recreate");
+        let mut thread = running_thread();
+        thread.detail.shell.worktree_path = Some("/worktree".into());
+        thread.detail.shell.branch = Some("tria/topic".into());
+        app.thread = Some(thread);
+        app.run_command("worktree recreate");
+        assert!(
+            app.toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("stop the running turn")
+        );
+        app.thread.as_mut().unwrap().detail.shell = shell_thread("t1", "p", Some("/worktree"));
+        app.run_command("worktree recreate");
+        assert!(app.toast.as_ref().unwrap().0.contains("no recorded branch"));
+        assert!(asked_nothing(&mut requests).await);
+
+        app.thread.as_mut().unwrap().detail.shell.branch = Some("tria/topic".into());
+        app.run_command("worktree recreate");
+        let Some(crate::session::Request::Call { reply, .. }) = asked(&mut requests).await else {
+            panic!("expected worktree creation");
+        };
+        reply
+            .send(Err(anyhow::anyhow!("branch is checked out elsewhere")))
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        apply(&mut app, event);
+        assert!(app.recreating.is_empty());
+        assert!(!app.live_worktrees.contains("/worktree"));
+        assert!(
+            app.toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("branch is checked out elsewhere")
+        );
+        app.run_command("worktree recreate");
+        assert!(matches!(
+            asked(&mut requests).await,
+            Some(crate::session::Request::Call { .. })
+        ));
+    }
+
+    #[test]
+    fn recreated_worktree_does_not_refresh_a_different_open_thread() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _received) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.current_thread_id = Some("t2".into());
+        app.recreating.insert("/worktree".into());
+        app.on_worktree_recreated("t1".into(), "/worktree".into(), Ok(()));
+        assert_eq!(app.current_thread_id.as_deref(), Some("t2"));
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(crate::session::Request::RefreshVcs)
+        ));
+        assert!(requests.try_recv().is_err());
     }
 
     fn shell_thread(id: &str, project: &str, worktree: Option<&str>) -> crate::model::ThreadShell {
@@ -9379,6 +9928,7 @@ mod tests {
 
         app.send_message();
         assert!(app.composer.is_empty(), "the message left on its way out");
+        assert_eq!(app.mode, Mode::Normal);
 
         let refusal = tokio::time::timeout(Duration::from_millis(500), sent.recv())
             .await
@@ -10295,6 +10845,7 @@ mod tests {
 
         assert_eq!(app.confirm_transcript_send, None);
         assert_eq!(app.composer.text(), "not for the main agent");
+        assert_eq!(app.mode, Mode::Insert);
         assert_eq!(app.queued_message(), None);
         assert!(app.reader.is_open());
         assert!(sent_no_command(&mut requests).await);
@@ -10314,8 +10865,11 @@ mod tests {
 
         app.composer.set_text("first");
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::Normal);
+        app.on_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
         app.composer.set_text("second");
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::Normal);
         assert!(app.composer.is_empty());
         assert_eq!(app.queued_message(), Some("first\n\nsecond"));
         assert!(
@@ -10352,6 +10906,7 @@ mod tests {
             .await
             .expect("sent straight away");
         assert_eq!(command["message"]["text"], "now");
+        assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.queued_message(), None);
     }
 
@@ -11562,7 +12117,8 @@ mod tests {
         for letter in "shelf".chars() {
             press(&mut app, KeyCode::Char(letter), false);
         }
-        assert_eq!(app.picker.as_ref().unwrap().filtered().len(), 1);
+        let picker = app.picker.as_ref().unwrap();
+        assert_eq!(picker.filtered().len(), picker.items.len());
         press(&mut app, KeyCode::Enter, false);
         tokio::task::yield_now().await;
 

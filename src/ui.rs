@@ -160,6 +160,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     apply_selection(frame, app, chat_inner);
 
     match app.mode {
+        Mode::AddProject => {
+            if let Some(browser) = &app.project_browser {
+                crate::project::draw(frame, browser, area);
+            }
+        }
         Mode::Picker => draw_picker(frame, app, area),
         Mode::Help => draw_help(frame, app, area),
         Mode::Tasks => draw_tasks(frame, app, area),
@@ -1808,7 +1813,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             " INSERT ",
             Style::default().bg(Color::Green).fg(Color::Black).bold(),
         ),
-        (Mode::Picker, _) => (
+        (Mode::Picker | Mode::AddProject, _) => (
             " PICK ",
             Style::default().bg(Color::Magenta).fg(Color::Black).bold(),
         ),
@@ -2018,7 +2023,7 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         PickerKind::Thread if picker.content.searching() => " threads · searching messages… ",
         PickerKind::Thread => " threads ",
         PickerKind::Model => " models ",
-        PickerKind::Project => " new thread in project · ^R renames ",
+        PickerKind::Project => " new thread in project · Add project… browses · ^R renames ",
         PickerKind::Effort => " effort ",
         PickerKind::PullRequest => " pull requests · ^Y copies the link · ^D unlinks ",
         PickerKind::Label if app.labels_truncated => {
@@ -3294,6 +3299,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(Span::styled("Commands", Style::default().bold())),
         Line::from("  :new [project]  :model  :effort [level]  :mode plan|default"),
         Line::from("  :perm full-access|auto|auto-accept-edits|approval-required"),
+        Line::from("  :worktree recreate       restore the thread’s recorded branch and checkout"),
+        Line::from("  :worktree recreate main  recreate a deleted branch from local main"),
         Line::from("  :rename <title>  :rename (regenerate)  :archive  :delete!"),
         Line::from(
             "  :pr  :tasks  :agents  :terminals  :tmux  :usage  :settle  :unsettle  :wake  :settled  :approve [n]  :stop  :stop! (the session)  :implement [new]  :rewind  :older  :answer  :dismiss  :reconnect  :sidebar  :worktrees  :split  :window  :q",

@@ -357,6 +357,14 @@ pub struct Outbox {
 }
 
 impl Outbox {
+    /// Switching environments must not discard queued, parked, or in-flight work.
+    pub fn has_pending_work(&self) -> bool {
+        !self.queued.is_empty()
+            || !self.creating.is_empty()
+            || !self.rewinding.is_empty()
+            || !self.asked.is_empty()
+            || self.drafts.values().any(|text| !text.trim().is_empty())
+    }
     // ── Sending ────────────────────────────────────────────────────────
 
     /// Send a message to a thread that exists, keeping hold of what was written until

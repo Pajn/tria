@@ -159,11 +159,26 @@ pub async fn ensure(origin: Option<String>, command: &str) -> Result<(String, bo
     ensure_among(origin, running, command).await
 }
 
+/// The project UI runs after the terminal is taken over: no progress on stdout.
+pub async fn ensure_quiet(origin: Option<String>, command: &str) -> Result<(String, bool)> {
+    let running = crate::discovery::local_origin().ok();
+    ensure_with_output(origin, running, command, false).await
+}
+
 /// `ensure`, given the origin the runtime file names, if there is one.
 async fn ensure_among(
     origin: Option<String>,
     running: Option<String>,
     command: &str,
+) -> Result<(String, bool)> {
+    ensure_with_output(origin, running, command, true).await
+}
+
+async fn ensure_with_output(
+    origin: Option<String>,
+    running: Option<String>,
+    command: &str,
+    verbose: bool,
 ) -> Result<(String, bool)> {
     if let Some(origin) = &origin
         && is_listening(origin).await
@@ -184,7 +199,7 @@ async fn ensure_among(
         && origin.as_ref() != Some(&running)
         && is_listening(&running).await
     {
-        if let Some(origin) = &origin {
+        if verbose && let Some(origin) = &origin {
             println!("Nothing answers at {origin}. Using the T3 Code server at {running}.");
         }
         return Ok((running, false));
@@ -195,9 +210,13 @@ async fn ensure_among(
              (server_command is empty in the config file)"
         );
     }
-    println!("No T3 Code server running. Starting one with `{command}`.");
+    if verbose {
+        println!("No T3 Code server running. Starting one with `{command}`.");
+    }
     let origin = start(command).await?;
-    println!("Server at {origin}. It keeps running after tria exits.");
+    if verbose {
+        println!("Server at {origin}. It keeps running after tria exits.");
+    }
     Ok((origin, true))
 }
 
@@ -211,6 +230,7 @@ async fn start(command: &str) -> Result<String> {
         .parent()
         .context("no config directory")?
         .join("server-start.log");
+    std::fs::create_dir_all(log_path.parent().context("no log directory")?)?;
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
     let mut spawn = Command::new("sh");

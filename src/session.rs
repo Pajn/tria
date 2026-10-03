@@ -217,8 +217,39 @@ impl Handle {
 pub fn spawn(origin: String, token: String) -> (Handle, mpsc::UnboundedReceiver<Update>) {
     let (req_tx, req_rx) = mpsc::unbounded_channel();
     let (upd_tx, upd_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run(origin, token, req_rx, upd_tx));
+    tokio::spawn(run(origin, token, "direct", req_rx, upd_tx));
     (Handle { tx: req_tx }, upd_rx)
+}
+
+pub struct Supervisor(tokio::task::JoinHandle<()>);
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+pub fn spawn_owned(
+    origin: String,
+    token: String,
+    method: &'static str,
+) -> (Handle, mpsc::UnboundedReceiver<Update>, Supervisor) {
+    let (req_tx, req_rx) = mpsc::unbounded_channel();
+    let (upd_tx, upd_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run(origin, token, method, req_rx, upd_tx));
+    (Handle { tx: req_tx }, upd_rx, Supervisor(task))
+}
+
+pub fn disconnected() -> (Handle, mpsc::UnboundedReceiver<Update>) {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (_tx, rx) = mpsc::unbounded_channel();
+    (Handle { tx }, rx)
+}
+
+struct CloseConnection(RpcClient);
+impl Drop for CloseConnection {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 struct OpenThread {
@@ -234,6 +265,7 @@ struct OpenThread {
 async fn run(
     origin: String,
     token: String,
+    method: &'static str,
     mut requests: mpsc::UnboundedReceiver<Request>,
     updates: mpsc::UnboundedSender<Update>,
 ) {
@@ -252,7 +284,7 @@ async fn run(
             let _ = updates.send(Update::Status(Status::Connecting));
         }
         let mut forced = false;
-        let client = match connect(&origin, &token).await {
+        let client = match connect(&origin, &token, method).await {
             Ok(client) => client,
             Err(err) => {
                 // Told apart by the status the server sent rather than by what the
@@ -289,6 +321,7 @@ async fn run(
         // command the server takes its time over would hold every stream here still
         // until it answered. The worker ends with the connection, once this sender
         // is dropped and what it was given has gone out.
+        let _close = CloseConnection(client.clone());
         let dispatches = dispatcher(&client);
 
         // Config first: it tells us whether pagination and completion markers are supported.
@@ -685,9 +718,9 @@ fn forward_thread_item(
     }
 }
 
-async fn connect(origin: &str, token: &str) -> Result<RpcClient> {
+async fn connect(origin: &str, token: &str, method: &str) -> Result<RpcClient> {
     let ticket = auth::websocket_ticket(origin, token).await?;
-    RpcClient::connect(origin, &ticket).await
+    RpcClient::connect_with_method(origin, &ticket, method).await
 }
 
 async fn subscribe_shell(client: &RpcClient, after: Option<u64>) -> Result<Subscription> {

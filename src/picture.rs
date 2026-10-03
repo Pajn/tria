@@ -125,6 +125,14 @@ pub fn reads_files() -> bool {
     STORE.with(|store| store.borrow().local_files)
 }
 
+pub fn set_local_files(local: bool) {
+    STORE.with(|store| {
+        let mut store = store.borrow_mut();
+        store.local_files = local;
+        store.ready.clear();
+    });
+}
+
 /// Forget what has been drawn. The screen has been handed to another program and back,
 /// and whatever the terminal was holding went with it.
 pub fn forget() {

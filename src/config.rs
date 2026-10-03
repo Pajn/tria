@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub url: Option<String>,
     pub token: Option<String>,
+    /// SSH profiles saved by the project browser. Tokens are issued on the host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_connections: Vec<crate::ssh::Target>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_ssh: Option<crate::ssh::Target>,
     /// Shell command `gl` and `:git` run in the thread's directory. Defaults to
     /// `lazygit`. The same thing as `programs.l`, which wins where both are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]

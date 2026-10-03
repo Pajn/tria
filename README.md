@@ -34,8 +34,13 @@ From a clone:
 cargo install --path .
 ```
 
-Mint a pairing credential on the machine that runs the server. The desktop app offers this
-under Connections; the CLI prints one with:
+Run `tria` and choose **Local** or **Remote** to add your first project. Local browses this
+machine; Remote accepts an SSH config alias or host, with optional user, port, and identity
+file overrides. Selecting a directory connects to its machine and opens a new-thread draft.
+Local setup issues a session automatically. SSH setup issues it on the remote host.
+
+For a direct network connection, mint a pairing credential on the machine that runs the
+server. The desktop app offers this under Connections; the CLI prints one with:
 
 ```sh
 t3 pair
@@ -96,8 +101,20 @@ tria then reports that nothing is running and exits. Output from a start goes to
 `server-start.log` beside the config file, and a command that exits without serving is reported
 with the first lines of it.
 
-Only a server on this machine is ever started. Pointed at another host with `--url` or a stored
-remote origin, an unreachable server is reported, not replaced.
+Direct connections made with `--url` never start a server on another host. The SSH project
+browser can start one remotely: it reuses the host's running T3 server, or starts a loopback
+server in its T3 home directory. If `t3` is absent, it downloads and verifies an official
+standalone release. That requires Linux or an Apple Silicon Mac, `curl` or `wget`, `tar`, and
+`sha256sum` or `shasum`. Provider CLIs such as Codex must already be installed and signed in
+on the host, and available to its non-interactive login shell.
+
+SSH uses OpenSSH, `~/.ssh/config`, and key or agent authentication. Password prompts are not
+supported; test access with `ssh <host>` first if authentication fails. New host keys are
+accepted; changed keys are refused. Tria restores a dropped forward automatically and closes
+it on exit; a server it started keeps running. SSH profiles and the last selected machine
+are remembered, and the next `tria` reconnects to that machine. Selecting Local switches back.
+Server paths on SSH connections are always treated as remote, including through localhost
+forwards. Direct forwards configured manually with `--url` still need this distinction.
 
 ## Keys
 
@@ -321,7 +338,15 @@ new tria. The running instance must have been started with a version that suppor
 handoff. Unsent text in an existing thread stays with that thread; an unsent new-thread
 draft must be finished first.
 
-`n` picks a project and opens a draft; the message you write starts the thread. The header says
+`n` picks a project and opens a draft; **Add project…** in that list (or `:project add`)
+opens the local/SSH directory browser. Use arrows and Enter to browse, Backspace for the
+parent, Tab to edit a path, and `Ctrl-o` or `F2` to use the directory being displayed. Esc
+returns to machine selection or cancels setup. A registered project for the exact directory
+is reused; otherwise it is added before the draft opens. Switching machines requires unsent
+and queued messages to be finished or cleared. With a saved SSH connection,
+`tria open /absolute/remote/path` also opens a server-side directory without checking it here.
+
+For a project selected from the list, the message you write starts the thread. The header says
 where it will run: `⌂ project checkout on <branch>`, or `⌂ new worktree off <branch>`, which
 the server creates when the thread starts. `gw` or `:worktree` switches between them. The
 default comes from the project's own setting, then the server's, and the server's default is
@@ -356,6 +381,18 @@ too, because it stays: what goes is the checkout.
 Removing a worktree leaves its branch, so nothing committed is lost by clearing them out.
 Threads that are done with a worktree still on the disk are marked `⌂` in the sidebar, and the
 settled section says how many there are.
+
+If a thread's worktree directory has gone, `:worktree recreate` restores its recorded
+path from its recorded branch, then you can send the failed message again. The operation
+runs on the server, including for SSH and direct remote connections. It retains the branch's
+committed work; deleted uncommitted files cannot be recovered this way. Git refuses a path
+that is occupied or a branch checked out elsewhere. The thread must not be running. If the
+directory was deleted outside Git, stale worktree metadata may need `git worktree prune`
+in the server's project checkout before recreating it.
+
+If its branch was also deleted, `:worktree recreate main` creates the recorded branch
+again from the server's local `main`, at the recorded path. It does not fetch or recover
+the old branch's commits, and refuses to overwrite an existing branch.
 
 The model for a new thread is the last one you picked with `m`, remembered in the config file
 between runs. Without one it falls back to the project's default model, then the server's.
@@ -747,8 +784,8 @@ Unsent composer text stays with its thread for as long as tria is running: switc
 back and the half-written message is still there. New-thread drafts have a slot of their
 own. Nothing is written to disk, so quitting is quitting.
 
-Sending empties the composer, which is what sending looks like. A message the server will
-not take never went anywhere, so it comes back: into the composer if that is still where
+Sending or queueing a message empties the composer and returns to normal mode. A message
+the server will not take never went anywhere, so it comes back: into the composer if that is still where
 you are and nothing has been written since, and into the thread's parked draft if you have
 gone elsewhere. Where neither is free it is not lost either — every sent message goes into
 the composer's history, and the toast says to reach for it with `Ctrl-p`. The same holds
