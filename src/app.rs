@@ -2792,17 +2792,31 @@ impl App {
             .map(|link| link.url.clone())
     }
 
-    /// The links on the cursor's line, for opening one without the mouse.
+    /// The link under the cursor, or the first on its line, without the mouse.
     fn link_at_cursor(&mut self) -> Option<String> {
         if self.focus != Focus::Chat {
             return None;
         }
-        let (row, _) = self.chat().cursor_cell()?;
+        let (row, column) = self.chat().cursor_cell()?;
         let row = self.chat_area.y + row as u16;
-        self.links
-            .iter()
-            .find(|link| link.row == row)
-            .map(|link| link.url.clone())
+        self.link_at(Position::new(self.chat_area.x + column, row))
+            .or_else(|| {
+                self.links
+                    .iter()
+                    .find(|link| link.row == row)
+                    .map(|link| link.url.clone())
+            })
+    }
+
+    /// `gY`: copy the destination even when only a Markdown label is drawn.
+    fn yank_link(&mut self) {
+        match self.link_at_cursor() {
+            Some(url) => {
+                copy_to_clipboard(&url);
+                self.toast(format!("copied {url}"), false);
+            }
+            None => self.toast("no link under the chat cursor", false),
+        }
     }
 
     /// `gw`: start the new thread in a fresh worktree, or in the project's checkout.
@@ -5932,6 +5946,7 @@ impl App {
             'N' => self.new_tmux_window(),
             'D' => self.reveal_directory(),
             'y' => self.yank_last_assistant(),
+            'Y' => self.yank_link(),
             'E' => self.view_conversation(),
             '!' => self.open_shell(),
             'w' => self.toggle_draft_worktree(),
@@ -12197,8 +12212,7 @@ mod link_tests {
             .collect()
     }
 
-    #[test]
-    fn a_markdown_labels_cells_resolve_for_clicks_and_keyboard_opening() {
+    fn rendered_chat(text: &str, width: u16) -> super::App {
         let (handle, _requests) = crate::session::Handle::detached();
         let (events, _events) = tokio::sync::mpsc::unbounded_channel();
         let mut app = super::App::new(handle, events);
@@ -12208,17 +12222,24 @@ mod link_tests {
                 "id": "t1", "projectId": "p1", "title": "Test",
                 "modelSelection": {"instanceId": "claudeAgent", "model": "m"},
                 "runtimeMode": "full-access", "latestTurn": null, "session": null,
-                "messages": [{"id": "m1", "role": "assistant", "text": "[#32](https://github.com/Pajn/fallout/pull/32), done."}],
+                "messages": [{"id": "m1", "role": "assistant", "text": text}],
                 "activities": []
             }
-        })).unwrap();
+        }))
+        .unwrap();
         app.thread = Some(crate::state::ThreadState::from_snapshot(snapshot));
         app.focus = super::Focus::Chat;
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 16)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
         terminal
             .draw(|frame| crate::ui::draw(frame, &mut app))
             .unwrap();
+        app
+    }
+
+    #[test]
+    fn a_markdown_labels_cells_resolve_for_clicks_and_keyboard_opening() {
+        let mut app = rendered_chat("[#32](https://github.com/Pajn/fallout/pull/32), done.", 70);
         let link = app.links[0].clone();
         for column in link.start..link.end {
             assert_eq!(
@@ -12235,6 +12256,67 @@ mod link_tests {
             link.start - app.chat_area.x,
         );
         assert_eq!(app.link_at_cursor(), Some(link.url));
+    }
+
+    #[test]
+    fn copying_a_link_prefers_the_cursor_over_the_first_link_on_the_line() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = rendered_chat(
+            "資 [first](https://first.example) and [second](https://second.example/path).",
+            100,
+        );
+        let first = app.links[0].clone();
+        let second = app.links[1].clone();
+        assert_eq!(first.row, second.row);
+        app.chat_view.click(
+            app.chat_view
+                .line_at((second.row - app.chat_area.y) as usize),
+            second.start - app.chat_area.x,
+        );
+        assert_eq!(app.link_at_cursor(), Some(second.url.clone()));
+        for c in ['g', 'Y'] {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.toast.as_ref().unwrap().0,
+            format!("copied {}", second.url)
+        );
+
+        // Away from the labels, the first link on the line is still available.
+        app.chat_view.line_start();
+        assert_eq!(app.link_at_cursor(), Some(first.url));
+        app.focus = super::Focus::Composer;
+        app.yank_link();
+        assert_eq!(
+            app.toast.as_ref().unwrap().0,
+            "no link under the chat cursor"
+        );
+    }
+
+    #[test]
+    fn every_wrapped_label_row_copies_the_complete_destination() {
+        let url = "https://example.com/a/very/long/path";
+        let mut app = rendered_chat(
+            &format!("[a long label with enough words to wrap across several rows]({url})"),
+            40,
+        );
+        assert!(app.links.len() > 1);
+        for link in app.links.clone() {
+            app.chat_view.click(
+                app.chat_view.line_at((link.row - app.chat_area.y) as usize),
+                link.start - app.chat_area.x,
+            );
+            app.yank_link();
+            assert_eq!(app.toast.as_ref().unwrap().0, format!("copied {url}"));
+        }
+
+        let mut app = rendered_chat("a line without a link", 70);
+        app.yank_link();
+        assert_eq!(
+            app.toast.as_ref().unwrap().0,
+            "no link under the chat cursor"
+        );
     }
 
     #[test]

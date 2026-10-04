@@ -3192,6 +3192,9 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("                          the g motions still work with the panel up, so the"),
         Line::from("                          thread can be looked at before answering"),
         Line::from("  gy                      yank last assistant message (OSC 52)"),
+        Line::from(
+            "  gY                      copy the link destination at the chat cursor (OSC 52)",
+        ),
         Line::from(programs.clone()),
         Line::from("  g!                      a shell in the pane; exiting it closes the popup"),
         Line::from("  gT                      background tasks still running in this thread:"),

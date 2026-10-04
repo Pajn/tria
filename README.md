@@ -138,6 +138,7 @@ Press `?` inside the app for the full list.
 | `1`..`9` | answer a pending approval, with nothing written in the composer; otherwise a count for the next motion |
 | `ga` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `gy` | copy the last assistant message (OSC 52) |
+| `gY` | chat focused: copy the link destination under the cursor, or the first link on its line (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
 | `gT` | list the agent's background tasks that are still running; `s` stops them, `S` the session, after asking |
 | `gA` | list the subagents the thread has run; `Enter` reads one's transcript (`r` re-reads a running one), `y` yanks its report |
@@ -588,6 +589,11 @@ URLs in the conversation are underlined, and clicking one opens it in the browse
 chat focused, `gx` opens the link on the cursor's line, falling back to the picture under the
 cursor — the one its tool row has, or the one its message shows — and then to the thread's
 pull request.
+
+`gY` copies the link's destination to the clipboard, including when Markdown shows only
+its label. Both `gx` and `gY` prefer the link under the cursor when a line has several
+links, and use the first link on the line otherwise. A toast shows the copied destination;
+if there is no link on the line, `gY` says so.
 
 Links are found on the drawn screen rather than in the message text, so one that wraps across
 two lines is still whole, and the same goes for a URL inside a tool row or a plan. Trailing
