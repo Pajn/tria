@@ -852,7 +852,12 @@ in it, which `zR` does in one. `zM` shuts them all, and is the one key that also
 the folds opened by hand.
 
 Expanding a tool row starts with what the server sends: the command or tool input, an
-output summary, changed files, and the status. When connected to a local server, opening
+output summary, changed files, and the status. File changes show each file's retained
+diff below its path, with green additions and red deletions; those patches also appear in
+copies and editor exports. For local servers, opening folds recovers patches stripped
+from the stream from the server's read-only `state.sqlite` activity records, matched by
+thread and tool-call ID. Calls without retained patches show their file paths.
+When connected to a local server, opening
 folds also looks for the full Claude tool inputs and results in the checkout's saved
 transcripts under `~/.claude/projects` (or `CLAUDE_CONFIG_DIR/projects`). Calls are matched
 by their tool-use IDs. Recovered content appears in expanded rows, searches, yanks, and
@@ -864,7 +869,8 @@ For a background Bash command, recovery also reads the output file referenced by
 result, labelled as current background output. These file previews are limited to 2 MiB
 and explicitly marked if cut off. Reopening folds retries recovery and refreshes that
 output. Missing transcripts or results are labelled, with the server summary kept as a
-fallback. This recovery currently supports Claude and local servers only; it does not
+fallback. Full tool input/result recovery supports Claude; file-patch recovery also
+supports Codex. Both require a local server; recovery does not
 resume a session or rerun a command. A subagent's tool calls already come from its transcript
 file and keep what they sent and what they got back.
 

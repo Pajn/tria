@@ -1,4 +1,4 @@
-//! Read-only recovery of Claude tool payloads on the provider's machine. IDs, never
+//! Read-only recovery of saved tool payloads on the provider's machine. IDs, never
 //! command text or timestamps, associate saved blocks with the server's summaries.
 use std::{
     collections::{HashMap, HashSet},
@@ -17,6 +17,13 @@ pub enum Recovery {
         input: Option<String>,
         output: Option<String>,
     },
+    FileChanges(Vec<ChangedFile>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ChangedFile {
+    pub path: String,
+    pub diff: Option<String>,
 }
 
 pub fn tool_id(activity: &crate::model::Activity) -> Option<&str> {
@@ -26,20 +33,90 @@ pub fn tool_id(activity: &crate::model::Activity) -> Option<&str> {
     activity
         .str("toolCallId")
         .or_else(|| activity.str("toolUseId"))
-        .filter(|id| id.starts_with("toolu_"))
+        .filter(|id| id.starts_with("toolu_") || activity.str("itemType") == Some("file_change"))
 }
 
-pub fn recover(cwd: &str, ids: &HashSet<String>) -> HashMap<String, Recovery> {
+pub fn recover(cwd: &str, thread_id: &str, ids: &HashSet<String>) -> HashMap<String, Recovery> {
+    let claude_ids: HashSet<String> = ids
+        .iter()
+        .filter(|id| id.starts_with("toolu_"))
+        .cloned()
+        .collect();
     let root = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|p| p.join(".claude")));
-    match root {
-        Some(root) => read_project(&root.join("projects"), Path::new(cwd), ids),
-        None => ids
-            .iter()
-            .map(|id| (id.clone(), Recovery::Unavailable))
-            .collect(),
+    let mut recovered = match root {
+        Some(root) if !claude_ids.is_empty() => {
+            read_project(&root.join("projects"), Path::new(cwd), &claude_ids)
+        }
+        _ => HashMap::new(),
+    };
+    if let Ok(runtime) = crate::discovery::runtime_state_path() {
+        recovered.extend(read_file_changes(
+            &runtime.with_file_name("state.sqlite"),
+            thread_id,
+            ids,
+        ));
     }
+    for id in ids {
+        recovered.entry(id.clone()).or_insert(Recovery::Unavailable);
+    }
+    recovered
+}
+
+/// The wire projection drops file patches; the local server retains them in its store.
+/// Open read-only and bind the thread ID so similarly named calls never cross threads.
+fn read_file_changes(
+    path: &Path,
+    thread_id: &str,
+    ids: &HashSet<String>,
+) -> HashMap<String, Recovery> {
+    let mut recovered = HashMap::new();
+    let Ok(db) =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return recovered;
+    };
+    let Ok(mut query) = db.prepare(
+        "SELECT payload_json FROM projection_thread_activities WHERE thread_id = ?1 AND kind IN ('tool.started', 'tool.updated', 'tool.completed') ORDER BY sequence, created_at"
+    ) else { return recovered };
+    let Ok(rows) = query.query_map([thread_id], |row| row.get::<_, String>(0)) else {
+        return recovered;
+    };
+    for row in rows.flatten() {
+        let Ok(payload) = serde_json::from_str::<Value>(&row) else {
+            continue;
+        };
+        if payload["itemType"].as_str() != Some("file_change") {
+            continue;
+        }
+        let Some(id) = payload["toolCallId"]
+            .as_str()
+            .filter(|id| ids.contains(*id))
+        else {
+            continue;
+        };
+        let files: Vec<_> = payload["data"]["item"]["changes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|file| {
+                Some(ChangedFile {
+                    path: file["path"].as_str()?.to_string(),
+                    diff: Some(
+                        file["diff"]
+                            .as_str()
+                            .filter(|diff| !diff.trim().is_empty())?
+                            .to_string(),
+                    ),
+                })
+            })
+            .collect();
+        if !files.is_empty() {
+            recovered.insert(id.to_string(), Recovery::FileChanges(files));
+        }
+    }
+    recovered
 }
 
 fn project_name(cwd: &Path) -> String {
@@ -232,6 +309,33 @@ mod tests {
 
     fn row(block: Value) -> String {
         format!("{}\n", json!({"message": {"content": [block]}}))
+    }
+
+    #[test]
+    fn local_patches_are_read_only_and_matched_by_thread_and_call() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("state.sqlite");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE projection_thread_activities (thread_id TEXT, kind TEXT, payload_json TEXT, sequence INTEGER, created_at TEXT);").unwrap();
+        for (thread, call, diff) in [
+            ("wanted", "edit", "+right"),
+            ("other", "edit", "+wrong"),
+            ("wanted", "other-call", "+unrelated"),
+        ] {
+            let payload = json!({"itemType":"file_change", "toolCallId":call,
+                "data":{"item":{"changes":[{"path":"/work/a", "diff":diff}]}}});
+            db.execute("INSERT INTO projection_thread_activities VALUES (?1, 'tool.completed', ?2, 1, 'now')", rusqlite::params![thread, payload.to_string()]).unwrap();
+        }
+        let ids = HashSet::from(["edit".into()]);
+        let recovered = read_file_changes(&path, "wanted", &ids);
+        let Recovery::FileChanges(files) = &recovered["edit"] else {
+            panic!()
+        };
+        assert_eq!(files[0].diff.as_deref(), Some("+right"));
+        assert_eq!(recovered.len(), 1);
+        let missing = fixture.0.join("missing.sqlite");
+        assert!(read_file_changes(&missing, "wanted", &ids).is_empty());
+        assert!(!missing.exists());
     }
 
     #[test]

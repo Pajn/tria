@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::recovery::ChangedFile as ToolFile;
 use crate::{model::Activity, picture, state::ThreadState};
 
 pub const USER_MARK: &str = "▌";
@@ -93,7 +94,7 @@ struct WorkEntry<'a> {
     /// cut at 180 characters and the output is its first meaningful line.
     input: Option<String>,
     output: Option<String>,
-    files: Vec<String>,
+    files: Vec<ToolFile>,
     /// Images the call came back with, borrowed from the activity that carried them:
     /// the bytes run to hundreds of kilobytes and the timeline is rebuilt often, so they
     /// are never copied for a row that may stay shut.
@@ -199,7 +200,7 @@ pub fn build(
                 let note = match recovered {
                     crate::recovery::Recovery::Loading => "[Loading saved tool content…]",
                     crate::recovery::Recovery::Unavailable => {
-                        "[Full content unavailable in the local Claude transcript; showing server summary]"
+                        "[Full content unavailable in local saved tool records; showing server summary]"
                     }
                     crate::recovery::Recovery::Found { input, output } => {
                         if let Some(input) = input {
@@ -213,6 +214,18 @@ pub fn build(
                         } else {
                             "[Saved input recovered; full result unavailable — reopen to retry]"
                         }
+                    }
+                    crate::recovery::Recovery::FileChanges(files) => {
+                        for file in files {
+                            if let Some(existing) =
+                                entry.files.iter_mut().find(|f| f.path == file.path)
+                            {
+                                existing.diff = file.diff.clone();
+                            } else {
+                                entry.files.push(file.clone());
+                            }
+                        }
+                        "[Diff recovered from local server]"
                     }
                 };
                 entry.output = Some(match entry.output.take() {
@@ -785,18 +798,37 @@ fn tool_images<'a>(key: &str, item_type: &str, activity: &'a Activity) -> Vec<To
         .collect()
 }
 
-fn tool_files(activity: &Activity) -> Vec<String> {
-    activity.payload["data"]
-        .get("files")
-        .and_then(Value::as_array)
-        .map(|files| {
-            files
-                .iter()
-                .filter_map(|f| f.get("path").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+fn tool_files(activity: &Activity) -> Vec<ToolFile> {
+    let data = &activity.payload["data"];
+    let mut files: Vec<ToolFile> = Vec::new();
+    // Some servers send a summary list alongside the original provider item.
+    // Keep its order, but fill in the patches retained by the provider.
+    for file in data["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(data["item"]["changes"].as_array().into_iter().flatten())
+    {
+        let Some(path) = file.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let diff = file
+            .get("diff")
+            .and_then(Value::as_str)
+            .filter(|diff| !diff.trim().is_empty())
+            .map(str::to_string);
+        if let Some(existing) = files.iter_mut().find(|file| file.path == path) {
+            if diff.is_some() {
+                existing.diff = diff;
+            }
+        } else {
+            files.push(ToolFile {
+                path: path.to_string(),
+                diff,
+            });
+        }
+    }
+    files
 }
 
 fn first_line(text: &str) -> &str {
@@ -859,8 +891,12 @@ fn export_entry(entry: &WorkEntry<'_>) -> String {
         out.push('\n');
         for file in &entry.files {
             out.push_str("✎ ");
-            out.push_str(file);
+            out.push_str(&file.path);
             out.push('\n');
+            if let Some(diff) = &file.diff {
+                out.push_str(diff.trim_end());
+                out.push('\n');
+            }
         }
     }
     out
@@ -1012,8 +1048,14 @@ fn render_work(
             for file in &entry.files {
                 lines.push(Line::from(vec![
                     Span::styled("      ✎ ", dim),
-                    Span::styled(file.clone(), Style::default().fg(Color::Gray)),
+                    Span::styled(file.path.clone(), Style::default().fg(Color::Gray)),
                 ]));
+                if let Some(diff) = &file.diff {
+                    for mut spans in crate::tool_text::highlight_diff(diff, Style::default()) {
+                        spans.insert(0, Span::raw("        "));
+                        lines.push(Line::from(spans));
+                    }
+                }
             }
             for image in &entry.images {
                 let room = image_room(width, height, IMAGE_INDENT);
@@ -1598,6 +1640,39 @@ mod tests {
         assert!(rendered.contains("Full content unavailable"));
     }
 
+    #[test]
+    fn projected_file_change_recovers_diff_in_the_thread_timeline() {
+        let snapshot = serde_json::from_value(json!({
+            "snapshotSequence": 1,
+            "thread": {"id":"thread", "projectId":"project", "title":"test",
+                "modelSelection":{"instanceId":"", "model":""},
+                "activities": [{"id":"activity", "kind":"tool.completed", "createdAt":"1",
+                    "payload":{"itemType":"file_change", "toolCallId":"exec-edit", "status":"completed", "title":"File change",
+                        "data":{"files":[{"path":"/work/a.ts"}]}}}]}
+        })).unwrap();
+        let mut thread = ThreadState::from_snapshot(snapshot);
+        assert_eq!(
+            crate::recovery::tool_id(&thread.detail.activities[0]),
+            Some("exec-edit")
+        );
+        thread.recovered_tools.insert(
+            "exec-edit".into(),
+            crate::recovery::Recovery::FileChanges(vec![ToolFile {
+                path: "/work/a.ts".into(),
+                diff: Some("@@ -1 +1 @@\n-old\n+new\n".into()),
+            }]),
+        );
+        let blocks = build(&thread, &HashSet::new(), 2, 100, 30);
+        assert!(blocks.iter().any(|b| b.text.to_string().contains("-old")));
+        assert!(
+            blocks
+                .iter()
+                .flat_map(|b| &b.exports)
+                .any(|(_, text)| text.contains("+new"))
+        );
+        assert!(thread.detail.activities[0].payload["data"]["item"].is_null());
+    }
+
     fn activity(kind: &str, payload: serde_json::Value) -> Activity {
         serde_json::from_value(json!({
             "id": format!("{kind}-{}", payload["taskId"]),
@@ -1616,6 +1691,58 @@ mod tests {
             merge_work(&mut pending, row);
         }
         pending
+    }
+
+    #[test]
+    fn file_changes_show_each_calls_patches_in_expanded_rows_and_exports() {
+        let patch = "@@ -1,2 +1,2 @@\n same\n-old\n+new\n";
+        let rows = [
+            activity(
+                "tool.started",
+                json!({
+                    "itemType": "file_change", "toolCallId": "edit", "title": "File change",
+                    "data": {"files": [{"path": "/work/a.ts"}]}
+                }),
+            ),
+            activity(
+                "tool.completed",
+                json!({
+                    "itemType": "file_change", "toolCallId": "edit", "title": "File change",
+                    "status": "completed",
+                    "data": {
+                        "files": [{"path": "/work/a.ts"}, {"path": "/work/no-patch.ts"}],
+                        "item": {"changes": [
+                            {"path": "/work/a.ts", "diff": patch},
+                            {"path": "/work/new.ts", "diff": "@@ -0,0 +1 @@\n+hello\n"}
+                        ]}
+                    }
+                }),
+            ),
+        ];
+        let entries = work(&rows);
+        assert_eq!(entries.len(), 1);
+        let (text, regions, _, _) =
+            render_work(&entries, true, true, &HashSet::new(), "group", 100, 30);
+        let rendered = text.to_string();
+        assert_eq!(rendered.matches("✎ /work/a.ts").count(), 1);
+        assert!(rendered.contains("✎ /work/no-patch.ts"));
+        assert!(rendered.contains("✎ /work/new.ts"));
+        assert!(rendered.contains("+hello"));
+        for (token, color) in [("-old", Color::Red), ("+new", Color::Green)] {
+            assert!(
+                text.lines
+                    .iter()
+                    .flat_map(|l| &l.spans)
+                    .any(|s| s.content == token && s.style.fg == Some(color))
+            );
+        }
+        assert_eq!(regions[1].end, text.lines.len());
+        let exported = export_entry(&entries[0]);
+        assert!(exported.contains(patch));
+        assert!(exported.contains("+hello"));
+        let (closed, _, _, _) =
+            render_work(&entries, true, false, &HashSet::new(), "group", 100, 30);
+        assert!(!closed.to_string().contains("-old"));
     }
 
     fn image_call(data: &str) -> Activity {

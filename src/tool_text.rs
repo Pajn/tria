@@ -6,11 +6,20 @@ use ratatui::{
 };
 
 pub fn highlight(text: &str, base: Style) -> Vec<Vec<Span<'static>>> {
+    highlight_text(text, base, false)
+}
+
+/// Provider file changes can contain only hunks, without unified diff file headers.
+pub fn highlight_diff(text: &str, base: Style) -> Vec<Vec<Span<'static>>> {
+    highlight_text(text, base, true)
+}
+
+fn highlight_text(text: &str, base: Style, diff: bool) -> Vec<Vec<Span<'static>>> {
     // A recovered JSON result can be followed by a provenance note or more logs.
     // Colour only a complete JSON value ending at a line boundary.
     let mut values = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
     let json_lines = match values.next() {
-        Some(Ok(value)) if value.is_object() || value.is_array() => {
+        Some(Ok(value)) if !diff && (value.is_object() || value.is_array()) => {
             let end = values.byte_offset();
             let tail = text[end..].trim_start_matches([' ', '\t', '\r']);
             if tail.is_empty() || tail.starts_with('\n') {
@@ -23,7 +32,7 @@ pub fn highlight(text: &str, base: Style) -> Vec<Vec<Span<'static>>> {
     };
     let lines: Vec<_> = text.lines().collect();
     let mut hunk = None;
-    let mut in_diff = false;
+    let mut in_diff = diff;
     lines
         .iter()
         .enumerate()

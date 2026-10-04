@@ -47,6 +47,7 @@ time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 vt100 = "0.16"
 lucide-icons = { version = "1.47.0", default-features = false }
 fontdue = "0.9.4"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 # Where `cargo binstall` looks for a built binary instead of compiling one. The URL is
 # spelled out rather than templated on the archive format, so that what the release

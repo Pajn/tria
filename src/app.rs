@@ -5765,15 +5765,17 @@ impl App {
         let events = self.events.clone();
         tokio::spawn(async move {
             let fallback = ids.clone();
-            let recovered =
-                tokio::task::spawn_blocking(move || crate::recovery::recover(&cwd, &ids))
-                    .await
-                    .unwrap_or_else(|_| {
-                        fallback
-                            .into_iter()
-                            .map(|id| (id, crate::recovery::Recovery::Unavailable))
-                            .collect()
-                    });
+            let recovery_thread = thread_id.clone();
+            let recovered = tokio::task::spawn_blocking(move || {
+                crate::recovery::recover(&cwd, &recovery_thread, &ids)
+            })
+            .await
+            .unwrap_or_else(|_| {
+                fallback
+                    .into_iter()
+                    .map(|id| (id, crate::recovery::Recovery::Unavailable))
+                    .collect()
+            });
             let _ = events.send(AppEvent::ToolRecovery {
                 request,
                 thread_id,
@@ -5800,7 +5802,10 @@ impl App {
             if matches!(payload, crate::recovery::Recovery::Unavailable)
                 && matches!(
                     thread.recovered_tools.get(&id),
-                    Some(crate::recovery::Recovery::Found { .. })
+                    Some(
+                        crate::recovery::Recovery::Found { .. }
+                            | crate::recovery::Recovery::FileChanges(_)
+                    )
                 )
             {
                 continue;
