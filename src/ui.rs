@@ -3193,6 +3193,9 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("                          thread can be looked at before answering"),
         Line::from("  gy                      yank last assistant message (OSC 52)"),
         Line::from(
+            "  gI                      copy thread ID; in the thread list, the selected row",
+        ),
+        Line::from(
             "  gY                      copy the link destination at the chat cursor (OSC 52)",
         ),
         Line::from(programs.clone()),

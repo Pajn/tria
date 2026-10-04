@@ -138,6 +138,7 @@ Press `?` inside the app for the full list.
 | `1`..`9` | answer a pending approval, with nothing written in the composer; otherwise a count for the next motion |
 | `ga` | answer the agent's question: digits pick, `Space` toggles, `c` types a custom answer, `Enter` advances |
 | `gy` | copy the last assistant message (OSC 52) |
+| `gI` | copy the open thread's ID; in the thread list, the selected thread's ID (OSC 52) |
 | `gY` | chat focused: copy the link destination under the cursor, or the first link on its line (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
 | `gT` | list the agent's background tasks that are still running; `s` stops them, `S` the session, after asking |

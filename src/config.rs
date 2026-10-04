@@ -87,7 +87,7 @@ pub const DEFAULT_GIT_COMMAND: &str = "lazygit";
 
 /// The keys tria answers after `g` itself. A program cannot be given one of these,
 /// because the key would never reach it.
-pub const TAKEN_KEYS: &str = "!ADENPSTWYaegpstwxy";
+pub const TAKEN_KEYS: &str = "!ADEINPSTWYaegpstwxy";
 
 /// A program bound to `g` and one more key, run in the thread's directory.
 #[derive(Debug, Clone, PartialEq, Eq)]

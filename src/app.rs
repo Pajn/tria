@@ -2283,6 +2283,26 @@ impl App {
         }
     }
 
+    /// `gI`: the selected thread in the thread list, or the open thread elsewhere.
+    fn yank_thread_id(&mut self) {
+        let id = if self.focus == Focus::Sidebar
+            && self.sidebar_view.tab() == sidebar_view::Tab::Threads
+        {
+            self.sidebar_selected_thread()
+        } else if self.draft.is_none() {
+            self.current_thread_id.clone()
+        } else {
+            None
+        };
+        match id {
+            Some(id) => {
+                copy_to_clipboard(&id);
+                self.toast(format!("copied thread ID: {id}"), false);
+            }
+            None => self.toast("no thread selected", false),
+        }
+    }
+
     fn yank_last_assistant(&mut self) {
         let Some(thread) = self.open_conversation() else {
             return;
@@ -5947,6 +5967,7 @@ impl App {
             'D' => self.reveal_directory(),
             'y' => self.yank_last_assistant(),
             'Y' => self.yank_link(),
+            'I' => self.yank_thread_id(),
             'E' => self.view_conversation(),
             '!' => self.open_shell(),
             'w' => self.toggle_draft_worktree(),
@@ -6035,6 +6056,14 @@ impl App {
                 KeyCode::Char('s') if prefix == Some('g') => {
                     let id = self.sidebar_selected_thread();
                     self.toggle_settled(id);
+                }
+                KeyCode::Char('I')
+                    if prefix == Some('g')
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.yank_thread_id()
                 }
                 KeyCode::Char(key) if prefix == Some('g') && self.bound(key) => {
                     self.open_program(key)
@@ -9260,6 +9289,47 @@ mod tests {
         for c in text.chars() {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
+    }
+
+    #[test]
+    fn copying_a_thread_id_uses_the_open_thread_or_the_selected_thread() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.current_thread_id = Some("open-thread".into());
+        for focus in [Focus::Composer, Focus::Chat] {
+            app.focus = focus;
+            typed(&mut app, "gI");
+            assert_eq!(
+                app.toast.as_ref().unwrap().0,
+                "copied thread ID: open-thread"
+            );
+        }
+
+        project(&mut app);
+        app.show_settled = true;
+        app.shell.threads.insert(
+            "selected-thread".into(),
+            shell_thread("selected-thread", "p", None),
+        );
+        app.select_sidebar_thread("selected-thread");
+        app.focus = Focus::Sidebar;
+        typed(&mut app, "gI");
+        assert_eq!(
+            app.toast.as_ref().unwrap().0,
+            "copied thread ID: selected-thread"
+        );
+        assert_eq!(app.current_thread_id.as_deref(), Some("open-thread"));
+
+        // A section header has no thread ID, even with another thread open.
+        app.sidebar_view.top(&app.sidebar_lent());
+        typed(&mut app, "gI");
+        assert_eq!(app.toast.as_ref().unwrap().0, "no thread selected");
+
+        app.focus = Focus::Composer;
+        app.current_thread_id = None;
+        typed(&mut app, "gI");
+        assert_eq!(app.toast.as_ref().unwrap().0, "no thread selected");
     }
 
     fn plain(code: KeyCode) -> KeyEvent {
