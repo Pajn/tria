@@ -1627,7 +1627,7 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
             "Enter steers the running turn · Ctrl-s queues for after it · Esc normal"
         }
         None if insert => "type a message · Enter sends · Ctrl-v Enter newline · Esc normal",
-        None => "i or a click to write · d c y w b f t motions edit",
+        None => "i or a click to write",
     };
     app.composer_area = text_area;
     let (lines, cursor) = app.composer.render(text_area, placeholder);
