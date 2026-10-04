@@ -759,14 +759,29 @@ fn tool_images<'a>(key: &str, item_type: &str, activity: &'a Activity) -> Vec<To
         .get("imagePath")
         .or_else(|| data.pointer("/input/file_path"))
         .or_else(|| data.get("path"))
+        .or_else(|| data.pointer("/item/path"))
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty());
-    named
-        .map(|path| ToolImage {
+    if let Some(path) = named {
+        return vec![ToolImage {
             key: format!("{key}/file"),
             source: picture::Source::File(path),
-        })
+        }];
+    }
+    // The server projects Codex imageView items down to a list of files on the
+    // wire, dropping the provider item that held the original path.
+    data["files"]
+        .as_array()
         .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, file)| {
+            let path = file.get("path")?.as_str().filter(|path| !path.is_empty())?;
+            Some(ToolImage {
+                key: format!("{key}/file/{index}"),
+                source: picture::Source::File(path),
+            })
+        })
         .collect()
 }
 
@@ -1704,6 +1719,73 @@ mod tests {
         let open = HashSet::from(["work-1/t2".to_string()]);
         let (_, _, images, _) = render_work(&entries, true, false, &open, "work-1", 80, 24);
         assert_eq!(images.len(), 1);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Codex imageView items keep the path inside the provider item, rather than
+    /// directly on data. Opening that row must reserve space for the image too.
+    #[test]
+    fn a_codex_image_view_shows_the_path_inside_its_item() {
+        picture::draw_in_halfblocks();
+        let path = std::env::temp_dir().join("tria-codex-image-view.png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(picture::test_png(120, 60))
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let mut activity = image_row_naming(path.to_str().unwrap());
+        activity.payload["data"] = json!({
+            "completedAtMs": 1791123583665_u64,
+            "item": { "id": "t2", "path": path.to_str().unwrap(), "type": "imageView" },
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+        });
+        let rows = [activity];
+        let entries = work(&rows);
+        let open = HashSet::from(["work-1/t2".to_string()]);
+        let (_, _, images, pictures) = render_work(&entries, true, false, &open, "work-1", 80, 24);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].key, "t2/file");
+        assert_eq!(
+            pictures,
+            [(
+                "work-1/t2".to_string(),
+                Picture::File(path.to_str().unwrap().to_string())
+            )]
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The thread stream does not carry the provider item saved in the database:
+    /// its projected image view carries only files, on both lifecycle events.
+    #[test]
+    fn a_projected_codex_image_view_draws_the_files_sent_on_the_wire() {
+        picture::draw_in_halfblocks();
+        let path = std::env::temp_dir().join("tria-projected-codex-image-view.png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(picture::test_png(120, 60))
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let mut completed = image_row_naming(path.to_str().unwrap());
+        completed.payload["data"] = json!({ "files": [{ "path": path.to_str().unwrap() }] });
+        let mut started = completed.clone();
+        started.id = "a-started".to_string();
+        started.kind = "tool.started".to_string();
+        started.payload["status"] = json!("inProgress");
+        let rows = [started, completed];
+        let entries = work(&rows);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].images.len(), 1);
+        let open = HashSet::from(["work-1/t2".to_string()]);
+        let (_, _, images, pictures) = render_work(&entries, true, false, &open, "work-1", 80, 24);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].key, "t2/file/0");
+        assert_eq!(
+            pictures,
+            [(
+                "work-1/t2".to_string(),
+                Picture::File(path.to_str().unwrap().to_string())
+            )]
+        );
         std::fs::remove_file(&path).unwrap();
     }
 
