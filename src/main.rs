@@ -9,6 +9,7 @@ mod discovery;
 mod handoff;
 mod kitty;
 mod list_cursor;
+mod local_pty;
 mod lucide;
 mod markdown;
 mod model;

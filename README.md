@@ -541,9 +541,8 @@ is open goes to the main agent, after asking, starting with `Sent looking at pul
 ## Programs
 
 `g` and one more key run a program in a terminal of the thread's own, as a popup inside tria:
-the chat stays on screen around it and tria keeps running. The program replaces the shell
-rather than running inside it, so the popup goes straight to it and closes again when you
-quit. `gl` is `lazygit` until you say otherwise, and what is on the other keys is the config
+the chat stays on screen around it and tria keeps running. The popup closes when the program
+exits. `gl` is `lazygit` until you say otherwise, and what is on the other keys is the config
 file's to decide:
 
 ```toml
@@ -565,14 +564,19 @@ While a program is up, `Ctrl-\` leaves it running and its key comes back to it e
 was. Each binding has a terminal of its own, so a file manager and a git client left open in
 one thread do not take turns in the same shell.
 
-The terminal belongs to the server, so this works the same whether the server is on this
-machine or another one, and the program runs where the repository is.
+For a local server, program bindings run in a PTY owned by tria. A plain executable such as
+`lazygit` starts directly; command strings with arguments or shell syntax run through
+non-interactive `/bin/sh -c`. They inherit tria's environment without loading interactive
+shell configuration, running prompt hooks such as direnv, or adding commands to shell history.
+If a program needs the checkout's direnv environment, bind it to `direnv exec . lazygit`.
 
-Startup goes through your login shell, which is the whole of what a popup costs, and a thread
-pays it once: closing the popup closes the terminal and opens another in its place, so the
-shell is already at a prompt when you next ask for one. Leaving a thread lets go of the
-one it was keeping. The pane also answers the capability queries a full-screen program sends
-on startup, so nothing waits on a timeout.
+Detached programs keep running and appear in the terminal list, where they can be attached,
+closed, or restarted. They end when tria exits or changes server connections. Shell terminals
+(`g!` and `:shell`) still belong to the server. For a remote server, program bindings also use
+server terminals and their usual shell startup, so the program runs where the repository is.
+
+The pane answers the capability queries a full-screen program sends on startup, including
+while a local program is detached, so nothing waits on a timeout.
 
 A paste in the pane reaches the program as a paste. One that has asked for bracketed paste
 gets the text between the markers, so a shell holds a multi-line paste at the prompt instead

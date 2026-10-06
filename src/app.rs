@@ -420,6 +420,7 @@ fn building(command: Value, implementing: Option<outbox::Implementing>) -> Value
 }
 
 pub enum AppEvent {
+    LocalTerminal(crate::local_pty::Event),
     ServerWarning(Option<String>),
     ProjectDirectory {
         id: String,
@@ -653,8 +654,11 @@ pub struct App {
     gh_tokens: std::sync::Arc<tokio::sync::Mutex<HashMap<(String, String), String>>>,
     /// The attached terminal, when one is open.
     pub pane: Option<crate::term::Pane>,
-    /// A command to type into the pane once its shell reports for duty, for `gl`.
+    /// A remote program command to type once its server shell reports for duty.
     pending_pane_command: Option<String>,
+    /// Local programs keep their parsed screen while detached.
+    local_terminals: HashMap<crate::local_pty::Key, crate::local_pty::Session>,
+    local_pane: Option<crate::local_pty::Key>,
     /// Where the pane's screen is drawn, for turning mouse positions into cells.
     pub pane_area: Rect,
     /// What each followed checkout is holding, by directory. A checkout is not one
@@ -796,6 +800,8 @@ impl App {
             gh_tokens: Default::default(),
             pane: None,
             pending_pane_command: None,
+            local_terminals: HashMap::new(),
+            local_pane: None,
             pane_area: Rect::default(),
             checkouts: HashMap::new(),
             watched_cwds: Vec::new(),
@@ -2400,7 +2406,18 @@ impl App {
         let mut list: Vec<&crate::model::TerminalSummary> = self
             .terminals
             .iter()
-            .filter(|t| t.thread_id == id)
+            .filter(|t| {
+                t.thread_id == id
+                    && !self
+                        .local_terminals
+                        .contains_key(&(t.thread_id.clone(), t.terminal_id.clone()))
+            })
+            .chain(
+                self.local_terminals
+                    .values()
+                    .map(|s| &s.summary)
+                    .filter(|t| t.thread_id == id),
+            )
             .collect();
         list.sort_by_key(|t| (!t.is_live(), t.terminal_id.clone()));
         list
@@ -2439,6 +2456,15 @@ impl App {
             self.toast("no terminal selected", true);
             return;
         };
+        if self
+            .local_terminals
+            .remove(&(thread_id.clone(), terminal_id.clone()))
+            .is_some()
+        {
+            self.toast(format!("closed {terminal_id}"), false);
+            self.handle.refresh_vcs();
+            return;
+        }
         self.call(
             "terminal.close",
             json!({"threadId": thread_id, "terminalId": terminal_id}),
@@ -2452,6 +2478,16 @@ impl App {
             self.toast("no terminal selected", true);
             return;
         };
+        let key = (thread_id.clone(), terminal_id.clone());
+        if let Some(session) = self.local_terminals.remove(&key) {
+            let command = session.summary.label.clone();
+            drop(session);
+            let mode = self.mode;
+            self.open_local_program(thread_id, terminal_id, command, cwd);
+            self.detach_terminal();
+            self.mode = mode;
+            return;
+        }
         self.call(
             "terminal.restart",
             json!({
@@ -2505,6 +2541,19 @@ impl App {
             self.toast("no terminal selected", true);
             return;
         };
+        if let Some(session) = self
+            .local_terminals
+            .get(&(terminal.thread_id.clone(), terminal.terminal_id.clone()))
+        {
+            let command = session.summary.label.clone();
+            self.open_local_program(
+                terminal.thread_id,
+                terminal.terminal_id,
+                command,
+                terminal.cwd,
+            );
+            return;
+        }
         self.open_pane(
             terminal.thread_id,
             terminal.terminal_id,
@@ -2515,6 +2564,9 @@ impl App {
 
     /// Attach and show the pane. The server opens or revives the terminal as needed.
     fn open_pane(&mut self, thread_id: String, terminal_id: String, label: String, cwd: String) {
+        if self.local_pane.is_some() {
+            self.detach_terminal();
+        }
         let (cols, rows) = self.pane_size();
         self.handle
             .attach_terminal(&thread_id, &terminal_id, &cwd, cols, rows);
@@ -2531,6 +2583,11 @@ impl App {
     /// Leave the pane. The shell keeps running; the server just stops streaming here.
     fn detach_terminal(&mut self) {
         self.handle.detach_terminal();
+        if let Some(key) = self.local_pane.take()
+            && let Some(session) = self.local_terminals.get_mut(&key)
+        {
+            session.screen = self.pane.take();
+        }
         self.pane = None;
         self.pending_pane_command = None;
         self.mode = Mode::Normal;
@@ -2551,6 +2608,9 @@ impl App {
 
     fn apply_terminal_stream(&mut self, event: crate::model::TerminalStreamEvent) {
         use crate::model::TerminalStreamEvent as Event;
+        if self.local_pane.is_some() {
+            return;
+        }
         let Some(pane) = self.pane.as_mut() else {
             return;
         };
@@ -2918,6 +2978,14 @@ impl App {
         let Some(pane) = self.pane.as_ref() else {
             return;
         };
+        if let Some(key) = &self.local_pane {
+            if let Some(session) = self.local_terminals.get(key)
+                && let Err(err) = session.write(&data)
+            {
+                tracing::warn!(%err, "writing to local terminal");
+            }
+            return;
+        }
         let payload = json!({
             "threadId": pane.thread_id,
             "terminalId": pane.terminal_id,
@@ -3000,6 +3068,14 @@ impl App {
             return;
         };
         if !pane.resize(cols, rows) {
+            return;
+        }
+        if let Some(key) = &self.local_pane {
+            if let Some(session) = self.local_terminals.get(key)
+                && let Err(err) = session.resize(cols, rows)
+            {
+                tracing::warn!(%err, "resizing local terminal");
+            }
             return;
         }
         let payload = json!({
@@ -3267,6 +3343,10 @@ impl App {
             .terminals
             .iter()
             .any(|t| t.is_live() && t.cwd == worktree.path)
+            || self
+                .local_terminals
+                .values()
+                .any(|s| s.summary.cwd == worktree.path)
         {
             return Some("a terminal is open in it");
         }
@@ -3910,13 +3990,106 @@ impl App {
             return;
         };
         let command = program.command.clone();
+        if self.local_disk {
+            self.open_local_program(thread_id, program.terminal_id(), command, dir);
+            return;
+        }
         // `exec` replaces the shell, so quitting the program ends the session and the
         // popup closes with it. It also means a program bound here should be one that
         // holds the terminal until you leave it.
+        self.detach_terminal();
         self.pending_pane_command = Some(format!("exec {command}\r"));
         self.open_pane(thread_id, program.terminal_id(), command.clone(), dir);
         if let Some(pane) = self.pane.as_mut() {
             pane.starting = Some(command);
+        }
+    }
+
+    /// Program popups on this machine belong to tria, and never need a shell prompt.
+    fn open_local_program(
+        &mut self,
+        thread_id: String,
+        terminal_id: String,
+        command: String,
+        cwd: String,
+    ) {
+        let (cols, rows) = self.pane_size();
+        self.detach_terminal();
+        let key = (thread_id.clone(), terminal_id.clone());
+        if !self.local_terminals.contains_key(&key) {
+            match crate::local_pty::Session::spawn(
+                key.clone(),
+                &command,
+                &cwd,
+                cols,
+                rows,
+                self.events.clone(),
+            ) {
+                Ok(session) => {
+                    self.local_terminals.insert(key.clone(), session);
+                }
+                Err(err) => {
+                    self.toast(format!("could not start {command}: {err:#}"), true);
+                    return;
+                }
+            }
+        }
+        let session = self.local_terminals.get_mut(&key).unwrap();
+        let mut pane = session
+            .screen
+            .take()
+            .unwrap_or_else(|| crate::term::Pane::new(thread_id, terminal_id, command, cols, rows));
+        pane.resize(cols, rows);
+        if let Err(err) = session.resize(cols, rows) {
+            tracing::warn!(%err, "resizing local terminal");
+        }
+        self.pane = Some(pane);
+        self.local_pane = Some(key);
+        self.mode = Mode::TerminalPane;
+    }
+
+    fn apply_local_terminal(&mut self, event: crate::local_pty::Event) {
+        use crate::local_pty::Output;
+        let Some(session) = self.local_terminals.get_mut(&event.key) else {
+            return;
+        };
+        if session.generation != event.generation {
+            return;
+        }
+        let attached = self.local_pane.as_ref() == Some(&event.key);
+        match event.output {
+            Output::Data(data) => {
+                let pane = if attached {
+                    self.pane.as_mut()
+                } else {
+                    session.screen.as_mut()
+                };
+                if let Some(pane) = pane {
+                    for reply in pane.feed(&data) {
+                        if let Err(err) = session.write(&reply) {
+                            tracing::warn!(%err, "answering local terminal query");
+                        }
+                    }
+                }
+            }
+            Output::Exited(result) => {
+                self.local_terminals.remove(&event.key);
+                if !attached {
+                    self.handle.refresh_vcs();
+                }
+                if attached {
+                    let label = self
+                        .pane
+                        .as_ref()
+                        .map(|p| p.label.clone())
+                        .unwrap_or_default();
+                    self.detach_terminal();
+                    match result {
+                        Ok(()) => self.toast(format!("{label} exited"), false),
+                        Err(err) => self.toast(format!("{label}: {err}"), true),
+                    }
+                }
+            }
         }
     }
 
@@ -7624,6 +7797,7 @@ fn mark_of(thread: &crate::model::ThreadShell) -> String {
 /// costs one screen rather than one each.
 fn apply(app: &mut App, event: AppEvent) {
     match event {
+        AppEvent::LocalTerminal(event) => app.apply_local_terminal(event),
         AppEvent::ServerWarning(warning) => app.server_warning = warning,
         AppEvent::ProjectDirectory { id, result } => {
             if let Some(browser) = app
@@ -8645,6 +8819,146 @@ mod tests {
                 }
                 crate::session::Request::Dispatch { .. } => panic!("no message has been sent"),
                 _ => {}
+            }
+        }
+    }
+
+    /// A detached local program keeps its screen, answers queries, and reattaches to
+    /// the same process without asking the server to start or write to a shell.
+    #[tokio::test]
+    async fn local_programs_detach_reattach_and_ignore_server_streams() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.local_disk = true;
+        let project_id = project(&mut app);
+        app.shell
+            .projects
+            .get_mut(&project_id)
+            .unwrap()
+            .workspace_root = std::env::temp_dir().display().to_string();
+        app.programs = vec![crate::config::Program {
+            key: 'b',
+            command: "/bin/cat".into(),
+        }];
+        app.start_new_thread(&project_id);
+        app.open_program('b');
+        let key = app.local_pane.clone().unwrap();
+        let generation = app.local_terminals[&key].generation;
+        assert_eq!(app.pending_pane_command, None);
+        assert_eq!(app.thread_terminals().len(), 1);
+        app.apply_terminal_stream(crate::model::TerminalStreamEvent::Exited {
+            exit_code: None,
+            exit_signal: None,
+        });
+        assert!(
+            app.pane.is_some(),
+            "server events do not close a local pane"
+        );
+        app.sync_pane_size(91, 19);
+        assert_eq!(
+            app.local_terminals[&key].summary.cwd,
+            std::env::temp_dir().display().to_string()
+        );
+        app.detach_terminal();
+        app.apply_local_terminal(crate::local_pty::Event {
+            key: key.clone(),
+            generation,
+            output: crate::local_pty::Output::Data("detached output".into()),
+        });
+        // A query received while detached is answered into the PTY too.
+        app.apply_local_terminal(crate::local_pty::Event {
+            key: key.clone(),
+            generation,
+            output: crate::local_pty::Output::Data("\x1b[6n".into()),
+        });
+        app.open_program('b');
+        assert_eq!(app.local_terminals[&key].generation, generation);
+        assert!(
+            app.pane
+                .as_ref()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("detached output")
+        );
+        app.write_to_pane("hello\r".into());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = received.recv().await.unwrap();
+                apply(&mut app, event);
+                if app
+                    .pane
+                    .as_ref()
+                    .unwrap()
+                    .screen()
+                    .contents()
+                    .contains("hello")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        while let Ok(request) = requests.try_recv() {
+            assert!(!matches!(request, crate::session::Request::Attach { .. }));
+            if let crate::session::Request::Call { tag, .. } = request {
+                assert!(!tag.starts_with("terminal."), "{tag}");
+            }
+        }
+        app.detach_terminal();
+        app.open_terminals();
+        app.terminal_cursor.top(&app.terminal_rows());
+        app.restart_terminal();
+        assert_eq!(app.mode, Mode::Terminals);
+        assert_ne!(app.local_terminals[&key].generation, generation);
+        app.apply_local_terminal(crate::local_pty::Event {
+            key: key.clone(),
+            generation,
+            output: crate::local_pty::Output::Exited(Ok(())),
+        });
+        assert_eq!(
+            app.local_terminals.len(),
+            1,
+            "old exit cannot close the replacement"
+        );
+        app.close_terminal();
+        assert!(app.local_terminals.is_empty());
+        // Output queued by the old process cannot affect another session or shell.
+        app.apply_local_terminal(crate::local_pty::Event {
+            key,
+            generation,
+            output: crate::local_pty::Output::Data("late output".into()),
+        });
+        assert!(app.pane.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_local_program_exiting_closes_its_pane_without_warming_a_shell() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.local_disk = true;
+        app.open_local_program(
+            "t1".into(),
+            "tria-gl".into(),
+            "/usr/bin/true".into(),
+            std::env::temp_dir().display().to_string(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !app.local_terminals.is_empty() {
+                apply(&mut app, received.recv().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert!(app.pane.is_none());
+        assert_eq!(app.mode, Mode::Normal);
+        while let Ok(request) = requests.try_recv() {
+            assert!(!matches!(request, crate::session::Request::Attach { .. }));
+            if let crate::session::Request::Call { tag, .. } = request {
+                assert!(!tag.starts_with("terminal."), "{tag}");
             }
         }
     }

@@ -1,8 +1,7 @@
-//! The attached terminal: a vt100 screen fed by the server's output stream, and
+//! The attached terminal: a vt100 screen fed by a local or server output stream, and
 //! the encoder that turns key events back into the bytes a pty expects.
 //!
-//! The server owns the pty. This side only parses what it sends and writes what
-//! the user types, so there is no process handling here.
+//! This module parses output and encodes input; local process handling lives in local_pty.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
