@@ -1,4 +1,5 @@
 mod app;
+mod attachment;
 mod auth;
 mod chat_view;
 mod commands;

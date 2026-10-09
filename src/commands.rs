@@ -62,7 +62,12 @@ pub fn worktree_branch(thread_id: &str) -> String {
 
 /// Send a message on an existing thread. The server decides what it does with it: starts
 /// a run, or steers or queues behind the one already going.
-pub fn turn_start(thread_id: &str, text: &str, model_selection: &ModelSelection) -> Value {
+pub fn turn_start(
+    thread_id: &str,
+    text: &str,
+    images: &[crate::attachment::Image],
+    model_selection: &ModelSelection,
+) -> Value {
     json!({
         "type": "message.dispatch",
         "commandId": new_id(),
@@ -71,7 +76,7 @@ pub fn turn_start(thread_id: &str, text: &str, model_selection: &ModelSelection)
         "threadId": thread_id,
         "messageId": new_id(),
         "text": text,
-        "attachments": [],
+        "attachments": attachments(images),
         "modelSelection": model_selection,
         "deliveryIntent": "auto",
         "dispatchMode": { "type": "start_immediately" },
@@ -80,7 +85,12 @@ pub fn turn_start(thread_id: &str, text: &str, model_selection: &ModelSelection)
 
 /// The input of `orchestration.launchThread`: make the thread, prepare where it works,
 /// and send its first message.
-pub fn launch_thread(thread_id: &str, text: &str, new_thread: NewThread<'_>) -> Value {
+pub fn launch_thread(
+    thread_id: &str,
+    text: &str,
+    images: &[crate::attachment::Image],
+    new_thread: NewThread<'_>,
+) -> Value {
     let workspace = match (&new_thread.worktree, new_thread.worktree_path) {
         (Some(worktree), _) => json!({
             "type": "worktree",
@@ -108,8 +118,21 @@ pub fn launch_thread(thread_id: &str, text: &str, new_thread: NewThread<'_>) -> 
         "runtimeMode": new_thread.runtime_mode,
         "interactionMode": new_thread.interaction_mode,
         "workspaceStrategy": workspace,
-        "initialMessage": { "messageId": new_id(), "text": text, "attachments": [] },
+        "initialMessage": {
+            "messageId": new_id(),
+            "text": text,
+            "attachments": attachments(images),
+        },
     })
+}
+
+fn attachments(images: &[crate::attachment::Image]) -> Value {
+    Value::Array(
+        images
+            .iter()
+            .map(crate::attachment::Image::to_json)
+            .collect(),
+    )
 }
 
 /// What a turn that builds a proposed plan says. The desktop's words, so that a plan
@@ -407,6 +430,7 @@ mod tests {
         let input = launch_thread(
             "thread-1",
             "hello",
+            &[],
             new_thread(&selection, Some(worktree), None),
         );
         assert_eq!(input["projectId"], "project-1");
@@ -433,11 +457,12 @@ mod tests {
     #[test]
     fn a_new_thread_in_the_checkout_asks_for_no_worktree() {
         let selection = selection();
-        let input = launch_thread("thread-1", "hello", new_thread(&selection, None, None));
+        let input = launch_thread("thread-1", "hello", &[], new_thread(&selection, None, None));
         assert_eq!(input["workspaceStrategy"], json!({ "type": "root" }));
         let input = launch_thread(
             "thread-1",
             "hello",
+            &[],
             new_thread(&selection, None, Some("topic")),
         );
         assert_eq!(

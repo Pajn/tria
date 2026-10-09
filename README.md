@@ -235,7 +235,9 @@ still waiting.
 | `Ctrl-s` | while a turn runs, queue the message until it ends |
 | `/` at the start of a line, or `$` | list the provider's commands and skills; `Tab` takes the row, `Up` `Down` move, `Esc` hides the list |
 | `Alt-Enter` or `Ctrl-j` | newline |
-| `Ctrl-v` or `Ctrl-q` | the next key as the character it stands for: `Ctrl-v` `Enter` is a newline, `Ctrl-v` `Tab` a tab |
+| `Ctrl-q` | the next key as the character it stands for: `Ctrl-q` `Enter` is a newline, `Ctrl-q` `Tab` a tab |
+| `Ctrl-v` | paste the clipboard: an image goes with the message, text is pasted as text |
+| `Backspace` on an empty message | drop the last image attached |
 | `Up` `Down` or `Ctrl-p` `Ctrl-n` | prompt history; on an empty composer, `Up` takes a queued message back first |
 | `←` `→` `Home` `End`, `Ctrl-a` `Ctrl-e` | move the cursor; `Alt` with an arrow, or `Alt-b` `Alt-f`, moves by word |
 | `Backspace` `Delete`, `Ctrl-w` `Ctrl-k` `Ctrl-u` | delete a character, the word before the cursor, to the end, to the start |
@@ -243,10 +245,11 @@ still waiting.
 
 Quitting is `:q`, and only `:q`. No key does it on its own, because the composer holds
 unsent messages that nothing writes to disk, and a chord that throws them away is not one
-to find by accident. `Ctrl-v` and `Ctrl-q` mean in insert mode what they mean in Vim,
-which is why neither is a quit: the next key goes in as the character it stands for.
-`Alt-Enter` is the usual way to write a newline where `Enter` sends, but a terminal has to
-be willing to send it; `Ctrl-v` `Enter` needs nothing of the terminal and always works.
+to find by accident. `Ctrl-q` means in insert mode what it means in Vim, which is why it is
+not a quit: the next key goes in as the character it stands for. `Alt-Enter` is the usual
+way to write a newline where `Enter` sends, but a terminal has to be willing to send it;
+`Ctrl-q` `Enter` needs nothing of the terminal and always works. Vim's other name for it,
+`Ctrl-v`, pastes instead, as it does in most agents' composers.
 
 A line that starts with `/` lists what the provider can run: its commands, which only mean
 anything as the first line of a message, and its skills. A word that starts with `$` lists the
@@ -312,6 +315,22 @@ before, and tabbing past the last gives back what was typed rather than leaving 
 guess in the line. An argument that comes from a fixed list completes the same way —
 `mode`, `perm`, `project`, and whichever efforts the model offers. The ones that take a
 title or a name do not: there is nothing here to complete those against.
+
+## Images
+
+An image goes with the message being written in either of two ways. A file dropped on the
+terminal, the screenshot preview macOS shows after a capture included, arrives as a paste of
+its path, and a paste that is nothing but paths to image files attaches them instead of
+typing them. A picture on the clipboard is attached with `Ctrl-v`, since a terminal's own
+paste carries text alone; this reads the clipboard of the machine tria runs on, so it finds
+nothing over SSH. Either way the image is read where tria runs and sent with the message,
+so it reaches a remote server too.
+
+The images wait above the composer until the message goes, and go with it whether it is
+sent, queued, or the first message of a new thread; one that comes back unsent brings its
+images back with it. `Backspace` on an empty message drops the last one. The server takes
+up to 10 MB an image and 80 MB a message; a larger image is sent as a JPEG when that is
+small enough.
 
 ## Approvals
 

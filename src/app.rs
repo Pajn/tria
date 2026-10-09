@@ -589,6 +589,8 @@ pub struct App {
     pub mode: Mode,
     pub focus: Focus,
     pub composer: Composer,
+    /// Images to go out with the message being written.
+    pub composer_images: Vec<crate::attachment::Image>,
     /// The `:` line. A one-line editor rather than a string, so that it has the keys
     /// and the history every other field in the client has.
     pub command_line: Composer,
@@ -708,7 +710,7 @@ pub struct App {
     pub terminal_focus: crate::notify::Focus,
     /// What each thread was last doing, so that a change can be told from a repeat.
     statuses: HashMap<Id, crate::model::ThreadStatus>,
-    /// Set by `Ctrl-v` in insert mode: the next key goes in as a character.
+    /// Set by `Ctrl-q` in insert mode: the next key goes in as a character.
     pub literal_next: bool,
     /// Set while a forced removal is waiting to be agreed to.
     pub worktree_confirm: Option<WorktreeConfirm>,
@@ -784,6 +786,7 @@ impl App {
             mode: Mode::Normal,
             focus: Focus::Composer,
             composer: Composer::new(),
+            composer_images: Vec::new(),
             command_line: Composer::new(),
             completing: None,
             picker: None,
@@ -1194,15 +1197,24 @@ impl App {
     fn swap_composer_draft(&mut self, target: &str) {
         let leaving = self.draft_key();
         let text = self.composer.text();
+        let images = std::mem::take(&mut self.composer_images);
         let parked = self
             .outbox
-            .swap(leaving.as_deref(), &text, target)
-            .map(str::to_string);
+            .swap(leaving.as_deref(), &text, images, target)
+            .cloned();
         self.composer.clear();
-        if let Some(text) = parked {
-            self.composer.set_text(&text);
-            self.composer.leave_insert();
+        if let Some(parked) = parked {
+            self.composer_images = parked.images;
+            if !parked.text.is_empty() {
+                self.composer.set_text(&parked.text);
+                self.composer.leave_insert();
+            }
         }
+    }
+
+    /// Whether nothing is being written: no text, and no images.
+    fn composer_holds_nothing(&self) -> bool {
+        self.composer.text().trim().is_empty() && self.composer_images.is_empty()
     }
 
     pub fn open_thread(&mut self, thread_id: &str) {
@@ -1322,7 +1334,7 @@ impl App {
             return Err("tria is still opening a directory; try again shortly".into());
         }
         let unsent_new_thread = if self.draft.is_some() {
-            !self.composer.text().trim().is_empty()
+            !self.composer_holds_nothing()
         } else {
             self.outbox
                 .parked(NEW_THREAD_DRAFT_KEY)
@@ -1512,6 +1524,7 @@ impl App {
         let here = outbox::Here {
             thread: self.current_thread_id.as_deref(),
             composer: &composer,
+            images: !self.composer_images.is_empty(),
         };
         let step = ask(&mut self.outbox, &here);
         self.take_outbox_step(step);
@@ -1526,6 +1539,7 @@ impl App {
         let here = outbox::Here {
             thread: self.current_thread_id.as_deref(),
             composer: &composer,
+            images: !self.composer_images.is_empty(),
         };
         let step = self.outbox.on_thread(thread, &here);
         self.take_outbox_step(step);
@@ -1556,6 +1570,7 @@ impl App {
             match back.slot {
                 outbox::Slot::Composer => {
                     self.composer.set_text(&back.text);
+                    self.composer_images = back.images;
                     // Sending leaves an empty composer in normal mode, which is where
                     // the text goes back to. Anywhere else — a list, a pane, the
                     // chat — the view is left where it is and the text is simply there
@@ -1580,8 +1595,15 @@ impl App {
                 // What was never sent as it is, such as a queued message's parts joined,
                 // goes in now, so the toast saying it is there is true.
                 outbox::Slot::History => {
-                    if !self.composer.remembers(&back.text) {
+                    if !back.text.trim().is_empty() && !self.composer.remembers(&back.text) {
                         self.composer.push_history(back.text);
+                    }
+                    // Pictures have no history to go to, so they join the composer they
+                    // were written in: this one, or that thread's parked draft.
+                    if self.current_thread_id.as_deref() == Some(back.thread.as_str()) {
+                        self.composer_images.extend(back.images);
+                    } else {
+                        self.outbox.park_images(&back.thread, back.images);
                     }
                 }
             }
@@ -1604,6 +1626,7 @@ impl App {
             outbox::Command::Start {
                 thread,
                 text,
+                images,
                 model_selection,
                 runtime_mode,
                 interaction_mode,
@@ -1626,13 +1649,17 @@ impl App {
                     commands.push(commands::interaction_mode_set(&thread, &interaction_mode));
                 }
                 commands.push(building(
-                    commands::turn_start(&thread, &text, &model_selection),
+                    commands::turn_start(&thread, &text, &images, &model_selection),
                     implementing,
                 ));
                 Carried::Commands(commands)
             }
             outbox::Command::Create {
-                thread, text, new, ..
+                thread,
+                text,
+                images,
+                new,
+                ..
             } => {
                 tracing::info!(
                     %thread,
@@ -1644,6 +1671,7 @@ impl App {
                 Carried::Launch(commands::launch_thread(
                     &thread,
                     &text,
+                    &images,
                     commands::NewThread {
                         project_id: &new.project_id,
                         title: &new.title,
@@ -1712,7 +1740,7 @@ impl App {
     /// knowing what the message was written against.
     fn send_composed(&mut self, context: Option<String>) {
         let text = self.composer.text().trim_end().to_string();
-        if text.trim().is_empty() {
+        if self.composer_holds_nothing() {
             return;
         }
         // It would land in the turns the rewind is about to drop.
@@ -1734,10 +1762,12 @@ impl App {
             let Some(draft) = self.draft.take() else {
                 return;
             };
-            self.outbox.create(draft, &text, worktree)
+            let images = std::mem::take(&mut self.composer_images);
+            self.outbox.create(draft, &text, images, worktree)
         } else if let Some(thread) = &self.thread {
+            let images = std::mem::take(&mut self.composer_images);
             self.outbox
-                .send(&thread.detail.shell, &text, context.as_deref())
+                .send(&thread.detail.shell, &text, images, context.as_deref())
         } else {
             self.toast(
                 "no thread open; press n for a new thread or / to pick one",
@@ -1753,8 +1783,11 @@ impl App {
     /// empty in normal mode, the message one `Ctrl-p` away, nothing parked for where it
     /// was written, and the conversation followed to where it will show.
     fn sent(&mut self, text: String, draft_key: Option<String>) {
-        self.composer.push_history(text);
+        if !text.trim().is_empty() {
+            self.composer.push_history(text);
+        }
         self.composer.clear();
+        self.composer_images.clear();
         self.mode = Mode::Normal;
         if let Some(key) = draft_key {
             self.outbox.unpark(&key);
@@ -1774,7 +1807,7 @@ impl App {
 
     fn queue_composed(&mut self, context: Option<String>) {
         let text = self.composer.text().trim_end().to_string();
-        if text.trim().is_empty() {
+        if self.composer_holds_nothing() {
             return;
         }
         let running = self
@@ -1789,8 +1822,9 @@ impl App {
             return;
         };
         let thread_id = thread.id().to_string();
+        let images = std::mem::take(&mut self.composer_images);
         self.outbox
-            .queue(&thread.detail.shell, &text, context.as_deref());
+            .queue(&thread.detail.shell, &text, images, context.as_deref());
         self.sent(text, Some(thread_id));
     }
 
@@ -1799,20 +1833,28 @@ impl App {
         self.outbox.queued(self.current_thread_id.as_ref()?)
     }
 
+    /// How many images the open thread's queued message carries.
+    pub fn queued_images(&self) -> usize {
+        self.current_thread_id
+            .as_ref()
+            .map_or(0, |thread| self.outbox.queued_images(thread))
+    }
+
     /// Take the open thread's queued message back into an empty composer, to be
     /// edited or thrown away. Nothing is sent for it until it is sent again.
     fn recall_queued(&mut self) -> bool {
-        if !self.composer.is_empty() {
+        if !self.composer.is_empty() || !self.composer_images.is_empty() {
             return false;
         }
-        let Some(text) = self
+        let Some(queued) = self
             .current_thread_id
             .as_ref()
             .and_then(|thread_id| self.outbox.recall(thread_id))
         else {
             return false;
         };
-        self.composer.set_text(&text);
+        self.composer.set_text(&queued.text);
+        self.composer_images = queued.images;
         true
     }
 
@@ -2781,6 +2823,13 @@ impl App {
         if text.is_empty() {
             return;
         }
+        // A file dropped on the terminal arrives as a paste of its path. One that is an
+        // image goes with the message rather than into it.
+        if matches!(self.mode, Mode::Insert | Mode::Normal)
+            && let Some(paths) = crate::attachment::dropped_images(text)
+        {
+            return self.attach_files(&paths);
+        }
         match self.mode {
             Mode::Insert => self.composer.insert_str(text),
             // Normal mode still has the composer under the cursor, so a paste lands
@@ -2815,6 +2864,63 @@ impl App {
             Mode::TerminalPane => self.paste_into_pane(text),
             _ => {}
         }
+    }
+
+    /// Attach image files to the message being written.
+    fn attach_files(&mut self, paths: &[std::path::PathBuf]) {
+        let mut images = Vec::new();
+        for path in paths {
+            match crate::attachment::Image::from_path(path) {
+                Ok(image) => images.push(image),
+                Err(error) => return self.toast(format!("not attached: {error:#}"), true),
+            }
+        }
+        self.attach_images(images);
+    }
+
+    /// `Ctrl-v`: the picture on the clipboard goes with the message, as the terminal's
+    /// own paste cannot carry one; text on it is pasted as text.
+    fn paste_clipboard(&mut self) {
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(clipboard) => clipboard,
+            Err(error) => return self.toast(format!("no clipboard here: {error}"), true),
+        };
+        match crate::attachment::Image::from_clipboard(&mut clipboard) {
+            Ok(Some(image)) => return self.attach_images(vec![image]),
+            Ok(None) => {}
+            Err(error) => return self.toast(format!("not attached: {error:#}"), true),
+        }
+        match clipboard.get_text() {
+            Ok(text) if !text.is_empty() => self.on_paste(&text),
+            _ => self.toast("nothing on the clipboard to paste", false),
+        }
+    }
+
+    /// Add images to the message being written, as long as all of them together are no
+    /// more than the server takes for one message.
+    fn attach_images(&mut self, images: Vec<crate::attachment::Image>) {
+        use crate::attachment::{MAX_TOTAL_BYTES, size_label};
+        let total: usize = self
+            .composer_images
+            .iter()
+            .chain(&images)
+            .map(|image| image.size_bytes)
+            .sum();
+        if total > MAX_TOTAL_BYTES {
+            return self.toast(
+                format!(
+                    "not attached: a message takes up to {} of images",
+                    size_label(MAX_TOTAL_BYTES)
+                ),
+                true,
+            );
+        }
+        let names: Vec<String> = images.iter().map(|image| image.name.clone()).collect();
+        self.composer_images.extend(images);
+        if self.mode == Mode::Normal {
+            self.focus = Focus::Composer;
+        }
+        self.toast(format!("attached {}", names.join(", ")), false);
     }
 
     /// Hand a paste to the program in the attached terminal.
@@ -4087,7 +4193,7 @@ impl App {
     /// Ask before sending a message written over a transcript: it looks like a reply to
     /// the subagent on screen, and it goes to the main agent.
     fn ask_to_send_over_transcript(&mut self, send: TranscriptSend) {
-        if self.composer.text().trim().is_empty() {
+        if self.composer_holds_nothing() {
             return;
         }
         self.confirm_transcript_send = Some(send);
@@ -5097,9 +5203,7 @@ impl App {
     }
 
     fn can_switch_connection(&self) -> bool {
-        self.composer.text().trim().is_empty()
-            && !self.outbox.has_pending_work()
-            && self.open_at.is_none()
+        self.composer_holds_nothing() && !self.outbox.has_pending_work() && self.open_at.is_none()
     }
 
     fn on_project_browser_key(&mut self, key: KeyEvent) {
@@ -6172,7 +6276,7 @@ impl App {
             return;
         }
         self.selection = None;
-        // A pending `Ctrl-v` belongs to the message being written and to nothing else,
+        // A pending `Ctrl-q` belongs to the message being written and to nothing else,
         // so it does not follow the focus out of insert mode.
         if self.mode != Mode::Insert {
             self.literal_next = false;
@@ -6831,11 +6935,17 @@ impl App {
 
     fn insert_key(&mut self, key: KeyEvent, ctrl: bool, alt: bool, shift: bool) {
         match key.code {
-            // As in vim, where `Ctrl-q` is `Ctrl-v` under another name: the next key
-            // goes in as the character it stands for rather than as the key it is.
-            // `Enter` is the one worth having — it sends a message, and this is how
-            // you put one inside a message instead.
-            KeyCode::Char('v') | KeyCode::Char('q') if ctrl => self.literal_next = true,
+            // Vim's `Ctrl-v`, under the other name vim has for it: the next key goes in
+            // as the character it stands for rather than as the key it is. `Enter` is
+            // the one worth having — it sends a message, and this is how you put one
+            // inside a message instead. `Ctrl-v` itself pastes, pictures included,
+            // which the terminal's own paste cannot carry.
+            KeyCode::Char('q') if ctrl => self.literal_next = true,
+            KeyCode::Char('v') if ctrl => self.paste_clipboard(),
+            // With nothing written, the last image attached is what there is to take back.
+            KeyCode::Backspace if self.composer.is_empty() && !self.composer_images.is_empty() => {
+                self.composer_images.pop();
+            }
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.composer.leave_insert();
@@ -6875,7 +6985,7 @@ impl App {
         }
     }
 
-    /// The key after `Ctrl-v`, as a character. Only the ones that stand for one: a
+    /// The key after `Ctrl-q`, as a character. Only the ones that stand for one: a
     /// message is text, and a control character written into it is no use to anybody
     /// reading it at the other end. Anything else drops the literal and does nothing,
     /// `Esc` included, which is how to change your mind about it.
@@ -10118,8 +10228,8 @@ mod tests {
         );
         assert!(!app.literal_next);
 
-        // Ctrl-v is the same key under vim's own name, and a tab is a tab.
-        app.on_key(ctrl('v'));
+        // And a tab is a tab.
+        app.on_key(ctrl('q'));
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.composer.text(), "one\n\t");
 
@@ -11484,6 +11594,98 @@ mod tests {
         assert_eq!(command["type"], "message.dispatch");
         assert_eq!(command["text"], "first\n\nsecond");
         assert_eq!(app.queued_message(), None);
+    }
+
+    /// A screenshot written to a file of its own, removed with the test.
+    struct Screenshot(std::path::PathBuf);
+
+    impl Screenshot {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("tria-shot-{}", commands::new_id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("Screenshot 2026-10-09 at 20.10.png");
+            let mut png = Vec::new();
+            image::DynamicImage::new_rgb8(2, 2)
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .unwrap();
+            std::fs::write(&path, png).unwrap();
+            Self(path)
+        }
+
+        /// What a terminal pastes for it when it is dropped there.
+        fn dropped(&self) -> String {
+            self.0.display().to_string().replace(' ', "\\ ")
+        }
+    }
+
+    impl Drop for Screenshot {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// A screenshot dropped on the terminal goes with the message rather than into it,
+    /// `Backspace` on an empty message takes the last one back, and what is attached when
+    /// the message goes goes with it.
+    #[tokio::test]
+    async fn a_dropped_screenshot_goes_with_the_message() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        let mut thread = running_thread();
+        thread.detail.shell.session = None;
+        thread.detail.shell.latest_turn.as_mut().unwrap().state = "completed".into();
+        app.thread = Some(thread);
+        app.current_thread_id = Some("t1".into());
+        app.mode = Mode::Insert;
+        app.focus = Focus::Composer;
+        let shot = Screenshot::new();
+
+        app.on_paste(&shot.dropped());
+        assert!(app.composer.is_empty(), "the path was typed");
+        assert_eq!(app.composer_images.len(), 1);
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(app.composer_images.is_empty(), "taken back");
+
+        app.on_paste(&shot.dropped());
+        app.composer.insert_str("what is wrong here?");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let command = sent_command(&mut requests).await.expect("sent");
+        assert_eq!(command["text"], "what is wrong here?");
+        let attachments = command["attachments"].as_array().unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0]["type"], "image");
+        assert_eq!(attachments[0]["name"], "Screenshot 2026-10-09 at 20.10.png");
+        assert_eq!(attachments[0]["mimeType"], "image/png");
+        assert!(app.composer_images.is_empty(), "went with the message");
+    }
+
+    /// An image is a message on its own: queued with nothing written, it goes out with
+    /// the next turn.
+    #[tokio::test]
+    async fn an_image_alone_can_be_queued() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.thread = Some(running_thread());
+        app.current_thread_id = Some("t1".into());
+        app.mode = Mode::Insert;
+        app.focus = Focus::Composer;
+        let shot = Screenshot::new();
+
+        app.on_paste(&shot.dropped());
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(app.queued_images(), 1);
+        assert!(app.composer_images.is_empty());
+        assert!(sent_no_command(&mut requests).await);
+
+        upsert(&mut app, listed("t1", Some(("turn", "completed"))));
+        let command = sent_command(&mut requests)
+            .await
+            .expect("sent once it ended");
+        assert_eq!(command["attachments"].as_array().map(Vec::len), Some(1));
     }
 
     /// With no turn running there is nothing to wait for.

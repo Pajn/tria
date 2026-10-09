@@ -86,10 +86,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .as_ref()
         .map(|q| question_panel_rows(app, q, main_area.width, main_area.height))
         .unwrap_or(0);
+    // The images going with the message take a line of their own over what is written.
     let composer_rows = app
         .composer
         .height(main_area.width.saturating_sub(4), COMPOSER_MAX_ROWS)
-        + 2;
+        + 2
+        + u16::from(!app.composer_images.is_empty());
 
     // Trouble that outlasts a toast gets a row of its own under the header, and only
     // takes one when there is some.
@@ -1539,6 +1541,32 @@ fn draw_question(
     }
 }
 
+/// The images going with the message, one chip each, as many as fit and a count of the
+/// rest.
+fn image_chips(app: &App, width: u16) -> Line<'static> {
+    let chip = Style::default().fg(Color::Black).bg(Color::Cyan);
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    let images = &app.composer_images;
+    for (index, image) in images.iter().enumerate() {
+        let text = format!(" ▣ {} ", image.label());
+        let more = images.len() - index - 1;
+        // Room for this chip, and for saying how many did not fit after it.
+        let reserve = if more > 0 { 12 } else { 0 };
+        if used + text.chars().count() + 1 + reserve > width as usize && index > 0 {
+            spans.push(Span::styled(
+                format!(" +{} more", images.len() - index),
+                Style::default().fg(Color::Cyan),
+            ));
+            break;
+        }
+        used += text.chars().count() + 1;
+        spans.push(Span::styled(fit(&text, width as usize), chip));
+        spans.push(Span::raw(" "));
+    }
+    Line::from(spans)
+}
+
 fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
     let insert = app.mode == Mode::Insert;
     let border_style = if insert {
@@ -1576,6 +1604,11 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
         if preview.len() < first.len() || queued.contains('\n') {
             preview.push('…');
         }
+        match app.queued_images() {
+            0 => {}
+            1 => preview.push_str(" + 1 image"),
+            count => preview.push_str(&format!(" + {count} images")),
+        }
         block = block.title_bottom(
             Line::from(Span::styled(
                 format!(" queued: {preview} · ↑ takes it back "),
@@ -1600,8 +1633,19 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )));
     }
-    let inner = block.inner(area);
+    let mut inner = block.inner(area);
     frame.render_widget(block, area);
+    if !app.composer_images.is_empty() && inner.height > 1 {
+        let chips = Rect {
+            x: inner.x + 1,
+            width: inner.width.saturating_sub(2),
+            height: 1,
+            ..inner
+        };
+        frame.render_widget(Paragraph::new(image_chips(app, chips.width)), chips);
+        inner.y += 1;
+        inner.height -= 1;
+    }
     let text_area = Rect {
         x: inner.x + 1,
         y: inner.y,
@@ -1628,7 +1672,9 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
         None if insert && app.thread.as_ref().is_some_and(|t| t.is_running()) => {
             "Enter steers the running turn · Ctrl-s queues for after it · Esc normal"
         }
-        None if insert => "type a message · Enter sends · Ctrl-v Enter newline · Esc normal",
+        None if insert => {
+            "type a message · Enter sends · Ctrl-q Enter newline · Ctrl-v pastes an image · Esc normal"
+        }
         None => "i or a click to write",
     };
     app.composer_area = text_area;
@@ -3302,8 +3348,12 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("Insert", Style::default().bold())),
         Line::from("  Enter send · Alt-Enter / Ctrl-j newline · Esc or Ctrl-c normal"),
-        Line::from("  Ctrl-v or Ctrl-q        the next key as a character: Ctrl-v Enter is a"),
+        Line::from("  Ctrl-q                  the next key as a character: Ctrl-q Enter is a"),
         Line::from("                          newline where Enter would send"),
+        Line::from("  Ctrl-v                  paste: an image on the clipboard goes with the"),
+        Line::from("                          message, as does an image file dropped on the"),
+        Line::from("                          terminal · Backspace on an empty message drops"),
+        Line::from("                          the last one"),
         Line::from("  / or $                  a line opening / lists the provider's commands"),
         Line::from("                          and skills, a $ word its skills · Tab takes the"),
         Line::from("                          row, Up/Down move, Esc hides the list"),
@@ -4454,6 +4504,36 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    /// The images going with the message sit on a line of their own over what is written,
+    /// which stays where it can be read.
+    #[test]
+    fn attached_images_sit_over_the_message() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        app.sidebar_visible = false;
+        app.composer.set_text("what is wrong here?");
+        app.composer_images.push(crate::attachment::Image {
+            name: "shot.png".into(),
+            mime_type: "image/png".into(),
+            size_bytes: 340 * 1024,
+            data_url: String::new(),
+        });
+        let buffer = screen(80, &mut app);
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let chip = rows
+            .iter()
+            .position(|row| row.contains("▣ shot.png · 340 KB"))
+            .expect("the image is shown");
+        assert!(rows[chip + 1].contains("what is wrong here?"), "{rows:#?}");
     }
 
     #[test]

@@ -24,6 +24,7 @@ use std::{
 };
 
 use crate::{
+    attachment::Image,
     commands::{self, PullRequestLink},
     model::{Id, LatestTurn, ModelSelection, ThreadShell},
     state::{Rewind, ThreadState},
@@ -93,6 +94,7 @@ pub enum Command {
         ticket: Ticket,
         thread: Id,
         text: String,
+        images: Vec<Image>,
         model_selection: ModelSelection,
         runtime_mode: String,
         interaction_mode: String,
@@ -104,6 +106,7 @@ pub enum Command {
         ticket: Ticket,
         thread: Id,
         text: String,
+        images: Vec<Image>,
         new: NewThread,
         /// The plan the thread is made to build, where it is made for one.
         implementing: Option<Implementing>,
@@ -185,6 +188,8 @@ pub struct GiveBack {
     /// The thread it was written in.
     pub thread: Id,
     pub text: String,
+    /// The images it was sent with, which go back with it.
+    pub images: Vec<Image>,
     pub slot: Slot,
 }
 
@@ -196,7 +201,8 @@ pub enum Slot {
     /// rewind took back, after whatever was already being written there.
     Rewound,
     /// The composer's history, since wherever it would have gone has something else in it.
-    /// A message sent as it was written is there already, from when it was sent.
+    /// A message sent as it was written is there already, from when it was sent. The
+    /// history holds text, so its images join those of the composer it was written in.
     History,
 }
 
@@ -263,11 +269,13 @@ pub struct Here<'a> {
     pub thread: Option<&'a str>,
     /// What the composer on screen holds.
     pub composer: &'a str,
+    /// Whether the composer on screen has images attached.
+    pub images: bool,
 }
 
 impl Here<'_> {
     fn composer_empty(&self) -> bool {
-        self.composer.trim().is_empty()
+        self.composer.trim().is_empty() && !self.images
     }
 }
 
@@ -281,6 +289,7 @@ const IN_HISTORY: &str = "it is in the composer's history (Ctrl-p)";
 struct Queued {
     /// What was written, which is what comes back.
     text: String,
+    images: Vec<Image>,
     /// The same as the agent gets it, with what each part was written over.
     sent: String,
     /// The turn that was running when it was queued.
@@ -304,6 +313,7 @@ struct Waited {
 struct Creating {
     draft: NewThreadDraft,
     text: String,
+    images: Vec<Image>,
 }
 
 /// A rewind the server has been asked for. The command is taken before the work is
@@ -322,6 +332,7 @@ enum Asked {
     Send {
         thread: Id,
         text: String,
+        images: Vec<Image>,
     },
     Create {
         thread: Id,
@@ -340,6 +351,19 @@ enum Asked {
     },
 }
 
+/// A message being written in a thread not open.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Parked {
+    pub text: String,
+    pub images: Vec<Image>,
+}
+
+impl Parked {
+    fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.images.is_empty()
+    }
+}
+
 /// The messages on their way, the ones held back, the threads being made for them, the
 /// rewinds that will give messages back, and what is parked for each thread not open.
 #[derive(Default)]
@@ -353,9 +377,10 @@ pub struct Outbox {
     creating: HashMap<Id, Creating>,
     /// Rewinds on their way, one per thread.
     rewinding: HashMap<Id, Rewinding>,
-    /// Unsent composer text per thread, keyed by thread id, so switching threads keeps a
-    /// half-written message where it belongs. New-thread drafts use `NEW_THREAD_DRAFT_KEY`.
-    drafts: HashMap<String, String>,
+    /// Unsent composer text and images per thread, keyed by thread id, so switching
+    /// threads keeps a half-written message where it belongs. New-thread drafts use
+    /// `NEW_THREAD_DRAFT_KEY`.
+    drafts: HashMap<String, Parked>,
     asked: HashMap<Ticket, Asked>,
 }
 
@@ -366,7 +391,7 @@ impl Outbox {
             || !self.creating.is_empty()
             || !self.rewinding.is_empty()
             || !self.asked.is_empty()
-            || self.drafts.values().any(|text| !text.trim().is_empty())
+            || self.drafts.values().any(|parked| !parked.is_empty())
     }
     // ── Sending ────────────────────────────────────────────────────────
 
@@ -374,21 +399,35 @@ impl Outbox {
     /// the server has taken it. The composer is emptied when a message goes, because
     /// that is what sending looks like; a message the server refuses has to come back,
     /// or the only copy of it is one keypress of history away and nothing says so.
-    pub fn send(&mut self, thread: &ThreadShell, text: &str, context: Option<&str>) -> Step {
+    pub fn send(
+        &mut self,
+        thread: &ThreadShell,
+        text: &str,
+        images: Vec<Image>,
+        context: Option<&str>,
+    ) -> Step {
         let sent = over_reading(context, text);
-        self.start(thread, text.to_string(), sent)
+        self.start(thread, text.to_string(), sent, images)
     }
 
-    fn start(&mut self, thread: &ThreadShell, text: String, sent: String) -> Step {
+    fn start(
+        &mut self,
+        thread: &ThreadShell,
+        text: String,
+        sent: String,
+        images: Vec<Image>,
+    ) -> Step {
         let ticket = self.ticket(Asked::Send {
             thread: thread.id.clone(),
             text,
+            images: images.clone(),
         });
         Step {
             commands: vec![Command::Start {
                 ticket,
                 thread: thread.id.clone(),
                 text: sent,
+                images,
                 model_selection: thread.model_selection.clone(),
                 runtime_mode: thread.runtime_mode.clone(),
                 interaction_mode: thread.interaction_mode.clone(),
@@ -405,6 +444,7 @@ impl Outbox {
         &mut self,
         draft: NewThreadDraft,
         text: &str,
+        images: Vec<Image>,
         worktree: Option<Worktree>,
     ) -> Step {
         let checkout = draft.checkout.as_ref();
@@ -438,6 +478,7 @@ impl Outbox {
             Creating {
                 draft,
                 text: text.to_string(),
+                images: images.clone(),
             },
         );
         Step {
@@ -445,6 +486,7 @@ impl Outbox {
                 ticket,
                 thread: thread.clone(),
                 text: text.to_string(),
+                images,
                 new,
                 implementing: None,
             }],
@@ -485,6 +527,7 @@ impl Outbox {
                     ticket,
                     thread: source,
                     text,
+                    images: Vec::new(),
                     model_selection: shell.model_selection.clone(),
                     runtime_mode: shell.runtime_mode.clone(),
                     interaction_mode: "default".into(),
@@ -524,6 +567,7 @@ impl Outbox {
                 ticket,
                 thread: made,
                 text,
+                images: Vec::new(),
                 new,
                 implementing,
             }],
@@ -536,7 +580,13 @@ impl Outbox {
     /// Hold the message until the thread's running turn is over, instead of steering
     /// the turn with it as `Enter` does. What `context` says goes out with it, and what
     /// was written is what comes back.
-    pub fn queue(&mut self, thread: &ThreadShell, text: &str, context: Option<&str>) {
+    pub fn queue(
+        &mut self,
+        thread: &ThreadShell,
+        text: &str,
+        images: Vec<Image>,
+        context: Option<&str>,
+    ) {
         let waited = thread
             .latest_turn
             .as_ref()
@@ -548,10 +598,12 @@ impl Outbox {
             });
         let queued = self.queued.entry(thread.id.clone()).or_insert(Queued {
             text: String::new(),
+            images: Vec::new(),
             sent: String::new(),
             after: None,
         });
-        if !queued.text.is_empty() {
+        queued.images.extend(images);
+        if !queued.text.is_empty() && !text.is_empty() {
             queued.text.push_str("\n\n");
             queued.sent.push_str("\n\n");
         }
@@ -574,10 +626,20 @@ impl Outbox {
         self.queued.get(thread).map(|queued| queued.text.as_str())
     }
 
+    /// How many images a thread's queued message carries.
+    pub fn queued_images(&self, thread: &str) -> usize {
+        self.queued
+            .get(thread)
+            .map_or(0, |queued| queued.images.len())
+    }
+
     /// Take a thread's queued message back, as it was written, to be edited or thrown
     /// away. Nothing is sent for it until it is sent again.
-    pub fn recall(&mut self, thread: &str) -> Option<String> {
-        self.queued.remove(thread).map(|queued| queued.text)
+    pub fn recall(&mut self, thread: &str) -> Option<Parked> {
+        self.queued.remove(thread).map(|queued| Parked {
+            text: queued.text,
+            images: queued.images,
+        })
     }
 
     // ── Drafts ─────────────────────────────────────────────────────────
@@ -585,20 +647,41 @@ impl Outbox {
     /// Park what the composer holds for the slot being left, `leaving`, and hand back
     /// what is parked for `target`, the slot being opened, to be written on. A composer
     /// holding nothing but blanks parks nothing, and takes away whatever was parked.
-    pub fn swap(&mut self, leaving: Option<&str>, composer: &str, target: &str) -> Option<&str> {
+    pub fn swap(
+        &mut self,
+        leaving: Option<&str>,
+        composer: &str,
+        images: Vec<Image>,
+        target: &str,
+    ) -> Option<&Parked> {
         if let Some(key) = leaving {
-            if composer.trim().is_empty() {
+            let parked = Parked {
+                text: composer.to_string(),
+                images,
+            };
+            if parked.is_empty() {
                 self.drafts.remove(key);
             } else {
-                self.drafts.insert(key.to_string(), composer.to_string());
+                self.drafts.insert(key.to_string(), parked);
             }
         }
-        self.drafts.get(target).map(String::as_str)
+        self.drafts.get(target)
     }
 
     /// What is parked for a slot.
     pub fn parked(&self, key: &str) -> Option<&str> {
-        self.drafts.get(key).map(String::as_str)
+        self.drafts.get(key).map(|parked| parked.text.as_str())
+    }
+
+    /// Images to go with what is written in a thread not open.
+    pub fn park_images(&mut self, key: &str, images: Vec<Image>) {
+        if !images.is_empty() {
+            self.drafts
+                .entry(key.to_string())
+                .or_default()
+                .images
+                .extend(images);
+        }
     }
 
     /// Nothing is parked for a slot any more: what was written there has been sent.
@@ -607,9 +690,7 @@ impl Outbox {
     }
 
     fn draft_free(&self, thread: &str) -> bool {
-        self.drafts
-            .get(thread)
-            .is_none_or(|text| text.trim().is_empty())
+        self.drafts.get(thread).is_none_or(Parked::is_empty)
     }
 
     // ── Rewinding ──────────────────────────────────────────────────────
@@ -758,12 +839,13 @@ impl Outbox {
             step.give_backs.push(GiveBack {
                 thread: thread.to_string(),
                 text: join(here.composer),
+                images: Vec::new(),
                 slot: Slot::Rewound,
             });
             return true;
         }
-        let joined = join(self.parked(thread).unwrap_or_default());
-        self.drafts.insert(thread.to_string(), joined);
+        let parked = self.drafts.entry(thread.to_string()).or_default();
+        parked.text = join(&parked.text);
         false
     }
 
@@ -798,14 +880,14 @@ impl Outbox {
             return Step::default();
         };
         match turn.map(|t| t.state.as_str()) {
-            Some("completed") => self.start(thread, queued.text, queued.sent),
+            Some("completed") => self.start(thread, queued.text, queued.sent, queued.images),
             state => {
                 let why = match state {
                     Some("interrupted") => "the turn was interrupted",
                     Some("error") => "the turn failed",
                     _ => "the turn did not finish",
                 };
-                self.not_sent(&thread.id, queued.text, why, here)
+                self.not_sent(&thread.id, queued.text, queued.images, why, here)
             }
         }
     }
@@ -824,6 +906,7 @@ impl Outbox {
             give_backs: vec![GiveBack {
                 thread: thread.to_string(),
                 text: queued.text,
+                images: Vec::new(),
                 slot: Slot::History,
             }],
             ..Step::warn(format!(
@@ -841,9 +924,14 @@ impl Outbox {
         };
         match (asked, answer.result) {
             (Asked::Send { .. }, Ok(())) => Step::default(),
-            (Asked::Send { thread, text }, Err(error)) => {
-                self.not_sent(&thread, text, &error, here)
-            }
+            (
+                Asked::Send {
+                    thread,
+                    text,
+                    images,
+                },
+                Err(error),
+            ) => self.not_sent(&thread, text, images, &error, here),
             (Asked::Create { thread }, Ok(())) => self.on_created(thread, here),
             (Asked::Create { thread }, Err(error)) => self.on_create_refused(thread, error, here),
             // The server would not take the rewind at all.
@@ -898,19 +986,20 @@ impl Outbox {
             return Step::warn(error);
         };
         if here.thread != Some(thread.as_str()) {
-            return history(&thread, creating.text, &error);
+            return history(&thread, creating.text, creating.images, &error);
         }
         let back = if here.composer_empty() {
             Step {
                 give_backs: vec![GiveBack {
                     thread,
                     text: creating.text,
+                    images: creating.images,
                     slot: Slot::Composer,
                 }],
                 ..Step::warn(error)
             }
         } else {
-            history(&thread, creating.text, &error)
+            history(&thread, creating.text, creating.images, &error)
         };
         Step {
             go: Some(Go::Draft(Box::new(creating.draft))),
@@ -924,7 +1013,14 @@ impl Outbox {
     /// thread's parked draft if you have gone elsewhere and it has none. Where neither is
     /// free, what was typed is not lost — it goes to the composer's history — and the
     /// toast says so rather than writing over whatever took its place.
-    fn not_sent(&mut self, thread: &str, text: String, why: &str, here: &Here) -> Step {
+    fn not_sent(
+        &mut self,
+        thread: &str,
+        text: String,
+        images: Vec<Image>,
+        why: &str,
+        here: &Here,
+    ) -> Step {
         let lead = format!("not sent: {why}");
         let here_now = here.thread == Some(thread);
         if here_now && here.composer_empty() {
@@ -932,16 +1028,18 @@ impl Outbox {
                 give_backs: vec![GiveBack {
                     thread: thread.to_string(),
                     text,
+                    images,
                     slot: Slot::Composer,
                 }],
                 ..Step::warn(lead)
             };
         }
         if !here_now && self.draft_free(thread) {
-            self.drafts.insert(thread.to_string(), text);
+            self.drafts
+                .insert(thread.to_string(), Parked { text, images });
             return Step::warn(format!("{lead} · the message is back in that thread"));
         }
-        history(thread, text, &lead)
+        history(thread, text, images, &lead)
     }
 
     fn ticket(&mut self, asked: Asked) -> Ticket {
@@ -973,11 +1071,12 @@ fn waited_is_over(waited: Option<&Waited>, latest: Option<&LatestTurn>) -> bool 
 }
 
 /// Into the composer's history, and said so after `lead`.
-fn history(thread: &str, text: String, lead: &str) -> Step {
+fn history(thread: &str, text: String, images: Vec<Image>, lead: &str) -> Step {
     Step {
         give_backs: vec![GiveBack {
             thread: thread.to_string(),
             text,
+            images,
             slot: Slot::History,
         }],
         ..Step::warn(format!("{lead} · {IN_HISTORY}"))
@@ -1031,6 +1130,7 @@ pub(crate) mod tests {
             Here {
                 thread: self.thread.as_deref(),
                 composer: &self.composer,
+                images: false,
             }
         }
     }
@@ -1138,6 +1238,7 @@ pub(crate) mod tests {
         vec![GiveBack {
             thread: thread.into(),
             text: text.into(),
+            images: Vec::new(),
             slot,
         }]
     }
@@ -1164,7 +1265,12 @@ pub(crate) mod tests {
     fn a_message_goes_saying_what_it_was_written_over_and_comes_back_as_written() {
         let mut outbox = Outbox::default();
         let context = "Sent looking at the transcript for subagent a1:";
-        let step = outbox.send(&on("turn", "completed", ""), "why?", Some(context));
+        let step = outbox.send(
+            &on("turn", "completed", ""),
+            "why?",
+            Vec::new(),
+            Some(context),
+        );
         match only_command(&step) {
             Command::Start {
                 thread,
@@ -1189,13 +1295,59 @@ pub(crate) mod tests {
         assert_eq!(warned(&answer), "not sent: refused");
     }
 
+    /// A message's images go with it, and a refused one brings them back with what was
+    /// written. Gone to a thread not open, they wait in that thread's draft.
+    #[test]
+    fn images_go_with_the_message_and_come_back_with_it() {
+        let image = crate::attachment::Image {
+            name: "shot.png".into(),
+            mime_type: "image/png".into(),
+            size_bytes: 3,
+            data_url: "data:image/png;base64,AAAA".into(),
+        };
+        let mut outbox = Outbox::default();
+        let step = outbox.send(
+            &on("turn", "completed", ""),
+            "this",
+            vec![image.clone()],
+            None,
+        );
+        match only_command(&step) {
+            Command::Start { images, .. } => assert_eq!(images, &vec![image.clone()]),
+            other => panic!("not a turn on a thread: {other:?}"),
+        }
+        let screen = Screen::on("t1");
+        let answer = outbox.on_answer(refused(&step, "refused"), &screen.here());
+        assert_eq!(answer.give_backs[0].images, vec![image.clone()]);
+
+        let step = outbox.send(
+            &on("turn", "completed", ""),
+            "again",
+            vec![image.clone()],
+            None,
+        );
+        let elsewhere = Screen::on("t2");
+        let _ = outbox.on_answer(refused(&step, "refused"), &elsewhere.here());
+        let parked = outbox
+            .swap(Some("t2"), "", Vec::new(), "t1")
+            .cloned()
+            .expect("parked in its thread");
+        assert_eq!(parked.text, "again");
+        assert_eq!(parked.images, vec![image]);
+    }
+
     /// Where the composer is not free, putting the message back would write over
     /// something else somebody typed. It goes to the thread it was meant for if that
     /// draft is free, and otherwise it stays in the history and the toast says so.
     #[test]
     fn a_refused_message_does_not_write_over_what_took_its_place() {
         let refuse = |outbox: &mut Outbox, screen: &Screen| {
-            let step = outbox.send(&on("turn", "completed", ""), "the message", None);
+            let step = outbox.send(
+                &on("turn", "completed", ""),
+                "the message",
+                Vec::new(),
+                None,
+            );
             outbox.on_answer(refused(&step, "refused"), &screen.here())
         };
 
@@ -1220,7 +1372,7 @@ pub(crate) mod tests {
         );
 
         let mut outbox = Outbox::default();
-        let _ = outbox.swap(Some("t1"), "parked", "t2");
+        let _ = outbox.swap(Some("t1"), "parked", Vec::new(), "t2");
         let step = refuse(&mut outbox, &screen);
         assert_eq!(step.give_backs, back("t1", "the message", Slot::History));
         assert_eq!(outbox.parked("t1"), Some("parked"));
@@ -1230,7 +1382,12 @@ pub(crate) mod tests {
     #[test]
     fn a_message_taken_is_let_go() {
         let mut outbox = Outbox::default();
-        let step = outbox.send(&on("turn", "completed", ""), "the message", None);
+        let step = outbox.send(
+            &on("turn", "completed", ""),
+            "the message",
+            Vec::new(),
+            None,
+        );
         let screen = Screen::on("t1");
         let answer = outbox.on_answer(taken(&step), &screen.here());
         assert!(answer.give_backs.is_empty() && answer.toast.is_none());
@@ -1250,7 +1407,12 @@ pub(crate) mod tests {
             base_branch: "main".into(),
             start_from_origin: true,
         };
-        let step = outbox.create(draft(), "Fix it\nplease", Some(worktree.clone()));
+        let step = outbox.create(
+            draft(),
+            "Fix it\nplease",
+            Vec::new(),
+            Some(worktree.clone()),
+        );
         let Command::Create {
             thread, text, new, ..
         } = only_command(&step)
@@ -1266,7 +1428,7 @@ pub(crate) mod tests {
 
         // Named for its first line with anything in it, whatever it starts with.
         let named = |outbox: &mut Outbox, text: &str| {
-            let step = outbox.create(draft(), text, None);
+            let step = outbox.create(draft(), text, Vec::new(), None);
             match only_command(&step) {
                 Command::Create { new, .. } => new.title.clone(),
                 _ => panic!("not a thread made"),
@@ -1279,7 +1441,7 @@ pub(crate) mod tests {
 
         // One made for a pull request checked out is the thread it was checked out for,
         // where it was checked out.
-        let step = outbox.create(checked_out(), "review this", None);
+        let step = outbox.create(checked_out(), "review this", Vec::new(), None);
         let Command::Create { thread, new, .. } = only_command(&step) else {
             panic!("not a thread made");
         };
@@ -1293,12 +1455,12 @@ pub(crate) mod tests {
     #[test]
     fn a_made_thread_is_opened_only_while_it_is_on_screen() {
         let mut outbox = Outbox::default();
-        let step = outbox.create(draft(), "one", None);
+        let step = outbox.create(draft(), "one", Vec::new(), None);
         let thread = creating(&step);
         let answer = outbox.on_answer(taken(&step), &Screen::on(&thread).here());
         assert!(matches!(&answer.go, Some(Go::Made(id)) if id == &thread));
 
-        let step = outbox.create(draft(), "two", None);
+        let step = outbox.create(draft(), "two", Vec::new(), None);
         let answer = outbox.on_answer(taken(&step), &Screen::on("elsewhere").here());
         assert!(answer.go.is_none());
     }
@@ -1308,7 +1470,7 @@ pub(crate) mod tests {
     #[test]
     fn a_thread_the_server_refuses_goes_back_to_its_draft() {
         let mut outbox = Outbox::default();
-        let step = outbox.create(draft(), "the message", None);
+        let step = outbox.create(draft(), "the message", Vec::new(), None);
         let thread = creating(&step);
         let screen = Screen::on(&thread);
         let answer = outbox.on_answer(refused(&step, "git worktree add failed"), &screen.here());
@@ -1325,7 +1487,7 @@ pub(crate) mod tests {
     #[test]
     fn a_refused_thread_does_not_write_over_what_was_typed_since() {
         let mut outbox = Outbox::default();
-        let step = outbox.create(draft(), "the message", None);
+        let step = outbox.create(draft(), "the message", Vec::new(), None);
         let thread = creating(&step);
         let mut screen = Screen::on(&thread);
         screen.composer = "typed since".into();
@@ -1340,7 +1502,7 @@ pub(crate) mod tests {
             "no · it is in the composer's history (Ctrl-p)"
         );
 
-        let step = outbox.create(draft(), "another", None);
+        let step = outbox.create(draft(), "another", Vec::new(), None);
         let thread = creating(&step);
         let answer = outbox.on_answer(refused(&step, "no"), &Screen::on("t1").here());
         assert!(answer.go.is_none(), "the view went somewhere of its own");
@@ -1352,8 +1514,8 @@ pub(crate) mod tests {
     #[test]
     fn two_threads_on_their_way_each_keep_their_own() {
         let mut outbox = Outbox::default();
-        let first = outbox.create(draft(), "first", None);
-        let second = outbox.create(draft(), "second", None);
+        let first = outbox.create(draft(), "first", Vec::new(), None);
+        let second = outbox.create(draft(), "second", Vec::new(), None);
         let (a, b) = (creating(&first), creating(&second));
         assert_ne!(a, b);
 
@@ -1364,8 +1526,8 @@ pub(crate) mod tests {
         assert_eq!(answer.give_backs, back(&b, "second", Slot::Composer));
 
         // And the other way round: the later refused first.
-        let first = outbox.create(draft(), "first", None);
-        let second = outbox.create(draft(), "second", None);
+        let first = outbox.create(draft(), "first", Vec::new(), None);
+        let second = outbox.create(draft(), "second", Vec::new(), None);
         let (a, b) = (creating(&first), creating(&second));
         let _ = outbox.on_answer(refused(&second, "no"), &Screen::on("t1").here());
         let answer = outbox.on_answer(refused(&first, "no"), &Screen::on(&a).here());
@@ -1379,7 +1541,7 @@ pub(crate) mod tests {
     #[test]
     fn a_pull_request_goes_on_the_thread_made_for_it() {
         let mut outbox = Outbox::default();
-        let step = outbox.create(checked_out(), "review this", None);
+        let step = outbox.create(checked_out(), "review this", Vec::new(), None);
         let screen = Screen::on("made-for-it");
         let made = outbox.on_answer(taken(&step), &screen.here());
         let Command::Link { thread, link, .. } = only_command(&made) else {
@@ -1390,7 +1552,7 @@ pub(crate) mod tests {
         let answer = outbox.on_answer(refused(&made, "gone"), &screen.here());
         assert_eq!(warned(&answer), "command failed: gone");
 
-        let step = outbox.create(checked_out(), "review this", None);
+        let step = outbox.create(checked_out(), "review this", Vec::new(), None);
         let _ = outbox.on_answer(refused(&step, "no"), &screen.here());
         assert!(outbox.creating.is_empty(), "a link kept for nothing");
         assert!(outbox.asked.is_empty());
@@ -1404,8 +1566,8 @@ pub(crate) mod tests {
     fn a_queued_message_waits_for_the_turn_to_finish() {
         let mut outbox = Outbox::default();
         let screen = Screen::on("t1");
-        outbox.queue(&working(EARLIER), "first", Some("Over it:"));
-        outbox.queue(&working(EARLIER), "second", None);
+        outbox.queue(&working(EARLIER), "first", Vec::new(), Some("Over it:"));
+        outbox.queue(&working(EARLIER), "second", Vec::new(), None);
         assert_eq!(outbox.queued("t1"), Some("first\n\nsecond"));
 
         // A list entry from before the turn began says nothing about this one.
@@ -1429,21 +1591,24 @@ pub(crate) mod tests {
     fn a_queued_message_comes_back_as_it_was_written() {
         let mut outbox = Outbox::default();
         let screen = Screen::on("t1");
-        outbox.queue(&working(""), "after that", Some("Over it:"));
+        outbox.queue(&working(""), "after that", Vec::new(), Some("Over it:"));
         let step = outbox.on_shell(&on("turn", "interrupted", ""), &screen.here());
         assert!(step.commands.is_empty());
         assert_eq!(step.give_backs, back("t1", "after that", Slot::Composer));
         assert_eq!(warned(&step), "not sent: the turn was interrupted");
 
-        outbox.queue(&working(""), "after that", Some("Over it:"));
+        outbox.queue(&working(""), "after that", Vec::new(), Some("Over it:"));
         let step = outbox.on_shell(&on("turn", "error", ""), &screen.here());
         assert_eq!(step.give_backs, back("t1", "after that", Slot::Composer));
         assert_eq!(warned(&step), "not sent: the turn failed");
 
         // Taken back with `Up`, it is the same.
-        outbox.queue(&working(""), "not yet", Some("Over it:"));
+        outbox.queue(&working(""), "not yet", Vec::new(), Some("Over it:"));
         assert_eq!(outbox.queued("t1"), Some("not yet"));
-        assert_eq!(outbox.recall("t1").as_deref(), Some("not yet"));
+        assert_eq!(
+            outbox.recall("t1").map(|parked| parked.text).as_deref(),
+            Some("not yet")
+        );
         let step = outbox.on_shell(&on("turn", "completed", ""), &screen.here());
         assert!(step.commands.is_empty(), "a recalled message went out");
     }
@@ -1455,8 +1620,8 @@ pub(crate) mod tests {
         let mut outbox = Outbox::default();
         let mut screen = Screen::on("t1");
         screen.composer = "busy".into();
-        outbox.queue(&working(""), "first", None);
-        outbox.queue(&working(""), "second", Some("Over it:"));
+        outbox.queue(&working(""), "first", Vec::new(), None);
+        outbox.queue(&working(""), "second", Vec::new(), Some("Over it:"));
         let step = outbox.on_shell(&on("turn", "interrupted", ""), &screen.here());
         assert_eq!(
             step.give_backs,
@@ -1477,14 +1642,14 @@ pub(crate) mod tests {
 
         // The list showed the turn waited for, so any other it shows came after.
         let mut outbox = Outbox::default();
-        outbox.queue(&working(""), "next", None);
+        outbox.queue(&working(""), "next", Vec::new(), None);
         let _ = outbox.on_shell(&working(""), &screen.here());
         let step = outbox.on_shell(&on("someone-elses", "completed", ""), &screen.here());
         assert_eq!(started(&step), ("t1".into(), "next".into()));
 
         // Never shown it, a turn asked for after it came after it.
         let mut outbox = Outbox::default();
-        outbox.queue(&working(EARLIER), "next", None);
+        outbox.queue(&working(EARLIER), "next", Vec::new(), None);
         let step = outbox.on_shell(&on("after-a-reconnect", "running", LATER), &screen.here());
         assert!(step.commands.is_empty(), "that one is still running");
         let step = outbox.on_shell(&on("after-a-reconnect", "completed", LATER), &screen.here());
@@ -1492,7 +1657,7 @@ pub(crate) mod tests {
 
         // A list entry with no turn says nothing, even once the turn has been shown.
         let mut outbox = Outbox::default();
-        outbox.queue(&working(""), "next", None);
+        outbox.queue(&working(""), "next", Vec::new(), None);
         let _ = outbox.on_shell(&working(""), &screen.here());
         let step = outbox.on_shell(&listed(None, None), &screen.here());
         assert!(step.commands.is_empty() && step.give_backs.is_empty());
@@ -1500,7 +1665,7 @@ pub(crate) mod tests {
 
         // How that turn ended decides it, as it would have for the one waited for.
         let mut outbox = Outbox::default();
-        outbox.queue(&working(EARLIER), "next", None);
+        outbox.queue(&working(EARLIER), "next", Vec::new(), None);
         let step = outbox.on_shell(
             &on("after-a-reconnect", "interrupted", LATER),
             &screen.here(),
@@ -1514,7 +1679,7 @@ pub(crate) mod tests {
     fn a_queued_message_refused_on_its_way_comes_back() {
         let mut outbox = Outbox::default();
         let screen = Screen::on("elsewhere");
-        outbox.queue(&working(""), "after that", Some("Over it:"));
+        outbox.queue(&working(""), "after that", Vec::new(), Some("Over it:"));
         let step = outbox.on_shell(&on("turn", "completed", ""), &screen.here());
         assert_eq!(started(&step).1, "Over it:\n\nafter that");
         let answer = outbox.on_answer(refused(&step, "refused"), &screen.here());
@@ -1527,7 +1692,7 @@ pub(crate) mod tests {
     #[test]
     fn a_removed_thread_drops_its_queued_message_out_loud() {
         let mut outbox = Outbox::default();
-        outbox.queue(&working(""), "after that", Some("Over it:"));
+        outbox.queue(&working(""), "after that", Vec::new(), Some("Over it:"));
         let step = outbox.on_removed("t1");
         assert_eq!(step.give_backs, back("t1", "after that", Slot::History));
         assert_eq!(
@@ -1743,12 +1908,14 @@ pub(crate) mod tests {
         let mut outbox = Outbox::default();
         let mut thread = rewindable_thread();
         let _ = rewinding(&mut outbox, &thread, Instant::now());
-        let _ = outbox.swap(Some("t1"), "half written", "t2");
+        let _ = outbox.swap(Some("t1"), "half written", Vec::new(), "t2");
         let other = with_id(rewindable_thread(), "t2");
         let step = outbox.on_thread(&other, &Screen::on("t2").here());
         assert!(step.toast.is_none(), "another thread's detail");
 
-        let parked = outbox.swap(Some("t2"), "", "t1").map(str::to_string);
+        let parked = outbox
+            .swap(Some("t2"), "", Vec::new(), "t1")
+            .map(|parked| parked.text.clone());
         let mut screen = Screen::on("t1");
         screen.composer = parked.expect("its draft");
         let step = outbox.on_thread(&thread, &screen.here());
@@ -1929,28 +2096,33 @@ pub(crate) mod tests {
     fn a_draft_is_parked_per_thread() {
         let mut outbox = Outbox::default();
         assert_eq!(
-            outbox.swap(None, "", "t1"),
+            outbox.swap(None, "", Vec::new(), "t1"),
             None,
             "nothing to leave, nothing there"
         );
         assert_eq!(
-            outbox.swap(Some("t1"), "half written", "t2"),
+            outbox.swap(Some("t1"), "half written", Vec::new(), "t2"),
             None,
             "t2 starts empty"
         );
-        assert_eq!(outbox.swap(Some("t2"), "  \n ", "t1"), Some("half written"));
+        assert_eq!(
+            outbox
+                .swap(Some("t2"), "  \n ", Vec::new(), "t1")
+                .map(|parked| parked.text.as_str()),
+            Some("half written")
+        );
         assert_eq!(outbox.parked("t2"), None, "blanks parked");
 
         // Written over with blanks, what was parked goes.
-        assert_eq!(outbox.swap(Some("t1"), "   ", "t2"), None);
+        assert_eq!(outbox.swap(Some("t1"), "   ", Vec::new(), "t2"), None);
         assert_eq!(outbox.parked("t1"), None);
 
-        let _ = outbox.swap(Some(NEW_THREAD_DRAFT_KEY), "a new one", "t1");
+        let _ = outbox.swap(Some(NEW_THREAD_DRAFT_KEY), "a new one", Vec::new(), "t1");
         assert_eq!(outbox.parked(NEW_THREAD_DRAFT_KEY), Some("a new one"));
         outbox.unpark(NEW_THREAD_DRAFT_KEY);
         assert_eq!(outbox.parked(NEW_THREAD_DRAFT_KEY), None);
 
-        let _ = outbox.swap(Some("t1"), "gone with it", "t2");
+        let _ = outbox.swap(Some("t1"), "gone with it", Vec::new(), "t2");
         let _ = outbox.on_removed("t1");
         assert_eq!(outbox.parked("t1"), None, "a draft for nothing");
     }
