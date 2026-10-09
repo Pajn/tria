@@ -36,6 +36,7 @@ mod tool_text;
 mod transcript;
 mod turn_time;
 mod ui;
+mod v2;
 mod vim;
 mod wire;
 mod workspace;
@@ -328,8 +329,8 @@ async fn dump(origin: &str, token: &str, thread_id: &str, seconds: u64) -> Resul
                 }
                 (None, _) => {}
             },
-            session::Update::OlderPage { snapshot, .. } => {
-                println!("older page: {} messages", snapshot.thread.messages.len())
+            session::Update::OlderPage { page, .. } => {
+                println!("older page: {} items", page.items.len())
             }
             session::Update::ThreadStreamError { thread_id, error } => {
                 println!("thread stream error ({thread_id}): {error}")

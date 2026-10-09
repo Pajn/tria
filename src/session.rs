@@ -16,7 +16,6 @@ use crate::{
     rpc::{RpcClient, Subscription},
 };
 
-const THREAD_TURN_LIMIT: u32 = 40;
 /// How often a thread's stream is quietly asked for again before the trouble is worth
 /// reporting. A first failure is ordinary — a thread the server has only just been told
 /// to make, a socket that blinked — and asking again is all it takes.
@@ -31,6 +30,7 @@ pub enum Request {
     RefreshThread(Id),
     CloseThread,
     Dispatch {
+        method: &'static str,
         command: Value,
         reply: oneshot::Sender<Result<u64>>,
     },
@@ -86,12 +86,12 @@ pub enum Update {
         thread_id: Id,
         item: ThreadItem,
     },
-    /// A windowed snapshot of older turns requested with `LoadOlder`.
+    /// A page of older history requested with `LoadOlder`.
     OlderPage {
         thread_id: Id,
-        snapshot: crate::model::ThreadDetailSnapshot,
+        page: crate::v2::HistoryPage,
     },
-    /// The terminal list changed. Absent entirely when the token lacks `terminal:operate`.
+    /// The terminal list changed. Absent entirely when the token lacks `terminal:read`.
     Terminals(crate::model::TerminalEvent),
     /// Output from the attached terminal.
     TerminalStream(crate::model::TerminalStreamEvent),
@@ -204,10 +204,36 @@ impl Handle {
         let _ = self.tx.send(Request::RefreshVcs);
     }
 
+    /// Send a command. A project's go to `projects.mutate`, which is where the server
+    /// keeps them; the rest are the orchestration's.
     pub async fn dispatch(&self, command: Value) -> Result<u64> {
+        let is_project = command
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.starts_with("project."));
+        let method = if is_project {
+            "projects.mutate"
+        } else {
+            "orchestration.dispatchCommand"
+        };
+        self.send_in_order(method, command).await
+    }
+
+    /// Make a thread and send its first message, in order with the commands around it:
+    /// a message written next must not reach the server ahead of the thread it is on.
+    pub async fn launch(&self, input: Value) -> Result<u64> {
+        self.send_in_order("orchestration.launchThread", input)
+            .await
+    }
+
+    async fn send_in_order(&self, method: &'static str, command: Value) -> Result<u64> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Request::Dispatch { command, reply })
+            .send(Request::Dispatch {
+                method,
+                command,
+                reply,
+            })
             .map_err(|_| anyhow!("connection supervisor stopped"))?;
         rx.await
             .map_err(|_| anyhow!("connection supervisor stopped"))?
@@ -350,8 +376,8 @@ async fn run(
                 continue;
             }
         };
-        // Terminals need the `terminal:operate` scope. A token without it still works;
-        // the terminal list is simply never populated.
+        // The terminal list needs the `terminal:read` scope. A token without it still
+        // works; the list is simply never populated.
         let mut terminals = match client
             .subscribe("subscribeTerminalMetadata", json!({}))
             .await
@@ -480,22 +506,18 @@ async fn run(
                         }
                         Request::LoadOlder { before_cursor } => {
                             if let Some(o) = open.as_ref() {
-                                let payload = json!({
-                                    "threadId": o.id,
-                                    "turnLimit": THREAD_TURN_LIMIT,
-                                    "beforeCursor": before_cursor,
-                                });
-                                // Older turns come as a one-shot windowed subscription; take its snapshot only.
-                                match client.subscribe("orchestration.subscribeThread", payload).await {
-                                    Ok(mut sub) => {
-                                        if let Some(Ok(item)) = sub.next().await
-                                            && let Ok(ThreadItem::Snapshot { snapshot }) = serde_json::from_value::<ThreadItem>(item)
-                                        {
-                                            let _ = updates.send(Update::OlderPage { thread_id: o.id.clone(), snapshot });
+                                // Older history is a page over HTTP, fetched off this loop
+                                // so the streams keep moving while it comes.
+                                let (origin, token, updates) = (origin.clone(), token.clone(), updates.clone());
+                                let thread_id = o.id.clone();
+                                tokio::spawn(async move {
+                                    match crate::v2::history_page(&origin, &token, &thread_id, &before_cursor).await {
+                                        Ok(page) => {
+                                            let _ = updates.send(Update::OlderPage { thread_id, page });
                                         }
+                                        Err(err) => { let _ = updates.send(Update::Error(format!("{err:#}"))); }
                                     }
-                                    Err(err) => { let _ = updates.send(Update::Error(err.to_string())); }
-                                }
+                                });
                             }
                         }
                         // Answered off this loop: a call can take as long as the work
@@ -508,15 +530,15 @@ async fn run(
                                 let _ = reply.send(client.call::<Value>(&tag, payload).await);
                             });
                         }
-                        Request::Dispatch { command, reply } => {
-                            let _ = dispatches.send((command, reply));
+                        Request::Dispatch { method, command, reply } => {
+                            let _ = dispatches.send((method, command, reply));
                         }
                     }
                 }
                 item = shell.next() => {
                     match item {
                         Some(Ok(value)) => {
-                            match serde_json::from_value::<ShellItem>(value) {
+                            match crate::v2::shell_item(value) {
                                 Ok(item) => {
                                     match &item {
                                         ShellItem::Snapshot { snapshot } => shell_sequence = Some(snapshot.snapshot_sequence),
@@ -700,7 +722,7 @@ fn forward_thread_item(
     value: Value,
     last_sequence: &mut Option<u64>,
 ) {
-    match serde_json::from_value::<ThreadItem>(value) {
+    match crate::v2::thread_item(value, None) {
         Ok(item) => {
             match &item {
                 ThreadItem::Snapshot { snapshot } => {
@@ -811,8 +833,8 @@ async fn subscribe_vcs(client: &RpcClient, cwd: &str) -> Option<Subscription> {
     }
 }
 
-/// A command and where its answer goes.
-type Dispatched = (Value, oneshot::Sender<Result<u64>>);
+/// A command, the method that carries it, and where its answer goes.
+type Dispatched = (&'static str, Value, oneshot::Sender<Result<u64>>);
 
 /// Send commands to the server one at a time, in the order they arrive, each once the
 /// one before it has been answered.
@@ -820,9 +842,9 @@ fn dispatcher(client: &RpcClient) -> mpsc::UnboundedSender<Dispatched> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Dispatched>();
     let client = client.clone();
     tokio::spawn(async move {
-        while let Some((command, reply)) = rx.recv().await {
+        while let Some((method, command, reply)) = rx.recv().await {
             let result = client
-                .call::<Value>("orchestration.dispatchCommand", command)
+                .call::<Value>(method, command)
                 .await
                 .map(|v| v.get("sequence").and_then(Value::as_u64).unwrap_or(0));
             let _ = reply.send(result);
@@ -850,7 +872,8 @@ async fn subscribe_thread(
     if let Some(after) = after {
         payload["afterSequence"] = json!(after);
     } else if pagination {
-        payload["turnLimit"] = json!(THREAD_TURN_LIMIT);
+        // The newest of the history, with a cursor for the rest.
+        payload["acceptBoundedSnapshot"] = json!(true);
     }
     client
         .subscribe("orchestration.subscribeThread", payload)
@@ -918,8 +941,12 @@ mod tests {
         let dispatches = dispatcher(&client);
         let (first, first_answer) = oneshot::channel();
         let (second, second_answer) = oneshot::channel();
-        dispatches.send((json!({"n": 1}), first)).unwrap();
-        dispatches.send((json!({"n": 2}), second)).unwrap();
+        dispatches
+            .send(("orchestration.dispatchCommand", json!({"n": 1}), first))
+            .unwrap();
+        dispatches
+            .send(("orchestration.launchThread", json!({"n": 2}), second))
+            .unwrap();
 
         let one = requests.recv().await.unwrap();
         assert_eq!(one["tag"], "orchestration.dispatchCommand");
@@ -933,6 +960,7 @@ mod tests {
         answers.send(answer(&one, 7)).unwrap();
         assert_eq!(first_answer.await.unwrap().unwrap(), 7);
         let two = requests.recv().await.unwrap();
+        assert_eq!(two["tag"], "orchestration.launchThread");
         assert_eq!(two["payload"]["n"], 2);
         answers.send(answer(&two, 8)).unwrap();
         assert_eq!(second_answer.await.unwrap().unwrap(), 8);

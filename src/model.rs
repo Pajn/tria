@@ -176,6 +176,9 @@ pub struct ThreadShell {
     /// Native background work alive after the turn settled: "working" or "monitoring".
     #[serde(default)]
     pub background_liveness: Option<String>,
+    /// That work, one task at a time.
+    #[serde(default)]
+    pub background_tasks: Vec<BackgroundTask>,
     #[serde(default)]
     pub session: Option<Session>,
     #[serde(default)]
@@ -186,6 +189,20 @@ pub struct ThreadShell {
     pub has_pending_user_input: bool,
     #[serde(default)]
     pub plan_progress: Option<PlanProgress>,
+}
+
+/// Work the provider started that outlives the turn: a backgrounded command, a monitor,
+/// a subagent.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTask {
+    pub task_id: Id,
+    /// Its name: a command's description, a monitor's, a subagent's title.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `command`, `monitor`, `subagent`, or `background_task` for the rest.
+    #[serde(default)]
+    pub kind: String,
 }
 
 fn default_runtime_mode() -> String {
@@ -935,10 +952,20 @@ pub struct ProposedPlan {
 pub struct Checkpoint {
     pub turn_id: Id,
     pub completed_at: String,
-    /// How many turns the thread had once this one was done: the number a revert is
-    /// asked for by. Absent from servers that predate it, which cannot revert either.
+    /// How many turns the thread had once this one was done.
     #[serde(default)]
     pub checkpoint_turn_count: Option<u32>,
+    /// The checkpoint to roll back to, to undo this turn: the one before it.
+    #[serde(default)]
+    pub rollback: Option<RollbackTarget>,
+}
+
+/// A checkpoint as `checkpoint.rollback` names it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackTarget {
+    pub scope_id: Id,
+    pub checkpoint_id: Id,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -972,6 +999,9 @@ pub struct ThreadDetailSnapshot {
     pub thread: ThreadDetail,
     #[serde(default)]
     pub page: Option<ThreadDetailPage>,
+    /// What the thread was derived from, which the stream's events apply to.
+    #[serde(skip)]
+    pub projection: Option<Box<crate::v2::Projection>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

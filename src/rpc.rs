@@ -88,6 +88,7 @@ impl RpcClient {
             .map_err(|_| anyhow!("cannot set websocket scheme"))?;
         url.set_path("/ws");
         url.query_pairs_mut()
+            .append_pair(crate::v2::PROTOCOL_QUERY, &crate::v2::PROTOCOL.to_string())
             .append_pair("wsTicket", ticket)
             .append_pair("clientSurface", "web")
             .append_pair("clientDeviceType", "desktop")

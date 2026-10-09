@@ -22,7 +22,7 @@ use crate::{
     commands,
     composer::Composer,
     list_cursor::{ListCursor, Row},
-    model::{Id, ModelSelection, ServerConfig, ShellItem, ThreadDetailSnapshot, ThreadItem},
+    model::{Id, ModelSelection, ServerConfig, ShellItem, ThreadItem},
     outbox::{self, NEW_THREAD_DRAFT_KEY, NewThreadDraft, Outbox, PreparedCheckout},
     picture,
     question::QuestionDraft,
@@ -409,6 +409,14 @@ impl WorktreeConfirm {
     pub fn last(&self, files: usize) -> usize {
         files.saturating_sub(self.room.max(1))
     }
+}
+
+/// What carrying one of the outbox's commands sends.
+enum Carried {
+    /// Commands, one after the other, each once the one before has been taken.
+    Commands(Vec<Value>),
+    /// A new thread with its first message.
+    Launch(Value),
 }
 
 /// A turn as the command for it, marked as building a plan where it builds one.
@@ -1572,7 +1580,7 @@ impl App {
     /// answer back as an event.
     fn carry(&self, command: outbox::Command) {
         let ticket = command.ticket();
-        let command = match command {
+        let send = match command {
             outbox::Command::Start {
                 thread,
                 text,
@@ -1581,23 +1589,30 @@ impl App {
                 interaction_mode,
                 implementing,
                 ..
-            } => building(
-                commands::turn_start(
-                    &thread,
-                    &text,
-                    &model_selection,
-                    &runtime_mode,
-                    &interaction_mode,
-                    None,
-                ),
-                implementing,
-            ),
+            } => {
+                // A message carries no modes: they are the thread's, and set on it first
+                // where the composer asks for different ones.
+                let mut commands = Vec::new();
+                let current = self.shell.threads.get(&thread).or_else(|| {
+                    self.thread
+                        .as_ref()
+                        .filter(|open| open.id() == thread)
+                        .map(|open| &open.detail.shell)
+                });
+                if current.is_some_and(|t| t.runtime_mode != runtime_mode) {
+                    commands.push(commands::runtime_mode_set(&thread, &runtime_mode));
+                }
+                if current.is_some_and(|t| t.interaction_mode != interaction_mode) {
+                    commands.push(commands::interaction_mode_set(&thread, &interaction_mode));
+                }
+                commands.push(building(
+                    commands::turn_start(&thread, &text, &model_selection),
+                    implementing,
+                ));
+                Carried::Commands(commands)
+            }
             outbox::Command::Create {
-                thread,
-                text,
-                new,
-                implementing,
-                ..
+                thread, text, new, ..
             } => {
                 tracing::info!(
                     %thread,
@@ -1606,51 +1621,61 @@ impl App {
                     "creating a thread"
                 );
                 let branch = commands::worktree_branch(&thread);
-                let command = commands::turn_start(
+                Carried::Launch(commands::launch_thread(
                     &thread,
                     &text,
-                    &new.model_selection,
-                    &new.runtime_mode,
-                    &new.interaction_mode,
-                    Some(commands::NewThread {
+                    commands::NewThread {
                         project_id: &new.project_id,
                         title: &new.title,
+                        generate_title: new.generate_title,
                         model_selection: &new.model_selection,
                         runtime_mode: &new.runtime_mode,
                         interaction_mode: &new.interaction_mode,
                         worktree: new.worktree.as_ref().map(|w| commands::Worktree {
-                            project_cwd: &w.project_cwd,
                             base_branch: &w.base_branch,
                             branch: &branch,
                             start_from_origin: w.start_from_origin,
                         }),
                         branch: new.branch.as_deref(),
                         worktree_path: new.worktree_path.as_deref(),
-                    }),
-                );
-                building(command, implementing)
+                    },
+                ))
             }
             outbox::Command::Link { thread, link, .. } => {
-                commands::pull_request_link(&thread, &link)
+                Carried::Commands(vec![commands::pull_request_link(&thread, &link)])
             }
             outbox::Command::Revert {
                 thread,
                 turn_count,
+                target,
                 restore_files,
                 ..
             } => {
                 tracing::info!(%thread, turn_count, restore_files, "rewinding");
-                commands::thread_revert(&thread, turn_count, restore_files)
+                Carried::Commands(vec![commands::thread_revert(
+                    &thread,
+                    &target,
+                    restore_files,
+                )])
             }
         };
         let handle = self.handle.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
-            let result = handle
-                .dispatch(command)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string());
+            let result = match send {
+                Carried::Launch(input) => handle.launch(input).await.map(|_| ()),
+                Carried::Commands(commands) => {
+                    let mut result = Ok(());
+                    for command in commands {
+                        result = handle.dispatch(command).await.map(|_| ());
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                    result
+                }
+            }
+            .map_err(|e| e.to_string());
             let _ = events.send(AppEvent::Outbox(outbox::Answer { ticket, result }));
         });
     }
@@ -2059,15 +2084,22 @@ impl App {
         let Some(thread) = &self.thread else { return };
         let running = thread.is_running();
         let thread_id = thread.id().to_string();
-        let turn_id = running
-            .then_some(thread.detail.shell.latest_turn.as_ref())
-            .flatten()
-            .map(|t| t.turn_id.clone());
         if !running && !self.background_alive() {
             self.toast("nothing running", false);
             return;
         }
-        self.dispatch(commands::turn_interrupt(&thread_id, turn_id.as_deref()));
+        // The run going, or failing that the last one, whose background work it is.
+        let Some(run_id) = thread
+            .detail
+            .shell
+            .latest_turn
+            .as_ref()
+            .map(|t| t.turn_id.clone())
+        else {
+            self.toast("nothing to interrupt", false);
+            return;
+        };
+        self.dispatch(commands::turn_interrupt(&thread_id, &run_id));
         self.toast(
             if running {
                 "interrupting…"
@@ -3575,7 +3607,19 @@ impl App {
             return;
         };
         let thread_id = thread.id().to_string();
-        self.dispatch(commands::session_stop(&thread_id));
+        let sessions: Vec<String> = thread
+            .projection
+            .iter()
+            .flat_map(|projection| &projection.provider_sessions)
+            .map(|session| session.id.clone())
+            .collect();
+        if sessions.is_empty() {
+            self.toast("no session to stop", false);
+            return;
+        }
+        for session in sessions {
+            self.dispatch(commands::session_stop(&thread_id, &session));
+        }
         self.toast("stopping the session…", false);
     }
 
@@ -7173,13 +7217,6 @@ impl App {
                     (Some(thread), item) => thread.apply(item),
                     (None, _) => {}
                 }
-                // A revert drops turns and the event says only how many are left, so
-                // what is left is asked for whole.
-                if let Some(thread) = self.thread.as_mut()
-                    && std::mem::take(&mut thread.needs_snapshot)
-                {
-                    self.handle.refresh_thread(&thread_id);
-                }
                 self.notice_open_thread();
                 self.reconcile_question();
                 self.sync_vcs_watch();
@@ -7191,14 +7228,11 @@ impl App {
                 }
                 self.was_running = running;
             }
-            Update::OlderPage {
-                thread_id,
-                snapshot,
-            } => {
+            Update::OlderPage { thread_id, page } => {
                 if self.current_thread_id.as_deref() == Some(thread_id.as_str())
                     && let Some(thread) = self.thread.as_mut()
                 {
-                    prepend_page(thread, snapshot);
+                    prepend_page(thread, page);
                 }
             }
             Update::Terminals(event) => self.apply_terminal_event(event),
@@ -7269,42 +7303,14 @@ pub(crate) fn edit_key(field: &mut Composer, key: KeyEvent) {
     }
 }
 
-fn prepend_page(thread: &mut ThreadState, snapshot: ThreadDetailSnapshot) {
-    let page = snapshot.page;
-    let older = snapshot.thread;
-    let mut messages = older.messages;
-    messages.retain(|m| !thread.detail.messages.iter().any(|e| e.id == m.id));
-    messages.append(&mut thread.detail.messages);
-    thread.detail.messages = messages;
-    let mut activities = older.activities;
-    activities.retain(|a| !thread.detail.activities.iter().any(|e| e.id == a.id));
-    activities.append(&mut thread.detail.activities);
-    thread.detail.activities = activities;
-    for checkpoint in older.checkpoints {
-        if !thread
-            .detail
-            .checkpoints
-            .iter()
-            .any(|c| c.turn_id == checkpoint.turn_id)
-        {
-            thread.detail.checkpoints.push(checkpoint);
-        }
+/// Put a page of older history in front of the thread.
+fn prepend_page(thread: &mut ThreadState, page: crate::v2::HistoryPage) {
+    if let Some(projection) = thread.projection.as_mut() {
+        projection.prepend(page.items);
+        thread.detail = projection.detail(&thread.detail.shell);
     }
-    for plan in older.proposed_plans {
-        if !thread.detail.proposed_plans.iter().any(|p| p.id == plan.id) {
-            thread.detail.proposed_plans.insert(0, plan);
-        }
-    }
-    match page {
-        Some(page) => {
-            thread.has_more = page.has_more;
-            thread.before_cursor = page.before_cursor;
-        }
-        None => {
-            thread.has_more = false;
-            thread.before_cursor = None;
-        }
-    }
+    thread.has_more = page.has_more_history;
+    thread.before_cursor = page.next_cursor;
     thread.touch();
 }
 
@@ -8137,6 +8143,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::model::ThreadDetailSnapshot;
     use crate::model::{Project, VcsLocal, VcsWorkingTree};
     use crate::outbox::tests::{planned_thread, rewindable_thread};
     use crate::reader::tests::{
@@ -8277,23 +8284,47 @@ mod tests {
     }
 
     #[test]
-    fn older_pages_keep_turn_completions_without_duplicates() {
-        let mut thread = running_thread();
+    fn older_pages_go_in_front_once() {
+        let message = |id: &str, ordinal: u64| {
+            json!({ "visibility": "local", "item": {
+                "id": id, "type": "assistant_message", "runId": null, "ordinal": ordinal,
+                "status": "completed", "messageId": id, "text": id, "streaming": false,
+                "startedAt": format!("2026-09-22T12:00:{ordinal:02}Z"), "updatedAt": "x",
+            }})
+        };
+        let snapshot = crate::v2::thread_item(
+            json!({ "kind": "snapshot", "snapshotSequence": 1, "hasMoreHistory": true,
+            "historyCursor": "page-1",
+            "projection": {
+                "thread": { "id": "t1", "projectId": "p", "title": "Test",
+                    "modelSelection": { "instanceId": "instance", "model": "a-model" } },
+                "visibleTurnItems": [message("new", 5)],
+            }}),
+            None,
+        )
+        .unwrap();
+        let ThreadItem::Snapshot { snapshot } = snapshot else {
+            panic!("not a snapshot");
+        };
+        let mut thread = ThreadState::from_snapshot(snapshot);
         let page = || {
-            serde_json::from_value::<ThreadDetailSnapshot>(json!({
-                "snapshotSequence":1,
-                "thread":{
-                    "id":"t1", "projectId":"p", "title":"Test",
-                    "modelSelection":{"instanceId":"instance","model":"a-model"},
-                    "checkpoints":[{"turnId":"old", "completedAt":"2026-09-22T12:00:00Z"}]
-                }
+            serde_json::from_value::<crate::v2::HistoryPage>(json!({
+                "snapshotSequence": 1, "items": [message("old", 1)],
+                "nextCursor": null, "hasMoreHistory": false,
             }))
             .unwrap()
         };
         prepend_page(&mut thread, page());
         prepend_page(&mut thread, page());
-        assert_eq!(thread.detail.checkpoints.len(), 1);
-        assert_eq!(thread.detail.checkpoints[0].turn_id, "old");
+        let ids: Vec<_> = thread
+            .detail
+            .messages
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(ids, ["old", "new"]);
+        assert!(!thread.has_more);
+        assert_eq!(thread.before_cursor, None);
     }
 
     #[test]
@@ -8422,7 +8453,7 @@ mod tests {
     ) -> Value {
         let (command, reply) = loop {
             match asked(requests).await.expect("a command") {
-                crate::session::Request::Dispatch { command, reply } => break (command, reply),
+                crate::session::Request::Dispatch { command, reply, .. } => break (command, reply),
                 _ => continue,
             }
         };
@@ -8452,7 +8483,7 @@ mod tests {
         app.focus = Focus::Chat;
 
         let create = refuse_the_next_command(&mut app, &mut requests, &mut sent).await;
-        assert!(create.get("bootstrap").is_some(), "{create}");
+        assert!(create.get("workspaceStrategy").is_some(), "{create}");
         assert!(
             app.current_thread_id.is_none(),
             "still on a thread that is not there"
@@ -8482,7 +8513,7 @@ mod tests {
         app.send_message();
 
         let create = refuse_the_next_command(&mut app, &mut requests, &mut sent).await;
-        assert_eq!(create["message"]["text"], "X");
+        assert_eq!(create["initialMessage"]["text"], "X");
         let said = app.toast.as_ref().expect("it says so").0.clone();
         assert!(said.contains("history"), "{said}");
         app.composer.history_prev();
@@ -8776,10 +8807,7 @@ mod tests {
         app.send_message();
         let command = sent_command(&mut requests).await.unwrap();
         assert_eq!(command["threadId"], id);
-        assert_eq!(
-            command["bootstrap"]["createThread"]["projectId"],
-            project_id
-        );
+        assert_eq!(command["projectId"], project_id);
         assert_eq!(app.current_thread_id.as_deref(), Some(id.as_str()));
     }
 
@@ -9111,6 +9139,10 @@ mod tests {
             }))
             .unwrap(),
         ));
+        // The provider session the thread's work runs in, which is what stopping it lets go.
+        app.thread.as_mut().unwrap().projection = Some(Box::new(
+            serde_json::from_value(json!({"providerSessions": [{"id": "session"}]})).unwrap(),
+        ));
     }
 
     fn dispatched(
@@ -9125,9 +9157,8 @@ mod tests {
     }
 
     /// A watcher outlives the turn that started it, so by the time it is worth stopping
-    /// there is no turn to name and nothing is "running". The interrupt still goes —
-    /// without a turn id, which is what the desktop's `Monitoring · Stop` sends — and
-    /// the session stops the watch loop.
+    /// nothing is "running". The interrupt still goes, to the run whose background work
+    /// it is, which is what the desktop's `Monitoring · Stop` sends.
     #[tokio::test]
     async fn a_thread_only_monitoring_can_still_be_stopped() {
         let (handle, mut requests) = crate::session::Handle::detached();
@@ -9147,11 +9178,10 @@ mod tests {
         let commands = dispatched(&mut requests);
         let interrupt = commands
             .iter()
-            .find(|command| command["type"] == "thread.turn.interrupt")
+            .find(|command| command["type"] == "run.interrupt")
             .expect("the watcher was never stopped");
         assert_eq!(interrupt["threadId"], "t1");
-        // No turn is running, and naming one that is not would be naming the wrong one.
-        assert!(interrupt["turnId"].is_null());
+        assert_eq!(interrupt["runId"], "turn");
         // The list stays open: the rows clearing is what says it worked.
         assert_eq!(app.mode, Mode::Tasks);
     }
@@ -9180,9 +9210,11 @@ mod tests {
         app.run_command("stop!");
         tokio::task::yield_now().await;
 
-        let stopped = dispatched(&mut requests)
-            .iter()
-            .any(|command| command["type"] == "thread.session.stop" && command["threadId"] == "t1");
+        let stopped = dispatched(&mut requests).iter().any(|command| {
+            command["type"] == "provider-session.detach"
+                && command["threadId"] == "t1"
+                && command["providerSessionId"] == "session"
+        });
         assert!(stopped, "the session was never stopped");
     }
 
@@ -9225,7 +9257,7 @@ mod tests {
     fn stopped(requests: &mut mpsc::UnboundedReceiver<crate::session::Request>) -> bool {
         dispatched(requests)
             .iter()
-            .any(|command| command["type"] == "thread.session.stop")
+            .any(|command| command["type"] == "provider-session.detach")
     }
 
     /// A thread as the list has it, on a given turn in a given state.
@@ -10310,9 +10342,8 @@ mod tests {
         let turn = sent_command(&mut requests)
             .await
             .expect("the thread starts");
-        assert_eq!(turn["type"], "thread.turn.start");
-        assert_eq!(turn["bootstrap"]["createThread"]["projectId"], id);
-        assert!(turn["bootstrap"]["createThread"]["worktreePath"].is_null());
+        assert_eq!(turn["projectId"], id);
+        assert_eq!(turn["workspaceStrategy"]["type"], "root");
     }
 
     /// Sending empties the composer, which is what sending looks like — but a message
@@ -10391,7 +10422,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         let command = sent_command(&mut requests).await.expect("sent once agreed");
         assert_eq!(
-            command["message"]["text"],
+            command["text"],
             "Sent looking at the transcript for subagent a1:\n\nwhy did it stop?"
         );
         assert!(!app.reader.is_open(), "still reading the transcript");
@@ -10723,7 +10754,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         let command = sent_command(&mut requests).await.expect("sent once agreed");
         assert_eq!(
-            command["message"]["text"],
+            command["text"],
             "Sent looking at pull request o/r#1 (https://github.com/o/r/pull/1):\n\nis this ready?"
         );
         assert!(!app.reader.is_open(), "the message joins the conversation");
@@ -11149,7 +11180,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let (create, reply) = loop {
             match asked(&mut requests).await.expect("the thread is made") {
-                crate::session::Request::Dispatch { command, reply } => break (command, reply),
+                crate::session::Request::Dispatch { command, reply, .. } => break (command, reply),
                 _ => continue,
             }
         };
@@ -11158,15 +11189,10 @@ mod tests {
             thread_id.as_str(),
             "the id the checkout was made for"
         );
-        assert_eq!(create["bootstrap"]["createThread"]["branch"], "a");
-        assert_eq!(
-            create["bootstrap"]["createThread"]["worktreePath"],
-            "/src/p-worktrees/a"
-        );
-        assert!(
-            create["bootstrap"].get("prepareWorktree").is_none(),
-            "no second worktree"
-        );
+        let workspace = &create["workspaceStrategy"];
+        assert_eq!(workspace["branch"], "a");
+        assert_eq!(workspace["worktreePath"], "/src/p-worktrees/a");
+        assert_eq!(workspace["type"], "existing_worktree", "no second worktree");
 
         let _ = reply.send(Ok(1));
         let made = tokio::time::timeout(Duration::from_millis(500), sent.recv())
@@ -11285,8 +11311,8 @@ mod tests {
         let command = sent_command(&mut requests)
             .await
             .expect("sent once it ended");
-        assert_eq!(command["type"], "thread.turn.start");
-        assert_eq!(command["message"]["text"], "first\n\nsecond");
+        assert_eq!(command["type"], "message.dispatch");
+        assert_eq!(command["text"], "first\n\nsecond");
         assert_eq!(app.queued_message(), None);
     }
 
@@ -11309,7 +11335,7 @@ mod tests {
         let command = sent_command(&mut requests)
             .await
             .expect("sent straight away");
-        assert_eq!(command["message"]["text"], "now");
+        assert_eq!(command["text"], "now");
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.queued_message(), None);
     }
@@ -11769,19 +11795,19 @@ mod tests {
         app.run_command("implement new");
         let command = loop {
             match asked(&mut requests).await.expect("the plan was sent") {
-                crate::session::Request::Dispatch { command, reply } => {
+                crate::session::Request::Dispatch { command, reply, .. } => {
                     let _ = reply.send(Ok(1));
                     break command;
                 }
                 _ => continue,
             }
         };
-        let created = &command["bootstrap"]["createThread"];
-        assert_eq!(created["title"], "Implement Add a queue");
-        assert_eq!(created["interactionMode"], "default");
-        assert_eq!(created["branch"], "tria/abc");
-        assert_eq!(created["worktreePath"], "/worktrees/p-1");
-        assert_eq!(command["sourceProposedPlan"]["planId"], "plan");
+        assert_eq!(command["title"], "Implement Add a queue");
+        assert_eq!(command["generateTitle"], false, "the plan names it");
+        assert_eq!(command["interactionMode"], "default");
+        let workspace = &command["workspaceStrategy"];
+        assert_eq!(workspace["branch"], "tria/abc");
+        assert_eq!(workspace["worktreePath"], "/worktrees/p-1");
         assert_ne!(command["threadId"], "t1");
         assert_eq!(
             app.current_thread_id.as_deref(),
@@ -11811,6 +11837,10 @@ mod tests {
         let thread = rewindable_thread();
         let expected = crate::state::Rewind {
             turn_count: 1,
+            target: crate::model::RollbackTarget {
+                scope_id: "root".into(),
+                checkpoint_id: "c1".into(),
+            },
             text: "u2\n\nu3".into(),
             message_ids: vec!["u2".into(), "u3".into()],
             later_turns: 1,
@@ -11853,8 +11883,9 @@ mod tests {
         let command = sent_command(&mut requests)
             .await
             .expect("a rewind was sent");
-        assert_eq!(command["type"], "thread.conversation.revert");
-        assert_eq!(command["turnCount"], 1);
+        assert_eq!(command["type"], "checkpoint.rollback");
+        assert_eq!(command["checkpointId"], "c1");
+        assert_eq!(command["restoreFiles"], false);
         assert!(app.is_rewinding());
 
         // Nothing goes into the turns that are about to go.
@@ -11893,8 +11924,9 @@ mod tests {
         let command = sent_command(&mut requests)
             .await
             .expect("a rewind was sent");
-        assert_eq!(command["type"], "thread.checkpoint.revert");
-        assert_eq!(command["turnCount"], 2);
+        assert_eq!(command["type"], "checkpoint.rollback");
+        assert_eq!(command["checkpointId"], "c2");
+        assert_eq!(command["restoreFiles"], true);
     }
 
     /// Not while a turn runs, and not where the provider cannot drop turns.
@@ -11919,34 +11951,6 @@ mod tests {
         app.ask_rewind(None);
         assert!(app.rewind_ask.is_none());
         assert!(app.toast.as_ref().unwrap().0.contains("cannot rewind"));
-    }
-
-    /// A revert from anywhere — here, the desktop — drops turns the stream only counts,
-    /// so the thread is asked for whole again.
-    #[tokio::test]
-    async fn a_revert_asks_for_the_thread_again() {
-        let (handle, mut requests) = crate::session::Handle::detached();
-        let (events, _events) = mpsc::unbounded_channel();
-        let mut app = App::new(handle, events);
-        app.thread = Some(rewindable_thread());
-        app.current_thread_id = Some("t1".into());
-        let reverted: crate::model::Event = serde_json::from_value(json!({
-            "sequence": 2, "type": "thread.reverted",
-            "payload": {"threadId": "t1", "turnCount": 1}
-        }))
-        .unwrap();
-        app.on_update(crate::session::Update::Thread {
-            thread_id: "t1".into(),
-            item: ThreadItem::Event { event: reverted },
-        });
-        let mut refreshed = false;
-        while let Some(request) = asked(&mut requests).await {
-            if matches!(&request, crate::session::Request::RefreshThread(id) if id == "t1") {
-                refreshed = true;
-                break;
-            }
-        }
-        assert!(refreshed, "the thread was not asked for again");
     }
 
     /// A thread the server removes takes what was being written for it along: its parked
@@ -12527,8 +12531,9 @@ mod tests {
         tokio::task::yield_now().await;
 
         let renamed = std::iter::from_fn(|| requests.try_recv().ok()).any(|request| {
-            matches!(request, crate::session::Request::Dispatch { command, .. }
-                if command["type"] == "project.meta.update"
+            matches!(request, crate::session::Request::Dispatch { method, command, .. }
+                if method == "projects.mutate"
+                    && command["type"] == "project.update"
                     && command["projectId"] == "p"
                     && command["title"] == "shelf")
         });

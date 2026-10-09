@@ -2846,10 +2846,9 @@ fn tokens(total: u64) -> String {
     }
 }
 
-/// The agent's unfinished background tasks, and what the server says is still live in
-/// the thread even when no row for it was loaded. The protocol has no per-task stop: the
-/// stop offered here is the session's own, which is what the desktop's `Monitoring ·
-/// Stop` sends too.
+/// The agent's unfinished background tasks, as the server lists them. The protocol has no
+/// per-task stop: the stop offered here is the interrupt of the run that left them going,
+/// which is what the desktop's `Monitoring · Stop` sends too.
 fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
     let tasks = app.running_tasks();
     let liveness = app.background_liveness();
@@ -2857,10 +2856,9 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if tasks.is_empty() {
         match liveness {
-            // The server keeps its own register of what is still running, and it is
-            // older than anything on screen: a watcher left going for hours started in
-            // activities that have long since fallen off the end of the loaded history.
-            // So it is said plainly rather than answered with "nothing running".
+            // The server's list holds subagents too, which this list leaves to `gA`. So
+            // a thread still working with none of these is working on its subagents, and
+            // is not answered with "nothing running".
             Some(label) => {
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -2873,7 +2871,7 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
                     ),
                 ]));
                 lines.push(Line::from(Span::styled(
-                    "   it started before the history tria loaded",
+                    "   its subagents are still going · gA lists them",
                     Style::default().fg(Color::DarkGray),
                 )));
             }

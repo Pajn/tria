@@ -227,17 +227,36 @@ mod tests {
 
     #[test]
     fn completion_events_are_retained_and_deduplicated() {
-        let mut thread = thread();
-        thread.detail.checkpoints.clear();
+        let item = crate::v2::thread_item(
+            json!({
+                "kind": "snapshot", "snapshotSequence": 1,
+                "projection": {
+                    "thread": {"id": "t1", "projectId": "p", "title": "Test",
+                        "modelSelection": {"instanceId": "instance", "model": "a-model"}},
+                    "runs": [{"id": "one", "ordinal": 1, "status": "completed",
+                        "requestedAt": "2026-09-22T12:00:00Z",
+                        "completedAt": "2026-09-22T12:02:08Z"}],
+                },
+            }),
+            None,
+        )
+        .unwrap();
+        let crate::model::ThreadItem::Snapshot { snapshot } = item else {
+            panic!("not a snapshot");
+        };
+        let mut thread = ThreadState::from_snapshot(snapshot);
         for sequence in [2, 3] {
-            thread.apply_event(
-                serde_json::from_value(json!({
-                    "sequence":sequence, "type":"thread.turn-diff-completed",
-                    "payload":{"turnId":"one","completedAt":"2026-09-22T12:02:08Z"}
-                }))
-                .unwrap(),
-            );
+            thread.apply_event(crate::model::Event {
+                sequence,
+                event_id: format!("e{sequence}"),
+                kind: "checkpoint.captured".into(),
+                occurred_at: String::new(),
+                payload: json!({"id": "c1", "scopeId": "root", "runId": "one",
+                    "parentCheckpointId": "c0", "appRunOrdinal": 1, "status": "ready",
+                    "capturedAt": "2026-09-22T12:02:08Z"}),
+            });
         }
         assert_eq!(thread.detail.checkpoints.len(), 1);
+        assert_eq!(thread.detail.checkpoints[0].turn_id, "one");
     }
 }

@@ -114,12 +114,13 @@ pub enum Command {
         thread: Id,
         link: PullRequestLink,
     },
-    /// Drop the thread's turns after the first `turn_count`, and with `restore_files` put
-    /// the files back as that turn left them.
+    /// Drop the thread's turns after the first `turn_count` by rolling back to
+    /// `target`, and with `restore_files` put the files back as that turn left them.
     Revert {
         ticket: Ticket,
         thread: Id,
         turn_count: u32,
+        target: crate::model::RollbackTarget,
         restore_files: bool,
     },
 }
@@ -148,6 +149,8 @@ pub struct Implementing {
 pub struct NewThread {
     pub project_id: Id,
     pub title: String,
+    /// The title is only the message's start, for the server to write a better one.
+    pub generate_title: bool,
     pub model_selection: ModelSelection,
     pub runtime_mode: String,
     pub interaction_mode: String,
@@ -419,6 +422,7 @@ impl Outbox {
         let new = NewThread {
             project_id: draft.project_id.clone(),
             title: title.trim_end().to_string(),
+            generate_title: true,
             model_selection: draft.model_selection.clone(),
             runtime_mode: draft.runtime_mode.clone(),
             interaction_mode: draft.interaction_mode.clone(),
@@ -501,6 +505,7 @@ impl Outbox {
         let new = NewThread {
             project_id: shell.project_id.clone(),
             title: title.trim().to_string(),
+            generate_title: false,
             model_selection: shell.model_selection.clone(),
             runtime_mode: shell.runtime_mode.clone(),
             interaction_mode: "default".into(),
@@ -639,6 +644,7 @@ impl Outbox {
             ticket,
             thread: id.clone(),
             turn_count: rewind.turn_count,
+            target: rewind.target.clone(),
             restore_files,
         };
         self.rewinding.insert(
@@ -1562,9 +1568,11 @@ pub(crate) mod tests {
             json!({"id": id, "role": role, "text": id, "turnId": turn,
                 "createdAt": format!("2026-01-01T10:{at}:00Z")})
         };
+        // Each turn rolls back to the checkpoint before it, `c0` being the thread's start.
         let checkpoint = |turn: &str, count: u32, at: &str| {
             json!({"turnId": turn, "checkpointTurnCount": count,
-                "completedAt": format!("2026-01-01T10:{at}:00Z")})
+                "completedAt": format!("2026-01-01T10:{at}:00Z"),
+                "rollback": {"scopeId": "root", "checkpointId": format!("c{}", count - 1)}})
         };
         let snapshot: crate::model::ThreadDetailSnapshot = serde_json::from_value(json!({
             "snapshotSequence": 1,
@@ -1635,11 +1643,17 @@ pub(crate) mod tests {
             Command::Revert {
                 thread,
                 turn_count,
+                target,
                 restore_files,
                 ..
             } => assert_eq!(
-                (thread.as_str(), *turn_count, *restore_files),
-                ("t1", 1, false)
+                (
+                    thread.as_str(),
+                    *turn_count,
+                    target.checkpoint_id.as_str(),
+                    *restore_files
+                ),
+                ("t1", 1, "c1", false)
             ),
             other => panic!("not a rewind: {other:?}"),
         }

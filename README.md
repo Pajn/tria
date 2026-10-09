@@ -608,20 +608,15 @@ itself.
 ## Background tasks
 
 The agent runs monitors and background commands that outlive the turn that started them.
-`gT` or `:tasks` lists the ones with no reported end, with how long each has been running,
-and the status bar shows a count. Work the agent delegated to a subagent is not background
-work and is listed by `gA` instead.
+`gT` or `:tasks` lists the ones still running, as the server keeps them, and the status bar
+shows a count. Work the agent delegated to a subagent is not background work and is listed by
+`gA` instead.
 
-A watcher that has been going for hours started further back than the history tria
-loads, so there is no row left for the list to show. The server keeps its own register of
-what is still running in a thread, and the panel says what that register says when it has
-nothing else to show: `the server says this thread is monitoring`.
-
-There is no per-task stop in the protocol. What stops a watcher is the session's own
-interrupt sent with no turn to name — `Ctrl-c`, `:stop`, or `s` in the list, which is
-what the desktop app's `Monitoring · Stop` sends. `S` or `:stop!` is the harder one: it
-ends the provider session, and every process it started goes with it. Either way the
-conversation stays, and the next message starts a session again.
+There is no per-task stop in the protocol. What stops a watcher is an interrupt of the turn
+that left it running — `Ctrl-c`, `:stop`, or `s` in the list, which is what the desktop
+app's `Monitoring · Stop` sends. `S` or `:stop!` is the harder one: it ends the provider
+session, and every process it started goes with it. Either way the conversation stays, and
+the next message starts a session again.
 
 `S` asks before it does it. It is `s` with a finger on shift, it takes down work the list
 is not showing, and nothing takes it back: `S` again or `y` agrees, and any other key —
@@ -698,9 +693,9 @@ as, how long it has been going or how long it took, what it is doing now or the 
 of the report it came back with, and its model, tokens, and tool count. The status bar
 carries a count while any are working.
 
-They come from the same `task.*` activities as the background tasks, told apart by the
-`agentKind` the server stamps on each one as it ingests it. So `gT` lists monitors and
-backgrounded commands, `gA` lists subagents, and neither shows the other. Like a background
+They come from the thread's own history, where each subagent has an entry, and the
+background tasks from the server's list of them. So `gT` lists monitors and backgrounded
+commands, `gA` lists subagents, and neither shows the other. Like a background
 task, a subagent has no stop of its own in the protocol: `Ctrl-c` interrupts the turn that
 started it, and stopping the session ends everything running in it.
 

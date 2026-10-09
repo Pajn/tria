@@ -1,8 +1,14 @@
-//! Builders for `orchestration.dispatchCommand` payloads.
+//! Builders for `orchestration.dispatchCommand` payloads, and for the other requests
+//! that change a thread or project: `orchestration.launchThread` and `projects.mutate`.
 
 use serde_json::{Value, json};
 
-use crate::model::ModelSelection;
+use crate::model::{ModelSelection, RollbackTarget};
+
+/// What the server records as where a thread or message came from. The protocol names
+/// the desktop and web apps, phones, agents, and itself; a client of the desktop's kind
+/// is the nearest of those to this one.
+const CREATION_SOURCE: &str = "web";
 
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -17,6 +23,8 @@ pub fn now_iso() -> String {
 pub struct NewThread<'a> {
     pub project_id: &'a str,
     pub title: &'a str,
+    /// Ask the server for a title in place of `title`, which is only a stand-in.
+    pub generate_title: bool,
     pub model_selection: &'a ModelSelection,
     pub runtime_mode: &'a str,
     pub interaction_mode: &'a str,
@@ -31,7 +39,6 @@ pub struct NewThread<'a> {
 
 /// Where a worktree for a new thread comes from, and what it is called.
 pub struct Worktree<'a> {
-    pub project_cwd: &'a str,
     pub base_branch: &'a str,
     /// The branch to make for it. Naming one is what asks for a branch at all: without
     /// it the server checks the base branch out into the worktree instead, which git
@@ -50,55 +57,56 @@ pub fn worktree_branch(thread_id: &str) -> String {
     format!("tria/{short}")
 }
 
-/// Start a turn on an existing thread, or create the thread first when `bootstrap` is given.
-pub fn turn_start(
-    thread_id: &str,
-    text: &str,
-    model_selection: &ModelSelection,
-    runtime_mode: &str,
-    interaction_mode: &str,
-    bootstrap: Option<NewThread<'_>>,
-) -> Value {
-    let created_at = now_iso();
-    let mut command = json!({
-        "type": "thread.turn.start",
+/// Send a message on an existing thread. The server decides what it does with it: starts
+/// a run, or steers or queues behind the one already going.
+pub fn turn_start(thread_id: &str, text: &str, model_selection: &ModelSelection) -> Value {
+    json!({
+        "type": "message.dispatch",
         "commandId": new_id(),
+        "createdBy": "user",
+        "creationSource": CREATION_SOURCE,
         "threadId": thread_id,
-        "message": {
-            "messageId": new_id(),
-            "role": "user",
-            "text": text,
-            "attachments": [],
-        },
+        "messageId": new_id(),
+        "text": text,
+        "attachments": [],
         "modelSelection": model_selection,
-        "runtimeMode": runtime_mode,
-        "interactionMode": interaction_mode,
-        "createdAt": created_at,
-    });
-    if let Some(new_thread) = bootstrap {
-        command["bootstrap"] = json!({
-            "createThread": {
-                "projectId": new_thread.project_id,
-                "title": new_thread.title,
-                "modelSelection": new_thread.model_selection,
-                "runtimeMode": new_thread.runtime_mode,
-                "interactionMode": new_thread.interaction_mode,
-                "branch": new_thread.branch,
-                "worktreePath": new_thread.worktree_path,
-                "createdAt": created_at,
-            }
-        });
-        if let Some(worktree) = new_thread.worktree {
-            // The server names the branch itself and updates the thread to match.
-            command["bootstrap"]["prepareWorktree"] = json!({
-                "projectCwd": worktree.project_cwd,
-                "baseBranch": worktree.base_branch,
-                "branch": worktree.branch,
-                "startFromOrigin": worktree.start_from_origin,
-            });
-        }
+        "deliveryIntent": "auto",
+        "dispatchMode": { "type": "start_immediately" },
+    })
+}
+
+/// The input of `orchestration.launchThread`: make the thread, prepare where it works,
+/// and send its first message.
+pub fn launch_thread(thread_id: &str, text: &str, new_thread: NewThread<'_>) -> Value {
+    let workspace = match (&new_thread.worktree, new_thread.worktree_path) {
+        (Some(worktree), _) => json!({
+            "type": "worktree",
+            "baseRef": worktree.base_branch,
+            "branch": worktree.branch,
+            "startFromOrigin": worktree.start_from_origin,
+        }),
+        (None, Some(path)) => json!({ "type": "existing_worktree", "worktreePath": path }),
+        (None, None) => json!({ "type": "root" }),
+    };
+    let mut workspace = workspace;
+    if new_thread.worktree.is_none()
+        && let Some(branch) = new_thread.branch
+    {
+        workspace["branch"] = json!(branch);
     }
-    command
+    json!({
+        "commandId": new_id(),
+        "creationSource": CREATION_SOURCE,
+        "threadId": thread_id,
+        "projectId": new_thread.project_id,
+        "title": new_thread.title,
+        "generateTitle": new_thread.generate_title,
+        "modelSelection": new_thread.model_selection,
+        "runtimeMode": new_thread.runtime_mode,
+        "interactionMode": new_thread.interaction_mode,
+        "workspaceStrategy": workspace,
+        "initialMessage": { "messageId": new_id(), "text": text, "attachments": [] },
+    })
 }
 
 /// What a turn that builds a proposed plan says. The desktop's words, so that a plan
@@ -108,46 +116,46 @@ pub const PLAN_PROMPT_PREFIX: &str = "PLEASE IMPLEMENT THIS PLAN:\n";
 /// Mark a turn as building a plan, which is what has the server record the plan as
 /// implemented.
 pub fn implementing(mut command: Value, thread_id: &str, plan_id: &str) -> Value {
-    command["sourceProposedPlan"] = json!({ "threadId": thread_id, "planId": plan_id });
+    command["sourcePlanRef"] = json!({ "threadId": thread_id, "planId": plan_id });
     command
 }
 
-pub fn turn_interrupt(thread_id: &str, turn_id: Option<&str>) -> Value {
-    let mut command = json!({
-        "type": "thread.turn.interrupt",
-        "commandId": new_id(),
-        "threadId": thread_id,
-        "createdAt": now_iso(),
-    });
-    if let Some(turn_id) = turn_id {
-        command["turnId"] = json!(turn_id);
-    }
-    command
-}
-
-/// Drop the thread's turns after the first `turn_count`, from the conversation and, with
-/// `restore_files`, from the checkout too, by putting back the files as that turn left
-/// them. Two commands rather than a flag, so that a server which does not know the
-/// history-only one refuses it instead of restoring files nobody asked it to.
-pub fn thread_revert(thread_id: &str, turn_count: u32, restore_files: bool) -> Value {
+/// Interrupt a run: the one going, or the one whose background work is still going.
+/// Messages queued behind it stay queued.
+pub fn turn_interrupt(thread_id: &str, run_id: &str) -> Value {
     json!({
-        "type": if restore_files { "thread.checkpoint.revert" } else { "thread.conversation.revert" },
+        "type": "run.interrupt",
         "commandId": new_id(),
         "threadId": thread_id,
-        "turnCount": turn_count,
-        "createdAt": now_iso(),
+        "runId": run_id,
+        "holdQueue": true,
     })
 }
 
-/// Stop the thread's provider session. The protocol has no stop for one background task,
-/// and monitors and backgrounded commands are the session's own processes, so this is
-/// what ends them. The conversation is untouched: the next message starts a session again.
-pub fn session_stop(thread_id: &str) -> Value {
+/// Undo the turns after a checkpoint: from the conversation and, with `restore_files`,
+/// from the checkout too, by putting back the files as the checkpoint has them.
+pub fn thread_revert(thread_id: &str, target: &RollbackTarget, restore_files: bool) -> Value {
     json!({
-        "type": "thread.session.stop",
+        "type": "checkpoint.rollback",
         "commandId": new_id(),
         "threadId": thread_id,
-        "createdAt": now_iso(),
+        "scopeId": target.scope_id,
+        "checkpointId": target.checkpoint_id,
+        "restoreFiles": restore_files,
+    })
+}
+
+/// Let go of one of the thread's provider sessions. The protocol has no stop for one
+/// background task, and monitors and backgrounded commands are the session's own
+/// processes, so this is what ends them. The conversation is untouched: the next
+/// message starts a session again.
+pub fn session_stop(thread_id: &str, provider_session_id: &str) -> Value {
+    json!({
+        "type": "provider-session.detach",
+        "commandId": new_id(),
+        "threadId": thread_id,
+        "providerSessionId": provider_session_id,
+        "reason": "client-requested",
     })
 }
 
@@ -213,23 +221,21 @@ pub fn pull_request_unlink(thread_id: &str, host: &str, repository: &str, number
 
 pub fn approval_respond(thread_id: &str, request_id: &str, decision: &str) -> Value {
     json!({
-        "type": "thread.approval.respond",
+        "type": "runtime-request.respond",
         "commandId": new_id(),
         "threadId": thread_id,
         "requestId": request_id,
         "decision": decision,
-        "createdAt": now_iso(),
     })
 }
 
 pub fn user_input_respond(thread_id: &str, request_id: &str, answers: Value) -> Value {
     json!({
-        "type": "thread.user-input.respond",
+        "type": "runtime-request.respond",
         "commandId": new_id(),
         "threadId": thread_id,
         "requestId": request_id,
         "answers": answers,
-        "createdAt": now_iso(),
     })
 }
 
@@ -239,13 +245,12 @@ pub fn user_input_dismiss(thread_id: &str, request_id: &str) -> Value {
         "commandId": new_id(),
         "threadId": thread_id,
         "requestId": request_id,
-        "createdAt": now_iso(),
     })
 }
 
 pub fn meta_update_title(thread_id: &str, title: &str) -> Value {
     json!({
-        "type": "thread.meta.update",
+        "type": "thread.metadata.update",
         "commandId": new_id(),
         "threadId": thread_id,
         "title": title,
@@ -264,7 +269,6 @@ pub fn project_create(project_id: &str, title: &str, workspace_root: &str) -> Va
         "projectId": project_id,
         "title": title,
         "workspaceRoot": workspace_root,
-        "createdAt": now_iso(),
     })
 }
 
@@ -272,7 +276,7 @@ pub fn project_create(project_id: &str, title: &str, workspace_root: &str) -> Va
 /// project — this one, the desktop app — is renaming it for all of them.
 pub fn project_rename(project_id: &str, title: &str) -> Value {
     json!({
-        "type": "project.meta.update",
+        "type": "project.update",
         "commandId": new_id(),
         "projectId": project_id,
         "title": title,
@@ -281,7 +285,7 @@ pub fn project_rename(project_id: &str, title: &str) -> Value {
 
 pub fn meta_regenerate_title(thread_id: &str) -> Value {
     json!({
-        "type": "thread.meta.update",
+        "type": "thread.metadata.update",
         "commandId": new_id(),
         "threadId": thread_id,
         "regenerateTitle": true,
@@ -290,7 +294,7 @@ pub fn meta_regenerate_title(thread_id: &str) -> Value {
 
 pub fn meta_update_model(thread_id: &str, model_selection: &ModelSelection) -> Value {
     json!({
-        "type": "thread.meta.update",
+        "type": "thread.model-selection.set",
         "commandId": new_id(),
         "threadId": thread_id,
         "modelSelection": model_selection,
@@ -329,7 +333,6 @@ pub fn runtime_mode_set(thread_id: &str, runtime_mode: &str) -> Value {
         "commandId": new_id(),
         "threadId": thread_id,
         "runtimeMode": runtime_mode,
-        "createdAt": now_iso(),
     })
 }
 
@@ -339,7 +342,6 @@ pub fn interaction_mode_set(thread_id: &str, interaction_mode: &str) -> Value {
         "commandId": new_id(),
         "threadId": thread_id,
         "interactionMode": interaction_mode,
-        "createdAt": now_iso(),
     })
 }
 
@@ -373,41 +375,46 @@ mod tests {
         }
     }
 
+    fn new_thread<'a>(
+        selection: &'a ModelSelection,
+        worktree: Option<Worktree<'a>>,
+        branch: Option<&'a str>,
+    ) -> NewThread<'a> {
+        NewThread {
+            project_id: "project-1",
+            title: "hello",
+            generate_title: true,
+            model_selection: selection,
+            runtime_mode: "full-access",
+            interaction_mode: "default",
+            worktree,
+            branch,
+            worktree_path: None,
+        }
+    }
+
     #[test]
     fn a_new_thread_can_ask_for_a_worktree() {
         let selection = selection();
-        let command = turn_start(
+        let worktree = Worktree {
+            base_branch: "main",
+            branch: "tria/12345678",
+            start_from_origin: true,
+        };
+        let input = launch_thread(
             "thread-1",
             "hello",
-            &selection,
-            "full-access",
-            "default",
-            Some(NewThread {
-                project_id: "project-1",
-                title: "hello",
-                model_selection: &selection,
-                runtime_mode: "full-access",
-                interaction_mode: "default",
-                worktree: Some(Worktree {
-                    project_cwd: "/src/project",
-                    base_branch: "main",
-                    branch: "tria/12345678",
-                    start_from_origin: true,
-                }),
-                branch: None,
-                worktree_path: None,
-            }),
+            new_thread(&selection, Some(worktree), None),
         );
-        let bootstrap = &command["bootstrap"];
-        assert_eq!(bootstrap["createThread"]["projectId"], "project-1");
-        // The thread starts without one; the server fills both in once it has the worktree.
-        assert!(bootstrap["createThread"]["worktreePath"].is_null());
-        assert_eq!(bootstrap["prepareWorktree"]["projectCwd"], "/src/project");
-        assert_eq!(bootstrap["prepareWorktree"]["baseBranch"], "main");
+        assert_eq!(input["projectId"], "project-1");
+        assert_eq!(input["initialMessage"]["text"], "hello");
+        let workspace = &input["workspaceStrategy"];
+        assert_eq!(workspace["type"], "worktree");
+        assert_eq!(workspace["baseRef"], "main");
         // Without a branch of its own the server checks the base branch out instead,
         // which fails while the project's checkout has it.
-        assert_eq!(bootstrap["prepareWorktree"]["branch"], "tria/12345678");
-        assert_eq!(bootstrap["prepareWorktree"]["startFromOrigin"], true);
+        assert_eq!(workspace["branch"], "tria/12345678");
+        assert_eq!(workspace["startFromOrigin"], true);
     }
 
     #[test]
@@ -423,23 +430,16 @@ mod tests {
     #[test]
     fn a_new_thread_in_the_checkout_asks_for_no_worktree() {
         let selection = selection();
-        let command = turn_start(
+        let input = launch_thread("thread-1", "hello", new_thread(&selection, None, None));
+        assert_eq!(input["workspaceStrategy"], json!({ "type": "root" }));
+        let input = launch_thread(
             "thread-1",
             "hello",
-            &selection,
-            "full-access",
-            "default",
-            Some(NewThread {
-                project_id: "project-1",
-                title: "hello",
-                model_selection: &selection,
-                runtime_mode: "full-access",
-                interaction_mode: "default",
-                worktree: None,
-                branch: None,
-                worktree_path: None,
-            }),
+            new_thread(&selection, None, Some("topic")),
         );
-        assert!(command["bootstrap"]["prepareWorktree"].is_null());
+        assert_eq!(
+            input["workspaceStrategy"],
+            json!({ "type": "root", "branch": "topic" })
+        );
     }
 }

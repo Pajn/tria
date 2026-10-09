@@ -6,7 +6,8 @@ because the server already runs them. No diff viewer, browser, file explorer, or
 
 This document records the protocol findings the design rests on and the decisions taken.
 Upstream references are paths inside the [t3code repository](https://github.com/pingdotgg/t3code)
-at the commit surveyed (Effect `4.0.0-rc.112`, `t3` npm `0.0.40`).
+at the commit surveyed (Effect `4.0.0-rc.112`, `t3` npm `0.0.40`). The orchestration sections
+describe protocol 2, surveyed again at `t3` `0.0.46`.
 
 ## 1. How the server talks
 
@@ -46,7 +47,11 @@ Shortcut for same-machine use: `t3 auth session issue --token-only` prints a lon
 bearer token directly.
 
 Per connection: `POST /api/auth/websocket-ticket` with `Authorization: Bearer <token>` returns a
-short-lived `{ ticket, expiresAt }`. Open `ws(s)://<origin>/ws?wsTicket=<ticket>`. Optional
+short-lived `{ ticket, expiresAt }`. Open
+`ws(s)://<origin>/ws?orchestrationProtocol=2&wsTicket=<ticket>`. The server answers a socket
+that names no protocol, or another one, with HTTP 426 (`orchestration_protocol_incompatible`)
+before it reads the ticket; HTTP requests to `/api/orchestration` name it in the
+`x-t3-orchestration-protocol` header. Optional
 query params `clientSurface`, `clientAppVersion`, `clientDeviceType`, `clientOs`,
 `connectionMethod=direct` only feed the server's Connections list and analytics.
 
@@ -92,116 +97,122 @@ Rules that are easy to get wrong:
 Sources: `effect/unstable/rpc/RpcMessage.d.ts`, `RpcServer.js`, `RpcClient.js`;
 `apps/server/src/ws.ts` (route `/ws`); `packages/client-runtime/src/rpc/session.ts`.
 
-### The four RPCs a chat client needs
+### The RPCs a chat client needs
 
 | Purpose | Method | Kind |
 | --- | --- | --- |
 | Provider and model catalog, capabilities, slash commands | `server.getConfig` (or stream `subscribeServerConfig`) | unary |
 | Project and thread list, live | `orchestration.subscribeShell` | stream |
-| One thread's messages and activities, live | `orchestration.subscribeThread` | stream |
-| Every mutation | `orchestration.dispatchCommand` | unary |
+| One thread's projection, live | `orchestration.subscribeThread` | stream |
+| Thread mutations | `orchestration.dispatchCommand` | unary |
+| A new thread with its first message | `orchestration.launchThread` | unary |
+| Project mutations | `projects.mutate` | unary |
 
-Optional later: `orchestration.getArchivedShellSnapshot`, `orchestration.searchThreads`.
-The same reads and dispatch exist over plain HTTP (`GET /api/orchestration/shell`,
-`GET /api/orchestration/threads/:threadId`, `POST /api/orchestration/dispatch`), which is
-useful for a smoke test before the WebSocket layer exists.
+Also: `orchestration.searchThreads`, `orchestration.getTurnItem` (a tool item's withheld output),
+and over HTTP `GET /api/orchestration/threads/:threadId/history?cursor=` for older history.
 
-Sources: `packages/contracts/src/rpc.ts`, `packages/contracts/src/orchestration.ts`.
+Sources: `packages/contracts/src/rpc.ts`, `packages/contracts/src/orchestrationV2.ts`,
+`packages/contracts/src/environmentHttp.ts`.
 
 ### Subscriptions
 
 Both streams deliver a snapshot, then deltas, each carrying a monotonic global `sequence`.
 
 `subscribeShell { afterSequence?, requestCompletionMarker? }` yields items with `kind` one of
-`snapshot`, `project-upserted`, `project-removed`, `thread-upserted`, `thread-removed`,
-`synchronized`. The shell snapshot holds projects and thread shells (metadata, session status,
-latest turn state, pending approval flags, plan progress) with no message bodies. Archived
-threads are excluded.
+`snapshot`, `project.updated`, `project.removed`, `thread.updated`, `thread.removed`,
+`synchronized`. The snapshot holds projects, `threads`, and `archivedThreads`, with no message
+bodies. A second `snapshot` carrying `resolvedRepositoryIdentityRoots` only refreshes the
+projects' repository identities: it has no threads and replaces nothing.
 
-`subscribeThread { threadId, afterSequence?, requestCompletionMarker?, turnLimit? }` yields
-`snapshot`, `event`, `synchronized`. Only six event types appear: `thread.message-sent`,
-`thread.activity-appended`, `thread.session-set`, `thread.proposed-plan-upserted`,
-`thread.turn-diff-completed`, `thread.reverted`. Thread metadata changes (title, model,
-archive) arrive on the shell stream, not here.
+`subscribeThread { threadId, afterSequence?, requestCompletionMarker?, acceptBoundedSnapshot? }`
+yields `snapshot`, `event`, `synchronized`. The snapshot is the thread's projection: the app
+thread, `runs`, `attempts`, `providerSessions`, `runtimeRequests`, `plans`, `checkpoints`,
+`turnItems`, and `visibleTurnItems`, the timeline rows in order. With `acceptBoundedSnapshot`
+the rows are the newest window, with `historyCursor`, `hasMoreHistory`, and
+`latestLocalTurnOrdinal`; the rest of the projection is whole. Events are upserts of one entity
+each: `run.updated`, `turn-item.updated`, `runtime-request.updated`, `plan.updated`,
+`checkpoint.captured`, `provider-session.attached|detached`, `thread.*` with the app thread,
+and more that a chat client can skip. `packages/client-runtime/src/state/orchestrationV2Projection.ts`
+is the reference reducer, and `packages/shared/src/orchestrationV2Timeline.ts` says which items
+are visible: none of a rolled-back run, and no queued message whose run was cancelled.
 
 Resume after a disconnect by resubscribing with `afterSequence` set to the last applied
-sequence. The server replays the gap or, if the gap is too large, sends a fresh snapshot.
-Dedupe by `sequence`. Only send `turnLimit` when `ServerConfig.threadSnapshotPagination` is
-advertised.
+sequence. Dedupe by `sequence`. Only send `acceptBoundedSnapshot` when
+`ServerConfig.threadSnapshotPagination` is advertised.
 
 ### Data model, as far as chat cares
 
 - **Project**: `{ id, title, workspaceRoot, defaultModelSelection, ... }`.
 - **Thread shell**: `{ id, projectId, title, modelSelection, runtimeMode, interactionMode,
-  branch, session, latestTurn, hasPendingApprovals, hasPendingUserInput, planProgress,
-  pinnedAt, pinOrderKey, archivedAt, settledAt, settledOverride, unsettledAt, snoozedUntil,
-  backgroundLiveness, hasActionableProposedPlan, updatedAt, ... }`.
+  branch, worktreePath, status, latestRunId, latestRun{Requested,Started,Completed}At,
+  pendingRuntimeRequest, pendingBackgroundTasks, lastError, pinnedAt, pinOrderKey, archivedAt,
+  settledAt, settledOverride, unsettledAt, snoozedUntil, hasActionableProposedPlan,
+  updatedAt, ... }`. `status` is the latest run's, or `idle` for a thread with none.
 - **Pull requests**: `pullRequests[]` on the shell, each `{ host, repository, number, url,
   source, linkedAt, snapshot?: { state: open|closed|merged, title, headBranch, baseBranch,
   isDraft, checksState, reviewDecision, mergeability, ... } }`, plus `branchPullRequest`
   (`{ repository, number, url }`) for the one whose head is the thread's branch. Changes
-  arrive as `thread-upserted` shell items and as `thread.pull-request-linked|unlinked|synced`
-  thread events; tria relies on the shell upserts.
+  arrive as `thread.updated` shell items; tria relies on those.
 - **Sidebar sections** (as the desktop app derives them): *settled* when `settledAt` is set
   (the server parks a thread after its turn finishes; `thread.settle` and `thread.unsettle`
   move it by hand), *snoozed* when `snoozedUntil` is in the future, *pinned* when `pinnedAt`
   is set, otherwise *active*. Active threads sort by `unsettledAt` when it is newer than
   `createdAt`, settled ones by `settledAt`, snoozed ones by `snoozedUntil` ascending.
-- **Sidebar status**, first match wins: pending approval, pending user input, turn running or
-  session starting (working), session error (failed), `backgroundLiveness` working or
-  monitoring (native background work outliving the turn), plan mode with an actionable
-  proposed plan (plan ready), then the last turn's state.
-- **Thread detail**: shell fields plus `messages[]`, `activities[]`, `proposedPlans[]`,
-  `session`, and `checkpoints[]` (ignore).
-- **Message**: `{ id, role: user|assistant|system, text, attachments?, turnId, streaming,
-  createdAt, updatedAt }`. Text is flat markdown. There is no parts array.
-- **Streaming assistant text**: `thread.message-sent` with `streaming: true` carries a
-  **delta**; append it to the message with that id. A final event with `streaming: false`
-  carries the full text and replaces it (empty text means keep what you have).
-- **Activity**: `{ id, tone: info|tool|approval|error, kind, summary, payload, turnId,
-  sequence?, createdAt }`. `kind` is an open string. Kinds worth rendering:
-  `tool.started|updated|completed|denied` (payload has `toolCallId`, `itemType`, `status`,
-  `title`, `detail`), `approval.requested|resolved`, `user-input.requested|resolved`,
-  `turn.plan.updated`, `runtime.error|warning|note`, `context-compaction`. Ignore
-  `task.*`, `context-window.updated`, `checkpoint.*`, `worktree-setup`, `setup-script.*`.
-- **Tool output is summarized on the wire.** `projectActivityPayload` in the server keeps
-  `data.command`, `toolName`, `files[].path`, and `rawOutput.content` reduced to the first
-  meaningful line (84 characters) or an `N lines` count; MCP results become
-  `result.content` summaries; `detail` is cut at 180 characters. Full payloads stay in the
-  server's database only. A tool row can expand to show exactly this much.
-- **Background tasks**: `task.started`, `task.updated`, `task.completed` activities keyed by
-  `taskId`, carrying `title`, `taskType` (`local_bash`), `agentKind` (`background`),
-  `toolUseId`, and sometimes `isBackgrounded`. A task has ended once an activity carries a
-  `status` or an `endedAt`; monitors outlive their turn, so the turn cannot settle them.
-  There is no per-task stop command: `thread.turn.interrupt` and `thread.session.stop` are
-  the only stops a client can dispatch. `turnId` on the interrupt is optional and only
-  marks the turn as interrupted in the projection — the interrupt reaches the provider
-  either way, so one sent without a turn is what stops a watch loop that has outlived its
-  turn. That is what the desktop's `Monitoring · Stop` dispatches.
-- **Reasoning is not on the wire.** Only assistant text becomes messages; reasoning items are
-  filtered server-side. Nothing to render.
-- **Session**: `{ status: idle|starting|running|ready|interrupted|stopped|error,
-  activeTurnId, lastError, runtimeMode, ... }` via `thread.session-set`.
-- **Approval**: `approval.requested` payload `{ requestId, requestKind, requestType, detail,
-  options: [{ decision, label, warning? }] }`. Answer with `thread.approval.respond`.
-- **Proposed plan**: `{ id, turnId, planMarkdown, implementedAt }`.
+- **Sidebar status**, first match wins: a pending runtime request that is an approval, one
+  that is a question (`user_input`), a run going (working), a failed run, background tasks
+  outliving the run (working, or monitoring when all are monitors), plan mode with an
+  actionable proposed plan (plan ready), then the latest run's state. A rolled-back run is no
+  turn at all.
+- **Run**: what tria calls a turn. `{ id, ordinal, status: preparing|queued|starting|running|
+  waiting|completed|interrupted|failed|cancelled|rolled_back, requestedAt, startedAt,
+  completedAt }`.
+- **Turn item**: one timeline entry, by `type`: `user_message`, `assistant_message` (text is
+  the whole message each time, with `streaming`), `reasoning`, `proposed_plan`, `todo_list`,
+  `command_execution`, `file_change`, `file_search`, `web_search`, `dynamic_tool`,
+  `approval_request`, `user_input_request`, `subagent`, `error`, `notification`,
+  `system_notice`, `compaction`, `handoff`, `checkpoint`, and more. Each carries `id`, `runId`,
+  `ordinal`, `status`, `title`, and its times. Unknown types are skipped.
+- **Tool output is withheld on the wire.** A tool item carries `outputOmitted: true` in place
+  of its output; `orchestration.getTurnItem` returns the item whole.
+- **Background tasks**: `pendingBackgroundTasks` on the thread shell, each `{ taskId,
+  description?, kind: command|monitor|subagent|background_task }`. The server keeps the list
+  and drops a task when it ends or its session goes.
+- **Approval and question**: an `approval_request` or `user_input_request` item names a
+  runtime request, which is `pending` until answered. Approvals carry `requestKind`, `prompt`,
+  and `options: [{ decision, label, warning? }]`. Both are answered with
+  `runtime-request.respond`.
+- **Checkpoint**: `{ id, scopeId, runId, parentCheckpointId, appRunOrdinal, status }`, one per
+  run, after a baseline with no run. Rolling back to a run's parent checkpoint undoes the run.
+  A rollback the server gives up on is set on the app thread as `rollbackFailure`.
 
-### Commands (all via `orchestration.dispatchCommand`)
+### How tria reads it
 
-Every command carries `type`, a client-minted `commandId`, `threadId`, and usually
-`createdAt`. The client needs:
+`src/v2.rs` holds the open thread's projection, applies the stream's events to it, and
+derives from it the model the timeline and panes were written against: messages, activities,
+proposed plans, and checkpoints keyed by turn. A run's id is its turn id, tool items become
+`tool.*` activities, approvals and questions become `approval.*` and `user-input.*`, subagents
+become `task.*` with `agentKind: "agent"`, and a todo list becomes `turn.plan.updated`. Items
+are stamped no earlier than the one before them, since the timeline orders by time and the
+server orders by ordinal.
+
+### Commands (via `orchestration.dispatchCommand`)
+
+Every command carries `type`, a client-minted `commandId`, and `threadId`. The client needs:
 
 | Action | `type` | Notes |
 | --- | --- | --- |
-| Send a message / start a turn | `thread.turn.start` | `message: { messageId, role: "user", text, attachments: [] }`, `runtimeMode`, `interactionMode`, optional `modelSelection`; `bootstrap.createThread` creates the thread in the same dispatch |
-| Stop | `thread.turn.interrupt` | optional `turnId` |
-| Approve or deny | `thread.approval.respond` | `requestId`, `decision` one of `accept`, `acceptForSession`, `acceptAlways`, `decline`, `cancel` |
-| New thread without a first message | `thread.create` | `projectId`, `title`, `modelSelection`, `runtimeMode`, `branch: null`, `worktreePath: null` |
-| Rename | `thread.meta.update` | `title` or `regenerateTitle: true` |
-| Change model | `thread.meta.update` | `modelSelection` |
+| Send a message | `message.dispatch` | `messageId`, `text`, `attachments: []`, `createdBy: "user"`, `creationSource`, optional `modelSelection`, `dispatchMode: { type: "start_immediately" }`, `deliveryIntent: "auto"`: with `serverResolvedCommandContext` advertised the server decides whether to start, steer, or queue. Modes are the thread's, set first where they change |
+| Stop | `run.interrupt` | `runId`: the run going, or the last one, whose background work it is; `holdQueue: true` |
+| Stop the session | `provider-session.detach` | one per provider session in the projection |
+| Approve, deny, or answer | `runtime-request.respond` | `requestId`, and `decision` one of `accept`, `acceptForSession`, `acceptAlways`, `decline`, `cancel`, or `answers` |
+| Rewind | `checkpoint.rollback` | `scopeId`, `checkpointId`, `restoreFiles` |
+| Rename | `thread.metadata.update` | `title` or `regenerateTitle: true` |
+| Change model | `thread.model-selection.set` | `modelSelection` |
 | Archive / unarchive / delete | `thread.archive`, `thread.unarchive`, `thread.delete` | |
 | Permission mode | `thread.runtime-mode.set` | `approval-required`, `auto-accept-edits`, `auto`, `full-access` |
 | Plan mode | `thread.interaction-mode.set` | `default` or `plan` |
+
+`projects.mutate` takes `project.create`, `project.update`, and `project.delete`.
 
 `ModelSelection` is `{ instanceId, model, options?: [{ id, value }] }`. `instanceId` is the
 configured provider instance from `ServerConfig.providers[]`; `model` is a slug from that
@@ -213,13 +224,15 @@ Slash commands need no encoding: a provider command works when it is the first t
 text. File mentions can be plain `@path` text. Attachments and the `t3-context://` chip format
 are out of scope.
 
-### Starting a thread in a worktree
+### Starting a thread
 
-`thread.turn.start` takes `bootstrap.prepareWorktree` beside `bootstrap.createThread`:
-`{ projectCwd, baseBranch, branch?, startFromOrigin? }`. The server creates the worktree off
-`baseBranch`, names the branch itself when `branch` is absent, and then dispatches a
-`thread.meta.update` setting the thread's `branch` and `worktreePath`. A `createThread` sends
-both as null and lets that happen.
+`orchestration.launchThread` makes a thread, prepares where it works, and sends its first
+message: `{ commandId, threadId, projectId, title, generateTitle, modelSelection, runtimeMode,
+interactionMode, workspaceStrategy, initialMessage: { messageId, text, attachments } }`. The
+workspace strategy is `{ type: "root", branch? }`, `{ type: "existing_worktree", worktreePath,
+branch? }`, or `{ type: "worktree", baseRef, branch?, startFromOrigin? }`, for which the server
+creates the worktree and sets the thread's branch and path. It carries no plan reference, so a
+plan built in a thread of its own is not marked as built.
 
 Where a new thread runs by default is `defaultThreadEnvMode`, `worktree` or `local`: on the
 project when set, otherwise the server setting, whose own default is `local`.
@@ -243,7 +256,8 @@ subscribers, so a client that wants current numbers has to ask.
 ### Terminals
 
 Terminals are a subsystem of their own, outside `orchestration.dispatchCommand` and outside the
-`orchestration:read`/`operate` scopes. They need `terminal:operate`.
+`orchestration:read`/`operate` scopes. The list needs `terminal:read`, and driving one
+`terminal:operate`.
 
 `subscribeTerminalMetadata` streams `{ type: "snapshot", terminals }`, `{ type: "upsert",
 terminal }`, and `{ type: "remove", threadId, terminalId }`. A terminal carries `threadId`,
@@ -269,16 +283,13 @@ session as it was.
 
 ### Stopping work
 
-There is no per-task stop. Background tasks — the `task.started`/`updated`/`completed`
-activities — carry no command to cancel one. What exists is `thread.turn.interrupt`,
-which the server hands to the provider as `interruptTurn(threadId)` whether or not a
-`turnId` came with it, so it stops a watch loop that no turn is holding;
-`thread.session.stop` (with an optional `onlyIfSettled`), which ends the session and every
-process it started; `terminal.close` and `terminal.restart` for shells; and
-`server.signalProcess` (`SIGINT` or `SIGKILL`) for host processes listed by
-`server.getProcessDiagnostics`. The last one refuses the server's own pid,
-requires a `startTimeMs` identity match so a recycled pid cannot be hit, and only signals
-processes it classifies as `server-child`, `provider-root`, or `terminal-root`.
+There is no per-task stop. What exists is `run.interrupt`, which stops a run and, sent for a
+settled run, the background work it left going; `provider-session.detach`, which ends a
+provider session and every process it started; `terminal.close` and `terminal.restart` for
+shells; and `server.signalProcess` (`SIGINT` or `SIGKILL`) for host processes listed by
+`server.getProcessDiagnostics`. The last one refuses the server's own pid, requires a
+`startTimeMs` identity match so a recycled pid cannot be hit, and only signals processes it
+classifies as `server-child`, `provider-root`, or `terminal-root`.
 
 ## 2. Decisions
 
@@ -291,9 +302,9 @@ union gets an `Other(String)` variant, every struct uses `#[serde(default)]` for
 fields, and activity payloads stay `serde_json::Value` until a renderer needs a field. Unknown
 event or activity kinds are kept and ignored, never fatal.
 
-**State.** A single `App` struct with a pure reducer per stream, mirroring
-`packages/client-runtime/src/state/threadReducer.ts`: apply shell items to a project and thread
-map, apply thread items to the open thread. Track `lastSequence` per subscription for resume.
+**State.** A single `App` struct with a pure reducer per stream: apply shell items to a project
+and thread map, and apply thread events to the open thread's projection, mirroring
+`packages/client-runtime/src/state/orchestrationV2Projection.ts`. Track `lastSequence` per subscription for resume.
 Only one thread is subscribed at a time; switching threads interrupts the old subscription and
 starts a new one. Keep a small cache of recently viewed threads with their cursor so switching
 back is instant.
@@ -383,8 +394,8 @@ prompt history, yank, config file and first-run pairing flow, packaging.
   releases. Mitigation is the lenient decoding rule above.
 - **Backpressure.** The server fails slow subscribers. Acking in the socket task, not the UI
   task, is what keeps a long-running turn alive.
-- **Large threads.** A full thread snapshot can be large. Request `turnLimit` when the server
-  advertises pagination, and render lazily from the bottom.
+- **Large threads.** A full thread snapshot can be large. Accept a bounded snapshot when the
+  server advertises pagination, page older history over HTTP, and render lazily from the bottom.
 - **Ratatui markdown quality.** Tables, nested lists, and code fences may need the custom
   renderer sooner than hoped.
 

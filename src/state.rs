@@ -9,8 +9,7 @@ use serde_json::Value;
 
 use crate::{
     model::{
-        Activity, Event, Id, Message, Project, ProposedPlan, Session, ShellItem, ThreadDetail,
-        ThreadDetailSnapshot, ThreadItem, ThreadShell,
+        Event, Id, Project, ShellItem, ThreadDetail, ThreadDetailSnapshot, ThreadItem, ThreadShell,
     },
     subagent::Subagent,
 };
@@ -182,6 +181,8 @@ pub struct PendingApproval {
 pub struct Rewind {
     /// How many turns the thread keeps.
     pub turn_count: u32,
+    /// The checkpoint those turns end at, which is what is rolled back to.
+    pub target: crate::model::RollbackTarget,
     /// What you sent in the turn that goes, to write again.
     pub text: String,
     /// Those messages, which are gone once the rewind has been through.
@@ -323,8 +324,8 @@ pub struct ThreadState {
     /// Moved on by every change, so what is laid out from the state can be kept until it
     /// moves. No two states share one: see `REVISIONS`.
     pub revision: u64,
-    /// Set when an event could not be applied incrementally and a fresh snapshot is needed.
-    pub needs_snapshot: bool,
+    /// What `detail` is derived from, and what the stream's events apply to.
+    pub projection: Option<Box<crate::v2::Projection>>,
 }
 
 /// Every revision any thread state has had, counted once for all of them. A state built
@@ -367,6 +368,7 @@ impl ThreadState {
                 .map(|turn| (turn.turn_id.clone(), turn.clone()))
                 .collect(),
             detail: snapshot.thread,
+            projection: snapshot.projection,
             recovered_tools: HashMap::new(),
             attachment_images: HashMap::new(),
             last_sequence: snapshot.snapshot_sequence,
@@ -374,7 +376,6 @@ impl ThreadState {
             has_more,
             before_cursor,
             revision: next_revision(),
-            needs_snapshot: false,
         }
     }
 
@@ -395,8 +396,16 @@ impl ThreadState {
                 let timings = std::mem::take(&mut self.turn_timings);
                 let same_thread = self.id() == snapshot.thread.shell.id;
                 let images = std::mem::take(&mut self.attachment_images);
+                let shell = self.detail.shell.clone();
                 *self = Self::from_snapshot(snapshot);
                 if same_thread {
+                    // The list's entry carries what the projection does not; the turn
+                    // is the projection's own, and newer.
+                    let turn = self.detail.shell.latest_turn.take();
+                    self.detail.shell = shell;
+                    if turn.is_some() {
+                        self.detail.shell.latest_turn = turn;
+                    }
                     let ids: HashSet<_> = self
                         .detail
                         .messages
@@ -426,108 +435,25 @@ impl ThreadState {
             return;
         }
         self.last_sequence = event.sequence;
-        match event.kind.as_str() {
-            "thread.message-sent" => {
-                let Ok(incoming) = serde_json::from_value::<MessageSent>(event.payload) else {
-                    return;
-                };
-                self.apply_message(incoming);
-            }
-            "thread.activity-appended" => {
-                let Some(activity) = event.payload.get("activity").cloned() else {
-                    return;
-                };
-                let Ok(activity) = serde_json::from_value::<Activity>(activity) else {
-                    return;
-                };
-                if !self.detail.activities.iter().any(|a| a.id == activity.id) {
-                    self.detail.activities.push(activity);
-                }
-            }
-            "thread.session-set" => {
-                let Some(session) = event.payload.get("session").cloned() else {
-                    return;
-                };
-                if let Ok(session) = serde_json::from_value::<Session>(session) {
-                    self.detail.shell.session = Some(session);
-                }
-            }
-            "thread.proposed-plan-upserted" => {
-                let Some(plan) = event.payload.get("proposedPlan").cloned() else {
-                    return;
-                };
-                let Ok(plan) = serde_json::from_value::<ProposedPlan>(plan) else {
-                    return;
-                };
-                match self
-                    .detail
-                    .proposed_plans
-                    .iter_mut()
-                    .find(|p| p.id == plan.id)
-                {
-                    Some(existing) => *existing = plan,
-                    None => self.detail.proposed_plans.push(plan),
-                }
-            }
-            "thread.turn-diff-completed" => {
-                let Ok(checkpoint) =
-                    serde_json::from_value::<crate::model::Checkpoint>(event.payload)
-                else {
-                    return;
-                };
-                match self
-                    .detail
-                    .checkpoints
-                    .iter_mut()
-                    .find(|c| c.turn_id == checkpoint.turn_id)
-                {
-                    Some(existing) => *existing = checkpoint,
-                    None => self.detail.checkpoints.push(checkpoint),
-                }
-            }
-            "thread.reverted" => self.needs_snapshot = true,
-            _ => return,
-        }
-        self.touch();
-    }
-
-    fn apply_message(&mut self, incoming: MessageSent) {
-        if let Some(existing) = self
-            .detail
-            .messages
-            .iter_mut()
-            .find(|m| m.id == incoming.message_id)
-        {
-            if incoming.streaming {
-                existing.text.push_str(&incoming.text);
-            } else if !incoming.text.is_empty() {
-                existing.text = incoming.text;
-            }
-            if let Some(attachments) = incoming.attachments {
-                existing.attachments = attachments;
-            }
-            existing.streaming = incoming.streaming;
-            existing.updated_at = incoming.updated_at;
-            if incoming.turn_id.is_some() {
-                existing.turn_id = incoming.turn_id;
-            }
-        } else {
-            self.detail.messages.push(Message {
-                id: incoming.message_id,
-                role: incoming.role,
-                text: incoming.text,
-                attachments: incoming.attachments.unwrap_or_default(),
-                turn_id: incoming.turn_id,
-                streaming: incoming.streaming,
-                created_at: incoming.created_at,
-                updated_at: incoming.updated_at,
-            });
+        let Some(projection) = self.projection.as_mut() else {
+            return;
+        };
+        if projection.apply(&event.kind, event.payload) {
+            self.detail = projection.detail(&self.detail.shell);
+            self.turn_timings
+                .retain(|id, _| !projection.is_rolled_back(id));
+            self.touch();
         }
     }
 
     /// Update list-level fields from the shell stream (title, model, latest turn).
     pub fn sync_shell(&mut self, shell: &ThreadShell) {
-        if let Some(turn) = &shell.latest_turn {
+        // The open thread's own runs say more than the list does, and sooner.
+        let latest_turn = match &self.projection {
+            Some(projection) => projection.latest_turn(),
+            None => shell.latest_turn.clone(),
+        };
+        if let Some(turn) = &latest_turn {
             self.turn_timings.insert(turn.turn_id.clone(), turn.clone());
         }
         let mine = &mut self.detail.shell;
@@ -535,12 +461,13 @@ impl ThreadState {
         mine.model_selection = shell.model_selection.clone();
         mine.runtime_mode = shell.runtime_mode.clone();
         mine.interaction_mode = shell.interaction_mode.clone();
-        mine.latest_turn = shell.latest_turn.clone();
+        mine.latest_turn = latest_turn;
         mine.plan_progress = shell.plan_progress.clone();
         mine.has_pending_approvals = shell.has_pending_approvals;
         mine.has_pending_user_input = shell.has_pending_user_input;
         mine.has_actionable_proposed_plan = shell.has_actionable_proposed_plan;
         mine.background_liveness = shell.background_liveness.clone();
+        mine.background_tasks = shell.background_tasks.clone();
         mine.session = shell.session.clone();
         mine.branch = shell.branch.clone();
         mine.worktree_path = shell.worktree_path.clone();
@@ -596,82 +523,29 @@ impl ThreadState {
         })
     }
 
-    /// Whether the provider session that owned this work has ended. Monitors and
-    /// backgrounded commands are its processes, and nothing settles their rows when it
-    /// goes: the server ends a task it saw finish, and a killed session finishes
-    /// nothing. An interrupted session is not ended — that is a turn aborted, and a
-    /// watch loop outlives the turn that started it — and a thread with no session row
-    /// has said nothing either way.
-    fn session_ended(&self) -> bool {
+    /// Background work the agent started that is still going: monitors and
+    /// backgrounded commands, but not subagents, which have rows of their own. The
+    /// server keeps the list, so it holds work started before the history this client
+    /// loaded, and loses each task as it ends or its session goes.
+    pub fn running_tasks(&self) -> Vec<RunningTask> {
         self.detail
             .shell
-            .session
-            .as_ref()
-            .is_some_and(|session| matches!(session.status.as_str(), "stopped" | "error"))
-    }
-
-    /// Background tasks the agent started that have not reported an end: monitors and
-    /// backgrounded commands, but not the subagents that share these activities. A task
-    /// is done once any of its activities carries a status or an `endedAt`; this work
-    /// outlives its turn, so the turn is not used to settle it.
-    pub fn running_tasks(&self) -> Vec<RunningTask> {
-        if self.session_ended() {
-            return Vec::new();
-        }
-        let mut open: Vec<RunningTask> = Vec::new();
-        let mut agents: Vec<&str> = Vec::new();
-        for activity in &self.detail.activities {
-            if !activity.kind.starts_with("task.") {
-                continue;
-            }
-            let Some(id) = activity.str("taskId") else {
-                continue;
-            };
-            // Membership is settled by the first row for a task id: the rows that end a
-            // task often carry nothing but the id and a status.
-            if activity.str("agentKind") == Some("agent") && !agents.contains(&id) {
-                agents.push(id);
-            }
-            if agents.contains(&id) {
-                continue;
-            }
-            let payload = &activity.payload;
-            let ended = activity.kind == "task.completed"
-                || payload.get("status").is_some_and(|v| !v.is_null())
-                || payload.get("endedAt").is_some_and(|v| !v.is_null());
-            if ended {
-                open.retain(|task| task.id != id);
-                continue;
-            }
-            match open.iter_mut().find(|task| task.id == id) {
-                Some(task) => {
-                    if let Some(title) = activity.str("title") {
-                        task.title = title.to_string();
-                    }
-                    task.backgrounded |= payload
-                        .get("isBackgrounded")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-                }
-                None => open.push(RunningTask {
-                    id: id.to_string(),
-                    title: activity
-                        .str("title")
-                        .or_else(|| activity.str("detail"))
-                        .unwrap_or("background task")
-                        .to_string(),
-                    task_type: activity.str("taskType").unwrap_or("").to_string(),
-                    agent_kind: activity.str("agentKind").unwrap_or("").to_string(),
-                    started_at: activity.created_at.clone(),
-                    turn_id: activity.turn_id.clone(),
-                    backgrounded: payload
-                        .get("isBackgrounded")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false),
-                }),
-            }
-        }
-        open
+            .background_tasks
+            .iter()
+            .filter(|task| task.kind != "subagent")
+            .map(|task| RunningTask {
+                id: task.task_id.clone(),
+                title: task
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| "background task".to_string()),
+                task_type: task.kind.clone(),
+                agent_kind: "background".to_string(),
+                started_at: String::new(),
+                turn_id: None,
+                backgrounded: task.kind == "command",
+            })
+            .collect()
     }
 
     pub fn pending_approvals(&self) -> Vec<PendingApproval> {
@@ -747,7 +621,7 @@ impl ThreadState {
         let turns = self.counted_turns();
         let at = turns
             .iter()
-            .position(|(_, completed)| *completed >= message.created_at.as_str())
+            .position(|(_, completed, _)| *completed >= message.created_at.as_str())
             .ok_or("that message's turn has not finished")?;
         self.rewind_to(&turns, at)
     }
@@ -762,19 +636,30 @@ impl ThreadState {
     }
 
     /// Finished turns in order, by their count and when they finished.
-    fn counted_turns(&self) -> Vec<(u32, &str)> {
-        let mut turns: Vec<(u32, &str)> = self
+    fn counted_turns(&self) -> Vec<(u32, &str, Option<&crate::model::RollbackTarget>)> {
+        let mut turns: Vec<_> = self
             .detail
             .checkpoints
             .iter()
-            .filter_map(|c| Some((c.checkpoint_turn_count?, c.completed_at.as_str())))
+            .filter_map(|c| {
+                Some((
+                    c.checkpoint_turn_count?,
+                    c.completed_at.as_str(),
+                    c.rollback.as_ref(),
+                ))
+            })
             .collect();
-        turns.sort();
+        turns.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         turns
     }
 
-    fn rewind_to(&self, turns: &[(u32, &str)], at: usize) -> Result<Rewind, &'static str> {
-        let (count, completed) = turns[at];
+    fn rewind_to(
+        &self,
+        turns: &[(u32, &str, Option<&crate::model::RollbackTarget>)],
+        at: usize,
+    ) -> Result<Rewind, &'static str> {
+        let (count, completed, target) = turns[at];
+        let target = target.ok_or("that turn left nothing to roll back to")?;
         let after = at.checked_sub(1).map(|before| turns[before].1);
         let (message_ids, texts): (Vec<Id>, Vec<&str>) = self
             .detail
@@ -792,6 +677,7 @@ impl ThreadState {
         }
         Ok(Rewind {
             turn_count: count.saturating_sub(1),
+            target: target.clone(),
             text: texts.join("\n\n"),
             message_ids,
             later_turns: turns.len() - at - 1,
@@ -934,24 +820,6 @@ impl ThreadState {
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MessageSent {
-    message_id: Id,
-    role: String,
-    text: String,
-    #[serde(default)]
-    attachments: Option<Vec<crate::model::Attachment>>,
-    #[serde(default)]
-    turn_id: Option<Id>,
-    #[serde(default)]
-    streaming: bool,
-    #[serde(default)]
-    created_at: String,
-    #[serde(default)]
-    updated_at: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -969,26 +837,6 @@ mod tests {
         }))
         .unwrap();
         ThreadState::from_snapshot(snapshot)
-    }
-
-    #[test]
-    fn message_events_keep_attachments_until_the_server_replaces_them() {
-        let mut state = thread();
-        let mut event = message_event(11, "See this screenshot.", false);
-        event.payload["role"] = json!("user");
-        event.payload["attachments"] = json!([{
-            "type": "image", "id": "image-1", "name": "Screenshot.png",
-            "mimeType": "image/png", "sizeBytes": 37407
-        }]);
-        state.apply_event(event);
-        assert_eq!(state.detail.messages[0].attachments[0].id, "image-1");
-        assert!(state.detail.messages[0].attachments[0].is_image());
-        state.apply_event(message_event(12, "", false));
-        assert_eq!(state.detail.messages[0].attachments.len(), 1);
-        let mut event = message_event(13, "", false);
-        event.payload["attachments"] = json!([]);
-        state.apply_event(event);
-        assert!(state.detail.messages[0].attachments.is_empty());
     }
 
     #[test]
@@ -1152,167 +1000,139 @@ mod tests {
         assert_eq!(thread().resume_with_less(now), None);
     }
 
+    /// A thread opened from the server's snapshot, at sequence 10, with a run going.
+    fn opened() -> ThreadState {
+        let item = crate::v2::thread_item(
+            json!({
+                "kind": "snapshot", "snapshotSequence": 10,
+                "projection": {
+                    "thread": {
+                        "id": "t1", "projectId": "p1", "title": "Test",
+                        "modelSelection": {"instanceId": "claudeAgent", "model": "m"},
+                    },
+                    "runs": [{"id": "run", "ordinal": 1, "status": "running",
+                        "requestedAt": "2026-01-01T00:00:00Z"}],
+                    "visibleTurnItems": [],
+                },
+            }),
+            None,
+        )
+        .unwrap();
+        let ThreadItem::Snapshot { snapshot } = item else {
+            panic!("not a snapshot");
+        };
+        ThreadState::from_snapshot(snapshot)
+    }
+
+    fn item_event(sequence: u64, item: serde_json::Value) -> Event {
+        let mut item = item;
+        for (key, value) in [
+            ("threadId", json!("t1")),
+            ("runId", json!("run")),
+            ("ordinal", json!(sequence)),
+            ("startedAt", json!("2026-01-01T00:00:01Z")),
+            ("updatedAt", json!("2026-01-01T00:00:01Z")),
+        ] {
+            item.as_object_mut().unwrap().entry(key).or_insert(value);
+        }
+        Event {
+            sequence,
+            event_id: format!("e{sequence}"),
+            kind: "turn-item.updated".into(),
+            occurred_at: String::new(),
+            payload: item,
+        }
+    }
+
     fn message_event(sequence: u64, text: &str, streaming: bool) -> Event {
-        serde_json::from_value(json!({
-            "sequence": sequence, "eventId": format!("e{sequence}"), "type": "thread.message-sent",
-            "payload": {"threadId": "t1", "messageId": "m1", "role": "assistant", "text": text,
-                        "turnId": "turn", "streaming": streaming, "createdAt": "", "updatedAt": ""}
-        }))
-        .unwrap()
-    }
-
-    fn task_event(sequence: u64, kind: &str, payload: serde_json::Value) -> Event {
-        serde_json::from_value(json!({
-            "sequence": sequence, "eventId": format!("e{sequence}"),
-            "type": "thread.activity-appended",
-            "payload": {"threadId": "t1", "activity": {
-                "id": format!("a{sequence}"), "tone": "info", "kind": kind,
-                "summary": "", "payload": payload, "turnId": "turn",
-                "createdAt": "2026-01-01T00:00:00Z"
-            }}
-        }))
-        .unwrap()
+        item_event(
+            sequence,
+            json!({"id": "i1", "type": "assistant_message", "messageId": "m1",
+                "status": if streaming { "running" } else { "completed" },
+                "text": text, "streaming": streaming}),
+        )
     }
 
     #[test]
-    fn running_tasks_track_unfinished_background_work() {
-        let mut state = thread();
-        state.apply_event(task_event(
+    fn a_message_comes_with_its_attachments() {
+        let mut state = opened();
+        state.apply_event(item_event(
             11,
-            "task.started",
-            json!({"taskId": "t-1", "title": "watch build", "taskType": "local_bash",
-                   "agentKind": "background"}),
+            json!({"id": "i1", "type": "user_message", "messageId": "m1", "status": "completed",
+                "inputIntent": "turn_start", "text": "See this screenshot.",
+                "attachments": [{"type": "image", "id": "image-1", "name": "Screenshot.png",
+                    "mimeType": "image/png", "sizeBytes": 37407}]}),
         ));
-        state.apply_event(task_event(
-            12,
-            "task.started",
-            json!({"taskId": "t-2", "title": "run tests", "taskType": "local_bash",
-                   "agentKind": "background"}),
-        ));
+        assert_eq!(state.detail.messages[0].attachments[0].id, "image-1");
+        assert!(state.detail.messages[0].attachments[0].is_image());
+    }
+
+    /// Background work is the server's list of it, which it keeps on the thread's entry.
+    #[test]
+    fn running_tasks_are_the_background_work_the_server_lists() {
+        let mut state = opened();
+        let mut shell = state.detail.shell.clone();
+        shell.background_tasks = serde_json::from_value(json!([
+            {"taskId": "t-1", "description": "watch build", "kind": "monitor"},
+            {"taskId": "t-2", "description": "run tests", "kind": "command"},
+            {"taskId": "t-3", "description": "review", "kind": "subagent"},
+        ]))
+        .unwrap();
+        state.sync_shell(&shell);
         let running = state.running_tasks();
-        assert_eq!(running.len(), 2);
-        assert_eq!(running[0].title, "watch build");
+        let titles: Vec<_> = running.iter().map(|task| task.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["watch build", "run tests"],
+            "subagents have rows of their own"
+        );
         assert!(!running[0].backgrounded);
+        assert!(running[1].backgrounded);
 
-        // An update without an end keeps it running and can refine the title.
-        state.apply_event(task_event(
-            13,
-            "task.updated",
-            json!({"taskId": "t-1", "title": "watch build (rebuilding)", "isBackgrounded": true}),
-        ));
-        let running = state.running_tasks();
-        assert_eq!(running.len(), 2);
-        assert_eq!(running[0].title, "watch build (rebuilding)");
-        assert!(running[0].backgrounded);
-
-        // An update carrying a status and an end settles it, as does task.completed.
-        state.apply_event(task_event(
-            14,
-            "task.updated",
-            json!({"taskId": "t-1", "status": "completed", "endedAt": "2026-01-01T00:05:00Z"}),
-        ));
-        state.apply_event(task_event(
-            15,
-            "task.completed",
-            json!({"taskId": "t-2", "status": "failed"}),
-        ));
-        assert!(state.running_tasks().is_empty());
-    }
-
-    /// A session that is killed takes its watch loops with it and settles nothing: the
-    /// rows that started them are the last word the thread ever hears. So the session's
-    /// own end is what ends them, and stopping it is how a monitor is stopped at all.
-    #[test]
-    fn a_stopped_session_leaves_no_background_work_running() {
-        let mut state = thread();
-        state.apply_event(task_event(
-            11,
-            "task.started",
-            json!({"taskId": "t-1", "title": "watch build", "taskType": "monitor",
-                   "agentKind": "background"}),
-        ));
-        assert_eq!(state.running_tasks().len(), 1);
-
-        // A turn aborted is not the session ending, and a watcher outlives its turn.
-        state.detail.shell.session = Some(crate::model::Session {
-            status: "interrupted".into(),
-            provider_name: None,
-            active_turn_id: None,
-            last_error: None,
-        });
-        assert_eq!(state.running_tasks().len(), 1);
-
-        state.detail.shell.session = Some(crate::model::Session {
-            status: "stopped".into(),
-            provider_name: None,
-            active_turn_id: None,
-            last_error: None,
-        });
+        shell.background_tasks.clear();
+        state.sync_shell(&shell);
         assert!(state.running_tasks().is_empty());
     }
 
     #[test]
-    fn streaming_deltas_append_and_final_replaces() {
-        let mut state = thread();
+    fn a_streamed_message_is_replaced_whole() {
+        let mut state = opened();
         state.apply_event(message_event(11, "Hel", true));
-        state.apply_event(message_event(12, "lo", true));
-        assert_eq!(state.detail.messages[0].text, "Hello");
+        assert_eq!(state.detail.messages[0].text, "Hel");
         assert!(state.detail.messages[0].streaming);
-        state.apply_event(message_event(13, "Hello!", false));
+        state.apply_event(message_event(12, "Hello!", false));
+        assert_eq!(state.detail.messages.len(), 1);
         assert_eq!(state.detail.messages[0].text, "Hello!");
         assert!(!state.detail.messages[0].streaming);
-        state.apply_event(message_event(14, "", false));
-        assert_eq!(state.detail.messages[0].text, "Hello!");
     }
 
     #[test]
     fn stale_sequences_are_ignored() {
-        let mut state = thread();
+        let mut state = opened();
         state.apply_event(message_event(5, "old", true));
         assert!(state.detail.messages.is_empty());
     }
 
     #[test]
     fn approvals_resolve() {
-        let mut state = thread();
-        let requested: Event = serde_json::from_value(json!({
-            "sequence": 11, "eventId": "a", "type": "thread.activity-appended",
-            "payload": {"threadId": "t1", "activity": {"id": "a1", "tone": "approval", "kind": "approval.requested",
-                "summary": "s", "payload": {"requestId": "r1", "requestKind": "command", "detail": "rm -rf",
-                "options": [{"decision": "accept", "label": "Allow"}]}, "turnId": null, "createdAt": ""}}
-        }))
-        .unwrap();
-        state.apply_event(requested);
-        assert_eq!(state.pending_approvals().len(), 1);
-        let resolved: Event = serde_json::from_value(json!({
-            "sequence": 12, "eventId": "b", "type": "thread.activity-appended",
-            "payload": {"threadId": "t1", "activity": {"id": "a2", "tone": "approval", "kind": "approval.resolved",
-                "summary": "s", "payload": {"requestId": "r1"}, "turnId": null, "createdAt": ""}}
-        }))
-        .unwrap();
-        state.apply_event(resolved);
+        let mut state = opened();
+        state.apply_event(item_event(
+            11,
+            json!({"id": "a1", "type": "approval_request", "status": "waiting", "requestId": "r1",
+                "requestKind": "command", "prompt": "rm -rf",
+                "options": [{"decision": "accept", "label": "Allow"}]}),
+        ));
+        let pending = state.pending_approvals();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].detail.as_deref(), Some("rm -rf"));
+        assert_eq!(pending[0].options[0].label, "Allow");
+        state.apply_event(Event {
+            sequence: 12,
+            event_id: "e12".into(),
+            kind: "runtime-request.updated".into(),
+            occurred_at: String::new(),
+            payload: json!({"id": "r1", "status": "resolved", "decision": "accept"}),
+        });
         assert!(state.pending_approvals().is_empty());
-    }
-}
-
-#[cfg(test)]
-mod question_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn parses_questions_with_defaults() {
-        let questions = parse_questions(Some(&json!([
-            {"id": "Which color?", "header": "Color", "question": "Which color?",
-             "options": [{"label": "Red", "description": "warm"}, {"label": "Blue", "description": "", "value": "b"}]},
-            {"question": "Anything else?", "options": [], "allowCustomAnswer": true, "multiSelect": true},
-            {"question": "dropped", "options": [], "allowCustomAnswer": false}
-        ])));
-        assert_eq!(questions.len(), 2);
-        assert_eq!(questions[0].options[0].value, "Red");
-        assert_eq!(questions[0].options[1].value, "b");
-        assert!(questions[0].allow_custom);
-        assert_eq!(questions[1].id, "Anything else?");
-        assert!(questions[1].multi_select);
     }
 }
