@@ -653,6 +653,8 @@ pub struct App {
     pub agent_cursor: ListCursor<String>,
     /// What is read in place of the thread's conversation, and the reads on their way.
     pub reader: Reader<Restore>,
+    /// The subagent thread the session was last told to follow for the reader.
+    followed: Option<String>,
     /// The labels on the pull request as the label picker shows them, what each is for, and
     /// whether the repository has more than were read.
     labels_applied: HashSet<String>,
@@ -802,6 +804,7 @@ impl App {
             terminal_cursor: ListCursor::default(),
             agent_cursor: ListCursor::default(),
             reader: Reader::default(),
+            followed: None,
             labels_applied: HashSet::new(),
             labels_described: Vec::new(),
             labels_truncated: false,
@@ -1204,6 +1207,7 @@ impl App {
         // A transcript belongs to the thread that ran the subagent, and a pull request to
         // the thread it is linked to; neither follows.
         self.reader.forget();
+        self.sync_following();
         self.tool_recovery_request = None;
         self.current_thread_id = Some(thread_id.to_string());
         self.lost_stream = None;
@@ -1360,6 +1364,7 @@ impl App {
         // What was being read belonged to the thread being left, as it does when another
         // thread is opened.
         self.reader.forget();
+        self.sync_following();
         self.draft = Some(NewThreadDraft {
             thread_id: commands::new_id(),
             project_id: project_id.to_string(),
@@ -3805,6 +3810,7 @@ impl App {
         let directory = self.working_directory();
         let Some(state) = self.thread.as_ref() else {
             self.reader.forget();
+            self.sync_following();
             return false;
         };
         let thread = reader::Thread {
@@ -3844,6 +3850,7 @@ impl App {
         for fetch in step.fetches {
             self.fetch(fetch);
         }
+        self.sync_following();
         match step.toast {
             None => {}
             Some(reader::Toast::Clear) => self.toast = None,
@@ -3863,11 +3870,23 @@ impl App {
         self.chat_view.open(place);
     }
 
+    /// Have the session follow the subagent thread the reader wants, and let go of one it
+    /// no longer does.
+    fn sync_following(&mut self) {
+        let wanted = self.reader.following();
+        if wanted != self.followed.as_deref() {
+            self.handle.follow(wanted);
+            self.followed = wanted.map(str::to_string);
+        }
+    }
+
     /// Fetch what the reader asked for, and hand it back as an event once it has come.
     fn fetch(&mut self, fetch: reader::Fetch) {
         let handle = self.handle.clone();
         let events = self.events.clone();
         match fetch {
+            // Asked of the session by `sync_following`, which every step ends with.
+            reader::Fetch::Follow { .. } => {}
             reader::Fetch::Transcript {
                 agent_id,
                 cwd,
@@ -3961,6 +3980,11 @@ impl App {
         });
     }
 
+    fn on_child(&mut self, thread_id: String, item: ThreadItem) {
+        let here = self.here();
+        self.read_with(|reader, thread| reader.on_child(thread, &thread_id, item, here));
+    }
+
     fn on_pull_request(&mut self, url: String, result: Result<Value, String>) {
         let here = self.here();
         self.read_with(|reader, thread| reader.on_pull_request(thread, url, result, here));
@@ -3979,6 +4003,7 @@ impl App {
     /// next is the caller's, from where the reading was asked for, which this gives back.
     fn leave_reading(&mut self) -> Option<Origin> {
         let closed = self.reader.close()?;
+        self.sync_following();
         let (place, focus) = closed.restore;
         self.chat_view.restore(place);
         self.focus = focus;
@@ -7231,6 +7256,7 @@ impl App {
                 }
                 self.was_running = running;
             }
+            Update::Child { thread_id, item } => self.on_child(thread_id, item),
             Update::OlderPage { thread_id, page } => {
                 if self.current_thread_id.as_deref() == Some(thread_id.as_str())
                     && let Some(thread) = self.thread.as_mut()

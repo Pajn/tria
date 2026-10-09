@@ -1,6 +1,8 @@
 //! The reader: something read in place of the thread's conversation, from being asked for
-//! to being put away. It is either a subagent's transcript or one of the thread's pull
-//! requests, and the conversation is kept underneath it and put back on the way out.
+//! to being put away. It is either a subagent's work or one of the thread's pull requests,
+//! and the conversation is kept underneath it and put back on the way out. A subagent's
+//! work is the thread the server keeps of it, followed live, or for one from before the
+//! server kept those, its transcript file.
 //!
 //! It does no reading of its own. Asked to open something, or told that time has passed or
 //! the thread has moved, it says what to fetch; told what came back, it says what changed
@@ -21,7 +23,7 @@ use std::{
 use serde_json::{Value, json};
 
 use crate::{
-    model::PullRequestRef,
+    model::{PullRequestRef, ThreadItem},
     pull_request::{self, Activity, Detail},
     state::ThreadState,
     subagent::Subagent,
@@ -82,6 +84,9 @@ pub enum Fetch {
         cwd: String,
         path: String,
     },
+    /// Follow a subagent's thread, whose items come back through `on_child`. Following
+    /// stops when the reader no longer wants it, which `following` says.
+    Follow { thread_id: String },
     /// `pullRequests.detail` and `pullRequests.activity` together, back through
     /// `on_pull_request` and `on_activity`; `fresh` asks `pullRequests.invalidate` first,
     /// past the server's copy of what the host said.
@@ -251,6 +256,12 @@ enum Kind {
         read_at: Instant,
         seen: String,
     },
+    /// A subagent's thread, kept up to date by its stream.
+    Child {
+        agent_id: String,
+        thread_id: String,
+        live: bool,
+    },
     PullRequest {
         detail: Box<Detail>,
         /// Its link as the thread list last had it, to notice the server's sync bringing
@@ -282,6 +293,9 @@ pub struct Reader<R> {
     images_asked: HashSet<String>,
     /// The server's refresh count as last heard, to tell a change from where it stands.
     server_refreshes: Option<u64>,
+    /// The subagent thread asked to be followed and not yet heard from: its agent and
+    /// its thread.
+    child_asked: Option<(String, String)>,
 }
 
 impl<R> Default for Reader<R> {
@@ -294,6 +308,7 @@ impl<R> Default for Reader<R> {
             images: HashMap::new(),
             images_asked: HashSet::new(),
             server_refreshes: None,
+            child_asked: None,
         }
     }
 }
@@ -308,7 +323,9 @@ impl<R> Reader<R> {
     /// What the open reading is of.
     pub fn source(&self) -> Option<Source> {
         Some(match &self.open.as_ref()?.kind {
-            Kind::Transcript { agent_id, .. } => Source::Subagent(agent_id.clone()),
+            Kind::Transcript { agent_id, .. } | Kind::Child { agent_id, .. } => {
+                Source::Subagent(agent_id.clone())
+            }
             Kind::PullRequest { detail, .. } => Source::PullRequest(detail.url.clone()),
         })
     }
@@ -321,7 +338,7 @@ impl<R> Reader<R> {
     /// The subagent being read, when it is one.
     pub fn agent_id(&self) -> Option<&str> {
         match &self.open.as_ref()?.kind {
-            Kind::Transcript { agent_id, .. } => Some(agent_id),
+            Kind::Transcript { agent_id, .. } | Kind::Child { agent_id, .. } => Some(agent_id),
             Kind::PullRequest { .. } => None,
         }
     }
@@ -330,7 +347,18 @@ impl<R> Reader<R> {
     pub fn pull_request(&self) -> Option<&Detail> {
         match &self.open.as_ref()?.kind {
             Kind::PullRequest { detail, .. } => Some(detail),
-            Kind::Transcript { .. } => None,
+            Kind::Transcript { .. } | Kind::Child { .. } => None,
+        }
+    }
+
+    /// The subagent thread to follow: the one asked for, or else the one open.
+    pub fn following(&self) -> Option<&str> {
+        if let Some((_, thread_id)) = &self.child_asked {
+            return Some(thread_id);
+        }
+        match &self.open.as_ref()?.kind {
+            Kind::Child { thread_id, .. } => Some(thread_id),
+            _ => None,
         }
     }
 
@@ -347,7 +375,7 @@ impl<R> Reader<R> {
     /// What a message written over it says first, so the agent knows what "this" is.
     pub fn context(&self) -> Option<String> {
         Some(match &self.open.as_ref()?.kind {
-            Kind::Transcript { agent_id, .. } => {
+            Kind::Transcript { agent_id, .. } | Kind::Child { agent_id, .. } => {
                 format!("Sent looking at the transcript for subagent {agent_id}:")
             }
             Kind::PullRequest { detail, .. } => format!(
@@ -360,7 +388,7 @@ impl<R> Reader<R> {
     /// What it is, in a sentence about it.
     pub fn noun(&self) -> Option<&'static str> {
         Some(match self.open.as_ref()?.kind {
-            Kind::Transcript { .. } => "the subagent",
+            Kind::Transcript { .. } | Kind::Child { .. } => "the subagent",
             Kind::PullRequest { .. } => "the pull request",
         })
     }
@@ -385,6 +413,13 @@ impl<R> Reader<R> {
                 } else {
                     "q back"
                 }
+            }
+            // Its stream keeps it up to date, so there is nothing to read again.
+            Kind::Child { live, .. } => {
+                if *live {
+                    badges.push(Badge::Working);
+                }
+                "q back"
             }
             Kind::PullRequest { detail, .. } if detail.labels_editable() => {
                 "r re-reads · gx opens · L labels · q back"
@@ -429,7 +464,7 @@ impl<R> Reader<R> {
                     },
                 )
             }
-            Kind::Transcript { .. } => {
+            Kind::Transcript { .. } | Kind::Child { .. } => {
                 timeline::build(&open.state, expanded, open_levels, size.0, size.1)
             }
         }
@@ -615,6 +650,9 @@ impl<R> Reader<R> {
                 let Some(agent) = agents.iter().find(|agent| agent.id == agent_id) else {
                     return failed(Step::warn("that subagent is no longer in this thread"));
                 };
+                if let Some(thread_id) = &agent.child_thread_id {
+                    return self.follow(agent_id, thread_id.clone(), intent, origin);
+                }
                 let Some(path) = transcript_path(thread.state, agent) else {
                     return failed(Step::say("no transcript for this subagent yet"));
                 };
@@ -687,6 +725,55 @@ impl<R> Reader<R> {
         }
     }
 
+    /// Follow a subagent's thread. One already open is live, so it is only put in view
+    /// again; asking for another lets go of whatever was being followed.
+    fn follow(
+        &mut self,
+        agent_id: String,
+        thread_id: String,
+        intent: Intent,
+        origin: Origin,
+    ) -> Step {
+        let open_on_it = matches!(
+            &self.open,
+            Some(Open { kind: Kind::Child { thread_id: open, .. }, .. }) if *open == thread_id
+        );
+        if open_on_it {
+            self.child_asked = None;
+            if let Some(open) = self.open.as_mut() {
+                open.origin = origin;
+            }
+            return match intent {
+                Intent::Quiet => Step::default(),
+                Intent::Loud => Step {
+                    toast: Some(Toast::Clear),
+                    outcome: Outcome::Opened {
+                        place: Place::Keep,
+                        take_focus: origin != Origin::Sidebar,
+                    },
+                    ..Step::default()
+                },
+            };
+        }
+        let source = Source::Subagent(agent_id.clone());
+        if self.in_flight(&source, intent, origin, false) {
+            return Step::default();
+        }
+        self.ask(
+            source,
+            Asked {
+                intent,
+                origin,
+                again: None,
+            },
+        );
+        self.child_asked = Some((agent_id, thread_id.clone()));
+        Step {
+            fetches: vec![Fetch::Follow { thread_id }],
+            ..Step::default()
+        }
+    }
+
     // ── Reads on their way ─────────────────────────────────────────────
 
     /// Whether a read of this is already on its way, so it is not asked for twice. One
@@ -719,6 +806,13 @@ impl<R> Reader<R> {
         if asked.intent == Intent::Loud {
             for other in self.asked.values_mut() {
                 other.intent = Intent::Quiet;
+            }
+            // A subagent thread is only followed to be read, and is not going to be.
+            if let Some((agent_id, _)) = &self.child_asked
+                && Source::Subagent(agent_id.clone()) != source
+            {
+                self.asked.remove(&Source::Subagent(agent_id.clone()));
+                self.child_asked = None;
             }
         }
         self.asked.insert(source, asked);
@@ -844,6 +938,91 @@ impl<R> Reader<R> {
             },
             ..Step::default()
         }
+    }
+
+    /// An item of a followed subagent thread. The first, its snapshot, opens it if it was
+    /// asked for; the rest bring it up to date under the reader. `here` is where the
+    /// conversation is, kept for the way back should this open over it.
+    pub fn on_child(
+        &mut self,
+        thread: &Thread,
+        thread_id: &str,
+        item: ThreadItem,
+        here: R,
+    ) -> Step {
+        let asked_for = self
+            .child_asked
+            .as_ref()
+            .filter(|(_, asked)| asked == thread_id)
+            .map(|(agent_id, _)| agent_id.clone());
+        let agents = thread.state.subagents();
+        if let Some(agent_id) = asked_for
+            && let ThreadItem::Snapshot { snapshot } = item
+        {
+            self.child_asked = None;
+            let Some(asked) = self.answered(&Source::Subagent(agent_id.clone())) else {
+                return Step::default();
+            };
+            let Some(agent) = agents.iter().find(|agent| agent.id == agent_id) else {
+                return Step::default();
+            };
+            let mut state = ThreadState::from_snapshot(snapshot);
+            self.revision += 1;
+            state.revision = self.revision;
+            let (restore, before) = match self.open.take() {
+                Some(open) => (open.restore, Some(open.origin)),
+                None => (here, None),
+            };
+            let quiet = asked.intent == Intent::Quiet;
+            self.open = Some(Open {
+                kind: Kind::Child {
+                    agent_id,
+                    thread_id: thread_id.to_string(),
+                    live: state.is_running() || !agent.status.is_terminal(),
+                },
+                title: agent.title.clone(),
+                subtitle: child_subtitle(agent),
+                state,
+                restore,
+                origin: before.filter(|_| quiet).unwrap_or(asked.origin),
+            });
+            if quiet {
+                return Step::refreshed();
+            }
+            return Step {
+                toast: Some(Toast::Clear),
+                outcome: Outcome::Opened {
+                    place: Place::Top,
+                    take_focus: asked.origin != Origin::Sidebar,
+                },
+                ..Step::default()
+            };
+        }
+        let Some(Open {
+            kind:
+                Kind::Child {
+                    agent_id,
+                    thread_id: open,
+                    live,
+                },
+            state,
+            ..
+        }) = &mut self.open
+        else {
+            return Step::default();
+        };
+        if open != thread_id {
+            return Step::default();
+        }
+        state.apply(item);
+        *live = state.is_running()
+            || agents
+                .iter()
+                .find(|agent| &agent.id == agent_id)
+                .is_some_and(|agent| !agent.status.is_terminal());
+        self.revision += 1;
+        state.revision = self.revision;
+        Step::refreshed()
     }
 
     /// A pull request's detail came back from the host, through the server. `here` is
@@ -1055,6 +1234,9 @@ impl<R> Reader<R> {
     /// message simply carries on.
     pub fn close(&mut self) -> Option<Closed<R>> {
         let open = self.open.take()?;
+        if let Some((agent_id, _)) = self.child_asked.take() {
+            self.asked.remove(&Source::Subagent(agent_id));
+        }
         Some(Closed {
             restore: open.restore,
             origin: open.origin,
@@ -1067,6 +1249,22 @@ impl<R> Reader<R> {
     pub fn forget(&mut self) {
         self.open = None;
         self.asked.clear();
+        self.child_asked = None;
+    }
+}
+
+/// What a subagent thread's header says under its title: what it runs as.
+fn child_subtitle(agent: &Subagent) -> String {
+    let parts: Vec<String> = agent
+        .role
+        .iter()
+        .cloned()
+        .chain(agent.model_label())
+        .collect();
+    if parts.is_empty() {
+        "subagent".to_string()
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -1345,6 +1543,112 @@ pub(crate) mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A thread whose subagent `a1` is still working, in a thread the server keeps of it.
+    fn thread_with_a_child_agent() -> ThreadState {
+        let started = json!({
+            "id": "task.started-1", "kind": "task.started", "tone": "info", "summary": "",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "payload": {"taskId": "a1", "agentKind": "agent", "title": "Look into it",
+                "childThreadId": "child"},
+        });
+        thread(vec![started], json!({"status": "running"}), json!([]))
+    }
+
+    /// The subagent's thread as its stream sends it, saying `replies` after its brief.
+    fn child_saying(replies: &[&str]) -> ThreadItem {
+        let mut messages = vec![json!({"id": "u", "role": "user", "text": "Look into it"})];
+        for (n, reply) in replies.iter().enumerate() {
+            messages.push(json!({"id": format!("a{n}"), "role": "assistant", "text": reply}));
+        }
+        ThreadItem::Snapshot {
+            snapshot: serde_json::from_value(json!({
+                "snapshotSequence": 1,
+                "thread": {"id": "child", "projectId": "p", "title": "Look into it",
+                    "modelSelection": {"instanceId": "c", "model": "m"},
+                    "messages": messages, "activities": []},
+            }))
+            .unwrap(),
+        }
+    }
+
+    // ── Subagent threads ───────────────────────────────────────────────
+
+    /// A subagent the server keeps a thread of is followed rather than read from a file:
+    /// its thread opens at the top once it arrives, and what it says next comes in under
+    /// the reader with nothing asked for again. Put away, it is let go.
+    #[test]
+    fn a_subagent_thread_is_followed_live() {
+        let thread = thread_with_a_child_agent();
+        let mut reader: Reader<&str> = Reader::default();
+        let a1 = Source::Subagent("a1".into());
+        let step = reader.open(&lent(&thread), a1.clone(), Origin::Chat);
+        assert_eq!(
+            step.fetches,
+            vec![Fetch::Follow {
+                thread_id: "child".into()
+            }]
+        );
+        assert_eq!(reader.following(), Some("child"));
+        assert!(reader.is_loading(&a1));
+
+        let step = reader.on_child(
+            &lent(&thread),
+            "child",
+            child_saying(&["Looking now."]),
+            CONVERSATION,
+        );
+        assert_eq!(step.outcome, opened(Place::Top, true));
+        assert!(!reader.is_loading(&a1));
+        assert_eq!(said(&reader), vec!["Look into it", "Looking now."]);
+        let header = reader.header().expect("a header");
+        assert_eq!(header.title, "Look into it");
+        assert_eq!(header.badges, vec![Badge::Working]);
+        assert_eq!(header.hint, "q back");
+
+        let step = reader.on_child(
+            &lent(&thread),
+            "child",
+            child_saying(&["Looking now.", "Found it."]),
+            CONVERSATION,
+        );
+        assert_eq!(step.outcome, Outcome::Refreshed);
+        assert!(step.fetches.is_empty());
+        assert_eq!(
+            said(&reader),
+            vec!["Look into it", "Looking now.", "Found it."]
+        );
+
+        let other = reader.on_child(&lent(&thread), "elsewhere", child_saying(&[]), CONVERSATION);
+        assert_eq!(other.outcome, Outcome::Nothing);
+
+        let again = reader.open(&lent(&thread), a1, Origin::Chat);
+        assert!(again.fetches.is_empty(), "followed twice");
+        assert_eq!(again.outcome, opened(Place::Keep, true));
+
+        let closed = reader.close().expect("it was open");
+        assert_eq!(closed.restore, CONVERSATION);
+        assert_eq!(reader.following(), None);
+    }
+
+    /// Something else asked for before the subagent's thread arrives takes its place, and
+    /// the thread is no longer followed nor opened when it does arrive.
+    #[test]
+    fn a_subagent_thread_asked_over_is_let_go() {
+        let mut thread = thread_with_a_child_agent();
+        thread.detail.shell = stacked_thread().detail.shell;
+        let mut reader: Reader<&str> = Reader::default();
+        let _ = reader.open(&lent(&thread), Source::Subagent("a1".into()), Origin::Chat);
+        let _ = reader.open(
+            &lent(&thread),
+            Source::PullRequest(FIRST.into()),
+            Origin::Chat,
+        );
+        assert_eq!(reader.following(), None);
+        let step = reader.on_child(&lent(&thread), "child", child_saying(&[]), CONVERSATION);
+        assert_eq!(step.outcome, Outcome::Nothing);
+        assert!(!reader.is_open());
     }
 
     // ── Transcripts ────────────────────────────────────────────────────

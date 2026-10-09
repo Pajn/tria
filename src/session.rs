@@ -1,6 +1,6 @@
-//! Connection supervisor: owns the socket, the shell subscription, and the
-//! subscription for the currently open thread. Reconnects with backoff and
-//! resumes both streams from their last applied sequence.
+//! Connection supervisor: owns the socket, the shell subscription, the subscription
+//! for the currently open thread, and one for a subagent's thread being read over it.
+//! Reconnects with backoff and resumes the streams from their last applied sequence.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -29,6 +29,9 @@ pub enum Request {
     /// only that it happened.
     RefreshThread(Id),
     CloseThread,
+    /// Follow this subagent thread, read in place of the open thread's conversation, or
+    /// none. One at a time: following another lets the last go.
+    Follow(Option<Id>),
     Dispatch {
         method: &'static str,
         command: Value,
@@ -83,6 +86,11 @@ pub enum Update {
     Config(Box<ServerConfig>),
     Shell(ShellItem),
     Thread {
+        thread_id: Id,
+        item: ThreadItem,
+    },
+    /// An item of the subagent thread being followed.
+    Child {
         thread_id: Id,
         item: ThreadItem,
     },
@@ -143,6 +151,10 @@ impl Handle {
 
     pub fn close_thread(&self) {
         let _ = self.tx.send(Request::CloseThread);
+    }
+
+    pub fn follow(&self, thread_id: Option<&str>) {
+        let _ = self.tx.send(Request::Follow(thread_id.map(str::to_string)));
     }
 
     /// Drop the connection and make a new one, whatever state the old one was in.
@@ -297,6 +309,7 @@ async fn run(
 ) {
     let mut shell_sequence: Option<u64> = None;
     let mut open: Option<OpenThread> = None;
+    let mut child: Option<OpenThread> = None;
     // Kept across reconnects so the watch resumes with the socket.
     let mut watched_cwds: Vec<String> = Vec::new();
     // A task per followed checkout, forwarding its statuses. Keyed by the directory,
@@ -326,7 +339,7 @@ async fn run(
                     // Requests still get an answer, because a UI left with none of them
                     // coming back is a UI that has stopped rather than one that is
                     // saying what is wrong.
-                    if wait_for_reconnect(&mut requests, &mut open).await {
+                    if wait_for_reconnect(&mut requests, &mut open, &mut child).await {
                         attempt = 0;
                         continue;
                     }
@@ -423,6 +436,12 @@ async fn run(
                 }
             }
         }
+        if let Some(c) = child.as_mut() {
+            // Whole, unlike the open thread's: older history is paged for that one only.
+            c.subscription = subscribe_thread(&client, &c.id, c.last_sequence, false)
+                .await
+                .ok();
+        }
         attempt = 0;
         let _ = updates.send(Update::Status(Status::Connected));
 
@@ -432,6 +451,12 @@ async fn run(
         loop {
             let thread_next = async {
                 match open.as_mut().and_then(|o| o.subscription.as_mut()) {
+                    Some(sub) => sub.next().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let child_next = async {
+                match child.as_mut().and_then(|c| c.subscription.as_mut()) {
                     Some(sub) => sub.next().await,
                     None => std::future::pending().await,
                 }
@@ -473,6 +498,21 @@ async fn run(
                             }
                         }
                         Request::CloseThread => open = None,
+                        Request::Follow(id) => {
+                            if child.as_ref().map(|c| &c.id) == id.as_ref() {
+                                continue;
+                            }
+                            child = match id {
+                                Some(id) => {
+                                    let subscription = subscribe_thread(&client, &id, None, false).await;
+                                    if let Err(err) = &subscription {
+                                        let _ = updates.send(Update::Error(format!("following the subagent: {err}")));
+                                    }
+                                    Some(OpenThread { id, last_sequence: None, subscription: subscription.ok(), attempts: 0 })
+                                }
+                                None => None,
+                            };
+                        }
                         Request::Reconnect => {
                             forced = true;
                             break;
@@ -609,12 +649,39 @@ async fn run(
                         None => terminals = None,
                     }
                 }
+                item = child_next => {
+                    let Some(c) = child.as_mut() else { continue };
+                    match item {
+                        Some(Ok(value)) => {
+                            c.attempts = 0;
+                            forward_thread_item(&updates, &c.id, value, &mut c.last_sequence, true);
+                        }
+                        // Asked for again from where it got to, as the open thread's is, and
+                        // let go once that stops working: the reading stays as it was.
+                        item => {
+                            c.attempts += 1;
+                            let again = if c.attempts >= STREAM_ATTEMPTS {
+                                None
+                            } else {
+                                subscribe_thread(&client, &c.id, c.last_sequence, false).await.ok()
+                            };
+                            if again.is_none() {
+                                let failed = match item {
+                                    Some(Err(err)) => err.to_string(),
+                                    _ => "its stream ended".to_string(),
+                                };
+                                let _ = updates.send(Update::Error(format!("lost the subagent's updates: {failed}")));
+                            }
+                            c.subscription = again;
+                        }
+                    }
+                }
                 item = thread_next => {
                     let Some(o) = open.as_mut() else { continue };
                     match item {
                         Some(Ok(value)) => {
                             o.attempts = 0;
-                            forward_thread_item(&updates, &o.id, value, &mut o.last_sequence);
+                            forward_thread_item(&updates, &o.id, value, &mut o.last_sequence, false);
                         }
                         // A stream that ends or fails is answered the same way, by asking
                         // for it again from where it got to. One that comes back is a
@@ -661,6 +728,10 @@ async fn run(
             }
         }
 
+        if let Some(c) = child.as_mut() {
+            c.subscription = None;
+            c.attempts = 0;
+        }
         if let Some(o) = open.as_mut() {
             o.subscription = None;
             // A new connection is a fresh start: what the old one could not keep up says
@@ -691,6 +762,7 @@ async fn run(
 async fn wait_for_reconnect(
     requests: &mut mpsc::UnboundedReceiver<Request>,
     open: &mut Option<OpenThread>,
+    child: &mut Option<OpenThread>,
 ) -> bool {
     while let Some(request) = requests.recv().await {
         match request {
@@ -704,6 +776,14 @@ async fn wait_for_reconnect(
                 })
             }
             Request::CloseThread => *open = None,
+            Request::Follow(id) => {
+                *child = id.map(|id| OpenThread {
+                    id,
+                    last_sequence: None,
+                    subscription: None,
+                    attempts: 0,
+                })
+            }
             Request::Dispatch { reply, .. } => {
                 let _ = reply.send(Err(anyhow!("not connected")));
             }
@@ -721,6 +801,7 @@ fn forward_thread_item(
     thread_id: &str,
     value: Value,
     last_sequence: &mut Option<u64>,
+    child: bool,
 ) {
     match crate::v2::thread_item(value, None) {
         Ok(item) => {
@@ -731,9 +812,11 @@ fn forward_thread_item(
                 ThreadItem::Event { event } => *last_sequence = Some(event.sequence),
                 _ => {}
             }
-            let _ = updates.send(Update::Thread {
-                thread_id: thread_id.to_string(),
-                item,
+            let thread_id = thread_id.to_string();
+            let _ = updates.send(if child {
+                Update::Child { thread_id, item }
+            } else {
+                Update::Thread { thread_id, item }
             });
         }
         Err(err) => tracing::warn!(?err, "undecodable thread item"),

@@ -108,6 +108,9 @@ pub struct Subagent {
     pub error: Option<String>,
     /// Where the full transcript lives on the machine that ran it.
     pub output_file: Option<String>,
+    /// The thread the server keeps of its work, which is read live in place of the
+    /// transcript. Absent for work from before the server kept one.
+    pub child_thread_id: Option<String>,
     pub recent: Vec<String>,
     pub first_seen_at: String,
     pub started_at: Option<String>,
@@ -339,6 +342,7 @@ fn new_agent(id: &str, activity: &Activity, at: &str) -> Subagent {
         result: None,
         error: None,
         output_file: None,
+        child_thread_id: None,
         recent: Vec::new(),
         first_seen_at: at.to_string(),
         started_at: None,
@@ -368,6 +372,9 @@ fn fill_metadata(agent: &mut Subagent, activity: &Activity) {
     }
     if let Some(file) = activity.str("outputFile") {
         agent.output_file = Some(file.to_string());
+    }
+    if let Some(thread) = activity.str("childThreadId") {
+        agent.child_thread_id = Some(thread.to_string());
     }
 }
 

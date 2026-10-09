@@ -142,7 +142,7 @@ Press `?` inside the app for the full list.
 | `gY` | chat focused: copy the link destination under the cursor, or the first link on its line (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
 | `gT` | list the agent's background tasks that are still running; `s` stops them, `S` the session, after asking |
-| `gA` | list the subagents the thread has run; `Enter` reads one's transcript (`r` re-reads a running one), `y` yanks its report |
+| `gA` | list the subagents the thread has run; `Enter` reads one's work as it goes (`r` re-reads a transcript file), `y` yanks its report |
 | `gS` | list the thread's terminals; attach to one, or close, restart, open a new one |
 | `gW` | list the worktrees threads are holding; remove the ones that are done with |
 | `gl` | open lazygit in a terminal popup for the thread; `[programs]` in the config file binds more keys |
@@ -721,7 +721,13 @@ to the transcript on screen, tria asks first — `Enter` (or `Ctrl-s` when queue
 sends, anything else goes back to writing. What is sent starts with `Sent looking at the
 transcript for subagent <id>:`, so the agent knows what the message was written against.
 
-The transcript is a file the provider wrote on the machine that ran the agent, fetched with
+Servers that keep a subagent's work as a thread of its own say which thread it is, and that
+thread is what opens: tria subscribes to it as it does to the open thread, so what the agent
+does next arrives while it is read, with nothing to read again. Reading further up stays put;
+reading at the end follows what is new. Going back lets the thread go.
+
+Work from before the server kept such threads is read from its transcript instead. The
+transcript is a file the provider wrote on the machine that ran the agent, fetched with
 `projects.readFile`, which takes an absolute path for exactly this. It therefore works against
 a remote server too. The server stops reading at a megabyte and the header says so when the
 tail is missing.

@@ -336,6 +336,7 @@ async fn dump(origin: &str, token: &str, thread_id: &str, seconds: u64) -> Resul
                 println!("thread stream error ({thread_id}): {error}")
             }
             session::Update::Terminals(_)
+            | session::Update::Child { .. }
             | session::Update::TerminalStream(_)
             | session::Update::Vcs { .. } => {}
             session::Update::Error(error) => println!("error: {error}"),

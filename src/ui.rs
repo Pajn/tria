@@ -2699,11 +2699,12 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
         if agent.activations > 1 {
             facts.push(format!("run {}", agent.activations));
         }
+        // One whose work the server keeps as a thread is read from that, file or not.
         let path = app
             .thread
             .as_ref()
             .and_then(|thread| crate::reader::transcript_path(thread, agent));
-        if path.is_none() {
+        if agent.child_thread_id.is_none() && path.is_none() {
             facts.push("no transcript".to_string());
         }
         if app.reader.is_loading(&Source::Subagent(agent.id.clone())) {

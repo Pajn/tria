@@ -934,6 +934,7 @@ impl Projection {
                     "title": title,
                     "description": prompt,
                     "summary": item.str("result").or(item.str("progress")),
+                    "childThreadId": item.str("childThreadId"),
                 });
                 if done {
                     payload["status"] = json!(tool_status(&item.status));
@@ -1424,6 +1425,25 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(item, ShellItem::Unknown));
+    }
+
+    /// A subagent names the thread the server keeps of its work, which is how it is read.
+    #[test]
+    fn a_subagent_names_its_thread() {
+        let snapshot = open(
+            vec![row(item(
+                "s",
+                1,
+                "subagent",
+                json!({ "subagentId": "a1", "origin": "provider_native", "driver": "claude",
+                    "providerInstanceId": "claude", "childThreadId": "child",
+                    "prompt": "Look into it", "result": null, "status": "running" }),
+            ))],
+            vec![run("running")],
+        );
+        let agents = crate::state::ThreadState::from_snapshot(snapshot).subagents();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].child_thread_id.as_deref(), Some("child"));
     }
 
     #[test]
