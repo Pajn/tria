@@ -1711,11 +1711,21 @@ impl App {
         let events = self.events.clone();
         tokio::spawn(async move {
             let result = match send {
-                Carried::Launch(input) => handle.launch(input).await.map(|_| ()),
+                Carried::Launch(mut input) => {
+                    let thread = input["threadId"].clone();
+                    match stored_images(&handle, &thread, &mut input["initialMessage"]).await {
+                        Ok(()) => handle.launch(input).await.map(|_| ()),
+                        Err(error) => Err(error),
+                    }
+                }
                 Carried::Commands(commands) => {
                     let mut result = Ok(());
-                    for command in commands {
-                        result = handle.dispatch(command).await.map(|_| ());
+                    for mut command in commands {
+                        let thread = command["threadId"].clone();
+                        result = match stored_images(&handle, &thread, &mut command).await {
+                            Ok(()) => handle.dispatch(command).await.map(|_| ()),
+                            Err(error) => Err(error),
+                        };
                         if result.is_err() {
                             break;
                         }
@@ -7817,6 +7827,29 @@ pub enum SidebarRow {
 pub const POPUP_ROW_LINES: usize = 3;
 
 /// The rows of one of those lists, by what each one is.
+/// A message takes its images as attachments the server has stored, so the images it
+/// was written with are stored first, under the thread and message they belong to, and
+/// it goes with what the server stored them as. `message` has `messageId` and
+/// `attachments`, which is how both a dispatched message and a new thread's first
+/// message have them.
+async fn stored_images(handle: &Handle, thread: &Value, message: &mut Value) -> anyhow::Result<()> {
+    let written = &message["attachments"];
+    if written.as_array().is_none_or(Vec::is_empty) {
+        return Ok(());
+    }
+    let payload = json!({
+        "threadId": thread,
+        "messageId": message["messageId"],
+        "attachments": written,
+    });
+    let stored = handle
+        .call("assets.persistChatAttachments", payload)
+        .await
+        .map_err(|error| anyhow::anyhow!("storing the images: {error:#}"))?;
+    message["attachments"] = stored["attachments"].clone();
+    Ok(())
+}
+
 /// A file the provider wrote outside any workspace, read through the server with
 /// `projects.readFile`, which takes an absolute path for exactly this. The server stops
 /// reading at a megabyte.
@@ -11652,14 +11685,26 @@ mod tests {
         app.on_paste(&shot.dropped());
         app.composer.insert_str("what is wrong here?");
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let command = sent_command(&mut requests).await.expect("sent");
+        assert!(app.composer_images.is_empty(), "went with the message");
+        // The server stores the image first, for the message it goes with, and the
+        // message carries what it was stored as.
+        let (stored, command) = stored_then_sent(&mut requests).await;
+        assert_eq!(stored["threadId"], "t1");
+        assert_eq!(stored["messageId"], command["messageId"]);
+        let written = &stored["attachments"][0];
+        assert_eq!(written["name"], "Screenshot 2026-10-09 at 20.10.png");
+        assert_eq!(written["mimeType"], "image/png");
+        assert!(
+            written["dataUrl"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
         assert_eq!(command["text"], "what is wrong here?");
         let attachments = command["attachments"].as_array().unwrap();
         assert_eq!(attachments.len(), 1);
-        assert_eq!(attachments[0]["type"], "image");
-        assert_eq!(attachments[0]["name"], "Screenshot 2026-10-09 at 20.10.png");
-        assert_eq!(attachments[0]["mimeType"], "image/png");
-        assert!(app.composer_images.is_empty(), "went with the message");
+        assert_eq!(attachments[0]["id"], "stored-0");
+        assert!(attachments[0].get("dataUrl").is_none(), "sent inline");
     }
 
     /// An image is a message on its own: queued with nothing written, it goes out with
@@ -11682,10 +11727,8 @@ mod tests {
         assert!(sent_no_command(&mut requests).await);
 
         upsert(&mut app, listed("t1", Some(("turn", "completed"))));
-        let command = sent_command(&mut requests)
-            .await
-            .expect("sent once it ended");
-        assert_eq!(command["attachments"].as_array().map(Vec::len), Some(1));
+        let (_, command) = stored_then_sent(&mut requests).await;
+        assert_eq!(command["attachments"][0]["id"], "stored-0");
     }
 
     /// With no turn running there is nothing to wait for.
@@ -12512,6 +12555,40 @@ mod tests {
                 _ => continue,
             }
         }
+    }
+
+    /// The images a message was written with, stored as the server stores them, and then
+    /// the message: what was asked to be stored, and what was sent.
+    async fn stored_then_sent(
+        requests: &mut mpsc::UnboundedReceiver<crate::session::Request>,
+    ) -> (Value, Value) {
+        let stored = loop {
+            match asked(requests).await.expect("asked to store the images") {
+                crate::session::Request::Call {
+                    tag,
+                    payload,
+                    reply,
+                } if tag == "assets.persistChatAttachments" => {
+                    let attachments: Vec<Value> = payload["attachments"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, image)| {
+                            json!({"id": format!("stored-{index}"), "type": "image",
+                                "name": image["name"], "mimeType": image["mimeType"],
+                                "sizeBytes": image["sizeBytes"]})
+                        })
+                        .collect();
+                    let _ = reply.send(Ok(json!({ "attachments": attachments })));
+                    break payload;
+                }
+                crate::session::Request::Dispatch { .. } => panic!("sent before storing"),
+                _ => continue,
+            }
+        };
+        let sent = sent_command(requests).await.expect("sent");
+        (stored, sent)
     }
 
     /// That no command was dispatched, whatever else was asked for.
