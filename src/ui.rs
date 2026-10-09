@@ -421,7 +421,7 @@ pub fn status_style(status: ThreadStatus) -> Style {
         ThreadStatus::Approval | ThreadStatus::Question => Style::default().fg(Color::Yellow),
         ThreadStatus::Working => Style::default().fg(Color::Cyan),
         ThreadStatus::Monitoring => Style::default().fg(Color::Blue),
-        ThreadStatus::Failed => Style::default().fg(Color::Red),
+        ThreadStatus::Failed | ThreadStatus::Interrupted => Style::default().fg(Color::Red),
         ThreadStatus::PlanReady => Style::default().fg(Color::Magenta),
         ThreadStatus::Done | ThreadStatus::Idle => Style::default().fg(Color::DarkGray),
     }
@@ -699,6 +699,8 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                     ThreadStatus::Working => (app.spinner_frame(), status_style(status)),
                     ThreadStatus::Approval | ThreadStatus::Question => ("!", status_style(status)),
                     ThreadStatus::Failed => ("✗", status_style(status)),
+                    // Stopped rather than broken, so not the failure's cross.
+                    ThreadStatus::Interrupted => ("⊘", status_style(status)),
                     // Monitoring is the one status that outlasts the news it brings:
                     // the watcher sits there for hours, so it says in its own colour
                     // whether anything has happened since anybody looked.

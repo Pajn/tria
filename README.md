@@ -937,7 +937,8 @@ header to unfold it. `J`/`K` and the picker only cycle through visible threads.
 
 Each row shows the project on the right and a status glyph on the left: `!` needs an approval
 or an answer, a spinner is working, `◔` is monitoring (background work still running after the
-turn), `▤` has a plan ready, `✗` failed. The status bar spells the status out for the open
+turn), `▤` has a plan ready, `✗` failed, and a red `⊘` was interrupted, its last turn stopped
+before it finished. The status bar spells the status out for the open
 thread. `:settle` and `:unsettle` move the current thread between the active list and the
 shelf; `:wake` ends a snooze.
 

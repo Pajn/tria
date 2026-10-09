@@ -572,6 +572,8 @@ pub enum ThreadStatus {
     Question,
     Working,
     Failed,
+    /// Its last turn was stopped before it finished.
+    Interrupted,
     Monitoring,
     PlanReady,
     Done,
@@ -587,6 +589,7 @@ impl ThreadStatus {
             Self::Question => "asks a question",
             Self::Working => "is working",
             Self::Failed => "failed",
+            Self::Interrupted => "was interrupted",
             Self::Monitoring => "finished, still watching",
             Self::PlanReady => "has a plan ready",
             Self::Done => "finished",
@@ -600,6 +603,7 @@ impl ThreadStatus {
             Self::Question => "question",
             Self::Working => "working",
             Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
             Self::Monitoring => "monitoring",
             Self::PlanReady => "plan ready",
             Self::Done => "done",
@@ -869,6 +873,7 @@ impl ThreadShell {
         }
         match self.latest_turn.as_ref().map(|t| t.state.as_str()) {
             Some("error") => ThreadStatus::Failed,
+            Some("interrupted") => ThreadStatus::Interrupted,
             Some("completed") => ThreadStatus::Done,
             _ => ThreadStatus::Idle,
         }
@@ -1402,6 +1407,24 @@ mod tests {
         let detail: ThreadDetail = serde_json::from_str(json).unwrap();
         assert_eq!(detail.shell.title, "T");
         assert!(!detail.shell.has_pending_approvals);
+    }
+
+    /// A turn stopped before it finished leaves the thread interrupted, not resting, until
+    /// the next one ends.
+    #[test]
+    fn a_turn_stopped_short_leaves_the_thread_interrupted() {
+        let ended = |state: &str| -> ThreadStatus {
+            serde_json::from_value::<ThreadShell>(serde_json::json!({
+                "id": "t", "projectId": "p", "title": "T",
+                "modelSelection": {"instanceId": "i", "model": "m"},
+                "latestTurn": {"turnId": "turn", "state": state, "requestedAt": "x"},
+            }))
+            .unwrap()
+            .status()
+        };
+        assert_eq!(ended("interrupted"), ThreadStatus::Interrupted);
+        assert_eq!(ended("completed"), ThreadStatus::Done);
+        assert_eq!(ended("error"), ThreadStatus::Failed);
     }
 
     fn shell_with_prs(prs: serde_json::Value) -> ThreadShell {
