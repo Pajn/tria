@@ -612,12 +612,16 @@ The agent runs monitors and background commands that outlive the turn that start
 shows a count. Work the agent delegated to a subagent is not background work and is listed by
 `gA` instead.
 
-`Enter` on a task reads it in place of the conversation: the call that started it, unfolded
-to show its output, and the notes the agent was sent about it since. It is cut out of the
-open thread and cut again whenever the thread moves, so it keeps up while it runs and stays
-readable once it has ended. Output the server leaves out of the thread's stream is read with
-`orchestration.getTurnItem`, again every five seconds while the task runs; `r` reads it at
-once. `q` or `Esc` goes back to the list.
+`Enter` on a task reads it in place of the conversation: the command that started it, drawn
+open, with what it has written so far as its output. A command sent to the background
+answers only with where its output goes, a file named after the task, so that file is what
+is read, with `projects.readFile`, which works against a remote server too. Nothing ties the
+task to the command that launched it but that answer, so the thread's commands are looked
+through, newest first, asking with `orchestration.getTurnItem` for any whose output the
+stream left out; once found, it is remembered for the session. The file is read again every
+five seconds while the task runs, and at once on `r`, and stays readable once it has ended.
+The header says where the file is, and when the launch is older than the loaded history.
+`q` or `Esc` goes back to the list.
 
 A pull request the agent asked the server to watch is listed as a task while the watch lasts.
 The watch has nothing of its own to read, since it is the server polling the host, so `Enter`

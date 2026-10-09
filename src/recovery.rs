@@ -259,7 +259,8 @@ fn content_text(value: &Value) -> String {
     }
 }
 
-fn background_path(text: &str) -> Option<String> {
+/// The file a backgrounded command's acknowledgement says it writes its output to.
+pub(crate) fn background_path(text: &str) -> Option<String> {
     let rest = text.split_once("Output is being written to: ")?.1;
     let end = rest.find(".output")? + ".output".len();
     let path = &rest[..end];

@@ -101,6 +101,13 @@ pub enum Fetch {
         /// `live` for a call still going, else when it last changed.
         revision: String,
     },
+    /// `projects.readFile` of the file a backgrounded command writes its output to, back
+    /// through `on_task_output`.
+    TaskOutput {
+        task_id: String,
+        cwd: String,
+        path: String,
+    },
     /// `pullRequests.detail` and `pullRequests.activity` together, back through
     /// `on_pull_request` and `on_activity`; `fresh` asks `pullRequests.invalidate` first,
     /// past the server's copy of what the host said.
@@ -282,8 +289,9 @@ enum Kind {
         live: bool,
         /// The rows as last cut, to tell when they have moved.
         seen: u64,
-        /// The output the stream left out, as last fetched, and when.
-        output: Option<String>,
+        /// What finding and reading its output has come to.
+        output: TaskOutput,
+        /// When its output was last asked for.
         read_at: Instant,
     },
     PullRequest {
@@ -320,6 +328,9 @@ pub struct Reader<R> {
     /// The subagent thread asked to be followed and not yet heard from: its agent and
     /// its thread.
     child_asked: Option<(String, String)>,
+    /// Backgrounded commands whose launch has been found, by task: the call and the file
+    /// it writes to. Kept for the session, so opening one again does not search again.
+    launches: HashMap<String, Launch>,
 }
 
 impl<R> Default for Reader<R> {
@@ -333,6 +344,7 @@ impl<R> Default for Reader<R> {
             images_asked: HashSet::new(),
             server_refreshes: None,
             child_asked: None,
+            launches: HashMap::new(),
         }
     }
 }
@@ -1130,9 +1142,12 @@ impl<R> Reader<R> {
                 kind: Kind::Task { output, .. },
                 ..
             }) if again => output.clone(),
-            _ => None,
+            _ => TaskOutput {
+                launch: self.launches.get(&task_id).cloned(),
+                ..TaskOutput::default()
+            },
         };
-        let Some(cut) = cut_task(thread.state, &task_id, output.as_deref()) else {
+        let Some(cut) = cut_task(thread.state, &task_id, &output) else {
             return if loud {
                 Step::warn("that task is no longer in this thread")
             } else {
@@ -1166,11 +1181,14 @@ impl<R> Reader<R> {
             restore,
             origin,
         });
-        let fetches = match cut.omitted {
-            // What was fetched before is shown until `r` asks past it.
-            Some(omitted) if fresh || !again => self.fetch_output(thread, &task_id, omitted),
-            _ => Vec::new(),
+        // What was read before is shown until `r` asks past it.
+        let fetches = if fresh || !again {
+            self.read_task(thread)
+        } else {
+            Vec::new()
         };
+        // The header says what asking has come to.
+        let _ = self.recut_task(thread);
         if !loud {
             return Step {
                 fetches,
@@ -1188,95 +1206,50 @@ impl<R> Reader<R> {
     }
 
     /// Keep an open task up to date: cut its rows again whenever the thread has moved
-    /// them, and while it runs, read again every few seconds what the stream leaves out.
+    /// them, and while it runs, read its output again every few seconds.
     fn follow_task(&mut self, thread: &Thread, now: Instant) -> Step {
         let Some(Open {
-            kind:
-                Kind::Task {
-                    task_id,
-                    live,
-                    seen,
-                    output,
-                    read_at,
-                },
-            state,
-            subtitle,
+            kind: Kind::Task {
+                output, read_at, ..
+            },
             ..
         }) = &mut self.open
         else {
             return Step::default();
         };
-        let Some(cut) = cut_task(thread.state, task_id, output.as_deref()) else {
-            return Step::default();
-        };
-        let task_id = task_id.clone();
-        let mut step = Step::default();
-        if cut.seen != *seen {
-            *seen = cut.seen;
-            *live = cut.live;
-            *subtitle = cut.subtitle;
-            self.revision += 1;
-            *state = cut.state;
-            state.revision = self.revision;
-            step.outcome = Outcome::Refreshed;
-        }
         let due = now.saturating_duration_since(*read_at) >= TRANSCRIPT_POLL;
-        if let Some(omitted) = cut.omitted.filter(|_| cut.live && due) {
-            *read_at = now;
-            step.fetches = self.fetch_output(thread, &task_id, omitted);
+        // What is being written is read again: the file, or the task's own call. A search
+        // for the launch is left to finish.
+        let reread = due
+            && output.searching.is_empty()
+            && (output.launch.is_some() || output.text.is_some());
+        let fetches = if reread && self.task_live() {
+            self.read_task(thread)
+        } else {
+            Vec::new()
+        };
+        Step {
+            fetches,
+            ..self.recut_task(thread)
         }
-        step
     }
 
-    /// Ask for the output the stream left out of a task's call, unless it is on its way.
-    fn fetch_output(&mut self, thread: &Thread, task_id: &str, omitted: Omitted) -> Vec<Fetch> {
-        let source = Source::Task(task_id.to_string());
-        if self.asked.contains_key(&source) {
-            return Vec::new();
-        }
-        self.asked.insert(
-            source,
-            Asked {
-                intent: Intent::Quiet,
-                origin: Origin::Chat,
-                again: None,
-            },
-        );
-        vec![Fetch::TurnItem {
-            task_id: task_id.to_string(),
-            thread_id: thread.state.id().to_string(),
-            item_id: omitted.item_id,
-            revision: omitted.revision,
-        }]
+    fn task_live(&self) -> bool {
+        matches!(
+            &self.open,
+            Some(Open {
+                kind: Kind::Task { live: true, .. },
+                ..
+            })
+        )
     }
 
-    /// The call that started a task came back whole, with the output the stream left out.
-    pub fn on_turn_item(
-        &mut self,
-        thread: &Thread,
-        task_id: String,
-        result: Result<Value, String>,
-    ) -> Step {
-        if self.answered(&Source::Task(task_id.clone())).is_none() {
-            return Step::default();
-        }
-        let item = match result {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::info!(%error, "reading a task's output");
-                return Step::default();
-            }
-        };
-        let item = item.get("item").unwrap_or(&item);
-        let text = match item.get("output") {
-            Some(Value::String(text)) => text.clone(),
-            Some(Value::Null) | None => return Step::default(),
-            Some(other) => other.to_string(),
-        };
+    /// Cut the open task's rows again, and say whether that changed anything.
+    fn recut_task(&mut self, thread: &Thread) -> Step {
         let Some(Open {
             kind:
                 Kind::Task {
-                    task_id: open,
+                    task_id,
                     live,
                     seen,
                     output,
@@ -1289,13 +1262,12 @@ impl<R> Reader<R> {
         else {
             return Step::default();
         };
-        if *open != task_id {
-            return Step::default();
-        }
-        let Some(cut) = cut_task(thread.state, &task_id, Some(&text)) else {
+        let Some(cut) = cut_task(thread.state, task_id, output) else {
             return Step::default();
         };
-        *output = Some(text);
+        if cut.seen == *seen && cut.subtitle == *subtitle {
+            return Step::default();
+        }
         *seen = cut.seen;
         *live = cut.live;
         *subtitle = cut.subtitle;
@@ -1303,6 +1275,190 @@ impl<R> Reader<R> {
         *state = cut.state;
         state.revision = self.revision;
         Step::refreshed()
+    }
+
+    /// Ask for what the open task's output needs next. A backgrounded command's call says
+    /// only that it went to the background and which file it writes to, so that file is
+    /// what is read, once the call that launched the task has been found: among the
+    /// commands the thread ran, newest first, asking whole for any whose output the
+    /// stream left out. A call that is the task itself, and launched nothing, has its own
+    /// output read whole when the stream left it out.
+    fn read_task(&mut self, thread: &Thread) -> Vec<Fetch> {
+        let Some(Open {
+            kind:
+                Kind::Task {
+                    task_id,
+                    output,
+                    read_at,
+                    ..
+                },
+            ..
+        }) = &mut self.open
+        else {
+            return Vec::new();
+        };
+        *read_at = Instant::now();
+        let thread_id = thread.state.id().to_string();
+        if let Some(launch) = &output.launch {
+            let Some(cwd) = thread.directory else {
+                output.problem = Some("no directory to read its output from");
+                return Vec::new();
+            };
+            if output.reading {
+                return Vec::new();
+            }
+            output.reading = true;
+            return vec![Fetch::TaskOutput {
+                task_id: task_id.clone(),
+                cwd: cwd.to_string(),
+                path: launch.path.clone(),
+            }];
+        }
+        if !output.searching.is_empty() {
+            return Vec::new();
+        }
+        let calls = command_calls(thread.state);
+        // The task's own call, when the provider named the task after it.
+        if let Some(call) = calls.iter().find(|call| is_task_call(call, task_id)) {
+            if let Some(path) = call_output(call).and_then(|text| launched(text, task_id)) {
+                let launch = Launch {
+                    call_id: call.id.clone(),
+                    path,
+                };
+                self.launches.insert(task_id.clone(), launch.clone());
+                output.launch = Some(launch);
+                return self.read_task(thread);
+            }
+            if omits_output(call) {
+                output.searching.insert(call.id.clone());
+                return vec![turn_item(task_id, &thread_id, call)];
+            }
+            return Vec::new();
+        }
+        for call in &calls {
+            if let Some(path) = call_output(call).and_then(|text| launched(text, task_id)) {
+                let launch = Launch {
+                    call_id: call.id.clone(),
+                    path,
+                };
+                self.launches.insert(task_id.clone(), launch.clone());
+                output.launch = Some(launch);
+                return self.read_task(thread);
+            }
+        }
+        let asked: Vec<Fetch> = calls
+            .iter()
+            .filter(|call| omits_output(call) && !output.searched.contains(&call.id))
+            .take(LAUNCH_SEARCH)
+            .map(|call| {
+                output.searching.insert(call.id.clone());
+                turn_item(task_id, &thread_id, call)
+            })
+            .collect();
+        if asked.is_empty() {
+            output.problem = Some("the command that started it is not in the loaded history");
+        }
+        asked
+    }
+
+    /// A call came back whole, with the output the stream left out: perhaps the launch of
+    /// the task being read, perhaps the task's own call.
+    pub fn on_turn_item(
+        &mut self,
+        thread: &Thread,
+        task_id: String,
+        item_id: String,
+        result: Result<Value, String>,
+    ) -> Step {
+        let Some(Open {
+            kind:
+                Kind::Task {
+                    task_id: open,
+                    output,
+                    ..
+                },
+            ..
+        }) = &mut self.open
+        else {
+            return Step::default();
+        };
+        if *open != task_id || !output.searching.remove(&item_id) {
+            return Step::default();
+        }
+        output.searched.insert(item_id.clone());
+        let text = match result {
+            Ok(value) => {
+                let item = value.get("item").unwrap_or(&value);
+                match item.get("output") {
+                    Some(Value::String(text)) => Some(text.clone()),
+                    Some(Value::Null) | None => None,
+                    Some(other) => Some(other.to_string()),
+                }
+            }
+            Err(error) => {
+                tracing::info!(%error, "reading a call for a task's output");
+                None
+            }
+        };
+        let mut fetches = Vec::new();
+        if let Some(path) = text.as_deref().and_then(|text| launched(text, &task_id)) {
+            let launch = Launch {
+                call_id: item_id,
+                path,
+            };
+            self.launches.insert(task_id.clone(), launch.clone());
+            output.launch = Some(launch);
+            output.searching.clear();
+            fetches = self.read_task(thread);
+        } else if let Some(text) = text.filter(|_| {
+            command_calls(thread.state)
+                .iter()
+                .any(|call| call.id == item_id && is_task_call(call, &task_id))
+        }) {
+            output.text = Some(text);
+        } else if output.searching.is_empty() && output.launch.is_none() && output.text.is_none() {
+            // Every call asked for has come back without it: look further back.
+            fetches = self.read_task(thread);
+        }
+        let step = self.recut_task(thread);
+        Step { fetches, ..step }
+    }
+
+    /// The file a backgrounded command writes to came back, as far as the server reads it.
+    pub fn on_task_output(
+        &mut self,
+        thread: &Thread,
+        task_id: String,
+        result: Result<TranscriptFile, String>,
+    ) -> Step {
+        let Some(Open {
+            kind:
+                Kind::Task {
+                    task_id: open,
+                    output,
+                    ..
+                },
+            ..
+        }) = &mut self.open
+        else {
+            return Step::default();
+        };
+        if *open != task_id {
+            return Step::default();
+        }
+        output.reading = false;
+        match result {
+            Ok(file) => {
+                output.problem = None;
+                output.truncated = file.truncated;
+                output.text = Some(file.contents);
+            }
+            Err(error) => {
+                tracing::info!(%error, "reading a task's output file");
+                output.problem = Some("its output file could not be read");
+            }
+        }
+        self.recut_task(thread)
     }
 
     /// A pull request's detail came back from the host, through the server. `here` is
@@ -1533,11 +1689,80 @@ impl<R> Reader<R> {
     }
 }
 
-/// Output the stream left out of the call that started a task, and how to ask for it.
+/// How many calls are asked for whole at a time, looking for the one that launched a task.
+const LAUNCH_SEARCH: usize = 20;
+
+/// The call that launched a backgrounded command, and the file it writes its output to.
 #[derive(Debug, Clone, PartialEq)]
-struct Omitted {
-    item_id: String,
-    revision: String,
+struct Launch {
+    call_id: String,
+    path: String,
+}
+
+/// What finding and reading a task's output has come to.
+#[derive(Debug, Clone, Default)]
+struct TaskOutput {
+    launch: Option<Launch>,
+    /// What was last read: the file, or the task's own call read whole.
+    text: Option<String>,
+    /// The server stopped reading the file at its limit.
+    truncated: bool,
+    /// A read of the file is on its way.
+    reading: bool,
+    /// Calls asked for whole, and not yet back; and those already looked through.
+    searching: HashSet<String>,
+    searched: HashSet<String>,
+    /// Why there is nothing to show, when there is not.
+    problem: Option<&'static str>,
+}
+
+/// The commands the thread ran, newest first.
+fn command_calls(thread: &ThreadState) -> Vec<&crate::model::Activity> {
+    thread
+        .detail
+        .activities
+        .iter()
+        .rev()
+        .filter(|activity| {
+            activity.str("toolCallId").is_some()
+                && activity.str("itemType") == Some("command_execution")
+        })
+        .collect()
+}
+
+/// Whether the provider named the task after this call.
+fn is_task_call(call: &crate::model::Activity, task_id: &str) -> bool {
+    call.str("nativeId") == Some(task_id) || call.str("toolCallId") == Some(task_id)
+}
+
+fn call_output(call: &crate::model::Activity) -> Option<&str> {
+    call.payload["data"]["rawOutput"]["content"].as_str()
+}
+
+fn omits_output(call: &crate::model::Activity) -> bool {
+    call.payload["outputOmitted"] == Value::Bool(true)
+}
+
+/// Where a call's output says it launched this task to write: a provider's backgrounded
+/// command names the file after the task.
+fn launched(text: &str, task_id: &str) -> Option<String> {
+    let path = crate::recovery::background_path(text)?;
+    let stem = std::path::Path::new(&path).file_stem()?.to_str()?;
+    (stem == task_id).then_some(path)
+}
+
+/// Ask for a call whole, for a task being read.
+fn turn_item(task_id: &str, thread_id: &str, call: &crate::model::Activity) -> Fetch {
+    Fetch::TurnItem {
+        task_id: task_id.to_string(),
+        thread_id: thread_id.to_string(),
+        item_id: call.id.clone(),
+        revision: if call.kind == "tool.completed" {
+            call.str("updatedAt").unwrap_or_default().to_string()
+        } else {
+            "live".to_string()
+        },
+    }
 }
 
 /// A background task's rows, cut out of the thread they are in.
@@ -1548,69 +1773,88 @@ struct Cut {
     live: bool,
     /// The rows as they stand, to tell when they have moved.
     seen: u64,
-    omitted: Option<Omitted>,
 }
 
-/// Cut a background task's rows out of the thread: the call that started it, which the
-/// task is named after, and the news it has sent back about it since. `output` is what
-/// was fetched of the call's output when the stream left it out.
-fn cut_task(thread: &ThreadState, task_id: &str, output: Option<&str>) -> Option<Cut> {
+/// Cut a background task's rows out of the thread: the call that started it, showing
+/// what has been read of its output, and the news it has sent back about it since. A
+/// task still listed is cut before its call is found, with nothing to show yet.
+fn cut_task(thread: &ThreadState, task_id: &str, output: &TaskOutput) -> Option<Cut> {
     let activities = &thread.detail.activities;
-    let mut call = activities
+    let launch = output.launch.as_ref().map(|launch| launch.call_id.as_str());
+    let call = activities
         .iter()
         .rfind(|activity| {
             activity.str("toolCallId").is_some()
-                && (activity.str("nativeId") == Some(task_id)
-                    || activity.str("toolCallId") == Some(task_id))
-        })?
-        .clone();
+                && (is_task_call(activity, task_id) || Some(activity.id.as_str()) == launch)
+        })
+        .cloned();
     let listed = thread
         .detail
         .shell
         .background_tasks
         .iter()
         .find(|task| task.task_id == task_id);
-    let live = listed.is_some();
-    let omitted = (call.payload["outputOmitted"] == Value::Bool(true)).then(|| Omitted {
-        item_id: call.id.clone(),
-        revision: if call.kind == "tool.completed" {
-            call.str("updatedAt").unwrap_or_default().to_string()
-        } else {
-            "live".to_string()
-        },
-    });
-    if let Some(text) = output.filter(|_| omitted.is_some()) {
-        let place = if call.str("itemType") == Some("command_execution") {
-            "rawOutput"
-        } else {
-            "result"
-        };
-        call.payload["data"][place] = json!({ "content": text });
+    if call.is_none() && listed.is_none() {
+        return None;
     }
-    let news: Vec<crate::model::Activity> = activities
-        .iter()
-        .filter(|activity| activity.str("parentItemId") == Some(call.id.as_str()))
-        .cloned()
-        .collect();
+    let live = listed.is_some();
+    let mut rows = Vec::new();
+    if let Some(mut call) = call.clone() {
+        if let Some(text) = &output.text {
+            let place = if call.str("itemType") == Some("command_execution") {
+                "rawOutput"
+            } else {
+                "result"
+            };
+            call.payload["data"][place] = json!({ "content": text });
+        }
+        let news = activities
+            .iter()
+            .filter(|activity| activity.str("parentItemId") == Some(call.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.push(call);
+        rows.extend(news);
+    }
     let title = listed
         .and_then(|task| task.description.clone())
-        .or_else(|| call.str("detail").map(str::to_string))
-        .or_else(|| call.str("title").map(str::to_string))
+        .or_else(|| call.as_ref()?.str("detail").map(str::to_string))
+        .or_else(|| call.as_ref()?.str("title").map(str::to_string))
         .unwrap_or_else(|| "background task".to_string());
     let kind = match listed.map(|task| task.kind.as_str()) {
         Some("monitor") => "monitor",
         Some("command") => "command",
         Some(_) => "background task",
-        None if call.str("itemType") == Some("command_execution") => "command",
+        None if call.as_ref().and_then(|call| call.str("itemType"))
+            == Some("command_execution") =>
+        {
+            "command"
+        }
         None => "background task",
     };
-    let subtitle = if live {
+    let mut subtitle = if live {
         format!("{kind} · running")
     } else {
-        format!("{kind} · {}", call.str("status").unwrap_or("ended"))
+        let ended = call.as_ref().and_then(|call| call.str("status"));
+        format!("{kind} · {}", ended.unwrap_or("ended"))
     };
-    let mut rows = vec![call];
-    rows.extend(news);
+    if let Some(launch) = &output.launch {
+        subtitle.push_str(&format!(" · {}", launch.path));
+    }
+    if output.truncated {
+        subtitle.push_str(" · cut at 1 MB");
+    }
+    if let Some(problem) = output.problem {
+        subtitle.push_str(&format!(" · {problem}"));
+    } else if output.text.is_none() && (!output.searching.is_empty() || output.reading) {
+        subtitle.push_str(" · finding its output…");
+    } else if output
+        .text
+        .as_deref()
+        .is_some_and(|text| text.trim().is_empty())
+    {
+        subtitle.push_str(" · no output yet");
+    }
     let seen = {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1640,7 +1884,6 @@ fn cut_task(thread: &ThreadState, task_id: &str, output: Option<&str>) -> Option
         subtitle,
         live,
         seen,
-        omitted,
     })
 }
 
@@ -2134,6 +2377,124 @@ pub(crate) mod tests {
         );
     }
 
+    /// A thread whose command `sleep 60` went to the background as task `b6`. Its call,
+    /// `launch`, is named after the call rather than the task and its output was left out
+    /// of the stream, as was that of an earlier, unrelated command.
+    fn thread_with_a_backgrounded_command() -> ThreadState {
+        let call = |id: &str, command: &str, at: &str| {
+            json!({"id": id, "kind": "tool.completed", "tone": "tool", "summary": "Ran command",
+                "createdAt": at, "payload": {"itemType": "command_execution", "toolCallId": id,
+                "nativeId": format!("toolu_{id}"), "outputOmitted": true, "status": "completed",
+                "updatedAt": at, "title": "Ran command", "detail": command,
+                "data": {"command": command, "rawOutput": {"content": null}}}})
+        };
+        let mut thread = thread(
+            vec![
+                call("earlier", "cargo test", "2026-01-01T00:00:00Z"),
+                call("launch", "sleep 60", "2026-01-01T00:00:01Z"),
+            ],
+            json!({"status": "ready"}),
+            json!([]),
+        );
+        thread.detail.shell.worktree_path = Some("/tmp".into());
+        thread.detail.shell.background_tasks = serde_json::from_value(json!([
+            {"taskId": "b6", "description": "Wait a minute", "kind": "command"},
+        ]))
+        .unwrap();
+        thread
+    }
+
+    /// A backgrounded command's call says only where its output goes, so the call that
+    /// launched it is looked for among the commands, asked for whole where the stream left
+    /// its output out, and the file it names is what is read: kept up with while the
+    /// command runs, and found again at once the next time it is opened.
+    #[test]
+    fn a_backgrounded_commands_output_file_is_found_and_read() {
+        let thread = thread_with_a_backgrounded_command();
+        let mut reader: Reader<&str> = Reader::default();
+        let step = reader.open_task(&lent(&thread), "b6", Origin::Tasks, CONVERSATION);
+        assert_eq!(step.outcome, opened(Place::Top, true));
+        let asked: Vec<&str> = step
+            .fetches
+            .iter()
+            .filter_map(|fetch| match fetch {
+                Fetch::TurnItem { item_id, .. } => Some(item_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked, ["launch", "earlier"], "newest first");
+        assert!(rows_read(&reader).is_empty(), "nothing to show yet");
+        assert_eq!(
+            reader.header().unwrap().subtitle,
+            "command · running · finding its output…"
+        );
+
+        let unrelated = reader.on_turn_item(
+            &lent(&thread),
+            "b6".into(),
+            "earlier".into(),
+            Ok(json!({"item": {"output": "test result: ok"}})),
+        );
+        assert!(unrelated.fetches.is_empty());
+        let path = "/tmp/claude/tasks/b6.output";
+        let ack = format!(
+            "Command running in background with ID: b6. Output is being written to: {path}. You will be notified."
+        );
+        let found = reader.on_turn_item(
+            &lent(&thread),
+            "b6".into(),
+            "launch".into(),
+            Ok(json!({"item": {"output": ack}})),
+        );
+        let read = Fetch::TaskOutput {
+            task_id: "b6".into(),
+            cwd: "/tmp".into(),
+            path: path.into(),
+        };
+        assert_eq!(found.fetches, vec![read.clone()]);
+        assert_eq!(rows_read(&reader), ["launch"]);
+
+        let file = |contents: &str| {
+            Ok(TranscriptFile {
+                contents: contents.into(),
+                truncated: false,
+            })
+        };
+        let step = reader.on_task_output(&lent(&thread), "b6".into(), file("waiting"));
+        assert_eq!(step.outcome, Outcome::Refreshed);
+        assert_eq!(output_read(&reader).as_deref(), Some("waiting"));
+        assert_eq!(
+            reader.header().unwrap().subtitle,
+            format!("command · running · {path}")
+        );
+
+        let soon = reader.tick(&lent(&thread), Instant::now());
+        assert!(soon.fetches.is_empty(), "read a moment ago");
+        let later = reader.tick(&lent(&thread), Instant::now() + TRANSCRIPT_POLL);
+        assert_eq!(later.fetches, vec![read.clone()]);
+        let _ = reader.on_task_output(&lent(&thread), "b6".into(), file("waiting\ndone"));
+        assert_eq!(output_read(&reader).as_deref(), Some("waiting\ndone"));
+
+        let _ = reader.close();
+        let again = reader.open_task(&lent(&thread), "b6", Origin::Tasks, CONVERSATION);
+        assert_eq!(again.fetches, vec![read], "found once is found");
+    }
+
+    /// With no command in the loaded history naming its file, the reading says so rather
+    /// than looking forever.
+    #[test]
+    fn a_backgrounded_command_with_no_launch_in_sight_says_so() {
+        let mut thread = thread_with_a_backgrounded_command();
+        thread.detail.activities.clear();
+        let mut reader: Reader<&str> = Reader::default();
+        let step = reader.open_task(&lent(&thread), "b6", Origin::Tasks, CONVERSATION);
+        assert!(step.fetches.is_empty());
+        assert_eq!(
+            reader.header().unwrap().subtitle,
+            "command · running · the command that started it is not in the loaded history"
+        );
+    }
+
     /// A pull request the agent has watched lists its watch as a task, which reads the pull
     /// request: the watch has nothing of its own in the thread, and the pull request is
     /// what it waits on. `q` still goes back to the task list.
@@ -2193,6 +2554,7 @@ pub(crate) mod tests {
         let step = reader.on_turn_item(
             &lent(&thread),
             "bg1".into(),
+            "item-1".into(),
             Ok(json!({"item": {"id": "item-1", "output": "all of it"}})),
         );
         assert_eq!(step.outcome, Outcome::Refreshed);
@@ -2207,7 +2569,12 @@ pub(crate) mod tests {
         );
         let later = reader.tick(&lent(&thread), Instant::now() + TRANSCRIPT_POLL);
         assert_eq!(later.fetches, vec![asked.clone()]);
-        let _ = reader.on_turn_item(&lent(&thread), "bg1".into(), Err("gone".into()));
+        let _ = reader.on_turn_item(
+            &lent(&thread),
+            "bg1".into(),
+            "item-1".into(),
+            Err("gone".into()),
+        );
 
         let step = reader.reread(&lent(&thread), Source::Task("bg1".into()), Origin::Chat);
         assert_eq!(step.fetches, vec![asked]);

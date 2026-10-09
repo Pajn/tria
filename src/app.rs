@@ -537,7 +537,13 @@ pub enum AppEvent {
     /// left out.
     TurnItem {
         task_id: String,
+        item_id: String,
         result: Result<Value, String>,
+    },
+    /// The file a backgrounded command writes its output to, as far as the server read it.
+    TaskOutput {
+        task_id: String,
+        result: Result<TranscriptFile, String>,
     },
     /// A subagent's transcript came back from the machine that ran it.
     Transcript {
@@ -3949,7 +3955,17 @@ impl App {
                         .call("orchestration.getTurnItem", payload)
                         .await
                         .map_err(|e| e.to_string());
-                    let _ = events.send(AppEvent::TurnItem { task_id, result });
+                    let _ = events.send(AppEvent::TurnItem {
+                        task_id,
+                        item_id,
+                        result,
+                    });
+                });
+            }
+            reader::Fetch::TaskOutput { task_id, cwd, path } => {
+                tokio::spawn(async move {
+                    let result = read_file(&handle, &cwd, &path).await;
+                    let _ = events.send(AppEvent::TaskOutput { task_id, result });
                 });
             }
             reader::Fetch::Transcript {
@@ -3957,23 +3973,8 @@ impl App {
                 cwd,
                 path,
             } => {
-                let payload = json!({ "cwd": cwd, "relativePath": path });
                 tokio::spawn(async move {
-                    let result = handle
-                        .call("projects.readFile", payload)
-                        .await
-                        .map_err(|e| e.to_string())
-                        .map(|value| TranscriptFile {
-                            contents: value
-                                .get("contents")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            truncated: value
-                                .get("truncated")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                        });
+                    let result = read_file(&handle, &cwd, &path).await;
                     let _ = events.send(AppEvent::Transcript { agent_id, result });
                 });
             }
@@ -4045,8 +4046,12 @@ impl App {
         });
     }
 
-    fn on_turn_item(&mut self, task_id: String, result: Result<Value, String>) {
-        self.read_with(|reader, thread| reader.on_turn_item(thread, task_id, result));
+    fn on_turn_item(&mut self, task_id: String, item_id: String, result: Result<Value, String>) {
+        self.read_with(|reader, thread| reader.on_turn_item(thread, task_id, item_id, result));
+    }
+
+    fn on_task_output(&mut self, task_id: String, result: Result<TranscriptFile, String>) {
+        self.read_with(|reader, thread| reader.on_task_output(thread, task_id, result));
     }
 
     fn on_child(&mut self, thread_id: String, item: ThreadItem) {
@@ -7702,6 +7707,28 @@ pub enum SidebarRow {
 pub const POPUP_ROW_LINES: usize = 3;
 
 /// The rows of one of those lists, by what each one is.
+/// A file the provider wrote outside any workspace, read through the server with
+/// `projects.readFile`, which takes an absolute path for exactly this. The server stops
+/// reading at a megabyte.
+async fn read_file(handle: &Handle, cwd: &str, path: &str) -> Result<TranscriptFile, String> {
+    let payload = json!({ "cwd": cwd, "relativePath": path });
+    handle
+        .call("projects.readFile", payload)
+        .await
+        .map_err(|e| e.to_string())
+        .map(|value| TranscriptFile {
+            contents: value
+                .get("contents")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            truncated: value
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+}
+
 fn popup_rows(keys: impl Iterator<Item = String>) -> Vec<Row<String>> {
     keys.map(|key| Row {
         key,
@@ -7994,7 +8021,12 @@ fn apply(app: &mut App, event: AppEvent) {
             recovered,
         } => app.on_tool_recovery(request, thread_id, recovered),
         AppEvent::Transcript { agent_id, result } => app.on_transcript(agent_id, result),
-        AppEvent::TurnItem { task_id, result } => app.on_turn_item(task_id, result),
+        AppEvent::TurnItem {
+            task_id,
+            item_id,
+            result,
+        } => app.on_turn_item(task_id, item_id, result),
+        AppEvent::TaskOutput { task_id, result } => app.on_task_output(task_id, result),
         AppEvent::PullRequest { url, result } => app.on_pull_request(url, result),
         AppEvent::AttachmentImage {
             thread_id,
