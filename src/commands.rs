@@ -51,10 +51,13 @@ pub struct Worktree<'a> {
 
 /// The branch a thread's worktree gets. The server names the worktree's directory after
 /// it, so it is the thread rather than the message: a name made of whatever was typed
-/// is a ref made of whatever was typed, and a message is not a ref.
+/// is a ref made of whatever was typed, and a message is not a ref. It takes the form
+/// the server treats as a placeholder, `t3/` and eight hex digits, which a thread ID
+/// starts with: after the first turn the server renames such a branch to one generated
+/// from the message, under its configured branch name prefix.
 pub fn worktree_branch(thread_id: &str) -> String {
     let short: String = thread_id.chars().take(8).collect();
-    format!("tria/{short}")
+    format!("t3/{short}")
 }
 
 /// Send a message on an existing thread. The server decides what it does with it: starts
@@ -421,10 +424,10 @@ mod tests {
     fn a_worktree_branch_is_named_after_its_thread() {
         assert_eq!(
             worktree_branch("1f3f5b4d-9421-4c40-81d4-fa96b4179d7e"),
-            "tria/1f3f5b4d"
+            "t3/1f3f5b4d"
         );
         // Whatever it is given, the result is a name git will take.
-        assert_eq!(worktree_branch(""), "tria/");
+        assert_eq!(worktree_branch(""), "t3/");
     }
 
     #[test]

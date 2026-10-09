@@ -234,6 +234,11 @@ branch? }`, or `{ type: "worktree", baseRef, branch?, startFromOrigin? }`, for w
 creates the worktree and sets the thread's branch and path. It carries no plan reference, so a
 plan built in a thread of its own is not marked as built.
 
+A worktree branch of the form `t3/` and eight hex digits is a placeholder: after the first turn
+the server generates a name from the first message, renames the branch, and sends the new one in
+`thread.meta.update`. The generated name takes the server's `branchNamePrefix` setting (`t3` by
+default). Only the branch is renamed; the worktree directory keeps the placeholder name.
+
 Where a new thread runs by default is `defaultThreadEnvMode`, `worktree` or `local`: on the
 project when set, otherwise the server setting, whose own default is `local`.
 
