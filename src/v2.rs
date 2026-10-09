@@ -350,6 +350,38 @@ pub struct Plan {
     pub status: String,
 }
 
+/// A subagent as the server keeps it, beside the item that shows it in the thread. Only
+/// what the item does not carry is read: the model it runs on, which the server takes
+/// from the subagent's first reply.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Subagent {
+    id: String,
+    #[serde(default)]
+    child_thread_id: Option<String>,
+    #[serde(default)]
+    native_task_ref: Option<NativeRef>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeRef {
+    native_id: String,
+}
+
+impl Subagent {
+    /// Whether this is the subagent a thread's `subagent` item shows.
+    fn shows(&self, item: &TurnItem) -> bool {
+        let child = item.str("childThreadId");
+        let native = item.str("subagentId");
+        (child.is_some() && self.child_thread_id.as_deref() == child)
+            || (native.is_some()
+                && self.native_task_ref.as_ref().map(|r| r.native_id.as_str()) == native)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderSession {
     pub id: String,
@@ -447,6 +479,8 @@ pub struct Projection {
     pub attempts: Vec<Attempt>,
     #[serde(default)]
     pub provider_sessions: Vec<ProviderSession>,
+    #[serde(default)]
+    pub subagents: Vec<Subagent>,
     #[serde(default)]
     pub runtime_requests: Vec<RuntimeRequest>,
     #[serde(default)]
@@ -683,6 +717,12 @@ impl Projection {
                     return false;
                 };
                 self.upsert_item(item);
+            }
+            "subagent.updated" => {
+                let Some(subagent) = read::<Subagent>(payload) else {
+                    return false;
+                };
+                upsert(&mut self.subagents, subagent, |subagent| &subagent.id);
             }
             _ => return false,
         }
@@ -943,6 +983,11 @@ impl Projection {
                     "description": prompt,
                     "summary": item.str("result").or(item.str("progress")),
                     "childThreadId": item.str("childThreadId"),
+                    "model": self
+                        .subagents
+                        .iter()
+                        .find(|subagent| subagent.shows(item))
+                        .and_then(|subagent| subagent.model.as_deref()),
                 });
                 if done {
                     payload["status"] = json!(tool_status(&item.status));
@@ -1453,6 +1498,71 @@ mod tests {
         let agents = crate::state::ThreadState::from_snapshot(snapshot).subagents();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].child_thread_id.as_deref(), Some("child"));
+    }
+
+    /// A subagent runs on the model its first reply names, which the server keeps on
+    /// its record of the subagent rather than on the item that shows it: there from the
+    /// snapshot, and moved by the record's updates.
+    #[test]
+    fn a_subagent_runs_on_the_model_its_record_says() {
+        let rows = vec![
+            row(item(
+                "s1",
+                1,
+                "subagent",
+                json!({ "subagentId": "a1", "origin": "provider_native", "driver": "claude",
+                    "providerInstanceId": "claude", "childThreadId": "child-1",
+                    "prompt": "Look into it", "result": null, "status": "running" }),
+            )),
+            row(item(
+                "s2",
+                2,
+                "subagent",
+                json!({ "subagentId": "a2", "origin": "provider_native", "driver": "claude",
+                    "providerInstanceId": "claude", "childThreadId": null,
+                    "prompt": "And this", "result": null, "status": "running" }),
+            )),
+        ];
+        let mut value = snapshot_item(rows, vec![run("running")]);
+        value["projection"]["subagents"] = json!([
+            { "id": "node-1", "childThreadId": "child-1", "model": "claude-haiku-4-5",
+              "nativeTaskRef": { "driver": "claude", "nativeId": "a1", "strength": "strong" } },
+        ]);
+        let ThreadItem::Snapshot { snapshot } = thread_item(value, None).unwrap() else {
+            panic!("not a snapshot");
+        };
+        let models = |detail: ThreadDetail| -> Vec<Option<String>> {
+            let state = crate::state::ThreadState::from_snapshot(ThreadDetailSnapshot {
+                snapshot_sequence: 0,
+                thread: detail,
+                page: None,
+                projection: None,
+            });
+            state
+                .subagents()
+                .into_iter()
+                .map(|agent| agent.model)
+                .collect()
+        };
+        let shell = snapshot.thread.shell.clone();
+        assert_eq!(
+            models(snapshot.thread),
+            [Some("claude-haiku-4-5".to_string()), None]
+        );
+
+        let mut projection = *snapshot.projection.unwrap();
+        assert!(projection.apply(
+            "subagent.updated",
+            json!({ "id": "node-2", "childThreadId": null, "model": "claude-sonnet-5-5",
+                "nativeTaskRef": { "driver": "claude", "nativeId": "a2", "strength": "strong" } }),
+        ));
+        assert_eq!(
+            models(projection.detail(&shell)),
+            [
+                Some("claude-haiku-4-5".to_string()),
+                Some("claude-sonnet-5-5".to_string())
+            ]
+        );
     }
 
     #[test]
