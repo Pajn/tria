@@ -159,6 +159,10 @@ pub struct ThreadShell {
     pub updated_at: String,
     #[serde(default)]
     pub archived_at: Option<String>,
+    /// A subagent the provider ran for another thread, which the server keeps as a thread
+    /// of its own. It is read through its parent, not listed beside it.
+    #[serde(default)]
+    pub subagent: bool,
     #[serde(default)]
     pub pinned_at: Option<String>,
     #[serde(default)]

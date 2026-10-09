@@ -7160,7 +7160,10 @@ impl App {
                             self.release_queued(thread);
                         }
                     }
-                    ShellItem::ThreadUpserted { thread, .. } => self.note_thread(thread),
+                    // A subagent's progress is its parent's, and is told through it.
+                    ShellItem::ThreadUpserted { thread, .. } if !thread.subagent => {
+                        self.note_thread(thread)
+                    }
                     ShellItem::ThreadRemoved { thread_id, .. } => {
                         // What was being written for it has nowhere to go.
                         dropped = self.outbox.on_removed(thread_id);

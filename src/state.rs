@@ -36,7 +36,7 @@ impl Shell {
                 self.threads = snapshot
                     .threads
                     .into_iter()
-                    .filter(|t| t.archived_at.is_none())
+                    .filter(|t| t.archived_at.is_none() && !t.subagent)
                     .map(|t| (t.id.clone(), t))
                     .collect();
                 self.last_sequence = Some(snapshot.snapshot_sequence);
@@ -57,7 +57,7 @@ impl Shell {
             }
             ShellItem::ThreadUpserted { sequence, thread } => {
                 if self.advance(sequence) {
-                    if thread.archived_at.is_some() {
+                    if thread.archived_at.is_some() || thread.subagent {
                         self.threads.remove(&thread.id);
                     } else {
                         self.threads.insert(thread.id.clone(), thread);
@@ -824,6 +824,35 @@ impl ThreadState {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A subagent the server keeps as a thread of its own is not listed beside its
+    /// parent, whether it arrives in a snapshot or on its own.
+    #[test]
+    fn subagent_threads_are_not_listed() {
+        let thread = |id: &str, subagent: bool| -> ThreadShell {
+            let mut thread: ThreadShell = serde_json::from_value(json!({
+                "id": id, "projectId": "p1", "title": id,
+                "modelSelection": {"instanceId": "claudeAgent", "model": "m"},
+            }))
+            .unwrap();
+            thread.subagent = subagent;
+            thread
+        };
+        let mut shell = Shell::default();
+        shell.apply(ShellItem::Snapshot {
+            snapshot: crate::model::ShellSnapshot {
+                snapshot_sequence: 1,
+                projects: vec![],
+                threads: vec![thread("parent", false), thread("child", true)],
+            },
+        });
+        shell.apply(ShellItem::ThreadUpserted {
+            sequence: 2,
+            thread: thread("later", true),
+        });
+        let listed: Vec<&str> = shell.threads.keys().map(String::as_str).collect();
+        assert_eq!(listed, ["parent"]);
+    }
 
     fn thread() -> ThreadState {
         let snapshot: ThreadDetailSnapshot = serde_json::from_value(json!({

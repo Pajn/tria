@@ -74,6 +74,8 @@ struct ShellThread {
     #[serde(default)]
     archived_at: Option<String>,
     #[serde(default)]
+    lineage: Option<Lineage>,
+    #[serde(default)]
     settled_override: Option<String>,
     #[serde(default)]
     settled_at: Option<String>,
@@ -85,6 +87,14 @@ struct ShellThread {
     pinned_at: Option<String>,
     #[serde(default)]
     pin_order_key: Option<String>,
+}
+
+/// Where a thread came from: forked off another, or run by another's provider as a subagent.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Lineage {
+    #[serde(default)]
+    relationship_to_parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -178,6 +188,10 @@ impl From<ShellThread> for ThreadShell {
             created_at: thread.created_at,
             updated_at: thread.updated_at,
             archived_at: thread.archived_at,
+            subagent: thread
+                .lineage
+                .and_then(|lineage| lineage.relationship_to_parent)
+                .is_some_and(|relationship| relationship == "subagent"),
             pinned_at: thread.pinned_at,
             pin_order_key: thread.pin_order_key,
             settled_at: thread.settled_at,
@@ -1379,6 +1393,26 @@ mod tests {
         };
         assert_eq!(snapshot.threads.len(), 2);
         assert!(snapshot.threads[1].archived_at.is_some());
+    }
+
+    #[test]
+    fn a_subagent_thread_is_marked_and_a_fork_is_not() {
+        let thread = |relationship: &str| -> ThreadShell {
+            let item = shell_item(json!({
+                "kind": "thread.updated", "sequence": 1,
+                "thread": shell_thread(json!({ "lineage": {
+                    "rootThreadId": "root", "parentThreadId": "root",
+                    "relationshipToParent": relationship,
+                } })),
+            }))
+            .unwrap();
+            let ShellItem::ThreadUpserted { thread, .. } = item else {
+                panic!("not a thread update");
+            };
+            thread
+        };
+        assert!(thread("subagent").subagent);
+        assert!(!thread("fork").subagent);
     }
 
     #[test]
