@@ -58,6 +58,13 @@ pub enum ProjectIcon {
         #[serde(default, rename = "monogramText", alias = "monogram")]
         monogram: Option<String>,
     },
+    /// A letter badge, as servers speaking protocol 2 send it; older ones sent it as a
+    /// drawn icon carrying the letters.
+    Monogram {
+        text: String,
+        #[serde(default)]
+        color: Option<String>,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -78,7 +85,12 @@ impl Project {
                 monogram: Some(text),
                 color,
                 ..
-            }) if !text.is_empty() => Some((text, color.as_deref())),
+            })
+            | Some(ProjectIcon::Monogram { text, color })
+                if !text.is_empty() =>
+            {
+                Some((text, color.as_deref()))
+            }
             _ => None,
         }
     }
@@ -1422,6 +1434,25 @@ mod tests {
         let detail: ThreadDetail = serde_json::from_str(json).unwrap();
         assert_eq!(detail.shell.title, "T");
         assert!(!detail.shell.has_pending_approvals);
+    }
+
+    /// A letter badge reads the same whichever way the server sends it: as protocol 2's
+    /// own kind, or as the drawn icon carrying the letters that older servers sent.
+    #[test]
+    fn a_letter_badge_reads_in_either_form() {
+        let project = |icon: serde_json::Value| -> Project {
+            serde_json::from_value(serde_json::json!({
+                "id": "p", "title": "main", "workspaceRoot": "/src/main", "projectIcon": icon,
+            }))
+            .unwrap()
+        };
+        let current =
+            project(serde_json::json!({"kind": "monogram", "text": "JS", "color": "yellow"}));
+        assert_eq!(current.monogram(), Some(("JS", Some("yellow"))));
+        assert!(current.lucide().is_none());
+        let older = project(serde_json::json!({"kind": "lucide", "name": "folder-code",
+            "color": "yellow", "monogramText": "JS"}));
+        assert_eq!(older.monogram(), Some(("JS", Some("yellow"))));
     }
 
     /// A turn stopped before it finished leaves the thread interrupted, not resting, until
