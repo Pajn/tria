@@ -141,7 +141,7 @@ Press `?` inside the app for the full list.
 | `gI` | copy the open thread's ID; in the thread list, the selected thread's ID (OSC 52) |
 | `gY` | chat focused: copy the link destination under the cursor, or the first link on its line (OSC 52) |
 | `gs` | toggle the thread between settled and active; in the thread list, the selected row |
-| `gT` | list the agent's background tasks that are still running; `s` stops them, `S` the session, after asking |
+| `gT` | list the agent's background tasks that are still running; `Enter` reads one, `s` stops them, `S` the session, after asking |
 | `gA` | list the subagents the thread has run; `Enter` reads one's work as it goes (`r` re-reads a transcript file), `y` yanks its report |
 | `gS` | list the thread's terminals; attach to one, or close, restart, open a new one |
 | `gW` | list the worktrees threads are holding; remove the ones that are done with |
@@ -611,6 +611,13 @@ The agent runs monitors and background commands that outlive the turn that start
 `gT` or `:tasks` lists the ones still running, as the server keeps them, and the status bar
 shows a count. Work the agent delegated to a subagent is not background work and is listed by
 `gA` instead.
+
+`Enter` on a task reads it in place of the conversation: the call that started it, unfolded
+to show its output, and the notes the agent was sent about it since. It is cut out of the
+open thread and cut again whenever the thread moves, so it keeps up while it runs and stays
+readable once it has ended. Output the server leaves out of the thread's stream is read with
+`orchestration.getTurnItem`, again every five seconds while the task runs; `r` reads it at
+once. `q` or `Esc` goes back to the list.
 
 There is no per-task stop in the protocol. What stops a watcher is an interrupt of the turn
 that left it running — `Ctrl-c`, `:stop`, or `s` in the list, which is what the desktop

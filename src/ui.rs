@@ -2883,8 +2883,13 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     let width = 76.min(area.width) as usize;
-    for task in &tasks {
+    let selected = app.task_cursor.selection(&app.task_rows());
+    for (index, task) in tasks.iter().enumerate() {
         let elapsed = elapsed_label(&task.started_at, &now);
+        let mut title_style = Style::default().add_modifier(Modifier::BOLD);
+        if selected == Some(index) {
+            title_style = title_style.add_modifier(Modifier::REVERSED);
+        }
         let mut tags: Vec<&str> = Vec::new();
         if task.agent_kind == "background" {
             tags.push("background");
@@ -2897,7 +2902,11 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
         }
         lines.push(Line::from(vec![
             Span::styled(
-                format!(" {} ", app.spinner_frame()),
+                format!(
+                    "{}{} ",
+                    if selected == Some(index) { "▸" } else { " " },
+                    app.spinner_frame()
+                ),
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled(
@@ -2905,7 +2914,7 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
                     &task.title,
                     width.saturating_sub(elapsed.chars().count() + 6),
                 ),
-                Style::default().add_modifier(Modifier::BOLD),
+                title_style,
             ),
             Span::styled(format!("  {elapsed}"), Style::default().fg(Color::DarkGray)),
         ]));
@@ -2932,7 +2941,11 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::from(Span::styled(
-            "  Esc to close",
+            if tasks.is_empty() {
+                "  Esc to close"
+            } else {
+                "  Enter reads what it has said · Esc to close"
+            },
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -3200,6 +3213,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(programs.clone()),
         Line::from("  g!                      a shell in the pane; exiting it closes the popup"),
         Line::from("  gT                      background tasks still running in this thread:"),
+        Line::from("                          Enter reads what one has said and keeps up with it,"),
         Line::from("                          s stops it as Ctrl-c does, S stops the session"),
         Line::from("                          after asking, since nothing undoes that one"),
         Line::from("  gA                      subagents this thread has run: Enter reads one's"),

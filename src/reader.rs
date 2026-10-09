@@ -1,6 +1,7 @@
 //! The reader: something read in place of the thread's conversation, from being asked for
-//! to being put away. It is either a subagent's work or one of the thread's pull requests,
-//! and the conversation is kept underneath it and put back on the way out. A subagent's
+//! to being put away. It is a subagent's work, one of the thread's pull requests, or a
+//! background task's own rows, and the conversation is kept underneath it and put
+//! back on the way out. A subagent's
 //! work is the thread the server keeps of it, followed live, or for one from before the
 //! server kept those, its transcript file.
 //!
@@ -23,7 +24,7 @@ use std::{
 use serde_json::{Value, json};
 
 use crate::{
-    model::{PullRequestRef, ThreadItem},
+    model::{PullRequestRef, ThreadDetail, ThreadDetailSnapshot, ThreadItem},
     pull_request::{self, Activity, Detail},
     state::ThreadState,
     subagent::Subagent,
@@ -47,6 +48,8 @@ pub struct TranscriptFile {
 pub enum Source {
     Subagent(String),
     PullRequest(String),
+    /// A background task, by the id the server lists it under.
+    Task(String),
 }
 
 /// Where a loud read was asked from, which decides where the keys go once it opens, and
@@ -59,6 +62,8 @@ pub enum Origin {
     Sidebar,
     /// The subagent roster, which `q` goes back to.
     Roster,
+    /// The background task list, which `q` goes back to.
+    Tasks,
 }
 
 /// The open thread, lent to the reader for one call. Everything the reader knows of the
@@ -87,6 +92,15 @@ pub enum Fetch {
     /// Follow a subagent's thread, whose items come back through `on_child`. Following
     /// stops when the reader no longer wants it, which `following` says.
     Follow { thread_id: String },
+    /// `orchestration.getTurnItem`, for the output of the call that started a task when
+    /// the stream left it out, back through `on_turn_item`.
+    TurnItem {
+        task_id: String,
+        thread_id: String,
+        item_id: String,
+        /// `live` for a call still going, else when it last changed.
+        revision: String,
+    },
     /// `pullRequests.detail` and `pullRequests.activity` together, back through
     /// `on_pull_request` and `on_activity`; `fresh` asks `pullRequests.invalidate` first,
     /// past the server's copy of what the host said.
@@ -262,6 +276,16 @@ enum Kind {
         thread_id: String,
         live: bool,
     },
+    /// A background task's rows, cut out of the open thread and cut again as it moves.
+    Task {
+        task_id: String,
+        live: bool,
+        /// The rows as last cut, to tell when they have moved.
+        seen: u64,
+        /// The output the stream left out, as last fetched, and when.
+        output: Option<String>,
+        read_at: Instant,
+    },
     PullRequest {
         detail: Box<Detail>,
         /// Its link as the thread list last had it, to notice the server's sync bringing
@@ -327,6 +351,7 @@ impl<R> Reader<R> {
                 Source::Subagent(agent_id.clone())
             }
             Kind::PullRequest { detail, .. } => Source::PullRequest(detail.url.clone()),
+            Kind::Task { task_id, .. } => Source::Task(task_id.clone()),
         })
     }
 
@@ -339,7 +364,7 @@ impl<R> Reader<R> {
     pub fn agent_id(&self) -> Option<&str> {
         match &self.open.as_ref()?.kind {
             Kind::Transcript { agent_id, .. } | Kind::Child { agent_id, .. } => Some(agent_id),
-            Kind::PullRequest { .. } => None,
+            Kind::PullRequest { .. } | Kind::Task { .. } => None,
         }
     }
 
@@ -347,7 +372,15 @@ impl<R> Reader<R> {
     pub fn pull_request(&self) -> Option<&Detail> {
         match &self.open.as_ref()?.kind {
             Kind::PullRequest { detail, .. } => Some(detail),
-            Kind::Transcript { .. } | Kind::Child { .. } => None,
+            Kind::Transcript { .. } | Kind::Child { .. } | Kind::Task { .. } => None,
+        }
+    }
+
+    /// The background task being read, when it is one.
+    pub fn task_id(&self) -> Option<&str> {
+        match &self.open.as_ref()?.kind {
+            Kind::Task { task_id, .. } => Some(task_id),
+            _ => None,
         }
     }
 
@@ -382,6 +415,7 @@ impl<R> Reader<R> {
                 "Sent looking at pull request {}#{} ({}):",
                 detail.repository, detail.number, detail.url
             ),
+            Kind::Task { task_id, .. } => format!("Sent looking at background task {task_id}:"),
         })
     }
 
@@ -390,6 +424,7 @@ impl<R> Reader<R> {
         Some(match self.open.as_ref()?.kind {
             Kind::Transcript { .. } | Kind::Child { .. } => "the subagent",
             Kind::PullRequest { .. } => "the pull request",
+            Kind::Task { .. } => "the task",
         })
     }
 
@@ -413,6 +448,14 @@ impl<R> Reader<R> {
                 } else {
                     "q back"
                 }
+            }
+            // Cut again from the thread as it moves; only output the stream left out is
+            // read again, which `r` asks for at once.
+            Kind::Task { live, .. } => {
+                if *live {
+                    badges.push(Badge::Working);
+                }
+                "r re-reads · q back"
             }
             // Its stream keeps it up to date, so there is nothing to read again.
             Kind::Child { live, .. } => {
@@ -467,6 +510,8 @@ impl<R> Reader<R> {
             Kind::Transcript { .. } | Kind::Child { .. } => {
                 timeline::build(&open.state, expanded, open_levels, size.0, size.1)
             }
+            // A task is opened to read what it said, so its rows are drawn open.
+            Kind::Task { .. } => timeline::build(&open.state, expanded, 2, size.0, size.1),
         }
     }
 
@@ -512,6 +557,9 @@ impl<R> Reader<R> {
     /// reading again every few seconds. Once the agent has finished, one last read shows
     /// how it ended, and that is the end of it.
     pub fn tick(&mut self, thread: &Thread, now: Instant) -> Step {
+        if self.task_id().is_some() {
+            return self.follow_task(thread, now);
+        }
         let Some(Open {
             kind:
                 Kind::Transcript {
@@ -691,6 +739,14 @@ impl<R> Reader<R> {
                     ..Step::default()
                 }
             }
+            // Opened by `open_task`, which has where the conversation is; asked for here,
+            // it is the open one read again.
+            Source::Task(task_id) => {
+                if self.task_id() != Some(task_id.as_str()) {
+                    return failed(Step::warn("that task is not open"));
+                }
+                self.show_task(thread, task_id, origin, None, intent, fresh)
+            }
             Source::PullRequest(url) => {
                 let (payload, number) = match pull_request_payload(thread, &url) {
                     Ok(found) => found,
@@ -804,18 +860,24 @@ impl<R> Reader<R> {
     /// its way is now only bringing up to date what is open, should it still be open.
     fn ask(&mut self, source: Source, asked: Asked) {
         if asked.intent == Intent::Loud {
-            for other in self.asked.values_mut() {
-                other.intent = Intent::Quiet;
-            }
-            // A subagent thread is only followed to be read, and is not going to be.
-            if let Some((agent_id, _)) = &self.child_asked
-                && Source::Subagent(agent_id.clone()) != source
-            {
-                self.asked.remove(&Source::Subagent(agent_id.clone()));
-                self.child_asked = None;
-            }
+            self.quiet_the_rest(&source);
         }
         self.asked.insert(source, asked);
+    }
+
+    /// `source` is the last thing asked for, so nothing else on its way is to take over
+    /// the view when it comes.
+    fn quiet_the_rest(&mut self, source: &Source) {
+        for other in self.asked.values_mut() {
+            other.intent = Intent::Quiet;
+        }
+        // A subagent thread is only followed to be read, and is not going to be.
+        if let Some((agent_id, _)) = &self.child_asked
+            && Source::Subagent(agent_id.clone()) != *source
+        {
+            self.asked.remove(&Source::Subagent(agent_id.clone()));
+            self.child_asked = None;
+        }
     }
 
     /// The read this answers, if it is still wanted.
@@ -1021,6 +1083,211 @@ impl<R> Reader<R> {
                 .find(|agent| &agent.id == agent_id)
                 .is_some_and(|agent| !agent.status.is_terminal());
         self.revision += 1;
+        state.revision = self.revision;
+        Step::refreshed()
+    }
+
+    /// Read a background task in place of the conversation: the call that started it and
+    /// what it has said since, cut out of the thread. `here` is where the conversation is,
+    /// kept for the way back.
+    pub fn open_task(&mut self, thread: &Thread, task_id: &str, origin: Origin, here: R) -> Step {
+        self.show_task(
+            thread,
+            task_id.to_string(),
+            origin,
+            Some(here),
+            Intent::Loud,
+            false,
+        )
+    }
+
+    fn show_task(
+        &mut self,
+        thread: &Thread,
+        task_id: String,
+        origin: Origin,
+        here: Option<R>,
+        intent: Intent,
+        fresh: bool,
+    ) -> Step {
+        let loud = intent == Intent::Loud;
+        let again = self.task_id() == Some(task_id.as_str());
+        let output = match &self.open {
+            Some(Open {
+                kind: Kind::Task { output, .. },
+                ..
+            }) if again => output.clone(),
+            _ => None,
+        };
+        let Some(cut) = cut_task(thread.state, &task_id, output.as_deref()) else {
+            return if loud {
+                Step::warn("that task is no longer in this thread")
+            } else {
+                Step::default()
+            };
+        };
+        if loud {
+            self.quiet_the_rest(&Source::Task(task_id.clone()));
+        }
+        let (restore, origin) = match (self.open.take(), here) {
+            // Read again from the view itself, it is still from wherever it was opened.
+            (Some(open), _) if again && origin == Origin::Chat => (open.restore, open.origin),
+            (Some(open), _) => (open.restore, origin),
+            (None, Some(here)) => (here, origin),
+            (None, None) => return Step::default(),
+        };
+        self.revision += 1;
+        let mut state = cut.state;
+        state.revision = self.revision;
+        self.open = Some(Open {
+            kind: Kind::Task {
+                task_id: task_id.clone(),
+                live: cut.live,
+                seen: cut.seen,
+                output,
+                read_at: Instant::now(),
+            },
+            title: cut.title,
+            subtitle: cut.subtitle,
+            state,
+            restore,
+            origin,
+        });
+        let fetches = match cut.omitted {
+            // What was fetched before is shown until `r` asks past it.
+            Some(omitted) if fresh || !again => self.fetch_output(thread, &task_id, omitted),
+            _ => Vec::new(),
+        };
+        if !loud {
+            return Step {
+                fetches,
+                ..Step::refreshed()
+            };
+        }
+        Step {
+            fetches,
+            toast: Some(Toast::Clear),
+            outcome: Outcome::Opened {
+                place: if again { Place::Keep } else { Place::Top },
+                take_focus: origin != Origin::Sidebar,
+            },
+        }
+    }
+
+    /// Keep an open task up to date: cut its rows again whenever the thread has moved
+    /// them, and while it runs, read again every few seconds what the stream leaves out.
+    fn follow_task(&mut self, thread: &Thread, now: Instant) -> Step {
+        let Some(Open {
+            kind:
+                Kind::Task {
+                    task_id,
+                    live,
+                    seen,
+                    output,
+                    read_at,
+                },
+            state,
+            subtitle,
+            ..
+        }) = &mut self.open
+        else {
+            return Step::default();
+        };
+        let Some(cut) = cut_task(thread.state, task_id, output.as_deref()) else {
+            return Step::default();
+        };
+        let task_id = task_id.clone();
+        let mut step = Step::default();
+        if cut.seen != *seen {
+            *seen = cut.seen;
+            *live = cut.live;
+            *subtitle = cut.subtitle;
+            self.revision += 1;
+            *state = cut.state;
+            state.revision = self.revision;
+            step.outcome = Outcome::Refreshed;
+        }
+        let due = now.saturating_duration_since(*read_at) >= TRANSCRIPT_POLL;
+        if let Some(omitted) = cut.omitted.filter(|_| cut.live && due) {
+            *read_at = now;
+            step.fetches = self.fetch_output(thread, &task_id, omitted);
+        }
+        step
+    }
+
+    /// Ask for the output the stream left out of a task's call, unless it is on its way.
+    fn fetch_output(&mut self, thread: &Thread, task_id: &str, omitted: Omitted) -> Vec<Fetch> {
+        let source = Source::Task(task_id.to_string());
+        if self.asked.contains_key(&source) {
+            return Vec::new();
+        }
+        self.asked.insert(
+            source,
+            Asked {
+                intent: Intent::Quiet,
+                origin: Origin::Chat,
+                again: None,
+            },
+        );
+        vec![Fetch::TurnItem {
+            task_id: task_id.to_string(),
+            thread_id: thread.state.id().to_string(),
+            item_id: omitted.item_id,
+            revision: omitted.revision,
+        }]
+    }
+
+    /// The call that started a task came back whole, with the output the stream left out.
+    pub fn on_turn_item(
+        &mut self,
+        thread: &Thread,
+        task_id: String,
+        result: Result<Value, String>,
+    ) -> Step {
+        if self.answered(&Source::Task(task_id.clone())).is_none() {
+            return Step::default();
+        }
+        let item = match result {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::info!(%error, "reading a task's output");
+                return Step::default();
+            }
+        };
+        let item = item.get("item").unwrap_or(&item);
+        let text = match item.get("output") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Null) | None => return Step::default(),
+            Some(other) => other.to_string(),
+        };
+        let Some(Open {
+            kind:
+                Kind::Task {
+                    task_id: open,
+                    live,
+                    seen,
+                    output,
+                    ..
+                },
+            state,
+            subtitle,
+            ..
+        }) = &mut self.open
+        else {
+            return Step::default();
+        };
+        if *open != task_id {
+            return Step::default();
+        }
+        let Some(cut) = cut_task(thread.state, &task_id, Some(&text)) else {
+            return Step::default();
+        };
+        *output = Some(text);
+        *seen = cut.seen;
+        *live = cut.live;
+        *subtitle = cut.subtitle;
+        self.revision += 1;
+        *state = cut.state;
         state.revision = self.revision;
         Step::refreshed()
     }
@@ -1251,6 +1518,117 @@ impl<R> Reader<R> {
         self.asked.clear();
         self.child_asked = None;
     }
+}
+
+/// Output the stream left out of the call that started a task, and how to ask for it.
+#[derive(Debug, Clone, PartialEq)]
+struct Omitted {
+    item_id: String,
+    revision: String,
+}
+
+/// A background task's rows, cut out of the thread they are in.
+struct Cut {
+    state: ThreadState,
+    title: String,
+    subtitle: String,
+    live: bool,
+    /// The rows as they stand, to tell when they have moved.
+    seen: u64,
+    omitted: Option<Omitted>,
+}
+
+/// Cut a background task's rows out of the thread: the call that started it, which the
+/// task is named after, and the news it has sent back about it since. `output` is what
+/// was fetched of the call's output when the stream left it out.
+fn cut_task(thread: &ThreadState, task_id: &str, output: Option<&str>) -> Option<Cut> {
+    let activities = &thread.detail.activities;
+    let mut call = activities
+        .iter()
+        .rfind(|activity| {
+            activity.str("toolCallId").is_some()
+                && (activity.str("nativeId") == Some(task_id)
+                    || activity.str("toolCallId") == Some(task_id))
+        })?
+        .clone();
+    let listed = thread
+        .detail
+        .shell
+        .background_tasks
+        .iter()
+        .find(|task| task.task_id == task_id);
+    let live = listed.is_some();
+    let omitted = (call.payload["outputOmitted"] == Value::Bool(true)).then(|| Omitted {
+        item_id: call.id.clone(),
+        revision: if call.kind == "tool.completed" {
+            call.str("updatedAt").unwrap_or_default().to_string()
+        } else {
+            "live".to_string()
+        },
+    });
+    if let Some(text) = output.filter(|_| omitted.is_some()) {
+        let place = if call.str("itemType") == Some("command_execution") {
+            "rawOutput"
+        } else {
+            "result"
+        };
+        call.payload["data"][place] = json!({ "content": text });
+    }
+    let news: Vec<crate::model::Activity> = activities
+        .iter()
+        .filter(|activity| activity.str("parentItemId") == Some(call.id.as_str()))
+        .cloned()
+        .collect();
+    let title = listed
+        .and_then(|task| task.description.clone())
+        .or_else(|| call.str("detail").map(str::to_string))
+        .or_else(|| call.str("title").map(str::to_string))
+        .unwrap_or_else(|| "background task".to_string());
+    let kind = match listed.map(|task| task.kind.as_str()) {
+        Some("monitor") => "monitor",
+        Some("command") => "command",
+        Some(_) => "background task",
+        None if call.str("itemType") == Some("command_execution") => "command",
+        None => "background task",
+    };
+    let subtitle = if live {
+        format!("{kind} · running")
+    } else {
+        format!("{kind} · {}", call.str("status").unwrap_or("ended"))
+    };
+    let mut rows = vec![call];
+    rows.extend(news);
+    let seen = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        live.hash(&mut hasher);
+        for row in &rows {
+            row.id.hash(&mut hasher);
+            row.kind.hash(&mut hasher);
+            row.payload.to_string().hash(&mut hasher);
+        }
+        hasher.finish()
+    };
+    let state = ThreadState::from_snapshot(ThreadDetailSnapshot {
+        snapshot_sequence: 0,
+        thread: ThreadDetail {
+            shell: thread.detail.shell.clone(),
+            messages: Vec::new(),
+            activities: rows,
+            proposed_plans: Vec::new(),
+            checkpoints: Vec::new(),
+        },
+        page: None,
+        projection: None,
+    });
+    Some(Cut {
+        state,
+        title,
+        subtitle,
+        live,
+        seen,
+        omitted,
+    })
 }
 
 /// What a subagent thread's header says under its title: what it runs as.
@@ -1649,6 +2027,139 @@ pub(crate) mod tests {
         let step = reader.on_child(&lent(&thread), "child", child_saying(&[]), CONVERSATION);
         assert_eq!(step.outcome, Outcome::Nothing);
         assert!(!reader.is_open());
+    }
+
+    // ── Background tasks ───────────────────────────────────────────────
+
+    /// A thread running background command `bg1`, started by call `item-1`, which has
+    /// printed `output`, beside a call that has nothing to do with it and a note about it.
+    fn thread_with_a_task(output: &str, omitted: bool) -> ThreadState {
+        let at = "2026-01-01T00:00:00Z";
+        let mut thread = thread(
+            vec![
+                json!({"id": "item-1", "kind": "tool.started", "tone": "tool", "summary": "Ran command",
+                    "createdAt": at, "payload": {"itemType": "command_execution", "toolCallId": "item-1",
+                    "nativeId": "bg1", "outputOmitted": omitted, "status": "inProgress",
+                    "title": "Ran command", "detail": "npm run watch",
+                    "data": {"command": "npm run watch", "rawOutput": {"content": output}}}}),
+                json!({"id": "item-2", "kind": "tool.completed", "tone": "tool", "summary": "Ran command",
+                    "createdAt": at, "payload": {"itemType": "command_execution", "toolCallId": "item-2",
+                    "status": "completed", "title": "Ran command", "detail": "ls",
+                    "data": {"command": "ls", "rawOutput": {"content": "a"}}}}),
+                json!({"id": "note-1", "kind": "runtime.note", "tone": "info", "summary": "Build failed",
+                    "createdAt": at, "payload": {"message": "3 errors", "parentItemId": "item-1"}}),
+            ],
+            json!({"status": "ready"}),
+            json!([]),
+        );
+        thread.detail.shell.background_tasks = serde_json::from_value(json!([
+            {"taskId": "bg1", "description": "watch the build", "kind": "command"},
+        ]))
+        .unwrap();
+        thread
+    }
+
+    fn rows_read(reader: &Reader<&'static str>) -> Vec<String> {
+        reader
+            .conversation()
+            .map(|state| {
+                state
+                    .detail
+                    .activities
+                    .iter()
+                    .map(|a| a.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn output_read(reader: &Reader<&'static str>) -> Option<String> {
+        let state = reader.conversation()?;
+        state.detail.activities[0].payload["data"]["rawOutput"]["content"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// A task opens on the call that started it and the news about it, and nothing else in
+    /// the thread; it keeps up as the thread moves, and says how it ended once it has.
+    #[test]
+    fn a_task_is_read_out_of_the_thread_and_keeps_up() {
+        let mut thread = thread_with_a_task("compiling", false);
+        let mut reader: Reader<&str> = Reader::default();
+        let step = reader.open_task(&lent(&thread), "bg1", Origin::Tasks, CONVERSATION);
+        assert_eq!(step.outcome, opened(Place::Top, true));
+        assert!(step.fetches.is_empty(), "the stream had all of it");
+        assert_eq!(rows_read(&reader), ["item-1", "note-1"]);
+        assert_eq!(reader.source(), Some(Source::Task("bg1".into())));
+        let header = reader.header().expect("a header");
+        assert_eq!(header.title, "watch the build");
+        assert_eq!(header.subtitle, "command · running");
+        assert_eq!(header.badges, vec![Badge::Working]);
+
+        let unmoved = reader.tick(&lent(&thread), Instant::now());
+        assert_eq!(unmoved.outcome, Outcome::Nothing);
+
+        thread.detail.activities[0].payload["data"]["rawOutput"]["content"] =
+            json!("compiling\nwatching");
+        let step = reader.tick(&lent(&thread), Instant::now());
+        assert_eq!(step.outcome, Outcome::Refreshed);
+        assert_eq!(output_read(&reader).as_deref(), Some("compiling\nwatching"));
+
+        thread.detail.shell.background_tasks.clear();
+        thread.detail.activities[0].kind = "tool.completed".into();
+        thread.detail.activities[0].payload["status"] = json!("completed");
+        let step = reader.tick(&lent(&thread), Instant::now());
+        assert_eq!(step.outcome, Outcome::Refreshed);
+        let header = reader.header().expect("still open once it has ended");
+        assert_eq!(header.subtitle, "command · completed");
+        assert!(header.badges.is_empty());
+
+        let closed = reader.close().expect("it was open");
+        assert_eq!(
+            (closed.restore, closed.origin),
+            (CONVERSATION, Origin::Tasks)
+        );
+    }
+
+    /// Output the stream left out is read whole, and read again while the task runs: every
+    /// few seconds on its own, and at once on `r`.
+    #[test]
+    fn a_tasks_omitted_output_is_read_whole() {
+        let thread = thread_with_a_task("", true);
+        let mut reader: Reader<&str> = Reader::default();
+        let at = Instant::now();
+        let step = reader.open_task(&lent(&thread), "bg1", Origin::Tasks, CONVERSATION);
+        let asked = Fetch::TurnItem {
+            task_id: "bg1".into(),
+            thread_id: "t1".into(),
+            item_id: "item-1".into(),
+            revision: "live".into(),
+        };
+        assert_eq!(step.fetches, vec![asked.clone()]);
+
+        let step = reader.on_turn_item(
+            &lent(&thread),
+            "bg1".into(),
+            Ok(json!({"item": {"id": "item-1", "output": "all of it"}})),
+        );
+        assert_eq!(step.outcome, Outcome::Refreshed);
+        assert_eq!(output_read(&reader).as_deref(), Some("all of it"));
+
+        let soon = reader.tick(&lent(&thread), at);
+        assert!(soon.fetches.is_empty(), "read a moment ago");
+        assert_eq!(
+            output_read(&reader).as_deref(),
+            Some("all of it"),
+            "kept between reads"
+        );
+        let later = reader.tick(&lent(&thread), Instant::now() + TRANSCRIPT_POLL);
+        assert_eq!(later.fetches, vec![asked.clone()]);
+        let _ = reader.on_turn_item(&lent(&thread), "bg1".into(), Err("gone".into()));
+
+        let step = reader.reread(&lent(&thread), Source::Task("bg1".into()), Origin::Chat);
+        assert_eq!(step.fetches, vec![asked]);
+        assert_eq!(step.outcome, opened(Place::Keep, true));
+        assert_eq!(output_read(&reader).as_deref(), Some("all of it"));
     }
 
     // ── Transcripts ────────────────────────────────────────────────────

@@ -857,6 +857,14 @@ impl Projection {
                     json!({
                         "itemType": item_type,
                         "toolCallId": item.id,
+                        // What the provider calls it, which is the id of the background
+                        // task it started, if it started one.
+                        "nativeId": item
+                            .get("nativeItemRef")
+                            .and_then(|native| native.get("nativeId"))
+                            .and_then(Value::as_str),
+                        "outputOmitted": item.get("outputOmitted").and_then(Value::as_bool) == Some(true),
+                        "updatedAt": item.updated_at,
                         "status": tool_status(&item.status),
                         "title": title,
                         "detail": summary,
@@ -970,7 +978,8 @@ impl Projection {
                     "runtime.note",
                     "info",
                     summary.to_string(),
-                    json!({ "message": item.str("detail") }),
+                    // The item a background task's news is about: the call that started it.
+                    json!({ "message": item.str("detail"), "parentItemId": item.str("parentItemId") }),
                 ));
             }
             "system_notice" | "run_interrupt_request" | "run_interrupt_result" => {

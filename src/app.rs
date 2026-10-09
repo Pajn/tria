@@ -533,6 +533,12 @@ pub enum AppEvent {
         url: String,
         result: Result<Value, String>,
     },
+    /// The call that started a background task, read whole for the output the stream
+    /// left out.
+    TurnItem {
+        task_id: String,
+        result: Result<Value, String>,
+    },
     /// A subagent's transcript came back from the machine that ran it.
     Transcript {
         agent_id: String,
@@ -651,6 +657,8 @@ pub struct App {
     pub terminal_cursor: ListCursor<String>,
     /// The cursor in the subagent roster, on a subagent by its id.
     pub agent_cursor: ListCursor<String>,
+    /// The cursor in the background task list, on a task by its id.
+    pub task_cursor: ListCursor<String>,
     /// What is read in place of the thread's conversation, and the reads on their way.
     pub reader: Reader<Restore>,
     /// The subagent thread the session was last told to follow for the reader.
@@ -803,6 +811,7 @@ impl App {
             terminals: Vec::new(),
             terminal_cursor: ListCursor::default(),
             agent_cursor: ListCursor::default(),
+            task_cursor: ListCursor::default(),
             reader: Reader::default(),
             followed: None,
             labels_applied: HashSet::new(),
@@ -3567,8 +3576,33 @@ impl App {
             self.toast("no thread open", true);
             return;
         }
+        // Land on the task being read, if one is.
+        let rows = self.task_rows();
+        let at = self
+            .reader
+            .task_id()
+            .and_then(|reading| rows.iter().position(|row| row.key == reading))
+            .unwrap_or(0);
+        self.task_cursor = ListCursor::on(&rows, at);
         self.mode = Mode::Tasks;
         self.confirm_stop_session = false;
+    }
+
+    /// The background tasks in the list, as its cursor is lent them: two lines each.
+    pub fn task_rows(&self) -> Vec<Row<String>> {
+        self.running_tasks()
+            .into_iter()
+            .map(|task| Row {
+                key: task.id,
+                height: 2,
+            })
+            .collect()
+    }
+
+    /// Read a background task in place of the conversation, from the task list.
+    fn open_task(&mut self, task_id: &str) {
+        let here = self.here();
+        self.read_with(|reader, thread| reader.open_task(thread, task_id, Origin::Tasks, here));
     }
 
     /// What the server says the session is still running after the turn settled:
@@ -3645,10 +3679,25 @@ impl App {
             }
             return;
         }
+        let rows = self.task_rows();
+        let cursor = &mut self.task_cursor;
+        let selected = cursor
+            .selection(&rows)
+            .and_then(|at| rows.get(at))
+            .map(|row| row.key.clone());
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('T') => {
-                self.mode = Mode::Normal
-            }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('T') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => cursor.move_by(&rows, 1),
+            KeyCode::Char('k') | KeyCode::Up => cursor.move_by(&rows, -1),
+            KeyCode::Char('g') => cursor.top(&rows),
+            KeyCode::Char('G') => cursor.bottom(&rows),
+            KeyCode::Enter | KeyCode::Char('l') => match selected {
+                Some(task_id) => {
+                    self.mode = Mode::Normal;
+                    self.open_task(&task_id);
+                }
+                None => self.mode = Mode::Normal,
+            },
             KeyCode::Char('s') => self.interrupt(),
             KeyCode::Char('S') => self.confirm_stop_session = true,
             _ => {}
@@ -3887,6 +3936,22 @@ impl App {
         match fetch {
             // Asked of the session by `sync_following`, which every step ends with.
             reader::Fetch::Follow { .. } => {}
+            reader::Fetch::TurnItem {
+                task_id,
+                thread_id,
+                item_id,
+                revision,
+            } => {
+                let payload =
+                    json!({ "threadId": thread_id, "itemId": item_id, "revision": revision });
+                tokio::spawn(async move {
+                    let result = handle
+                        .call("orchestration.getTurnItem", payload)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = events.send(AppEvent::TurnItem { task_id, result });
+                });
+            }
             reader::Fetch::Transcript {
                 agent_id,
                 cwd,
@@ -3978,6 +4043,10 @@ impl App {
         self.read_with(|reader, thread| {
             reader.on_transcript(thread, agent_id, result, here, Instant::now())
         });
+    }
+
+    fn on_turn_item(&mut self, task_id: String, result: Result<Value, String>) {
+        self.read_with(|reader, thread| reader.on_turn_item(thread, task_id, result));
     }
 
     fn on_child(&mut self, thread_id: String, item: ThreadItem) {
@@ -5698,8 +5767,10 @@ impl App {
             let reading_pull_request = self.reader.pull_request().is_some();
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc if idle => {
-                    if self.leave_reading() == Some(Origin::Roster) {
-                        self.mode = Mode::Agents;
+                    match self.leave_reading() {
+                        Some(Origin::Roster) => self.mode = Mode::Agents,
+                        Some(Origin::Tasks) => self.open_tasks(),
+                        _ => {}
                     }
                     return;
                 }
@@ -7923,6 +7994,7 @@ fn apply(app: &mut App, event: AppEvent) {
             recovered,
         } => app.on_tool_recovery(request, thread_id, recovered),
         AppEvent::Transcript { agent_id, result } => app.on_transcript(agent_id, result),
+        AppEvent::TurnItem { task_id, result } => app.on_turn_item(task_id, result),
         AppEvent::PullRequest { url, result } => app.on_pull_request(url, result),
         AppEvent::AttachmentImage {
             thread_id,
@@ -9212,6 +9284,43 @@ mod tests {
         assert_eq!(interrupt["threadId"], "t1");
         assert_eq!(interrupt["runId"], "turn");
         // The list stays open: the rows clearing is what says it worked.
+        assert_eq!(app.mode, Mode::Tasks);
+    }
+
+    /// A task in the list is read with `Enter`, in place of the conversation, and `q` goes
+    /// back to the list it was read from.
+    #[tokio::test]
+    async fn a_task_in_the_list_is_read_and_left_for_the_list() {
+        let (handle, _requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        watched(&mut app, Some("working"), "ready");
+        let thread = app.thread.as_mut().unwrap();
+        thread.detail.activities.push(
+            serde_json::from_value(json!({
+                "id": "item-1", "kind": "tool.started", "tone": "tool", "summary": "Ran command",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "payload": {"itemType": "command_execution", "toolCallId": "item-1",
+                    "nativeId": "bg1", "status": "inProgress", "title": "Ran command",
+                    "data": {"command": "npm run watch", "rawOutput": {"content": "watching"}}},
+            }))
+            .unwrap(),
+        );
+        thread.detail.shell.background_tasks = serde_json::from_value(json!([
+            {"taskId": "bg1", "description": "watch the build", "kind": "command"},
+        ]))
+        .unwrap();
+
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT));
+        assert_eq!(app.mode, Mode::Tasks);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.reader.task_id(), Some("bg1"));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.focus, Focus::Chat);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.reader.is_open());
         assert_eq!(app.mode, Mode::Tasks);
     }
 
