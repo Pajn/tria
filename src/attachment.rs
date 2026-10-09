@@ -112,6 +112,19 @@ impl Image {
     }
 }
 
+/// The image files copied to the clipboard, as from Finder or the screenshot preview.
+/// Copying a file also puts its icon there as a picture, so the files are what to look
+/// for first: the picture is only a picture of the file.
+pub fn copied_images(clipboard: &mut arboard::Clipboard) -> Vec<PathBuf> {
+    clipboard
+        .get()
+        .file_list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| path.is_file() && is_image_name(path))
+        .collect()
+}
+
 /// The image files a paste names, when that is all it is: what a terminal types for a
 /// file dropped on it. Each path is as a shell would take it, with spaces and the like
 /// escaped by backslashes or the whole of it quoted, or as a `file://` link. Anything

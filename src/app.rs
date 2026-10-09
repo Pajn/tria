@@ -2888,13 +2888,18 @@ impl App {
         self.attach_images(images);
     }
 
-    /// `Ctrl-v`: the picture on the clipboard goes with the message, as the terminal's
-    /// own paste cannot carry one; text on it is pasted as text.
+    /// `Ctrl-v`: image files copied to the clipboard go with the message, or failing
+    /// that the picture on it, as the terminal's own paste cannot carry one; text on it
+    /// is pasted as text.
     fn paste_clipboard(&mut self) {
         let mut clipboard = match arboard::Clipboard::new() {
             Ok(clipboard) => clipboard,
             Err(error) => return self.toast(format!("no clipboard here: {error}"), true),
         };
+        let copied = crate::attachment::copied_images(&mut clipboard);
+        if !copied.is_empty() {
+            return self.attach_files(&copied);
+        }
         match crate::attachment::Image::from_clipboard(&mut clipboard) {
             Ok(Some(image)) => return self.attach_images(vec![image]),
             Ok(None) => {}
