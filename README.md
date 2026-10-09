@@ -619,6 +619,10 @@ readable once it has ended. Output the server leaves out of the thread's stream 
 `orchestration.getTurnItem`, again every five seconds while the task runs; `r` reads it at
 once. `q` or `Esc` goes back to the list.
 
+A pull request the agent asked the server to watch is listed as a task while the watch lasts.
+The watch has nothing of its own to read, since it is the server polling the host, so `Enter`
+reads the pull request it is waiting on instead, picked by the watch the pull request carries.
+
 There is no per-task stop in the protocol. What stops a watcher is an interrupt of the turn
 that left it running — `Ctrl-c`, `:stop`, or `s` in the list, which is what the desktop
 app's `Monitoring · Stop` sends. `S` or `:stop!` is the harder one: it ends the provider

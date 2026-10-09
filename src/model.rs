@@ -236,6 +236,10 @@ pub struct PullRequest {
     /// The stack the host itself keeps the pull request in, where it has such a thing.
     #[serde(default)]
     pub stack: Option<PullRequestStack>,
+    /// What the server's watch of it has seen, while the agent has it watched. Only
+    /// whether there is one is read.
+    #[serde(default)]
+    pub watch: Option<Value>,
 }
 
 impl PullRequest {
@@ -252,6 +256,17 @@ impl PullRequest {
             self.host.trim().to_lowercase(),
             self.repository.trim().to_lowercase()
         )
+    }
+
+    /// The background task the server lists for its watch, while it is watched.
+    pub fn watch_task_id(&self) -> Option<String> {
+        (self.watch.is_some() && self.is_visible()).then(|| {
+            format!(
+                "pull-request-watch:{}#{}",
+                self.repository_key(),
+                self.number
+            )
+        })
     }
 
     fn head_branch(&self) -> Option<&str> {

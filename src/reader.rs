@@ -1090,7 +1090,20 @@ impl<R> Reader<R> {
     /// Read a background task in place of the conversation: the call that started it and
     /// what it has said since, cut out of the thread. `here` is where the conversation is,
     /// kept for the way back.
+    ///
+    /// A watch the server keeps of a pull request has nothing in the thread to read: what
+    /// it waits on is the pull request, which is read instead.
     pub fn open_task(&mut self, thread: &Thread, task_id: &str, origin: Origin, here: R) -> Step {
+        let watched = thread
+            .state
+            .detail
+            .shell
+            .pull_requests
+            .iter()
+            .find(|pr| pr.watch_task_id().as_deref() == Some(task_id));
+        if let Some(pr) = watched {
+            return self.open(thread, Source::PullRequest(pr.url.clone()), origin);
+        }
         self.show_task(
             thread,
             task_id.to_string(),
@@ -2119,6 +2132,46 @@ pub(crate) mod tests {
             (closed.restore, closed.origin),
             (CONVERSATION, Origin::Tasks)
         );
+    }
+
+    /// A pull request the agent has watched lists its watch as a task, which reads the pull
+    /// request: the watch has nothing of its own in the thread, and the pull request is
+    /// what it waits on. `q` still goes back to the task list.
+    #[test]
+    fn a_watched_pull_request_is_read_from_its_task() {
+        let mut thread = stacked_thread();
+        thread.detail.shell.pull_requests[1].host = "GitHub.com".into();
+        thread.detail.shell.pull_requests[1].watch = Some(json!({"wakes": 0}));
+        let mut reader: Reader<&str> = Reader::default();
+        let step = reader.open_task(
+            &lent(&thread),
+            "pull-request-watch:github.com/o/r#1",
+            Origin::Tasks,
+            CONVERSATION,
+        );
+        assert_eq!(
+            pull_request_fetches(&step),
+            vec![(FIRST.to_string(), false)]
+        );
+        let _ = reader.on_pull_request(
+            &lent(&thread),
+            FIRST.into(),
+            Ok(open_detail("layer 1")),
+            CONVERSATION,
+        );
+        assert_eq!(reader.source(), Some(Source::PullRequest(FIRST.into())));
+        assert_eq!(
+            reader.close().map(|closed| closed.origin),
+            Some(Origin::Tasks)
+        );
+
+        let unwatched = reader.open_task(
+            &lent(&thread),
+            "pull-request-watch:github.com/o/r#2",
+            Origin::Tasks,
+            CONVERSATION,
+        );
+        assert!(unwatched.fetches.is_empty(), "#2 is not watched");
     }
 
     /// Output the stream left out is read whole, and read again while the task runs: every
