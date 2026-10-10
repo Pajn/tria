@@ -648,7 +648,10 @@ reads the pull request it is waiting on instead, picked by the watch the pull re
 
 There is no per-task stop in the protocol. What stops a watcher is an interrupt of the turn
 that left it running — `Ctrl-c`, `:stop`, or `s` in the list, which is what the desktop
-app's `Monitoring · Stop` sends. `S` or `:stop!` is the harder one: it ends the provider
+app's `Monitoring · Stop` sends. A pull request watch is the server's own and outlives every
+turn, so once no turn is running the same keys turn each of the thread's watches off
+instead; the server refuses to interrupt a turn that has ended when nothing of it is still
+going. `S` or `:stop!` is the harder one: it ends the provider
 session, and every process it started goes with it. Either way the conversation stays, and
 the next message starts a session again.
 

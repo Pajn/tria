@@ -2152,34 +2152,63 @@ impl App {
     /// name: the interrupt goes without one and the session stops the watch loop, which
     /// is what the desktop's `Monitoring · Stop` sends and the only per-watcher stop
     /// there is.
+    ///
+    /// With no turn going, what is left is the background work. The provider's — a
+    /// backgrounded command, a monitor — is stopped by interrupting the last run, whose
+    /// work it is. A pull request watch is the server's own and outlives every run, so it
+    /// is turned off instead; the server refuses to interrupt a run that has ended when
+    /// nothing of it is still going.
     fn interrupt(&mut self) {
         let Some(thread) = &self.thread else { return };
-        let running = thread.is_running();
+        let shell = &thread.detail.shell;
         let thread_id = thread.id().to_string();
-        if !running && !self.background_alive() {
-            self.toast("nothing running", false);
+        let latest_run = shell.latest_turn.as_ref().map(|t| t.turn_id.clone());
+        if thread.is_running() {
+            match latest_run {
+                Some(run_id) => {
+                    self.dispatch(commands::turn_interrupt(&thread_id, &run_id));
+                    self.toast("interrupting…", false);
+                }
+                None => self.toast("nothing to interrupt", false),
+            }
             return;
         }
-        // The run going, or failing that the last one, whose background work it is.
-        let Some(run_id) = thread
-            .detail
-            .shell
-            .latest_turn
-            .as_ref()
-            .map(|t| t.turn_id.clone())
-        else {
-            self.toast("nothing to interrupt", false);
-            return;
-        };
-        self.dispatch(commands::turn_interrupt(&thread_id, &run_id));
-        self.toast(
-            if running {
-                "interrupting…"
-            } else {
-                "stopping the background work…"
-            },
-            false,
-        );
+        let watched: Vec<_> = shell
+            .pull_requests
+            .iter()
+            .filter(|pr| pr.watch_task_id().is_some())
+            .map(|pr| (pr.host.clone(), pr.repository.clone(), pr.number))
+            .collect();
+        let watch_tasks: HashSet<String> = shell
+            .pull_requests
+            .iter()
+            .filter_map(|pr| pr.watch_task_id())
+            .collect();
+        let provider_work = shell
+            .background_tasks
+            .iter()
+            .any(|task| !watch_tasks.contains(&task.task_id))
+            || (shell.background_tasks.is_empty() && self.background_alive());
+        let mut stopped = Vec::new();
+        if provider_work && let Some(run_id) = &latest_run {
+            self.dispatch(commands::turn_interrupt(&thread_id, run_id));
+            stopped.push("the background work".to_string());
+        }
+        for (host, repository, number) in &watched {
+            self.dispatch(commands::pull_request_watch(
+                &thread_id, host, repository, *number, false,
+            ));
+        }
+        match watched.len() {
+            0 => {}
+            1 => stopped.push(format!("the watch of #{}", watched[0].2)),
+            count => stopped.push(format!("{count} pull request watches")),
+        }
+        if stopped.is_empty() {
+            self.toast("nothing running", false);
+        } else {
+            self.toast(format!("stopping {}…", stopped.join(" and ")), false);
+        }
     }
 
     /// Whether a digit answers the approval rather than starting a count. Only with
@@ -9502,6 +9531,49 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.reader.is_open());
         assert_eq!(app.mode, Mode::Tasks);
+    }
+
+    /// A pull request watch is the server's, and outlives every run: with the turn over and
+    /// nothing else going, stopping turns the watch off, and interrupts nothing, since the
+    /// server refuses to interrupt a run that has ended.
+    #[tokio::test]
+    async fn stopping_a_finished_thread_turns_its_watches_off() {
+        let (handle, mut requests) = crate::session::Handle::detached();
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut app = App::new(handle, events);
+        watched(&mut app, Some("monitoring"), "ready");
+        let shell = &mut app.thread.as_mut().unwrap().detail.shell;
+        shell.pull_requests = serde_json::from_value(json!([
+            {"host": "github.com", "repository": "o/r", "number": 7,
+             "url": "https://github.com/o/r/pull/7", "source": "agent",
+             "linkedAt": "2026-01-01T00:00:00.000Z", "watch": {"wakes": 0}},
+            {"host": "github.com", "repository": "o/r", "number": 8,
+             "url": "https://github.com/o/r/pull/8", "source": "agent",
+             "linkedAt": "2026-01-01T00:00:00.000Z"},
+        ]))
+        .unwrap();
+        shell.background_tasks = serde_json::from_value(json!([
+            {"taskId": "pull-request-watch:github.com/o/r#7", "description": "Watching pull request #7", "kind": "monitor"},
+        ]))
+        .unwrap();
+
+        app.run_command("stop");
+        tokio::task::yield_now().await;
+        let commands = dispatched(&mut requests);
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command["type"] == "run.interrupt"),
+            "{commands:#?}"
+        );
+        let unwatched: Vec<_> = commands
+            .iter()
+            .filter(|command| command["type"] == "thread.pull-request.watch")
+            .collect();
+        assert_eq!(unwatched.len(), 1, "only the one watched");
+        assert_eq!(unwatched[0]["number"], 7);
+        assert_eq!(unwatched[0]["watching"], false);
+        assert_eq!(unwatched[0]["repository"], "o/r");
     }
 
     /// With nothing running and nothing watching, the interrupt is not sent at all.

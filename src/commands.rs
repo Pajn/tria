@@ -158,6 +158,25 @@ pub fn turn_interrupt(thread_id: &str, run_id: &str) -> Value {
     })
 }
 
+/// Start or stop the server's watch of a pull request linked to a thread.
+pub fn pull_request_watch(
+    thread_id: &str,
+    host: &str,
+    repository: &str,
+    number: u64,
+    watching: bool,
+) -> Value {
+    json!({
+        "type": "thread.pull-request.watch",
+        "commandId": new_id(),
+        "threadId": thread_id,
+        "host": host,
+        "repository": repository,
+        "number": number,
+        "watching": watching,
+    })
+}
+
 /// Undo the turns after a checkpoint: from the conversation and, with `restore_files`,
 /// from the checkout too, by putting back the files as the checkpoint has them.
 pub fn thread_revert(thread_id: &str, target: &RollbackTarget, restore_files: bool) -> Value {
