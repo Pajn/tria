@@ -1025,7 +1025,8 @@ request's own code, as `:checkout` does.
 - `tria dump <thread-id>` opens a thread through the same connection code as the UI and prints
   reduced state for a few seconds. Both are useful when checking a new server release.
 
-Logs go to `tria.log` next to the config file. Set `TRIA_LOG=debug` for more detail.
+Logs go to `tria.log` next to the config file. Each start begins a new log and keeps the
+previous start's as `tria.log.1`. Set `TRIA_LOG=debug` for more detail.
 
 ## How it talks to the server
 

@@ -353,19 +353,29 @@ async fn dump(origin: &str, token: &str, thread_id: &str, seconds: u64) -> Resul
     Ok(())
 }
 
-/// Log to a file under the state directory; the terminal is owned by the UI.
+/// Log to a file under the state directory; the terminal is owned by the UI. Each start
+/// begins a new `tria.log` and keeps the previous start's as `tria.log.1`, so the log
+/// holds two runs at most.
 fn init_logging() -> Result<()> {
     let dir = config::Config::path()?
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_default();
     std::fs::create_dir_all(&dir)?;
+    let path = dir.join("tria.log");
+    match std::fs::rename(&path, dir.join("tria.log.1")) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.into()),
+        _ => {}
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
-        .open(dir.join("tria.log"))?;
-    let filter =
-        tracing_subscriber::EnvFilter::try_from_env("TRIA_LOG").unwrap_or_else(|_| "info".into());
+        .write(true)
+        .truncate(true)
+        .open(&path)?;
+    // The markdown renderer warns about a code block's unknown language each time the
+    // block is drawn, which is every frame it is on screen.
+    let filter = tracing_subscriber::EnvFilter::try_from_env("TRIA_LOG")
+        .unwrap_or_else(|_| "info,tui_markdown=error".into());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(file)
