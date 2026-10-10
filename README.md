@@ -1032,3 +1032,20 @@ previous start's as `tria.log.1`. Set `TRIA_LOG=debug` for more detail.
 
 See [PLAN.md](./PLAN.md) for the protocol notes: pairing and WebSocket tickets, the Effect RPC
 JSON framing, the shell and thread subscriptions, and the dispatch commands this client uses.
+
+## Releasing
+
+Releases are cut with [cargo-release](https://github.com/crate-ci/cargo-release) from `main`:
+
+```sh
+cargo release minor            # shows what it would do
+cargo release minor --execute
+```
+
+It bumps the version in `Cargo.toml` and `Cargo.lock`, commits that as `Release <version>`,
+tags the commit `v<version>`, and pushes both. The tag starts the release workflow, which
+builds the binaries, attaches them to a GitHub release, and then publishes the crate to
+crates.io. Nothing is published from the machine that runs `cargo release`.
+
+Publishing uses crates.io trusted publishing, so the repository holds no registry token. The
+crate's settings on crates.io name this repository and `release.yml` as a trusted publisher.

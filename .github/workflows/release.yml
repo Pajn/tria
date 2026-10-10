@@ -12,7 +12,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The crate is published with the version Cargo.toml names, whatever the tag says, so a
+  # tag that disagrees with it stops the release before anything is built.
+  version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag matches Cargo.toml
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+
   build:
+    needs: version
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -67,3 +83,23 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  # Published last: `cargo binstall` looks for the release's archives as soon as the
+  # version is on crates.io, and compiles from source when they are not there yet.
+  publish:
+    needs: release
+    runs-on: ubuntu-24.04
+    # Trusted publishing: crates.io trades the workflow's OIDC token for a short-lived
+    # publish token, so no registry token is stored in the repository.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

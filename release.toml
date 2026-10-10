@@ -1,0 +1,8 @@
+# `cargo release <level>` bumps the version, commits it, tags the commit and pushes both.
+# The tag starts the release workflow, which builds the binaries and publishes the crate,
+# so nothing is published from here.
+allow-branch = ["main"]
+publish = false
+pre-release-commit-message = "Release {{version}}"
+tag-name = "v{{version}}"
+tag-message = "{{crate_name}} {{version}}"
